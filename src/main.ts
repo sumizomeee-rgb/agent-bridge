@@ -66,7 +66,13 @@ const inbox = new OrderedInbox<IncomingDM>(message => message.userId, async mess
 const discord = new DiscordTransport(config, message => inbox.handle(message), { logger: message => log(`DISCORD ${message}`) });
 manager = new SessionManager(config, adapters, {
   sendText: (channelId, text, options) => discord.sendText(channelId, redactText(text, [config.token]),
-    options?.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, [config.token]) } : undefined),
+    options ? {
+      ...options,
+      ...(options.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, [config.token]) } : {}),
+      ...(options.images ? { images: options.images.map(image => ({ ...image,
+        ...(image.description ? { description: redactText(image.description, [config.token]) } : {}),
+      })) } : {}),
+    } : undefined),
 });
 let closing = false;
 async function shutdown(): Promise<void> {

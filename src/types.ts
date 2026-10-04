@@ -37,6 +37,8 @@ export interface AgentTurn {
   conversation: Conversation;
   text: string;
   imagePaths: string[];
+  /** Bridge-owned transport guidance, supplied separately from the user's original message. */
+  deliveryInstructions?: string;
   signal: AbortSignal;
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;
@@ -58,7 +60,13 @@ export interface BridgeMessage {
   text: string;
   imagePaths: string[];
 }
-export interface ReplyOptions { repeatHeader?: string }
+export interface OutgoingImage {
+  filename: string;
+  contentType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+  data: Uint8Array;
+  description?: string;
+}
+export interface ReplyOptions { repeatHeader?: string; images?: OutgoingImage[]; signal?: AbortSignal }
 export interface ReplySink { sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> }
 export interface DiscordAttachment {
   id: string;

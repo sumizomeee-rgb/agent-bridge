@@ -177,6 +177,9 @@ export class CodexAdapter implements AgentAdapter {
       if (turn.text) input.push({ type: 'text', text: turn.text, text_elements: [] });
       for (const path of turn.imagePaths) input.push({ type: 'localImage', path });
       if (!input.length) throw new Error('消息没有文字或图片。');
+      if (turn.deliveryInstructions?.trim()) {
+        input.push({ type: 'text', text: turn.deliveryInstructions, text_elements: [] });
+      }
       const started = await rpc.request('turn/start', {
         threadId: nativeId, input, cwd: turn.conversation.cwd,
         approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },

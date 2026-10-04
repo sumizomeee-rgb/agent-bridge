@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { SessionStore } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
+import { collectOutgoingImages, createTurnArtifacts } from './artifacts.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
 
 interface RunningTurn {
@@ -101,9 +102,12 @@ export class SessionManager {
   }
 
   private cancel(conversation: Conversation): number {
-    const total = this.store.cancelPending(conversation.id);
+    let total = this.store.cancelPending(conversation.id);
     const current = this.running.get(conversation.userId);
     if (current?.conversationId === conversation.id) {
+      // The model is already completed while its reply is being collected or delivered.
+      // Preserve that terminal state, but still count and cancel this unfinished delivery.
+      if (!current.controller.signal.aborted && this.store.getMessage(current.messageId)?.state === 'completed') total++;
       current.controller.abort();
       const interruption = Promise.resolve().then(() => this.adapters[conversation.agent].interrupt(conversation.id))
         .catch(() => undefined).finally(() => this.interruptPromises.delete(interruption));
@@ -295,8 +299,11 @@ export class SessionManager {
       let actualModel: string | null = null;
       let actualEffort: string | null = null;
       try {
+        const artifacts = await createTurnArtifacts(this.config.dataDir, item.id);
+        if (!current()) continue;
         const result = await this.adapters[target.agent].run({
           conversation: target, text: item.text, imagePaths: item.imagePaths,
+          deliveryInstructions: artifacts.instructions,
           signal: controller.signal,
           onNativeId: nativeId => { if (current() && nativeId) this.store.saveNativeId(conversationId, nativeId); },
           onModel: model => {
@@ -313,9 +320,17 @@ export class SessionManager {
         if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
         this.store.saveNativeId(conversationId, result.nativeId);
         this.store.setState(item.id, 'completed');
+        const delivering = () => !this.closed && !controller.signal.aborted
+          && this.running.get(item.userId) === turn
+          && this.store.getActive(item.userId)?.id === conversationId
+          && this.store.getMessage(item.id)?.state === 'completed';
+        const outgoing = await collectOutgoingImages(result.text, artifacts.directory, this.config.maxImageBytes, controller.signal);
+        if (!delivering()) continue;
         const identity = { conversationId, agent: target.agent, nativeId: result.nativeId };
         const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort);
-        await this.sink.sendText(item.channelId, `${header}\n\n${result.text || '本轮完成（没有文本输出）。'}`, { repeatHeader: header });
+        await this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || (outgoing.images.length ? '图片已附上。' : '本轮完成（没有文本输出）。')}`,
+          { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}) });
+        if (!delivering()) continue;
         // Failed or partially delivered replies never establish successful continuity.
         this.store.saveDelivery(item.userId, item.channelId, identity);
       } catch (error) {

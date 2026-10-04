@@ -3,9 +3,9 @@ import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { fetch, ProxyAgent, type Dispatcher } from 'undici';
+import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
-import type { BridgeConfig, DiscordAttachment, IncomingDM, ReplyOptions } from './types.js';
+import type { BridgeConfig, DiscordAttachment, IncomingDM, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
@@ -35,6 +35,9 @@ const imageTypes: Record<string, string> = {
 };
 const fatalGatewayCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const cdnHosts = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+const mib = 1024 * 1024;
+const outgoingBatchBytes = 24 * mib; // Leave room below Discord's 25 MiB request limit.
+interface PreparedImage { filename: string; blob: Blob; description?: string }
 
 class DiscordRestError extends Error {
   constructor(public readonly status: number) { super(`Discord REST 请求失败（HTTP ${status}）。`); }
@@ -73,6 +76,51 @@ function validImage(header: Buffer, extension: string): boolean {
   }
 }
 
+function prepareOutgoingImages(images: OutgoingImage[], maxImageBytes: number): PreparedImage[][] {
+  if (!Array.isArray(images) || images.length > 10) throw new Error('单次回复最多发送 10 张图片。');
+  const perImageLimit = Math.min(maxImageBytes, 10 * mib);
+  let totalBytes = 0;
+  // Validate the entire logical reply before copying bytes or sending any text.
+  for (const image of images) {
+    if (!image || typeof image.filename !== 'string' || !image.filename.length || image.filename.length > 200
+      || image.filename !== image.filename.trim() || /[\x00-\x1f\x7f/\\:*?"<>|]/.test(image.filename)
+      || image.filename.endsWith('.') || image.filename === '.' || image.filename === '..') {
+      throw new Error('回复图片的文件名无效，必须是安全的文件名。');
+    }
+    const extension = imageTypes[image.contentType];
+    const filenameExtension = image.filename.split('.').at(-1)?.toLowerCase();
+    if (!extension || (filenameExtension === 'jpeg' ? 'jpg' : filenameExtension) !== extension) {
+      throw new Error('回复图片仅支持扩展名与类型一致的 JPG、PNG、WebP 和 GIF。');
+    }
+    if (!(image.data instanceof Uint8Array) || image.data.byteLength === 0 || image.data.byteLength > perImageLimit) {
+      throw new Error('回复图片为空或大小超过上限。');
+    }
+    totalBytes += image.data.byteLength;
+    if (totalBytes > 100 * mib) throw new Error('单次回复的图片总大小超过 100 MiB。');
+    if (!validImage(Buffer.from(image.data.buffer, image.data.byteOffset, Math.min(image.data.byteLength, 12)), extension)) {
+      throw new Error('回复图片内容不是声明的图片格式。');
+    }
+    if (image.description !== undefined && (typeof image.description !== 'string'
+      || image.description.length > 1024 || image.description.includes('\0'))) {
+      throw new Error('回复图片说明无效或超过 1024 字。');
+    }
+  }
+  const batches: PreparedImage[][] = [];
+  let batch: PreparedImage[] = [];
+  let batchBytes = 0;
+  for (const image of images) {
+    if (batch.length && batchBytes + image.data.byteLength > outgoingBatchBytes) {
+      batches.push(batch); batch = []; batchBytes = 0;
+    }
+    // A Blob snapshots the supplied view so queued sends and retries are immutable.
+    batch.push({ filename: image.filename, blob: new Blob([new Uint8Array(image.data)], { type: image.contentType }),
+      ...(image.description === undefined ? {} : { description: image.description }) });
+    batchBytes += image.data.byteLength;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
 function chunks(text: string, limit = 2000): string[] {
   const result: string[] = [];
   for (let offset = 0; offset < text.length;) {
@@ -84,6 +132,17 @@ function chunks(text: string, limit = 2000): string[] {
     offset = end;
   }
   return result;
+}
+
+function waitForSend(job: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return job;
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    const abort = () => { cleanup(); reject(signal.reason); };
+    signal.addEventListener('abort', abort, { once: true });
+    void job.then(() => { cleanup(); resolve(); }, error => { cleanup(); reject(error); });
+  });
 }
 
 export class DiscordTransport {
@@ -158,23 +217,36 @@ export class DiscordTransport {
   async sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> {
     if (!snowflake(channelId)) throw new Error('无效的 Discord channelId。');
     if (this.closed) throw new Error('Discord transport 已关闭。');
-    if (!text.length) return;
+    const signal = options?.signal;
+    signal?.throwIfAborted();
+    const imageBatches = prepareOutgoingImages(options?.images ?? [], this.config.maxImageBytes);
+    if (!text.length && !imageBatches.length) return;
     const prefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
-    if (prefix && (prefix.length >= 1998 || !text.startsWith(prefix))) throw new Error('回复头过长或与正文不一致。');
+    if (prefix && (prefix.length >= 1998 || (text.length > 0 && !text.startsWith(prefix)))) throw new Error('回复头过长或与正文不一致。');
     const parts = prefix ? chunks(text.slice(prefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : chunks(text);
     const previous = this.sendQueues.get(channelId) ?? Promise.resolve();
     const job = previous.catch(() => undefined).then(async () => {
-      for (const content of parts) {
+      signal?.throwIfAborted();
+      for (let index = 0; index < Math.max(parts.length, imageBatches.length); index++) {
+        signal?.throwIfAborted();
+        const images = imageBatches[index];
+        const content = parts[index] ?? `${prefix}${chunks(`图片 ${index + 1}/${imageBatches.length}`, 2000 - prefix.length)[0]}`;
         // A nonce prevents duplicate delivery if a server retries a message internally.
         await this.rest(`/channels/${channelId}/messages`, 'POST', {
           content, allowed_mentions: { parse: [] },
           nonce: randomUUID().replaceAll('-', '').slice(0, 24), enforce_nonce: true,
-        }, channelId);
+          ...(images ? { attachments: images.map((image, id) => ({ id, filename: image.filename,
+            ...(image.description === undefined ? {} : { description: image.description }) })) } : {}),
+        }, channelId, images, signal);
       }
     });
     this.sendQueues.set(channelId, job);
-    try { await job; }
-    finally { if (this.sendQueues.get(channelId) === job) this.sendQueues.delete(channelId); }
+    // An aborted caller returns immediately, but its slot still waits for the prior
+    // job so later replies cannot overtake an upload already running on this channel.
+    void job.finally(() => {
+      if (this.sendQueues.get(channelId) === job) this.sendQueues.delete(channelId);
+    }).catch(() => undefined);
+    await waitForSend(job, signal);
   }
 
   async syncSlashCommands(): Promise<void> {
@@ -548,21 +620,34 @@ export class DiscordTransport {
     throw new Error('Discord 交互持续限流，请稍后重试。');
   }
 
-  private async rest(path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown, channelId?: string): Promise<unknown> {
+  private async rest(path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown, channelId?: string,
+    images?: PreparedImage[], turnSignal?: AbortSignal): Promise<unknown> {
+    const cancel = turnSignal ? AbortSignal.any([this.shutdown.signal, turnSignal]) : this.shutdown.signal;
     let localWaitUntil = 0;
     for (let attempt = 0; attempt < 10; attempt++) {
       if (this.closed) throw new Error('Discord transport 已关闭。');
+      cancel.throwIfAborted();
       const wait = Math.max(this.globalWaitUntil, localWaitUntil, channelId ? this.channelWaitUntil.get(channelId) ?? 0 : 0) - Date.now();
-      if (wait > 0) await delay(wait, undefined, { signal: this.shutdown.signal });
+      if (wait > 0) await delay(wait, undefined, { signal: cancel });
+      cancel.throwIfAborted();
+      let form: FormData | undefined;
+      if (images?.length) {
+        // Rebuild multipart for every attempt; a consumed request body is never reused.
+        form = new FormData();
+        form.set('payload_json', JSON.stringify(body));
+        images.forEach((image, index) => form!.append(`files[${index}]`, image.blob, image.filename));
+      }
+      const requestSignal = AbortSignal.any([cancel, AbortSignal.timeout(30_000)]);
       const response = await this.httpFetch(`${this.restBase}${path}`, {
         method, dispatcher: this.restDispatcher,
-        signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(30_000)]), redirect: 'error',
-        headers: { authorization: `Bot ${this.config.token}`, 'content-type': 'application/json',
+        signal: requestSignal, redirect: 'error',
+        headers: { authorization: `Bot ${this.config.token}`, ...(form ? {} : { 'content-type': 'application/json' }),
           'user-agent': 'DiscordBot (https://github.com/discord/discord-api-docs, 0.1.0)' },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined ? {} : { body: form ?? JSON.stringify(body) }),
       });
       let data: unknown;
       try { data = await response.json(); } catch { data = null; }
+      requestSignal.throwIfAborted();
       if (response.status === 429) {
         const retryHeader = response.headers.get('retry-after');
         const seconds = record(data) && typeof data.retry_after === 'number' ? data.retry_after :
