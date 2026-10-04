@@ -73,4 +73,6 @@ export interface IncomingDM {
   channelId: string;
   text: string;
   attachments: DiscordAttachment[];
+  /** Gateway interaction credentials stay in memory and never enter the session store. */
+  interaction?: { id: string; token: string; applicationId: string };
 }

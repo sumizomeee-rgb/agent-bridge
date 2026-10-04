@@ -46,20 +46,22 @@ export class SessionManager {
 
   hasMessage(id: string): boolean { return this.store.hasMessage(id); }
 
-  async handle(message: BridgeMessage): Promise<void> {
+  async handle(message: BridgeMessage, commandReply?: (text: string) => Promise<void>): Promise<void> {
     if (this.closed) throw new Error('桥已关闭');
     if (!this.config.allowedUserIds.includes(message.userId) || this.hasMessage(message.id)) return;
     const parsed = command(message.text);
     if (parsed) {
       if (!this.store.addMessage(message, null, 'command')) return;
+      // An interaction reply belongs to this command invocation, never to a channel or queued turn.
+      const reply = commandReply ?? ((text: string) => this.sink.sendText(message.channelId, text));
       try {
-        await this.handleCommand(message, parsed.name, parsed.argument);
+        await this.handleCommand(message, parsed.name, parsed.argument, reply);
         if (this.closed) return;
         this.store.setState(message.id, 'completed');
       } catch (error) {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
-        await this.sink.sendText(message.channelId, `命令失败：${error instanceof Error ? error.message : String(error)}`);
+        await reply(`命令失败：${error instanceof Error ? error.message : String(error)}`);
       }
       return;
     }
@@ -139,9 +141,9 @@ export class SessionManager {
     return { models: [...models.values()], defaultModel: info.defaultModel ?? this.config.defaultModels?.[target.agent] ?? null };
   }
 
-  private async handleModel(message: BridgeMessage, argument: string, list = false): Promise<void> {
+  private async handleModel(message: BridgeMessage, argument: string,
+    reply: (text: string) => Promise<void>, list = false): Promise<void> {
     const target = this.ensureActive(message.userId);
-    const reply = (text: string) => this.sink.sendText(message.channelId, text);
     if (!argument || argument === 'list' || list) {
       const info = await this.modelInfo(target);
       if (this.closed) return;
@@ -194,13 +196,13 @@ export class SessionManager {
     }
   }
 
-  private async handleCommand(message: BridgeMessage, name: string, argument: string): Promise<void> {
-    const reply = (text: string) => this.sink.sendText(message.channelId, text);
+  private async handleCommand(message: BridgeMessage, name: string, argument: string,
+    reply: (text: string) => Promise<void>): Promise<void> {
     const current = this.store.getActive(message.userId);
     switch (name) {
       case 'help': await reply(HELP); return;
-      case 'model': await this.handleModel(message, argument); return;
-      case 'models': await this.handleModel(message, '', true); return;
+      case 'model': await this.handleModel(message, argument, reply); return;
+      case 'models': await this.handleModel(message, '', reply, true); return;
       case 'new':
       case 'agent': {
         if (name === 'agent' && !argument) {

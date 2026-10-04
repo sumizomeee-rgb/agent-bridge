@@ -53,9 +53,15 @@ const adapters = { codex: new CodexAdapter(config.commands.codex, env), claude: 
 let manager: SessionManager;
 const inbox = new OrderedInbox<IncomingDM>(message => message.userId, async message => {
   if (closing) return;
-  if (manager.hasMessage(message.id)) return;
+  if (manager.hasMessage(message.id)) {
+    if (message.interaction) await discord.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
+    return;
+  }
   const imagePaths = await discord.downloadImages(message);
-  await manager.handle({ ...message, imagePaths });
+  const commandReply = message.interaction
+    ? (text: string) => discord.sendInteractionText(message.interaction!, redactText(text, [config.token, message.interaction!.token]))
+    : undefined;
+  await manager.handle({ id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths }, commandReply);
 });
 const discord = new DiscordTransport(config, message => inbox.handle(message), { logger: message => log(`DISCORD ${message}`) });
 manager = new SessionManager(config, adapters, {
@@ -82,6 +88,7 @@ process.on('unhandledRejection', e => log(`ERROR ${safeError(e)}`));
 try {
   await discord.start();
   log(`READY bot=${discord.botUser?.username ?? 'unknown'} agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'}`);
+  void discord.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, [config.token])}`));
   await manager.recover();
 } catch (error) {
   log(`START_FAILED ${safeError(error)}`);

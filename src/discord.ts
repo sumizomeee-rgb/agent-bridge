@@ -6,6 +6,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { fetch, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
 import type { BridgeConfig, DiscordAttachment, IncomingDM, ReplyOptions } from './types.js';
+import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
 export interface DiscordTransportOptions {
@@ -97,6 +98,9 @@ export class DiscordTransport {
   private readonly sendQueues = new Map<string, Promise<void>>();
   private readonly channelWaitUntil = new Map<string, number>();
   private readonly seenMessages = new Set<string>();
+  private readonly seenInteractions = new Set<string>();
+  private readonly deliveryQueues = new Map<string, Promise<void>>();
+  private applicationId: string | undefined;
   private globalWaitUntil = 0;
   private ws: WebSocket | undefined;
   private gatewayUrl: string | undefined;
@@ -171,6 +175,28 @@ export class DiscordTransport {
     this.sendQueues.set(channelId, job);
     try { await job; }
     finally { if (this.sendQueues.get(channelId) === job) this.sendQueues.delete(channelId); }
+  }
+
+  async syncSlashCommands(): Promise<void> {
+    if (this.closed) throw new Error('Discord transport 已关闭。');
+    if (!this.applicationId) {
+      const application = await this.rest('/applications/@me', 'GET');
+      if (!record(application) || !snowflake(application.id)) throw new Error('Discord 没有返回有效应用标识。');
+      this.applicationId = application.id;
+    }
+    await this.rest(`/applications/${this.applicationId}/commands`, 'PUT', SLASH_COMMANDS);
+  }
+
+  async sendInteractionText(interaction: SlashInteraction, text: string): Promise<void> {
+    if (!snowflake(interaction.id) || !snowflake(interaction.applicationId) || !interaction.token || interaction.token.length > 4096) {
+      throw new Error('无效的 Discord 交互回复信息。');
+    }
+    const parts = chunks(text || '命令已完成。');
+    const endpoint = `/webhooks/${interaction.applicationId}/${encodeURIComponent(interaction.token)}`;
+    for (let index = 0; index < parts.length; index++) {
+      await this.interactionRest(index === 0 ? `${endpoint}/messages/@original` : endpoint,
+        index === 0 ? 'PATCH' : 'POST', { content: parts[index], allowed_mentions: { parse: [] } });
+    }
   }
 
   async downloadImages(message: IncomingDM): Promise<string[]> {
@@ -384,6 +410,7 @@ export class DiscordTransport {
         }
       }
       this.botUser = { id: user.id, username: user.username };
+      if (record(value.d.application) && snowflake(value.d.application.id)) this.applicationId = value.d.application.id;
       this.log(`已连接：${user.username}（${user.id}）。`);
       this.ready();
     } else if (value.t === 'RESUMED') {
@@ -391,6 +418,8 @@ export class DiscordTransport {
       this.ready();
     } else if (value.t === 'MESSAGE_CREATE') {
       this.incoming(value.d);
+    } else if (value.t === 'INTERACTION_CREATE') {
+      void this.incomingInteraction(value.d).catch(() => this.log('斜杠命令处理失败，未输出交互凭据。'));
     }
   }
 
@@ -425,7 +454,7 @@ export class DiscordTransport {
       text: typeof data.content === 'string' ? data.content : '', attachments,
     };
     // Agent turns must never block Gateway heartbeats or subsequent incoming commands.
-    void Promise.resolve().then(() => this.onMessage(message)).catch(async () => {
+    void this.deliverInOrder(message).catch(async () => {
       this.log('私聊消息处理失败。');
       if (!this.closed) {
         await this.sendText(message.channelId, '这条消息处理失败，请稍后再试。').catch(() => this.log('错误反馈发送失败。'));
@@ -433,10 +462,97 @@ export class DiscordTransport {
     });
   }
 
-  private async rest(path: string, method: 'GET' | 'POST', body?: unknown, channelId?: string): Promise<unknown> {
+  private async incomingInteraction(data: RecordValue): Promise<void> {
+    if (data.type !== 2 || !snowflake(data.id) || !snowflake(data.application_id)
+      || typeof data.token !== 'string' || !data.token || data.token.length > 4096
+      || this.seenInteractions.has(data.id)) return;
+    this.seenInteractions.add(data.id);
+    if (this.seenInteractions.size > 5000) this.seenInteractions.delete(this.seenInteractions.values().next().value!);
+    const endpoint = `/interactions/${data.id}/${encodeURIComponent(data.token)}/callback`;
+    const reject = (content: string) => this.interactionRest(endpoint, 'POST',
+      { type: 4, data: { content, flags: 64, allowed_mentions: { parse: [] } } }, true);
+    const user = data.user;
+    const channel = record(data.channel) ? data.channel : undefined;
+    const channelId = snowflake(data.channel_id) ? data.channel_id : channel?.id;
+    const botDM = data.context === 1 || (data.context == null && channel?.type === 1);
+    if (data.guild_id != null || !botDM || (channel?.type != null && channel.type !== 1)
+      || !record(user) || user.bot === true || !snowflake(user.id) || !this.allowedUsers.has(user.id)
+      || !snowflake(channelId) || (this.applicationId && data.application_id !== this.applicationId)) {
+      await reject('这些命令仅供已授权用户在机器人的私聊中使用。'); return;
+    }
+    const parsed = slashText(data.data);
+    if ('error' in parsed) { await reject(parsed.error); return; }
+    const interaction: SlashInteraction = { id: data.id, token: data.token, applicationId: data.application_id };
+    const message: IncomingDM & { interaction: SlashInteraction } = {
+      id: data.id, userId: user.id, channelId, text: parsed.text, attachments: [], interaction,
+    };
+    let acknowledged!: Promise<void>;
+    // Reserve the arrival position before starting the network request, so text cannot overtake it.
+    const delivered = this.deliverInOrder(message, () => acknowledged);
+    void delivered.catch(() => undefined);
+    // ACK bypasses the ordinary channel queue/rate-limit wait: Discord requires it within 3 seconds.
+    // No command may mutate state until this response succeeds.
+    acknowledged = this.interactionRest(endpoint, 'POST', { type: 5 }, true);
+    void acknowledged.catch(() => undefined);
+    await acknowledged;
+    try { await delivered; }
+    catch {
+      this.log('斜杠命令执行失败。');
+      if (!this.closed) await this.sendInteractionText(interaction, '这条命令处理失败，请稍后重试。')
+        .catch(() => this.log('斜杠命令错误反馈发送失败。'));
+    }
+  }
+
+  private deliverInOrder(message: IncomingDM, before: () => Promise<void> = () => Promise.resolve()): Promise<void> {
+    const previous = this.deliveryQueues.get(message.userId) ?? Promise.resolve();
+    let handled: Promise<void> = Promise.resolve();
+    const delivered = previous.catch(() => undefined).then(async () => {
+      await before();
+      if (this.closed) return;
+      // Preserve onMessage invocation order; its own OrderedInbox controls preparation/processing.
+      handled = Promise.resolve().then(() => this.onMessage(message));
+      void handled.catch(() => undefined);
+    });
+    this.deliveryQueues.set(message.userId, delivered);
+    return delivered.finally(() => {
+      if (this.deliveryQueues.get(message.userId) === delivered) this.deliveryQueues.delete(message.userId);
+    }).then(() => handled);
+  }
+
+  /** Interaction callback/webhook tokens authorize these requests; never attach the bot credential. */
+  private async interactionRest(path: string, method: 'POST' | 'PATCH', body: unknown, initial = false): Promise<void> {
+    for (let attempt = 0; attempt < (initial ? 1 : 10); attempt++) {
+      if (this.closed) throw new Error('Discord transport 已关闭。');
+      let response;
+      try {
+        response = await this.httpFetch(`${this.restBase}${path}`, {
+          method, dispatcher: this.restDispatcher, redirect: 'error',
+          signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(initial ? 2000 : 30_000)]),
+          headers: { 'content-type': 'application/json', 'user-agent': 'DiscordBot (https://github.com/discord/discord-api-docs, 0.1.0)' },
+          body: JSON.stringify(body),
+        });
+      } catch { throw new Error('Discord 交互网络请求失败。'); }
+      let data: unknown;
+      try { data = await response.json(); } catch { data = null; }
+      if (!response.ok) {
+        if (response.status === 429 && !initial) {
+          const seconds = record(data) && typeof data.retry_after === 'number' ? data.retry_after : Number(response.headers.get('retry-after'));
+          if (!Number.isFinite(seconds) || seconds < 0 || seconds > 300) throw new Error('Discord 交互限流等待时间无效。');
+          await delay(Math.max(50, seconds * 1000), undefined, { signal: this.shutdown.signal });
+          continue;
+        }
+        throw new DiscordRestError(response.status);
+      }
+      return;
+    }
+    throw new Error('Discord 交互持续限流，请稍后重试。');
+  }
+
+  private async rest(path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown, channelId?: string): Promise<unknown> {
+    let localWaitUntil = 0;
     for (let attempt = 0; attempt < 10; attempt++) {
       if (this.closed) throw new Error('Discord transport 已关闭。');
-      const wait = Math.max(this.globalWaitUntil, channelId ? this.channelWaitUntil.get(channelId) ?? 0 : 0) - Date.now();
+      const wait = Math.max(this.globalWaitUntil, localWaitUntil, channelId ? this.channelWaitUntil.get(channelId) ?? 0 : 0) - Date.now();
       if (wait > 0) await delay(wait, undefined, { signal: this.shutdown.signal });
       const response = await this.httpFetch(`${this.restBase}${path}`, {
         method, dispatcher: this.restDispatcher,
@@ -455,7 +571,7 @@ export class DiscordTransport {
         const until = Date.now() + Math.max(50, seconds * 1000);
         if (record(data) && data.global === true) this.globalWaitUntil = Math.max(this.globalWaitUntil, until);
         else if (channelId) this.channelWaitUntil.set(channelId, until);
-        else this.globalWaitUntil = Math.max(this.globalWaitUntil, until);
+        else localWaitUntil = until;
         continue;
       }
       if (!response.ok) throw new DiscordRestError(response.status);
