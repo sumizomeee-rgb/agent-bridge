@@ -192,11 +192,14 @@ function localPath(destination: string): string | null {
 
 function imageType(path: string, header: Buffer): OutgoingImage['contentType'] {
   const extension = extname(path).toLowerCase();
-  if (extension === '.png' && header.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
-  if (['.jpg', '.jpeg'].includes(extension) && header[0] === 255 && header[1] === 216 && header[2] === 255) return 'image/jpeg';
-  if (extension === '.gif' && ['GIF87a', 'GIF89a'].includes(header.subarray(0, 6).toString('ascii'))) return 'image/gif';
-  if (extension === '.webp' && header.subarray(0, 4).toString('ascii') === 'RIFF' && header.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
-  throw failed(`${basename(path)} 不是扩展名匹配的 PNG/JPG/WebP/GIF 图片。`);
+  if (!['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(extension)) throw failed(`${basename(path)} 必须使用 PNG/JPG/WebP/GIF 图片扩展名。`);
+  // Some capture APIs save JPEG bytes using a .png name. The signature determines
+  // the transmitted type/name; disk files and encoded image bytes remain untouched.
+  if (header.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
+  if (header[0] === 255 && header[1] === 216 && header[2] === 255) return 'image/jpeg';
+  if (['GIF87a', 'GIF89a'].includes(header.subarray(0, 6).toString('ascii'))) return 'image/gif';
+  if (header.subarray(0, 4).toString('ascii') === 'RIFF' && header.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  throw failed(`${basename(path)} 的文件内容不是 PNG/JPG/WebP/GIF 图片。`);
 }
 
 /** Only explicitly declared final-reply images are read; unrelated files are never enumerated. */
@@ -254,7 +257,8 @@ async function collect(finalText: string, rootDirectory: string, maxImageBytes: 
     } finally { await file.close(); }
     signal?.throwIfAborted();
     const contentType = imageType(path, data.subarray(0, 12));
-    let filename = basename(path);
+    const extension = contentType === 'image/jpeg' ? '.jpg' : `.${contentType.slice(6)}`;
+    let filename = `${basename(path, extname(path))}${extension}`;
     if (names.has(filename.toLowerCase())) filename = `${images.length + 1}-${filename}`;
     names.add(filename.toLowerCase());
     images.push({ filename, contentType, data, ...(marker.description ? { description: marker.description } : {}) });

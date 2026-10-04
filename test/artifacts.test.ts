@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, rm, symlink, link, unlink, writeFile, open, stat, type FileHandle } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, link, unlink, writeFile, open, stat, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,6 +11,8 @@ import { SessionStore } from '../src/store.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, BridgeMessage, ReplyOptions, ReplySink } from '../src/types.js';
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aU1kAAAAASUVORK5CYII=', 'base64');
+// An actual encoded 1x1 JPEG fixture, rather than a signature-only byte stub.
+const JPEG = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD5qooor+gz8iP/2Q==', 'base64');
 const marker = (path: string, alt = '截图') => `![${alt}](<${path}>)`;
 
 async function temporary(t: TestContext) {
@@ -186,17 +188,17 @@ test('hard links, directories and missing declarations are refused with a clear 
   await assert.rejects(collectOutgoingImages(marker(join(f.directory, 'missing.png')), f.directory, 100), /图片回传失败.*ENOENT/);
 });
 
-test('signature mismatches and unsupported extensions cannot masquerade as images', async t => {
+test('non-image bytes and unsupported extensions cannot masquerade as images', async t => {
   const f = await fixture(t);
   const spoof = join(f.directory, 'spoof.png');
   await writeFile(spoof, 'this is not an image');
-  await assert.rejects(collectOutgoingImages(marker(spoof), f.directory, 100), /扩展名匹配/);
+  await assert.rejects(collectOutgoingImages(marker(spoof), f.directory, 100), /文件内容不是/);
   const unsupported = join(f.directory, 'vector.svg');
   await writeFile(unsupported, PNG);
   await assert.rejects(collectOutgoingImages(marker(unsupported), f.directory, 100), /PNG\/JPG\/WebP\/GIF/);
 });
 
-test('JPG, WebP and GIF signatures are accepted only under their matching extension', async t => {
+test('JPG, WebP and GIF signatures are accepted under permitted image extensions', async t => {
   const f = await fixture(t);
   const files = [
     { name: 'image.jpeg', data: Buffer.from([255, 216, 255, 224, 0, 1]), type: 'image/jpeg' },
@@ -206,6 +208,41 @@ test('JPG, WebP and GIF signatures are accepted only under their matching extens
   for (const file of files) await writeFile(join(f.directory, file.name), file.data);
   const result = await collectOutgoingImages(files.map(file => marker(join(f.directory, file.name))).join('\n'), f.directory, 100);
   assert.deepEqual(result.images.map(image => image.contentType), files.map(file => file.type));
+});
+
+test('actual JPEG stored as .png uploads as .jpg without changing encoded bytes or the disk file', async t => {
+  const f = await fixture(t);
+  const path = join(f.directory, 'game-screenshot.png');
+  await writeFile(path, JPEG);
+  const before = await stat(path);
+  const originalHash = createHash('sha256').update(JPEG).digest('hex');
+  const result = await collectOutgoingImages(marker(path, '游戏截图'), f.directory, 1024);
+  assert.equal(result.images.length, 1);
+  assert.equal(result.images[0]!.contentType, 'image/jpeg');
+  assert.equal(result.images[0]!.filename, 'game-screenshot.jpg');
+  assert.equal(result.images[0]!.description, '游戏截图');
+  assert.deepEqual(Buffer.from(result.images[0]!.data), JPEG);
+  assert.equal(createHash('sha256').update(result.images[0]!.data).digest('hex'), originalHash);
+  assert.deepEqual(await readFile(path), JPEG);
+  assert.equal((await stat(path)).mtimeMs, before.mtimeMs);
+  await assert.rejects(stat(join(f.directory, 'game-screenshot.jpg')), { code: 'ENOENT' });
+});
+
+test('PNG, GIF and WebP magic normalize mismatched permitted suffixes without transcoding', async t => {
+  const f = await fixture(t);
+  const files = [
+    { name: 'png.jpg', data: PNG, filename: 'png.png', type: 'image/png' },
+    { name: 'gif.PNG', data: Buffer.from('GIF89a123456'), filename: 'gif.gif', type: 'image/gif' },
+    { name: 'webp.jpeg', data: Buffer.from('RIFF1234WEBP'), filename: 'webp.webp', type: 'image/webp' },
+  ];
+  for (const file of files) await writeFile(join(f.directory, file.name), file.data);
+  const result = await collectOutgoingImages(files.map(file => marker(join(f.directory, file.name))).join('\n'), f.directory, 100);
+  for (let index = 0; index < files.length; index++) {
+    assert.equal(result.images[index]!.filename, files[index]!.filename);
+    assert.equal(result.images[index]!.contentType, files[index]!.type);
+    assert.deepEqual(Buffer.from(result.images[index]!.data), files[index]!.data);
+    assert.deepEqual(await readFile(join(f.directory, files[index]!.name)), files[index]!.data);
+  }
 });
 
 test('configured byte limits and the hard 10 MiB limit are checked before large-file reads', async t => {
