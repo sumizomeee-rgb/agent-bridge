@@ -81,6 +81,8 @@ export class CodexAdapter implements AgentAdapter {
         turnId = params.turn.id;
       } else if (message.method === 'item/agentMessage/delta' && typeof params.delta === 'string') {
         turn.onProgress(params.delta);
+      } else if (message.method === 'model/rerouted' && typeof params.toModel === 'string' && params.toModel) {
+        turn.onModel?.(params.toModel);
       } else if (message.method === 'item/completed') {
         collect(params.item);
       } else if (message.method === 'error' && params.willRetry === false) {
@@ -142,6 +144,9 @@ export class CodexAdapter implements AgentAdapter {
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
       if (typeof thread.model === 'string' && thread.model) turn.onModel?.(thread.model);
+      if (typeof thread.reasoningEffort === 'string' || thread.reasoningEffort === null) {
+        turn.onReasoningEffort?.(thread.reasoningEffort);
+      }
       if (cancelled) throw abortError();
       const input: JsonObject[] = [];
       if (turn.text) input.push({ type: 'text', text: turn.text, text_elements: [] });

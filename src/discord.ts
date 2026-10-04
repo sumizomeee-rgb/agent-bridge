@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { fetch, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
-import type { BridgeConfig, DiscordAttachment, IncomingDM } from './types.js';
+import type { BridgeConfig, DiscordAttachment, IncomingDM, ReplyOptions } from './types.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
 export interface DiscordTransportOptions {
@@ -72,10 +72,10 @@ function validImage(header: Buffer, extension: string): boolean {
   }
 }
 
-function chunks(text: string): string[] {
+function chunks(text: string, limit = 2000): string[] {
   const result: string[] = [];
   for (let offset = 0; offset < text.length;) {
-    let end = Math.min(offset + 2000, text.length);
+    let end = Math.min(offset + limit, text.length);
     // Discord's limit counts UTF-16 units; avoid splitting a surrogate pair.
     const last = text.charCodeAt(end - 1);
     if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
@@ -151,13 +151,16 @@ export class DiscordTransport {
     return this.startPromise;
   }
 
-  async sendText(channelId: string, text: string): Promise<void> {
+  async sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> {
     if (!snowflake(channelId)) throw new Error('无效的 Discord channelId。');
     if (this.closed) throw new Error('Discord transport 已关闭。');
     if (!text.length) return;
+    const prefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
+    if (prefix && (prefix.length >= 1998 || !text.startsWith(prefix))) throw new Error('回复头过长或与正文不一致。');
+    const parts = prefix ? chunks(text.slice(prefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : chunks(text);
     const previous = this.sendQueues.get(channelId) ?? Promise.resolve();
     const job = previous.catch(() => undefined).then(async () => {
-      for (const content of chunks(text)) {
+      for (const content of parts) {
         // A nonce prevents duplicate delivery if a server retries a message internally.
         await this.rest(`/channels/${channelId}/messages`, 'POST', {
           content, allowed_mentions: { parse: [] },

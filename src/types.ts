@@ -8,6 +8,8 @@ export interface Conversation {
   model?: string | null;
   /** Most recently reported effective model, separate from aliases/selections. */
   actualModel?: string | null;
+  /** Most recently reported reasoning effort; null means the CLI did not confirm it. */
+  actualEffort?: string | null;
   title: string;
   cwd: string;
   createdAt: string;
@@ -39,6 +41,7 @@ export interface AgentTurn {
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;
   onModel?: (model: string) => void;
+  onReasoningEffort?: (effort: string | null) => void;
 }
 export interface AgentResult { nativeId: string; text: string }
 export interface AgentAdapter {
@@ -55,7 +58,8 @@ export interface BridgeMessage {
   text: string;
   imagePaths: string[];
 }
-export interface ReplySink { sendText(channelId: string, text: string): Promise<void> }
+export interface ReplyOptions { repeatHeader?: string }
+export interface ReplySink { sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> }
 export interface DiscordAttachment {
   id: string;
   filename: string;

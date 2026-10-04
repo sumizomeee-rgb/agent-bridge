@@ -9,6 +9,11 @@ export interface InboxItem extends BridgeMessage {
   conversationId: string | null;
   state: InboxState;
 }
+export interface DeliveredReply {
+  conversationId: string;
+  agent: AgentName;
+  nativeId: string;
+}
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
 function conversation(row: Row): Conversation {
@@ -16,6 +21,7 @@ function conversation(row: Row): Conversation {
     id: String(row.id), userId: String(row.user_id), agent: String(row.agent) as AgentName,
     nativeId: row.native_id === null ? null : String(row.native_id), title: String(row.title),
     model: row.model == null ? null : String(row.model), actualModel: row.actual_model == null ? null : String(row.actual_model),
+    actualEffort: row.actual_effort == null ? null : String(row.actual_effort),
     cwd: String(row.cwd), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
 }
@@ -59,11 +65,18 @@ export class SessionStore {
       );
       CREATE INDEX IF NOT EXISTS inbox_queue ON inbox(conversation_id, state, sequence);
       CREATE INDEX IF NOT EXISTS conversations_user ON conversations(user_id, updated_at);
+      CREATE TABLE IF NOT EXISTS delivered_replies (
+        user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        agent TEXT NOT NULL, native_id TEXT NOT NULL, delivered_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, channel_id)
+      );
     `);
     // Existing deployments keep native sessions, inbox, and active bindings.
     const columns = new Set(this.db.prepare('PRAGMA table_info(conversations)').all().map(row => String(row.name)));
     if (!columns.has('model')) this.db.exec('ALTER TABLE conversations ADD COLUMN model TEXT');
     if (!columns.has('actual_model')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_model TEXT');
+    if (!columns.has('actual_effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_effort TEXT');
   }
 
   hasMessage(id: string): boolean {
@@ -84,7 +97,7 @@ export class SessionStore {
   createConversation(userId: string, agent: AgentName, cwd: string): Conversation {
     const now = new Date().toISOString();
     const item: Conversation = {
-      id: randomUUID(), userId, agent, nativeId: null, model: null, actualModel: null,
+      id: randomUUID(), userId, agent, nativeId: null, model: null, actualModel: null, actualEffort: null,
       title: '新会话', cwd, createdAt: now, updatedAt: now,
     };
     this.db.prepare(`INSERT INTO conversations
@@ -103,6 +116,12 @@ export class SessionStore {
   listConversations(userId: string, limit = 20): Conversation[] {
     return this.db.prepare(`SELECT * FROM conversations WHERE user_id = ?
       ORDER BY updated_at DESC, rowid DESC LIMIT ?`).all(userId, limit).map(conversation);
+  }
+
+  latestAgentConversation(userId: string, agent: AgentName, cwd: string): Conversation | null {
+    const row = this.db.prepare(`SELECT * FROM conversations WHERE user_id = ? AND agent = ? AND cwd = ?
+      ORDER BY updated_at DESC, rowid DESC LIMIT 1`).get(userId, agent, cwd);
+    return row ? conversation(row) : null;
   }
 
   findConversations(userId: string, id: string): Conversation[] {
@@ -137,6 +156,25 @@ export class SessionStore {
   saveActualModel(id: string, model: string): void {
     this.db.prepare('UPDATE conversations SET actual_model = ?, updated_at = ? WHERE id = ?')
       .run(model, new Date().toISOString(), id);
+  }
+
+  saveActualEffort(id: string, effort: string | null): void {
+    this.db.prepare('UPDATE conversations SET actual_effort = ?, updated_at = ? WHERE id = ?')
+      .run(effort, new Date().toISOString(), id);
+  }
+
+  getLastDelivery(userId: string, channelId: string): DeliveredReply | null {
+    const row = this.db.prepare('SELECT conversation_id, agent, native_id FROM delivered_replies WHERE user_id = ? AND channel_id = ?')
+      .get(userId, channelId);
+    return row ? { conversationId: String(row.conversation_id), agent: String(row.agent) as AgentName, nativeId: String(row.native_id) } : null;
+  }
+
+  saveDelivery(userId: string, channelId: string, reply: DeliveredReply): void {
+    this.db.prepare(`INSERT INTO delivered_replies (user_id, channel_id, conversation_id, agent, native_id, delivered_at)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, channel_id) DO UPDATE SET
+      conversation_id = excluded.conversation_id, agent = excluded.agent,
+      native_id = excluded.native_id, delivered_at = excluded.delivered_at`)
+      .run(userId, channelId, reply.conversationId, reply.agent, reply.nativeId, new Date().toISOString());
   }
 
   nameConversation(id: string, text: string): void {

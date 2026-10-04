@@ -91,6 +91,9 @@ export class ClaudeAdapter implements AgentAdapter {
         recordNativeId(message.session_id);
         if (nativeId && prior === nativeId) turn.onNativeId?.(nativeId);
         if (typeof message.model === 'string' && message.model) turn.onModel?.(message.model);
+      } else if (message.type === 'assistant' && !message.parent_tool_use_id && isObject(message.message)) {
+        // The assistant envelope can resolve an init alias to the provider's actual model ID.
+        if (typeof message.message.model === 'string' && message.message.model) turn.onModel?.(message.message.model);
       } else if (message.type === 'stream_event' && !message.parent_tool_use_id && isObject(message.event)) {
         const event = message.event;
         if (event.type === 'content_block_delta' && isObject(event.delta) && event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {

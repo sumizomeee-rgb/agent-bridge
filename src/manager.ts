@@ -2,6 +2,7 @@ import { statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { SessionStore } from './store.js';
 import { isModelId } from './config.js';
+import { agentDisplayName, replyHeader } from './reply.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
 
 interface RunningTurn {
@@ -11,7 +12,7 @@ interface RunningTurn {
 }
 const HELP = `直接发送文字或图片即可继续当前会话。
 /new [codex|claude] 或 new chat：新会话
-/agent codex|claude：切换 Agent 并新建会话
+/agent：查看 Agent 选项；/agent codex 或 /agent claude：切换并续接会话
 /chats：列出自己的会话
 /resume ID：恢复会话，支持唯一短 ID
 /cwd 路径：在指定目录新建会话
@@ -118,7 +119,7 @@ export class SessionManager {
 
   private modelStatus(target: Conversation): string {
     const actual = target.actualModel ?? '尚未由 CLI 回报';
-    return `实际模型：${actual}\n会话选择：${target.model ?? 'CLI 默认'}`;
+    return `实际模型：${actual}\n会话选择：${target.model ?? 'CLI 默认'}\n推理强度：${target.actualEffort ?? '尚未由 CLI 回报（沿用 CLI 设置）'}`;
   }
 
   private async modelInfo(target: Conversation): Promise<AgentModelInfo> {
@@ -203,14 +204,29 @@ export class SessionManager {
       case 'models': await this.handleModel(message, '', true); return;
       case 'new':
       case 'agent': {
-        if ((argument && argument !== 'codex' && argument !== 'claude') || (name === 'agent' && !argument)) {
+        if (name === 'agent' && !argument) {
+          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}\n/agent codex → Codex CLI\n/agent claude → Claude Code\n切换优先恢复当前目录下的上次会话；/new 明确新建，/chats 和 /resume ID 选择其他历史会话。`); return;
+        }
+        if (argument && argument !== 'codex' && argument !== 'claude') {
           await reply(`用法：/${name} ${name === 'new' ? '[codex|claude]' : 'codex|claude'}`); return;
         }
         const agent = (argument || current?.agent || this.config.defaultAgent) as AgentName;
+        if (name === 'agent' && current?.agent === agent) {
+          await reply(`当前已是 ${agentDisplayName(agent)}，继续原会话 ${current.id.slice(0, 8)}。\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n需要清空上下文请用 /new。`); return;
+        }
+        if (name === 'agent') {
+          const previous = this.store.latestAgentConversation(message.userId, agent, current?.cwd ?? this.config.workspace);
+          if (previous) {
+            this.activate(message.userId, previous);
+            await reply(`已切换到 ${agentDisplayName(agent)}，恢复会话 ${previous.id.slice(0, 8)}：${previous.title}\n原生会话：${previous.nativeId ? `…${previous.nativeId.slice(-6)}` : '尚未创建'}\n目录：${previous.cwd}`);
+            this.wake(previous.id);
+            return;
+          }
+        }
         const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace);
         if (current?.agent === agent && current.model) this.store.setModel(target.id, current.model);
         this.activate(message.userId, target);
-        await reply(`已新建 ${agent} 会话 ${target.id.slice(0, 8)}。旧会话待处理任务已取消。\n目录：${target.cwd}`);
+        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。旧会话待处理任务已取消。\n原生会话：尚未创建\n目录：${target.cwd}`);
         return;
       }
       case 'cwd': {
@@ -244,7 +260,7 @@ export class SessionManager {
       }
       case 'status':
         await reply(current
-          ? `${current.agent} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}`
+          ? `${agentDisplayName(current.agent)} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}`
           : '还没有会话，发送文字或图片即可开始。');
         return;
       case 'stop': {
@@ -284,12 +300,19 @@ export class SessionManager {
         && this.running.get(item.userId) === turn
         && this.store.getActive(item.userId)?.id === conversationId
         && this.store.getMessage(item.id)?.state === 'running';
+      let actualModel: string | null = null;
+      let actualEffort: string | null = null;
       try {
         const result = await this.adapters[target.agent].run({
           conversation: target, text: item.text, imagePaths: item.imagePaths,
           signal: controller.signal,
           onNativeId: nativeId => { if (current() && nativeId) this.store.saveNativeId(conversationId, nativeId); },
-          onModel: model => { if (current() && model) this.store.saveActualModel(conversationId, model); },
+          onModel: model => {
+            if (current() && model) { actualModel = model; this.store.saveActualModel(conversationId, model); }
+          },
+          onReasoningEffort: effort => {
+            if (current()) { actualEffort = effort; this.store.saveActualEffort(conversationId, effort); }
+          },
           // Adapters emit deltas and protocol/tool events through this callback.
           // Only the completed reply is user-facing; no asynchronous sends can linger after cancellation.
           onProgress: () => {},
@@ -298,7 +321,11 @@ export class SessionManager {
         if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
         this.store.saveNativeId(conversationId, result.nativeId);
         this.store.setState(item.id, 'completed');
-        await this.sink.sendText(item.channelId, result.text || '本轮完成（没有文本输出）。');
+        const identity = { conversationId, agent: target.agent, nativeId: result.nativeId };
+        const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort);
+        await this.sink.sendText(item.channelId, `${header}\n\n${result.text || '本轮完成（没有文本输出）。'}`, { repeatHeader: header });
+        // Failed or partially delivered replies never establish successful continuity.
+        this.store.saveDelivery(item.userId, item.channelId, identity);
       } catch (error) {
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
           if (this.store.getMessage(item.id)?.state === 'running') this.store.setState(item.id, 'cancelled');

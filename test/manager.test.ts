@@ -322,3 +322,43 @@ test('关闭桥时未完成的命令回复不会访问已关闭的数据库', as
     assert.equal(inspect.getActive('u1')!.agent, 'codex');
   } finally { inspect.close(); }
 });
+
+test('忙中选择当前 Agent 不取消运行或排队任务，随后继续同一原生会话', async t => {
+  const f = fixture(t, false);
+  await f.manager.handle(message('running-current', 'running'));
+  await waitFor(() => f.codex.calls.length === 1);
+  await f.manager.handle(message('queued-current', 'queued'));
+  const running = f.codex.calls[0]!;
+  await f.manager.handle(message('choose-current', '/agent codex'));
+  assert.match(f.sink.replies.at(-1)!.text, /继续原会话/);
+  assert.equal(running.signal.aborted, false);
+  const inspect = new SessionStore(f.config.dataDir);
+  try {
+    assert.equal(inspect.getActive('u1')!.id, running.conversation.id);
+    assert.equal(inspect.pendingCount(running.conversation.id), 1);
+  } finally { inspect.close(); }
+  f.codex.finish(0);
+  await waitFor(() => f.codex.calls.length === 2);
+  assert.equal(f.codex.calls[1]!.conversation.id, running.conversation.id);
+  f.codex.finish(1);
+  await waitFor(() => f.sink.replies.some(reply => reply.text.endsWith('\n\nreply:queued')));
+});
+
+test('忙中切换 Agent 取消旧任务和队列，旧结果不发到新 Agent 会话', async t => {
+  const f = fixture(t, false);
+  await f.manager.handle(message('old-agent-running', 'old'));
+  await waitFor(() => f.codex.calls.length === 1);
+  await f.manager.handle(message('old-agent-queued', 'discard'));
+  await f.manager.handle(message('switch-busy-agent', '/agent claude'));
+  assert.equal(f.codex.calls[0]!.signal.aborted, true);
+  await f.manager.handle(message('new-agent-running', 'fresh'));
+  await waitFor(() => f.claude.calls.length === 1);
+  f.codex.finish(0, 'stale old agent answer');
+  f.claude.finish(0, 'fresh Claude answer');
+  await waitFor(() => f.sink.replies.some(reply => reply.text.endsWith('\n\nfresh Claude answer')));
+  assert(f.sink.replies.every(reply => !reply.text.includes('stale old agent answer')));
+  assert.equal(f.codex.calls.length, 1);
+  const reply = f.sink.replies.at(-1)!.text;
+  assert.match(reply, /^\[Claude Code ·/);
+  assert(!reply.includes('✅'));
+});

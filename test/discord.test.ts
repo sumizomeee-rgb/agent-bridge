@@ -208,6 +208,40 @@ test('429 retries only the rejected chunk with the same nonce, no duplicate succ
   assert.equal(f.posts[1]!.nonce, f.posts[2]!.nonce);
 });
 
+test('every physical reply chunk repeats the explicit header while preserving emoji and ordering', async t => {
+  const f = await fixture(t);
+  const header = '[Codex · confirmed-model · high · …abcdef ✅]';
+  const prefix = `${header}\n\n`;
+  const body = 'a'.repeat(1999 - prefix.length) + '😀' + 'b'.repeat(2100);
+  await Promise.all([
+    f.transport.sendText('222', `${prefix}${body}`, { repeatHeader: header }),
+    f.transport.sendText('222', 'command menu'),
+  ]);
+  const contents = f.posts.slice(0, -1).map(post => post.content as string);
+  assert(contents.length > 1);
+  assert.equal(contents.map(content => content.slice(prefix.length)).join(''), body);
+  assert.equal(f.posts.at(-1)!.content, 'command menu');
+  for (const content of contents) {
+    assert(content.startsWith(prefix));
+    assert(content.length <= 2000);
+    assert(!/[\ud800-\udbff]$/.test(content));
+    assert(!/^[\udc00-\udfff]/.test(content.slice(prefix.length)));
+  }
+});
+
+test('partial long-reply delivery reports failure without replaying successful chunks', async t => {
+  const f = await fixture(t);
+  let count = 0;
+  f.postHandler = (_body, response) => {
+    response.writeHead(++count === 2 ? 403 : 200, { 'content-type': 'application/json' });
+    response.end('{"id":"555"}');
+  };
+  const header = '[Claude Code · model · 强度未知 · …abcdef]';
+  await assert.rejects(f.transport.sendText('222', `${header}\n\n${'x'.repeat(5000)}`, { repeatHeader: header }), /HTTP 403/);
+  assert.equal(f.posts.length, 2);
+  assert(f.posts.every(post => (post.content as string).startsWith(`${header}\n\n`)));
+});
+
 test('downloads Discord images to random safe filenames and never forwards Bot authorization', async t => {
   const f = await fixture(t);
   const paths = await f.transport.downloadImages(message());

@@ -74,7 +74,7 @@ test('/model 查询区分实际模型与CLI默认，/models列目录且不生成
 test('切model保留nativeID及上下文，实际model与选择持久化到重启', async t => {
   const { f, send, inspect } = fixture(t);
   await send('first');
-  await waitFor(() => f.replies.some(reply => reply.text === 'reply:first'));
+  await waitFor(() => f.replies.some(reply => reply.text.endsWith('\n\nreply:first')));
   const prior = inspect(store => store.getActive('owner')!);
   await send('/model gpt-6.1-sol');
   const selected = inspect(store => store.getActive('owner')!);
@@ -83,7 +83,7 @@ test('切model保留nativeID及上下文，实际model与选择持久化到重�
   assert.equal(selected.model, 'gpt-6.1-sol');
   assert.equal(selected.actualModel, 'gpt-5.6-sol');
   await send('continue');
-  await waitFor(() => f.replies.some(reply => reply.text === 'reply:continue'));
+  await waitFor(() => f.replies.some(reply => reply.text.endsWith('\n\nreply:continue')));
   assert.equal(f.codex.calls[1]!.conversation.nativeId, prior.nativeId);
   assert.equal(f.codex.calls[1]!.conversation.model, 'gpt-6.1-sol');
   await f.manager.close();
@@ -95,7 +95,7 @@ test('切model保留nativeID及上下文，实际model与选择持久化到重�
 
 test('/model default解析配置默认5.6，保留原生会话，避免误用目录推荐6.1', async t => {
   const { f, send, inspect } = fixture(t);
-  await send('first'); await waitFor(() => f.replies.some(reply => reply.text === 'reply:first'));
+  await send('first'); await waitFor(() => f.replies.some(reply => reply.text.endsWith('\n\nreply:first')));
   const id = inspect(store => store.getActive('owner')!.nativeId);
   await send('/model gpt-6.1-sol');
   await send('/model default');
@@ -107,7 +107,7 @@ test('/model default解析配置默认5.6，保留原生会话，避免误用目
 
 test('同Agent的/new和/cwd保留显式model，清除原生上下文和实际model；换Agent用CLI默认', async t => {
   const { f, send, inspect } = fixture(t);
-  await send('first'); await waitFor(() => f.replies.some(reply => reply.text === 'reply:first'));
+  await send('first'); await waitFor(() => f.replies.some(reply => reply.text.endsWith('\n\nreply:first')));
   await send('/model gpt-6.1-sol');
   const previous = inspect(store => store.getActive('owner')!);
   await send('/new');
@@ -251,10 +251,10 @@ rl.on('line',line=>{const m=JSON.parse(line);trace(m);
   if(m.method==='model/list')send({id:m.id,result:m.params.cursor
     ?{data:[{model:'gpt-5.6-sol',displayName:'5.6',isDefault:false}],nextCursor:null}
     :{data:[{model:'gpt-6.1-sol',displayName:'6.1',isDefault:true}],nextCursor:'page2'}});
-  if(m.method==='thread/resume'||m.method==='thread/start')send({id:m.id,result:{thread:{id:m.params.threadId||id},model:m.params.model||'gpt-5.6-sol'}});
-  if(m.method==='turn/start'){send({id:m.id,result:{turn:{id:'turn'}}});send({method:'turn/completed',params:{threadId:id,turn:{id:'turn',status:'completed',items:[{type:'agentMessage',id:'reply',phase:'final_answer',text:'fake'}]}}});}
+  if(m.method==='thread/resume'||m.method==='thread/start')send({id:m.id,result:{thread:{id:m.params.threadId||id},model:m.params.model||'gpt-5.6-sol',reasoningEffort:'high'}});
+  if(m.method==='turn/start'){send({id:m.id,result:{turn:{id:'turn'}}});send({method:'model/rerouted',params:{threadId:'other-thread',turnId:'turn',toModel:'ignore-other-thread'}});send({method:'model/rerouted',params:{threadId:id,turnId:'turn',toModel:'provider-effective-model'}});send({method:'turn/completed',params:{threadId:id,turn:{id:'turn',status:'completed',items:[{type:'agentMessage',id:'reply',phase:'final_answer',text:'fake'}]}}});}
   if(m.type==='control_request')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{models:[{value:'sonnet',displayName:'Sonnet'}],defaultModel:'claude-fixture-default'}}});
-  if(m.type==='user'){const at=process.argv.indexOf('--model');send({type:'system',subtype:'init',session_id:id,model:at>=0?process.argv[at+1]:'claude-fixture-default'});send({type:'result',subtype:'success',session_id:id,result:'fake'});}
+  if(m.type==='user'){const at=process.argv.indexOf('--model');send({type:'system',subtype:'init',session_id:id,model:at>=0?process.argv[at+1]:'claude-fixture-default'});send({type:'assistant',parent_tool_use_id:null,message:{model:'provider-effective-model'}});send({type:'assistant',parent_tool_use_id:'subagent-tool',message:{model:'ignore-subagent-model'}});send({type:'result',subtype:'success',session_id:id,result:'fake'});}
 });`;
 for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user/turn，真实spawn模型override与resume原生ID`, async t => {
   const root = mkdtempSync(join(tmpdir(), 'bridge-model-process-'));
@@ -269,10 +269,12 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user
   assert(!trace.some(message => message.method === 'thread/start' || message.method === 'turn/start' || message.type === 'user'));
   if (agent === 'codex') assert.equal(info.models.length, 2);
   const reported: string[] = [];
+  const efforts: Array<string | null> = [];
   await adapter.run({ conversation: { id: 'conv', userId: 'owner', agent, nativeId: 'native-existing', model: 'gpt-6-sol',
     title: 'test', cwd: root, createdAt: 'before', updatedAt: 'now' }, text: 'fake', imagePaths: [], signal: new AbortController().signal,
-    onProgress: () => {}, onModel: model => reported.push(model) });
-  assert.deepEqual(reported, ['gpt-6-sol']);
+    onProgress: () => {}, onModel: model => reported.push(model), onReasoningEffort: effort => efforts.push(effort) });
+  assert.deepEqual(reported, ['gpt-6-sol', 'provider-effective-model']);
+  assert.deepEqual(efforts, agent === 'codex' ? ['high'] : []);
   trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   if (agent === 'codex') {
     const resume = trace.find(message => message.method === 'thread/resume');

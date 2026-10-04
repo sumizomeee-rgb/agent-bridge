@@ -41,6 +41,11 @@ function message(id: string, text = 'hello'): BridgeMessage {
   return { id, userId: 'owner', channelId: 'owner-dm', text, imagePaths: [] };
 }
 
+function finalBody(text: string): string {
+  assert.match(text, /^\[Codex · 模型未知 · 强度未知 · …[^\n]+\]\n\n/);
+  return text.slice(text.indexOf('\n\n') + 2);
+}
+
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'discord-bridge-reply-output-'));
   const config: BridgeConfig = {
@@ -79,19 +84,21 @@ function fixture(t: TestContext) {
   return { manager, adapter, config, replies, failNextDelivery() { failDelivery = true; } };
 }
 
-test('多个 token/delta 不发独立消息，最终回复只发送一次且没有会话前缀', async t => {
+test('多个 token/delta 不发独立消息，最终回复只发送一次并由程序加回复头', async t => {
   const f = fixture(t);
   await f.manager.handle(message('deltas'));
   await until(() => f.adapter.turns.length === 1);
   const turn = f.adapter.turns[0]!;
   for (const delta of ['你', '好', '，', '这是', '最终', '回复']) turn.onProgress(delta);
   await delay(10);
-  assert.deepEqual(f.replies, []);
+  assert.equal(f.replies.length, 0);
   f.adapter.finish(0, '你好，这是最终回复');
   await until(() => f.replies.length === 1);
   turn.onProgress('final echoed as progress');
   await delay(10);
-  assert.deepEqual(f.replies, [{ channelId: 'owner-dm', text: '你好，这是最终回复' }]);
+  assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0]!.channelId, 'owner-dm');
+  assert.equal(finalBody(f.replies[0]!.text), '你好，这是最终回复');
 });
 
 test('协议、工具和思考进度不泄漏到 Discord 正文', async t => {
@@ -104,10 +111,10 @@ test('协议、工具和思考进度不泄漏到 Discord 正文', async t => {
   turn.onProgress('reasoning: PRIVATE REASONING');
   f.adapter.finish(0, '检查完成，结果正常。');
   await until(() => f.replies.length === 1);
-  assert.deepEqual(f.replies.map(reply => reply.text), ['检查完成，结果正常。']);
+  assert.deepEqual(f.replies.map(reply => finalBody(reply.text)), ['检查完成，结果正常。']);
 });
 
-test('长最终回复整体交给 transport，manager 不重复分段或添加标签', async t => {
+test('长最终回复整体交给 transport，manager 仅添加一次确定回复头', async t => {
   const f = fixture(t);
   const final = '一个长回复\n' + '内容'.repeat(2100);
   await f.manager.handle(message('long'));
@@ -115,7 +122,7 @@ test('长最终回复整体交给 transport，manager 不重复分段或添加�
   f.adapter.turns[0]!.onProgress(final.slice(0, 100));
   f.adapter.finish(0, final);
   await until(() => f.replies.length === 1);
-  assert.equal(f.replies[0]!.text, final);
+  assert.equal(finalBody(f.replies[0]!.text), final);
 });
 
 test('/stop 后迟到 progress 和最终结果不会发送，原会话可继续', async t => {
@@ -137,11 +144,12 @@ test('/stop 后迟到 progress 和最终结果不会发送，原会话可继续'
   f.adapter.finish(1, '已继续原会话。');
   await until(() => f.replies.length === 2);
   assert.match(f.replies[0]!.text, /已停止/);
-  assert.equal(f.replies[1]!.text, '已继续原会话。');
+  assert.equal(finalBody(f.replies[1]!.text), '已继续原会话。');
+  assert(!f.replies[1]!.text.includes('✅'));
   assert(f.replies.every(reply => !/partial|stale|delta/.test(reply.text)));
 });
 
-test('new chat 后旧任务迟到失败不发消息，新会话只回复最终正文', async t => {
+test('new chat 后旧任务迟到失败不发消息，新会话回复头不假标连续', async t => {
   const f = fixture(t);
   await f.manager.handle(message('old'));
   await until(() => f.adapter.turns.length === 1);
@@ -154,7 +162,8 @@ test('new chat 后旧任务迟到失败不发消息，新会话只回复最终�
   f.adapter.finish(1, '新会话回复');
   await until(() => f.replies.length === 2);
   assert.match(f.replies[0]!.text, /已新建/);
-  assert.equal(f.replies[1]!.text, '新会话回复');
+  assert.equal(finalBody(f.replies[1]!.text), '新会话回复');
+  assert(!f.replies[1]!.text.includes('✅'));
   assert(f.replies.every(reply => !/old delta|late failure|new delta/.test(reply.text)));
 });
 
@@ -182,6 +191,7 @@ test('最终回复投递失败不重跑模型，已完成状态和 nativeId 仍�
   try {
     assert.equal(inspect.getMessage('delivery-failed')!.state, 'completed');
     assert.equal(inspect.getActive('owner')!.nativeId, `native-${f.adapter.turns[0]!.conversation.id}`);
+    assert.equal(inspect.getLastDelivery('owner', 'owner-dm'), null);
   } finally { inspect.close(); }
 });
 

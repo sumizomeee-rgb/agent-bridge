@@ -1,17 +1,17 @@
-# sumizome 笔记本助手导航
+# 笔记本助手导航
 
-当前机器：DESKTOP-6FVMGQD，Windows，用户 sumizome。这里用于普通聊天、查看笔记本环境和安排工作。
+本机：`DESKTOP-6FVMGQD`，Windows，用户 `sumizome`。用于日常聊天、检查本机和安排远程工作。
 
-- 网络项目：`C:\SuchProject\Other\ssh-tunnel-proxy`。代理是 `http://127.0.0.1:7898`，通过已连接的飞连使用工位网络。
-- SSH 配置库：`C:\SuchProject\Other\ssh-project`。
-- 工位电脑：主机 `11032022110008`，配置文件 `C:\SuchProject\Other\ssh-project\hosts\11032022110008\ssh_config`，别名 `administrator`。
-- 核对工位：`ssh.exe -F "C:\SuchProject\Other\ssh-project\hosts\11032022110008\ssh_config" administrator hostname`。
-- 工位默认 PowerShell 建议调用 `pwsh.exe`；中文脚本和复杂引号使用 UTF-16LE EncodedCommand 或传文件运行。
-- 工位工作习惯参考：`workstation-habits.md`（来自用户自己的 MyHaruSkills README，仅在相关工作时读取）。
-- 桥程序：`C:\SuchProject\Other\discord-agent-bridge`，会话和图片在该项目 `.local/data`。
-- Codex / Claude 的登录、提供商、skills 都使用各自用户级目录。切换提供商通过 CC Switch 完成。
+- 网络：`C:\SuchProject\Other\ssh-tunnel-proxy`，代理 `http://127.0.0.1:7898`。
+- 桥：`C:\SuchProject\Other\discord-agent-bridge`，数据在 `.local/data`，用户登录后自启。
+- 共用 skills：`C:\Users\sumizome\.agents\skills` → `.claude\skills`；登录及提供商在用户目录，通过 CC Switch 切换。
+- 飞书：优先本机 Chrome 的[网页版](https://www.feishu.cn/messenger/)。已登录（用户确认）；操作前核实当前账号和页面。
 
-- 家里本机：`DESKTOP-HB47FVQ`，Windows，用户 `sumizome`；当前局域网 IP 为 `192.168.0.105`，连接配置使用主机名，避免 DHCP 地址变化。
-- 家里配置：`C:\SuchProject\Other\ssh-project\hosts\DESKTOP-HB47FVQ-家里本机\ssh_config`，别名 `sumizome`。
-- 核对家里：`ssh.exe -F "C:\SuchProject\Other\ssh-project\hosts\DESKTOP-HB47FVQ-家里本机\ssh_config" sumizome hostname`，应返回 `DESKTOP-HB47FVQ`（2026-10-05 已验证）。
-- 共用技能：`C:\Users\sumizome\.agents\skills` 通过 Junction 指向现有 `.claude\skills`（MyAgentSkills），Codex 已扫描启用 28 个仓库技能。
+SSH 库：`C:\SuchProject\Other\ssh-project`。用对应配置的 `-F` 连接，操作前核对 `hostname`。
+
+| 目标 | 配置（相对 SSH 库） | 别名 |
+|---|---|---|
+| 工位 `11032022110008` | `hosts\11032022110008\ssh_config` | `administrator` |
+| 家里 `DESKTOP-HB47FVQ` | `hosts\DESKTOP-HB47FVQ-家里本机\ssh_config` | `sumizome` |
+
+工位工作习惯的唯一维护入口：工位 `E:\Such_Proj\Other\MyHaruSkills\README.md`。相关任务连接工位读取，日常聊天不套用工位流程；本目录不保存工作导航副本。

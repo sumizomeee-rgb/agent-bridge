@@ -58,7 +58,10 @@ const inbox = new OrderedInbox<IncomingDM>(message => message.userId, async mess
   await manager.handle({ ...message, imagePaths });
 });
 const discord = new DiscordTransport(config, message => inbox.handle(message), { logger: message => log(`DISCORD ${message}`) });
-manager = new SessionManager(config, adapters, { sendText: (channelId, text) => discord.sendText(channelId, redactText(text, [config.token])) });
+manager = new SessionManager(config, adapters, {
+  sendText: (channelId, text, options) => discord.sendText(channelId, redactText(text, [config.token]),
+    options?.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, [config.token]) } : undefined),
+});
 let closing = false;
 async function shutdown(): Promise<void> {
   if (closing) return;
