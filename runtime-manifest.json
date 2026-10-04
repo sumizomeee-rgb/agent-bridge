@@ -1,0 +1,8 @@
+{
+  "platform": "win32-x64",
+  "nodeVersion": "24.13.0",
+  "nodeSha256": "D14BA95CDCE1EF7DC9AD3AC74949CA5DB38B27378EE30F30A23CF26F9E875A11",
+  "nodeSource": "Existing signed Node installation on deployment laptop",
+  "runtimePath": ".local/runtime/win-x64/node.exe",
+  "agentPrerequisites": ["Authenticated Codex CLI", "Claude Code CLI with its own provider configuration"]
+}

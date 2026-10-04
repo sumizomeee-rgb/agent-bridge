@@ -1,0 +1,11 @@
+{
+  "token": "FILL_IN_YOUR_BOT_TOKEN",
+  "allowedUserIds": ["FILL_IN_YOUR_DISCORD_USER_ID"],
+  "defaultAgent": "codex",
+  "workspace": "C:\\SuchProject\\AgentWorkspace",
+  "proxyPort": 7898,
+  "commands": {
+    "codex": { "command": ".local/runtime/win-x64/node.exe", "args": ["C:\\Users\\sumizome\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js"] },
+    "claude": { "command": ".local/runtime/win-x64/node.exe", "args": ["C:\\Users\\sumizome\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"] }
+  }
+}

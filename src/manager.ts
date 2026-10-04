@@ -1,0 +1,240 @@
+import { statSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
+import { SessionStore } from './store.js';
+import type { AgentAdapter, AgentName, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
+
+interface RunningTurn {
+  messageId: string;
+  conversationId: string;
+  controller: AbortController;
+}
+const HELP = `直接发送文字或图片即可继续当前会话。
+/new [codex|claude] 或 new chat：新会话
+/agent codex|claude：切换 Agent 并新建会话
+/chats：列出自己的会话
+/resume ID：恢复会话，支持唯一短 ID
+/cwd 路径：在指定目录新建会话
+/status：查看当前会话和排队情况
+/stop：停止当前任务并清空其队列
+/help：查看帮助`;
+
+function command(text: string): { name: string; argument: string } | null {
+  const trimmed = text.trim();
+  if (/^(?:new\s+chat|新会话|新聊天)$/i.test(trimmed)) return { name: 'new', argument: '' };
+  const match = /^\/([a-z]+)(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  return match ? { name: match[1]!.toLowerCase(), argument: (match[2] ?? '').trim() } : null;
+}
+
+export class SessionManager {
+  private readonly store: SessionStore;
+  private readonly workers = new Map<string, Promise<void>>();
+  private readonly running = new Map<string, RunningTurn>();
+  private readonly interruptPromises = new Set<Promise<void>>();
+  private closed = false;
+  private recovered = false;
+
+  constructor(
+    private readonly config: BridgeConfig,
+    private readonly adapters: Record<AgentName, AgentAdapter>,
+    private readonly sink: ReplySink,
+  ) { this.store = new SessionStore(config.dataDir); }
+
+  hasMessage(id: string): boolean { return this.store.hasMessage(id); }
+
+  async handle(message: BridgeMessage): Promise<void> {
+    if (this.closed) throw new Error('桥已关闭');
+    if (!this.config.allowedUserIds.includes(message.userId) || this.hasMessage(message.id)) return;
+    const parsed = command(message.text);
+    if (parsed) {
+      if (!this.store.addMessage(message, null, 'command')) return;
+      try {
+        await this.handleCommand(message, parsed.name, parsed.argument);
+        if (this.closed) return;
+        this.store.setState(message.id, 'completed');
+      } catch (error) {
+        if (this.closed) return;
+        this.store.setState(message.id, 'failed', String(error));
+        await this.sink.sendText(message.channelId, `命令失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (!message.text.trim() && message.imagePaths.length === 0) {
+      if (this.store.addMessage(message, null, 'command')) {
+        this.store.setState(message.id, 'completed');
+        await this.sink.sendText(message.channelId, '请发送文字或图片；/help 查看帮助。');
+      }
+      return;
+    }
+    const active = this.ensureActive(message.userId);
+    if (!this.store.addMessage(message, active.id, 'queued')) return;
+    this.store.nameConversation(active.id, message.text);
+    this.wake(active.id);
+  }
+
+  async recover(): Promise<void> {
+    if (this.closed || this.recovered) return;
+    this.recovered = true;
+    for (const item of this.store.interruptRunning()) {
+      if (this.closed) return;
+      if (!this.config.allowedUserIds.includes(item.userId)) continue;
+      await this.sink.sendText(item.channelId,
+        `会话 ${item.conversationId?.slice(0, 8) ?? ''} 上次执行因桥重启而中断，未自动重做。请先确认执行结果，再决定继续。`)
+        .catch(() => undefined);
+    }
+    if (this.closed) return;
+    for (const id of this.store.queuedConversations()) this.wake(id);
+  }
+
+  private ensureActive(userId: string): Conversation {
+    const current = this.store.getActive(userId);
+    if (current) return current;
+    const item = this.store.createConversation(userId, this.config.defaultAgent, this.config.workspace);
+    this.store.setActive(userId, item.id);
+    return item;
+  }
+
+  private cancel(conversation: Conversation): number {
+    const total = this.store.cancelPending(conversation.id);
+    const current = this.running.get(conversation.userId);
+    if (current?.conversationId === conversation.id) {
+      current.controller.abort();
+      const interruption = Promise.resolve().then(() => this.adapters[conversation.agent].interrupt(conversation.id))
+        .catch(() => undefined).finally(() => this.interruptPromises.delete(interruption));
+      this.interruptPromises.add(interruption);
+    }
+    return total;
+  }
+
+  private activate(userId: string, target: Conversation): void {
+    const previous = this.store.getActive(userId);
+    if (previous) this.cancel(previous);
+    this.store.setActive(userId, target.id);
+  }
+
+  private async handleCommand(message: BridgeMessage, name: string, argument: string): Promise<void> {
+    const reply = (text: string) => this.sink.sendText(message.channelId, text);
+    const current = this.store.getActive(message.userId);
+    switch (name) {
+      case 'help': await reply(HELP); return;
+      case 'new':
+      case 'agent': {
+        if ((argument && argument !== 'codex' && argument !== 'claude') || (name === 'agent' && !argument)) {
+          await reply(`用法：/${name} ${name === 'new' ? '[codex|claude]' : 'codex|claude'}`); return;
+        }
+        const agent = (argument || current?.agent || this.config.defaultAgent) as AgentName;
+        const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace);
+        this.activate(message.userId, target);
+        await reply(`已新建 ${agent} 会话 ${target.id.slice(0, 8)}。旧会话待处理任务已取消。\n目录：${target.cwd}`);
+        return;
+      }
+      case 'cwd': {
+        if (!argument) { await reply('用法：/cwd 目录路径'); return; }
+        const value = argument.replace(/^(["'])([\s\S]*)\1$/, '$2');
+        const cwd = isAbsolute(value) ? value : resolve(current?.cwd ?? this.config.workspace, value);
+        if (!statSync(cwd).isDirectory()) { await reply('指定路径不是目录。'); return; }
+        const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd);
+        this.activate(message.userId, target);
+        await reply(`已在 ${cwd} 新建 ${target.agent} 会话 ${target.id.slice(0, 8)}。`);
+        return;
+      }
+      case 'chats': {
+        const items = this.store.listConversations(message.userId);
+        await reply(items.length ? items.map(item =>
+          `${item.id === current?.id ? '→ ' : ''}${item.id.slice(0, 8)} · ${item.agent} · ${item.title}`).join('\n') : '还没有会话，发送文字或图片即可开始。');
+        return;
+      }
+      case 'resume': {
+        if (!argument) { await reply('用法：/resume 会话 ID；/chats 查看自己的会话。'); return; }
+        const matches = this.store.findConversations(message.userId, argument);
+        if (matches.length !== 1) {
+          await reply(matches.length ? '短 ID 对应多个会话，请使用更长的 ID。' : '没有找到自己的这个会话。'); return;
+        }
+        const target = matches[0]!;
+        this.activate(message.userId, target);
+        await reply(`已恢复 ${target.agent} 会话 ${target.id.slice(0, 8)}：${target.title}\n目录：${target.cwd}`);
+        this.wake(target.id);
+        return;
+      }
+      case 'status':
+        await reply(current
+          ? `${current.agent} · ${current.id.slice(0, 8)} · ${current.title}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}`
+          : '还没有会话，发送文字或图片即可开始。');
+        return;
+      case 'stop': {
+        const count = current ? this.cancel(current) : 0;
+        await reply(count ? `已停止当前任务，取消 ${count} 条待处理任务。会话保留，可继续发送消息。` : '当前没有待处理任务。');
+        return;
+      }
+      default: await reply('未知命令；/help 查看可用命令。');
+    }
+  }
+
+  private wake(conversationId: string): void {
+    if (this.closed || this.workers.has(conversationId)) return;
+    const worker = Promise.resolve().then(() => this.processQueue(conversationId)).finally(() => {
+      this.workers.delete(conversationId);
+      if (!this.closed && this.store.nextQueued(conversationId)) this.wake(conversationId);
+    });
+    this.workers.set(conversationId, worker);
+    // Errors from Discord delivery must not become unhandled rejections.
+    void worker.catch(() => undefined);
+  }
+
+  private async processQueue(conversationId: string): Promise<void> {
+    while (!this.closed) {
+      const item = this.store.nextQueued(conversationId);
+      if (!item) return;
+      const target = this.store.getConversation(conversationId);
+      if (!target || !this.config.allowedUserIds.includes(item.userId)
+        || this.store.getActive(item.userId)?.id !== conversationId) {
+        this.store.setState(item.id, 'cancelled'); continue;
+      }
+      const controller = new AbortController();
+      const turn: RunningTurn = { messageId: item.id, conversationId, controller };
+      this.running.set(item.userId, turn);
+      this.store.setState(item.id, 'running');
+      const current = () => !this.closed && !controller.signal.aborted
+        && this.running.get(item.userId) === turn
+        && this.store.getActive(item.userId)?.id === conversationId
+        && this.store.getMessage(item.id)?.state === 'running';
+      try {
+        const result = await this.adapters[target.agent].run({
+          conversation: target, text: item.text, imagePaths: item.imagePaths,
+          signal: controller.signal,
+          onNativeId: nativeId => { if (current() && nativeId) this.store.saveNativeId(conversationId, nativeId); },
+          onProgress: text => {
+            if (current() && text) void this.sink.sendText(item.channelId,
+              `[${target.agent} · ${target.id.slice(0, 8)}] ${text}`).catch(() => undefined);
+          },
+        });
+        if (!current()) continue;
+        if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
+        this.store.saveNativeId(conversationId, result.nativeId);
+        this.store.setState(item.id, 'completed');
+        await this.sink.sendText(item.channelId,
+          `[${target.agent} · ${target.id.slice(0, 8)}]\n${result.text || '本轮完成（没有文本输出）。'}`);
+      } catch (error) {
+        if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
+          if (this.store.getMessage(item.id)?.state === 'running') this.store.setState(item.id, 'cancelled');
+        } else {
+          // A completed model turn is never retried merely because reply delivery failed.
+          if (this.store.getMessage(item.id)?.state === 'running') this.store.setState(item.id, 'failed', String(error));
+          await this.sink.sendText(item.channelId,
+            `[${target.agent} · ${target.id.slice(0, 8)}] 执行或回复失败：${error instanceof Error ? error.message : String(error)}`)
+            .catch(() => undefined);
+        }
+      } finally {
+        if (this.running.get(item.userId) === turn) this.running.delete(item.userId);
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    for (const turn of this.running.values()) turn.controller.abort();
+    await Promise.allSettled(Object.values(this.adapters).map(adapter => adapter.close()));
+    await Promise.allSettled([...this.workers.values(), ...this.interruptPromises]);
+    this.store.close();
+  }
+}
