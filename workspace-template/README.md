@@ -11,4 +11,7 @@
 - 桥程序：`C:\SuchProject\Other\discord-agent-bridge`，会话和图片在该项目 `.local/data`。
 - Codex / Claude 的登录、提供商、skills 都使用各自用户级目录。切换提供商通过 CC Switch 完成。
 
-家中另一台电脑的笔记本出站 SSH 尚未配置。需要操作时先检查配置库，不猜测账号和连接方式。
+- 家里本机：`DESKTOP-HB47FVQ`，Windows，用户 `sumizome`；当前局域网 IP 为 `192.168.0.105`，连接配置使用主机名，避免 DHCP 地址变化。
+- 家里配置：`C:\SuchProject\Other\ssh-project\hosts\DESKTOP-HB47FVQ-家里本机\ssh_config`，别名 `sumizome`。
+- 核对家里：`ssh.exe -F "C:\SuchProject\Other\ssh-project\hosts\DESKTOP-HB47FVQ-家里本机\ssh_config" sumizome hostname`，应返回 `DESKTOP-HB47FVQ`（2026-10-05 已验证）。
+- 共用技能：`C:\Users\sumizome\.agents\skills` 通过 Junction 指向现有 `.claude\skills`（MyAgentSkills），Codex 已扫描启用 28 个仓库技能。

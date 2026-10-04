@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import type { AgentAdapter, AgentCommand, AgentResult, AgentTurn } from '../types.js';
+import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, safeError, type JsonObject } from './process.js';
 
 function imageMediaType(bytes: Buffer): string {
@@ -14,8 +14,43 @@ function imageMediaType(bytes: Buffer): string {
 export class ClaudeAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
   private closed = false;
+  private readonly metadataProcesses = new Set<JsonLineProcess>();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv) {}
+
+  async getModelInfo(cwd: string): Promise<AgentModelInfo> {
+    if (this.closed) throw new Error('Claude 适配器已关闭。');
+    // Same initialize control envelope used by Anthropic's Agent SDK.
+    // No user message is sent, so this cannot start a model generation.
+    const transport = new JsonLineProcess(this.command, ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'], cwd, this.env);
+    this.metadataProcesses.add(transport);
+    const completed = deferred<AgentModelInfo>();
+    const timer = setTimeout(() => completed.reject(new Error('Claude 模型元数据等待超时。')), 10_000);
+    const removeFailure = transport.onFailure(error => completed.reject(error));
+    const removeMessage = transport.onMessage(message => {
+      if (message.type !== 'control_response' || !isObject(message.response) || message.response.request_id !== 'bridge-models') return;
+      const response = message.response;
+      if (response.subtype === 'error') { completed.reject(new Error(`Claude 元数据请求失败：${safeError(response.error, '控制协议错误')}`)); return; }
+      const payload = isObject(response.response) ? response.response : {};
+      const models: AgentModelInfo['models'] = [];
+      if (Array.isArray(payload.models)) for (const item of payload.models) {
+        if (!isObject(item)) continue;
+        const id = typeof item.value === 'string' ? item.value : item.id;
+        if (typeof id !== 'string' || !id || id === 'default') continue;
+        models.push({ id, displayName: typeof item.displayName === 'string' ? item.displayName : id,
+          description: typeof item.description === 'string' ? item.description : '' });
+      }
+      const defaultModel = typeof payload.model === 'string' ? payload.model : typeof payload.defaultModel === 'string' ? payload.defaultModel : this.env.ANTHROPIC_MODEL ?? null;
+      completed.resolve({ models, defaultModel: defaultModel === 'default' ? null : defaultModel });
+    });
+    let success = false;
+    try {
+      transport.write({ type: 'control_request', request_id: 'bridge-models', request: { subtype: 'initialize', hooks: null } });
+      const result = await completed.promise; success = true; return result;
+    } finally {
+      clearTimeout(timer); await transport.stop(success); removeMessage(); removeFailure(); this.metadataProcesses.delete(transport);
+    }
+  }
 
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('Claude 适配器已关闭。');
@@ -36,6 +71,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const args = ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
       '--verbose', '--include-partial-messages', '--dangerously-skip-permissions'];
     if (turn.conversation.nativeId) args.push('--resume', turn.conversation.nativeId);
+    if (turn.conversation.model) args.push('--model', turn.conversation.model);
     const transport = new JsonLineProcess(this.command, args, turn.conversation.cwd, this.env);
     const completed = deferred<AgentResult>();
     let nativeId = turn.conversation.nativeId;
@@ -54,6 +90,7 @@ export class ClaudeAdapter implements AgentAdapter {
         const prior = nativeId;
         recordNativeId(message.session_id);
         if (nativeId && prior === nativeId) turn.onNativeId?.(nativeId);
+        if (typeof message.model === 'string' && message.model) turn.onModel?.(message.model);
       } else if (message.type === 'stream_event' && !message.parent_tool_use_id && isObject(message.event)) {
         const event = message.event;
         if (event.type === 'content_block_delta' && isObject(event.delta) && event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
@@ -103,6 +140,6 @@ export class ClaudeAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.values()].map((cancel) => cancel()));
+    await Promise.all([...this.active.values()].map((cancel) => cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
   }
 }

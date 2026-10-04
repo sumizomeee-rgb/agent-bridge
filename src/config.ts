@@ -4,6 +4,9 @@ import { fileURLToPath } from 'node:url';
 import type { AgentCommand, AgentName, BridgeConfig } from './types.js';
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+export function isModelId(value: string): boolean {
+  return value.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._:/@+\-]*(?:\[[A-Za-z0-9]+\])?$/.test(value);
+}
 export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
   let configPath = resolve(projectRoot, '.local', 'config.json');
   let portOverride: number | undefined;
@@ -36,6 +39,25 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
   const proxyUrl = proxyPort == null ? null : `http://127.0.0.1:${proxyPort}`;
   const defaultAgent = raw.defaultAgent ?? 'codex';
   if (defaultAgent !== 'codex' && defaultAgent !== 'claude') throw new Error('defaultAgent 只能是 codex 或 claude');
+  const defaultModels: Partial<Record<AgentName, string>> = {};
+  const modelOptions: Partial<Record<AgentName, string[]>> = {};
+  for (const [key, target] of [['defaultModels', defaultModels], ['modelOptions', modelOptions]] as const) {
+    const input = raw[key];
+    if (input == null) continue;
+    if (typeof input !== 'object' || Array.isArray(input)) throw new Error(`${key} 必须按 Agent 配置`);
+    for (const [name, value] of Object.entries(input)) {
+      if (name !== 'codex' && name !== 'claude') throw new Error(`${key} 的 Agent 只能是 codex 或 claude`);
+      if (key === 'defaultModels') {
+        if (typeof value !== 'string' || !isModelId(value)) throw new Error(`${key}.${name} 需要有效模型 ID`);
+        (target as Partial<Record<AgentName, string>>)[name] = value;
+      } else {
+        if (!Array.isArray(value) || value.length > 100 || value.some(item => typeof item !== 'string' || !isModelId(item))) {
+          throw new Error(`${key}.${name} 需要有效模型 ID 数组`);
+        }
+        (target as Partial<Record<AgentName, string[]>>)[name] = [...new Set(value as string[])];
+      }
+    }
+  }
   const config: BridgeConfig = {
     token, allowedUserIds: raw.allowedUserIds.map(String), defaultAgent,
     workspace: localPath(raw.workspace, '.local/workspace'), proxyUrl,
@@ -43,6 +65,7 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
     dataDir: localPath(raw.dataDir, '.local/data'),
     attachmentsDir: localPath(raw.attachmentsDir, '.local/data/attachments'),
     logsDir: localPath(raw.logsDir, '.local/logs'), maxImageBytes: 20 * 1024 * 1024,
+    defaultModels, modelOptions,
   };
   for (const p of [config.workspace, config.dataDir, config.attachmentsDir, config.logsDir]) mkdirSync(p, { recursive: true });
   return config;

@@ -1,12 +1,48 @@
-import type { AgentAdapter, AgentCommand, AgentResult, AgentTurn } from '../types.js';
+import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, safeError, type JsonObject } from './process.js';
 
 /** App-server v2 stdio protocol, verified against Codex rust-v0.160.0. */
 export class CodexAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
   private closed = false;
+  private readonly metadataProcesses = new Set<JsonLineProcess>();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv) {}
+
+  async getModelInfo(cwd: string): Promise<AgentModelInfo> {
+    if (this.closed) throw new Error('Codex 适配器已关闭。');
+    const transport = new JsonLineProcess(this.command, ['app-server', '--listen', 'stdio://'], cwd, this.env);
+    this.metadataProcesses.add(transport);
+    const rpc = new JsonRpcClient(transport);
+    let success = false;
+    try {
+      await rpc.request('initialize', { clientInfo: { name: 'discord_agent_bridge', version: '0.1.0' }, capabilities: { experimentalApi: false } }, 15_000);
+      rpc.notify('initialized');
+      const configured = await rpc.request('config/read', { includeLayers: false, cwd }, 15_000);
+      const config = isObject(configured.config) ? configured.config : {};
+      const models: AgentModelInfo['models'] = [];
+      const cursors = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const page = await rpc.request('model/list', { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) }, 15_000);
+        if (!Array.isArray(page.data)) throw new Error('Codex 模型目录格式不正确。');
+        for (const value of page.data) {
+          if (!isObject(value) || typeof value.model !== 'string' || !value.model || value.hidden === true) continue;
+          if (!models.some(model => model.id === value.model)) models.push({
+            id: value.model, displayName: typeof value.displayName === 'string' ? value.displayName : value.model,
+            description: typeof value.description === 'string' ? value.description : '', isDefault: value.isDefault === true,
+          });
+        }
+        cursor = typeof page.nextCursor === 'string' && page.nextCursor ? page.nextCursor : null;
+        if (cursor && (cursors.has(cursor) || cursors.size >= 20)) throw new Error('Codex 模型目录分页异常。');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      success = true;
+      return { models, defaultModel: typeof config.model === 'string' && config.model ? config.model : models.find(model => model.isDefault)?.id ?? null };
+    } finally {
+      await transport.stop(success); rpc.close(); this.metadataProcesses.delete(transport);
+    }
+  }
 
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
@@ -98,12 +134,14 @@ export class CodexAdapter implements AgentAdapter {
       const thread = await rpc.request(nativeId ? 'thread/resume' : 'thread/start', {
         ...(nativeId ? { threadId: nativeId } : {}),
         cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
+        ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
       });
       if (!isObject(thread.thread) || typeof thread.thread.id !== 'string' || !thread.thread.id) {
         throw new Error('Codex 没有返回有效会话标识。');
       }
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
+      if (typeof thread.model === 'string' && thread.model) turn.onModel?.(thread.model);
       if (cancelled) throw abortError();
       const input: JsonObject[] = [];
       if (turn.text) input.push({ type: 'text', text: turn.text, text_elements: [] });
@@ -112,6 +150,7 @@ export class CodexAdapter implements AgentAdapter {
       const started = await rpc.request('turn/start', {
         threadId: nativeId, input, cwd: turn.conversation.cwd,
         approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
+        ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
       });
       if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 没有返回任务标识。');
       turnId = started.turn.id;
@@ -135,6 +174,6 @@ export class CodexAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.values()].map((cancel) => cancel()));
+    await Promise.all([...this.active.values()].map((cancel) => cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
   }
 }

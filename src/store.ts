@@ -15,6 +15,7 @@ function conversation(row: Row): Conversation {
   return {
     id: String(row.id), userId: String(row.user_id), agent: String(row.agent) as AgentName,
     nativeId: row.native_id === null ? null : String(row.native_id), title: String(row.title),
+    model: row.model == null ? null : String(row.model), actualModel: row.actual_model == null ? null : String(row.actual_model),
     cwd: String(row.cwd), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
 }
@@ -59,6 +60,10 @@ export class SessionStore {
       CREATE INDEX IF NOT EXISTS inbox_queue ON inbox(conversation_id, state, sequence);
       CREATE INDEX IF NOT EXISTS conversations_user ON conversations(user_id, updated_at);
     `);
+    // Existing deployments keep native sessions, inbox, and active bindings.
+    const columns = new Set(this.db.prepare('PRAGMA table_info(conversations)').all().map(row => String(row.name)));
+    if (!columns.has('model')) this.db.exec('ALTER TABLE conversations ADD COLUMN model TEXT');
+    if (!columns.has('actual_model')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_model TEXT');
   }
 
   hasMessage(id: string): boolean {
@@ -79,7 +84,7 @@ export class SessionStore {
   createConversation(userId: string, agent: AgentName, cwd: string): Conversation {
     const now = new Date().toISOString();
     const item: Conversation = {
-      id: randomUUID(), userId, agent, nativeId: null,
+      id: randomUUID(), userId, agent, nativeId: null, model: null, actualModel: null,
       title: '新会话', cwd, createdAt: now, updatedAt: now,
     };
     this.db.prepare(`INSERT INTO conversations
@@ -122,6 +127,16 @@ export class SessionStore {
   saveNativeId(id: string, nativeId: string): void {
     this.db.prepare('UPDATE conversations SET native_id = ?, updated_at = ? WHERE id = ?')
       .run(nativeId, new Date().toISOString(), id);
+  }
+
+  setModel(id: string, model: string): void {
+    this.db.prepare('UPDATE conversations SET model = ?, updated_at = ? WHERE id = ?')
+      .run(model, new Date().toISOString(), id);
+  }
+
+  saveActualModel(id: string, model: string): void {
+    this.db.prepare('UPDATE conversations SET actual_model = ?, updated_at = ? WHERE id = ?')
+      .run(model, new Date().toISOString(), id);
   }
 
   nameConversation(id: string, text: string): void {

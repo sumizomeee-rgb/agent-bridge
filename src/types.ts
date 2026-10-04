@@ -4,6 +4,10 @@ export interface Conversation {
   userId: string;
   agent: AgentName;
   nativeId: string | null;
+  /** Explicit per-conversation selection; null leaves the CLI default unchanged. */
+  model?: string | null;
+  /** Most recently reported effective model, separate from aliases/selections. */
+  actualModel?: string | null;
   title: string;
   cwd: string;
   createdAt: string;
@@ -21,7 +25,12 @@ export interface BridgeConfig {
   attachmentsDir: string;
   logsDir: string;
   maxImageBytes: number;
+  /** Reference defaults for display/fallback only, never an automatic CLI override. */
+  defaultModels?: Partial<Record<AgentName, string>>;
+  modelOptions?: Partial<Record<AgentName, string[]>>;
 }
+export interface AgentModel { id: string; displayName: string; description?: string; isDefault?: boolean }
+export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | null }
 export interface AgentTurn {
   conversation: Conversation;
   text: string;
@@ -29,12 +38,15 @@ export interface AgentTurn {
   signal: AbortSignal;
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;
+  onModel?: (model: string) => void;
 }
 export interface AgentResult { nativeId: string; text: string }
 export interface AgentAdapter {
   run(turn: AgentTurn): Promise<AgentResult>;
   interrupt(conversationId: string): Promise<void>;
   close(): Promise<void>;
+  /** Metadata only: never sends a user prompt or starts a generated turn. */
+  getModelInfo?(cwd: string): Promise<AgentModelInfo>;
 }
 export interface BridgeMessage {
   id: string;
