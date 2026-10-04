@@ -136,7 +136,7 @@ test('new chat 取消旧队列，迟到结果和进度不会回复新会话', as
   finally { db.close(); }
 });
 
-test('切换 backend 创建独立会话，短 ID 可恢复原 backend 上下文', async t => {
+test('/agent 切换 backend 创建独立会话，切回自动恢复原 backend 上下文', async t => {
   const f = fixture(t);
   await f.manager.handle(message('codex-start', 'codex context'));
   await waitFor(() => f.sink.replies.length === 1);
@@ -146,7 +146,7 @@ test('切换 backend 创建独立会话，短 ID 可恢复原 backend 上下文'
   await waitFor(() => f.claude.calls.length === 1);
   assert.notEqual(f.claude.calls[0]!.conversation.id, codexId);
   assert.equal(f.claude.calls[0]!.conversation.nativeId, null);
-  await f.manager.handle(message('resume', `/resume ${codexId.slice(0, 8)}`));
+  await f.manager.handle(message('switch-back', '/agent codex'));
   await f.manager.handle(message('codex-again', 'codex again'));
   await waitFor(() => f.codex.calls.length === 2);
   assert.equal(f.codex.calls[1]!.conversation.id, codexId);
@@ -163,7 +163,10 @@ test('会话列表和恢复按用户隔离，白名单之外不会执行', async
   const u2 = f.codex.calls.find(item => item.conversation.userId === 'u2')!;
   assert.notEqual(u1.conversation.id, u2.conversation.id);
   await f.manager.handle(message('steal', `/resume ${u1.conversation.id}`, 'u2'));
-  assert.match(f.sink.replies.at(-1)!.text, /没有找到自己的/);
+  assert.match(f.sink.replies.at(-1)!.text, /resume 已停用/);
+  const inspect = new SessionStore(f.config.dataDir);
+  try { assert.equal(inspect.getActive('u2')!.id, u2.conversation.id); }
+  finally { inspect.close(); }
   await f.manager.handle(message('list', '/chats', 'u2'));
   assert.ok(f.sink.replies.at(-1)!.text.includes('private-two'));
   assert.ok(!f.sink.replies.at(-1)!.text.includes('private-one'));
@@ -281,27 +284,40 @@ test('恢复通知发送失败不阻止安全排队任务继续', async t => {
   assert.deepEqual(f.codex.calls.map(item => item.text), ['safe queued']);
 });
 
-test('不唯一的短 ID 要求更长 ID，不会切换会话', async t => {
+test('旧 /resume 的完整、短、原生和无效 ID 都被拒绝，不改绑定或启动适配器', async t => {
   const f = fixture(t);
   await f.manager.close();
   const db = new SessionStore(f.config.dataDir);
-  const groups = new Map<string, string[]>();
-  let originalId = '';
-  for (let i = 0; i < 17; i++) {
-    const item = db.createConversation('u1', 'codex', f.root);
-    originalId = item.id;
-    const prefix = item.id[0]!;
-    groups.set(prefix, [...(groups.get(prefix) ?? []), item.id]);
-  }
-  db.setActive('u1', originalId);
-  const ambiguous = [...groups.entries()].find(([, ids]) => ids.length > 1)![0];
+  const original = db.createConversation('u1', 'codex', f.root);
+  const historical = db.createConversation('u1', 'claude', f.root);
+  db.saveNativeId(original.id, 'native-current');
+  db.saveNativeId(historical.id, 'native-historical');
+  db.setActive('u1', original.id);
+  db.addMessage(message('historical-queued', 'must not execute'), historical.id, 'queued');
   db.close();
   f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink);
-  await f.manager.handle(message('ambiguous', `/resume ${ambiguous}`));
-  assert.match(f.sink.replies.at(-1)!.text, /对应多个会话/);
-  const inspect = new SessionStore(f.config.dataDir);
-  try { assert.equal(inspect.getActive('u1')!.id, originalId); }
-  finally { inspect.close(); }
+  const argumentsToReject = ['', historical.id, historical.id.slice(0, 8), 'native-historical', original.id, 'invalid-id', 'claude'];
+  for (const [index, argument] of argumentsToReject.entries()) {
+    await f.manager.handle(message(`disabled-resume-${index}`, `/resume ${argument}`));
+    assert.match(f.sink.replies.at(-1)!.text, /resume 已停用/);
+    const inspect = new SessionStore(f.config.dataDir);
+    try {
+      assert.equal(inspect.getActive('u1')!.id, original.id);
+      assert.equal(inspect.getActive('u1')!.nativeId, 'native-current');
+      assert.equal(inspect.getMessage('historical-queued')!.state, 'queued');
+    } finally { inspect.close(); }
+  }
+  assert.equal(f.codex.calls.length, 0);
+  assert.equal(f.claude.calls.length, 0);
+  assert.deepEqual(f.codex.interrupts, []);
+  await f.manager.handle(message('readonly-chats', '/chats'));
+  assert.match(f.sink.replies.at(-1)!.text, new RegExp(original.id.slice(0, 8)));
+  assert.match(f.sink.replies.at(-1)!.text, new RegExp(historical.id.slice(0, 8)));
+  assert.equal(f.codex.calls.length + f.claude.calls.length, 0);
+  await f.manager.handle(message('current-help', '/help'));
+  assert(!f.sink.replies.at(-1)!.text.includes('/resume'));
+  await f.manager.handle(message('current-agent-menu', '/agent'));
+  assert(!f.sink.replies.at(-1)!.text.includes('/resume'));
 });
 
 test('关闭桥时未完成的命令回复不会访问已关闭的数据库', async t => {

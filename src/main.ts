@@ -11,7 +11,7 @@ import { OrderedInbox } from './inbox.js';
 import type { IncomingDM } from './types.js';
 
 if (process.argv.includes('--help')) {
-  console.log('启动：start.ps1 [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/resume、/agent、/stop');
+  console.log('启动：start.ps1 [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/agent、/stop');
   process.exit(0);
 }
 const config = loadConfig();

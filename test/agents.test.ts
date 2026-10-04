@@ -29,9 +29,10 @@ input.on('line', (line) => {
   trace(msg);
   if (codex) {
     if (msg.method === 'initialize') send({ id: msg.id, result: { userAgent: 'fake' } });
+    if (msg.method === 'config/read') send({ id: msg.id, result: { config: { model_provider: 'custom' } } });
     if (msg.method === 'thread/start' || msg.method === 'thread/resume') {
       threadId = msg.params.threadId || 'native-codex';
-      send({ id: msg.id, result: { thread: { id: threadId } } });
+      send({ id: msg.id, result: { thread: { id: threadId }, modelProvider: msg.params.modelProvider } });
     }
     if (msg.method === 'turn/start') {
       send({ method: 'turn/started', params: { threadId, turn: { id: 'turn-1' } } });

@@ -13,8 +13,7 @@ interface RunningTurn {
 const HELP = `直接发送文字或图片即可继续当前会话。
 /new [codex|claude] 或 new chat：新会话
 /agent：查看 Agent 选项；/agent codex 或 /agent claude：切换并续接会话
-/chats：列出自己的会话
-/resume ID：恢复会话，支持唯一短 ID
+/chats：只读查看自己的历史会话
 /cwd 路径：在指定目录新建会话
 /model：查看当前模型；/model list 或 /models：列出模型
 /model 模型名：切换当前会话模型，保留上下文
@@ -205,7 +204,7 @@ export class SessionManager {
       case 'new':
       case 'agent': {
         if (name === 'agent' && !argument) {
-          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}\n/agent codex → Codex CLI\n/agent claude → Claude Code\n切换优先恢复当前目录下的上次会话；/new 明确新建，/chats 和 /resume ID 选择其他历史会话。`); return;
+          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}\n/agent codex → Codex CLI\n/agent claude → Claude Code\n切换自动续接当前目录下的上次会话；/new 明确新建，/chats 只读查看历史。`); return;
         }
         if (argument && argument !== 'codex' && argument !== 'claude') {
           await reply(`用法：/${name} ${name === 'new' ? '[codex|claude]' : 'codex|claude'}`); return;
@@ -247,16 +246,7 @@ export class SessionManager {
         return;
       }
       case 'resume': {
-        if (!argument) { await reply('用法：/resume 会话 ID；/chats 查看自己的会话。'); return; }
-        const matches = this.store.findConversations(message.userId, argument);
-        if (matches.length !== 1) {
-          await reply(matches.length ? '短 ID 对应多个会话，请使用更长的 ID。' : '没有找到自己的这个会话。'); return;
-        }
-        const target = matches[0]!;
-        this.activate(message.userId, target);
-        await reply(`已恢复 ${target.agent} 会话 ${target.id.slice(0, 8)}：${target.title}\n目录：${target.cwd}`);
-        this.wake(target.id);
-        return;
+        await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 自动续接当前目录的会话；/new 新建，/chats 只读查看历史。'); return;
       }
       case 'status':
         await reply(current

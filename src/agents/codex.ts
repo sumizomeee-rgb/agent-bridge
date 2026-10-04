@@ -133,13 +133,38 @@ export class CodexAdapter implements AgentAdapter {
       });
       rpc.notify('initialized');
       if (cancelled) throw abortError();
-      const thread = await rpc.request(nativeId ? 'thread/resume' : 'thread/start', {
-        ...(nativeId ? { threadId: nativeId } : {}),
-        cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
-        ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
-      });
+      // Read the effective configuration for every turn, including after a CC Switch change.
+      // Resume directly by native ID rather than relying on the CLI's provider-filtered list.
+      const configured = await rpc.request('config/read', { includeLayers: false, cwd: turn.conversation.cwd }, 15_000);
+      if (cancelled) throw abortError();
+      if (!isObject(configured.config)) throw new Error('Codex 未返回有效供应商配置，本轮任务尚未提交。');
+      const configuredProvider = configured.config.model_provider;
+      if (configuredProvider != null && (typeof configuredProvider !== 'string' || !configuredProvider.trim())) {
+        throw new Error('Codex 当前供应商配置无效，本轮任务尚未提交。');
+      }
+      const modelProvider = typeof configuredProvider === 'string' ? configuredProvider : 'openai';
+      const resumeId = nativeId;
+      let thread: JsonObject;
+      try {
+        thread = await rpc.request(resumeId ? 'thread/resume' : 'thread/start', {
+          ...(resumeId ? { threadId: resumeId } : {}), modelProvider,
+          cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
+          ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
+        });
+      } catch (error) {
+        if (cancelled) throw abortError();
+        if (!resumeId) throw error;
+        throw new Error(`Codex 无法在当前供应商下续接；原会话已保留，本轮任务尚未提交。检查 CC Switch 配置后直接继续对话即可。原因：${safeError(error instanceof Error ? error.message : error, '续接失败')}`);
+      }
+      if (cancelled) throw abortError();
       if (!isObject(thread.thread) || typeof thread.thread.id !== 'string' || !thread.thread.id) {
         throw new Error('Codex 没有返回有效会话标识。');
+      }
+      if (typeof thread.modelProvider !== 'string' || thread.modelProvider !== modelProvider) {
+        throw new Error('Codex 回报的供应商与当前配置不一致；原会话已保留，本轮任务尚未提交。');
+      }
+      if (resumeId && thread.thread.id !== resumeId) {
+        throw new Error('Codex 续接返回了不同会话；原会话已保留，本轮任务尚未提交。');
       }
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
