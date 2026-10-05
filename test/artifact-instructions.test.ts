@@ -50,7 +50,6 @@ input.on('close', () => { if (codex) { clearInterval(keepAlive); process.exit(0)
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=', 'base64');
 const originalText = '看看这两张图 " & $(echo unexpected) %PATH%\n中文🙂';
-const instructions = '  需要回传附件时，保留完整路径。\n附件说明🙂  ';
 
 interface Trace {
   argv?: string[];
@@ -62,7 +61,7 @@ interface Trace {
 }
 
 async function fixture(agent: AgentName) {
-  const directory = await mkdtemp(join(tmpdir(), 'bridge-artifact-instructions-'));
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-raw-user-input-'));
   const cli = join(directory, 'fake cli.cjs');
   const tracePath = join(directory, 'trace.jsonl');
   const imagePaths = [join(directory, 'first image without extension'), join(directory, 'second image.png')];
@@ -104,15 +103,12 @@ function sentBlocks(agent: AgentName, traces: Trace[]): unknown[] {
 }
 
 for (const agent of ['codex', 'claude'] as const) {
-  test(`${agent}: separate delivery instructions preserve original text, images, and native resume`, async () => {
+  test(`${agent}: text and image input contains only the original user content and preserves native resume`, async () => {
     const f = await fixture(agent);
     try {
-      f.turn.deliveryInstructions = instructions;
       const result = await f.adapter.run(f.turn);
       const traces = await f.traces();
-      assert.deepEqual(sentBlocks(agent, traces), [...originalBlocks(agent, f.turn), agent === 'codex'
-        ? { type: 'text', text: instructions, text_elements: [] }
-        : { type: 'text', text: instructions }]);
+      assert.deepEqual(sentBlocks(agent, traces), originalBlocks(agent, f.turn));
       assert.equal(f.turn.text, originalText);
       assert.equal(result.nativeId, `saved-${agent}`);
       assert.deepEqual(f.nativeIds, [`saved-${agent}`]);
@@ -128,36 +124,33 @@ for (const agent of ['codex', 'claude'] as const) {
     } finally { await f.cleanup(); }
   });
 
-  test(`${agent}: image-only input remains image-only apart from the independent instructions`, async () => {
+  test(`${agent}: image-only input has exactly the original images without an added text block`, async () => {
     const f = await fixture(agent);
     try {
       f.turn.text = '';
-      f.turn.deliveryInstructions = instructions;
       await f.adapter.run(f.turn);
-      assert.deepEqual(sentBlocks(agent, await f.traces()), [...originalBlocks(agent, f.turn), agent === 'codex'
-        ? { type: 'text', text: instructions, text_elements: [] }
-        : { type: 'text', text: instructions }]);
+      assert.deepEqual(sentBlocks(agent, await f.traces()), originalBlocks(agent, f.turn));
       assert.equal(f.turn.text, '');
     } finally { await f.cleanup(); }
   });
 
-  test(`${agent}: missing or blank instructions leave the original protocol unchanged`, async () => {
-    for (const deliveryInstructions of [undefined, '', ' \n\t ']) {
-      const f = await fixture(agent);
-      try {
-        f.turn.deliveryInstructions = deliveryInstructions;
-        await f.adapter.run(f.turn);
-        assert.deepEqual(sentBlocks(agent, await f.traces()), originalBlocks(agent, f.turn));
-      } finally { await f.cleanup(); }
-    }
+  test(`${agent}: text-only input is one verbatim user text block`, async () => {
+    const f = await fixture(agent);
+    try {
+      f.turn.imagePaths = [];
+      await f.adapter.run(f.turn);
+      assert.deepEqual(sentBlocks(agent, await f.traces()), agent === 'codex'
+        ? [{ type: 'text', text: originalText, text_elements: [] }]
+        : [{ type: 'text', text: originalText }]);
+      assert.equal(f.turn.text, originalText);
+    } finally { await f.cleanup(); }
   });
 
-  test(`${agent}: delivery instructions alone cannot turn an empty user message into a task`, async () => {
+  test(`${agent}: an empty user message is rejected without submitting a task`, async () => {
     const f = await fixture(agent);
     try {
       f.turn.text = '';
       f.turn.imagePaths = [];
-      f.turn.deliveryInstructions = instructions;
       await assert.rejects(f.adapter.run(f.turn), /消息没有文字或图片/);
       if (agent === 'codex') {
         assert.equal((await f.traces()).some(trace => trace.method === 'turn/start'), false);

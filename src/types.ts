@@ -37,8 +37,6 @@ export interface AgentTurn {
   conversation: Conversation;
   text: string;
   imagePaths: string[];
-  /** Bridge-owned transport guidance, supplied separately from the user's original message. */
-  deliveryInstructions?: string;
   signal: AbortSignal;
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;

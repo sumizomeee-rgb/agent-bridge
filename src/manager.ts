@@ -1,9 +1,9 @@
 import { statSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { SessionStore } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
-import { collectOutgoingImages, createTurnArtifacts } from './artifacts.js';
+import { collectOutgoingImages } from './artifacts.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
 
 interface RunningTurn {
@@ -299,11 +299,8 @@ export class SessionManager {
       let actualModel: string | null = null;
       let actualEffort: string | null = null;
       try {
-        const artifacts = await createTurnArtifacts(this.config.dataDir, item.id);
-        if (!current()) continue;
         const result = await this.adapters[target.agent].run({
           conversation: target, text: item.text, imagePaths: item.imagePaths,
-          deliveryInstructions: artifacts.instructions,
           signal: controller.signal,
           onNativeId: nativeId => { if (current() && nativeId) this.store.saveNativeId(conversationId, nativeId); },
           onModel: model => {
@@ -324,7 +321,8 @@ export class SessionManager {
           && this.running.get(item.userId) === turn
           && this.store.getActive(item.userId)?.id === conversationId
           && this.store.getMessage(item.id)?.state === 'completed';
-        const outgoing = await collectOutgoingImages(result.text, artifacts.directory, this.config.maxImageBytes, controller.signal);
+        const outgoing = await collectOutgoingImages(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
+          this.config.maxImageBytes, controller.signal);
         if (!delivering()) continue;
         const identity = { conversationId, agent: target.agent, nativeId: result.nativeId };
         const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort);

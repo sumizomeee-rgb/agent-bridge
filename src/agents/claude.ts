@@ -64,7 +64,6 @@ export class ClaudeAdapter implements AgentAdapter {
       content.push({ type: 'image', source: { type: 'base64', media_type: imageMediaType(bytes), data: bytes.toString('base64') } });
     }
     if (!content.length) throw new Error('消息没有文字或图片。');
-    if (turn.deliveryInstructions?.trim()) content.push({ type: 'text', text: turn.deliveryInstructions });
     if (turn.signal.aborted) throw abortError();
     if (this.closed) throw new Error('Claude 适配器已关闭。');
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');

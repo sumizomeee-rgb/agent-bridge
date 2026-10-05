@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
-import { collectOutgoingImages, createTurnArtifacts } from '../src/artifacts.js';
+import { collectOutgoingImages } from '../src/artifacts.js';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, BridgeMessage, ReplyOptions, ReplySink } from '../src/types.js';
@@ -46,20 +46,40 @@ async function temporary(t: TestContext) {
 
 async function fixture(t: TestContext) {
   const f = await temporary(t);
-  const prepared = await createTurnArtifacts(join(f.root, 'data'), 'message');
-  return { ...f, ...prepared };
+  const directory = join(f.root, 'workspace');
+  await mkdir(directory);
+  return { ...f, directory };
 }
 
-test('message IDs cannot escape the hashed per-turn output directory; empty turns create no image', async t => {
+test('plain text and HTTP images do not inspect or create any nonexistent allowed roots', async t => {
   const f = await temporary(t);
-  const id = '../../outside\\..\\bad';
-  const prepared = await createTurnArtifacts(join(f.root, 'data'), id);
-  assert.equal(basename(prepared.directory), createHash('sha256').update(id).digest('hex'));
-  assert.equal(dirname(prepared.directory), join(f.root, 'data', 'outgoing'));
-  assert.deepEqual(await readdir(prepared.directory), []);
-  assert(prepared.instructions.includes(prepared.directory.replaceAll('\\', '\\\\')));
-  assert.match(prepared.instructions, /最终回复/);
-  assert(!prepared.instructions.includes('token'));
+  const cwd = join(f.root, 'missing-workspace');
+  const outgoing = join(f.root, 'data', 'outgoing');
+  const text = '普通回复。\n![网络图片](https://example.com/screenshot.png)';
+  assert.deepEqual(await collectOutgoingImages(text, [cwd, outgoing], 100), { text, images: [] });
+  await assert.rejects(stat(cwd), { code: 'ENOENT' });
+  await assert.rejects(stat(outgoing), { code: 'ENOENT' });
+});
+
+test('existing cwd screenshots upload directly without an unused legacy outgoing directory', async t => {
+  const f = await fixture(t);
+  const image = join(f.directory, 'game-screenshot.png'); await writeFile(image, PNG);
+  const missing = join(f.root, 'data', 'outgoing');
+  const result = await collectOutgoingImages(marker(image), [missing, f.directory], 100);
+  assert.equal(result.images.length, 1);
+  assert.deepEqual(Buffer.from(result.images[0]!.data), PNG);
+  await assert.rejects(stat(missing), { code: 'ENOENT' });
+});
+
+test('existing historical outgoing images remain allowed independently of the current cwd', async t => {
+  const f = await fixture(t);
+  const outgoing = join(f.root, 'data', 'outgoing');
+  const old = join(outgoing, 'previous-turn'); await mkdir(old, { recursive: true });
+  const image = join(old, 'saved.png'); await writeFile(image, PNG);
+  const result = await collectOutgoingImages(marker(image), [f.directory, outgoing], 100);
+  assert.equal(result.images[0]!.filename, 'saved.png');
+  const outside = join(f.root, 'private.png'); await writeFile(outside, PNG);
+  await assert.rejects(collectOutgoingImages(marker(outside), [f.directory, outgoing], 100), /不在允许/);
 });
 
 test('only explicitly declared PNG images are collected; HTTP images and normal text remain', async t => {
@@ -153,8 +173,8 @@ test('outside, sibling-prefix and traversal destinations fail before any images 
   await writeFile(local, PNG);
   const outside = join(sibling, 'private.png');
   await writeFile(outside, PNG);
-  await assert.rejects(collectOutgoingImages(`${marker(local)}\n${marker(outside)}`, f.directory, 100), /不在本轮产物目录/);
-  await assert.rejects(collectOutgoingImages(marker(join(f.directory, '..', basename(outside))), f.directory, 100), /不在本轮产物目录/);
+  await assert.rejects(collectOutgoingImages(`${marker(local)}\n${marker(outside)}`, f.directory, 100), /不在允许/);
+  await assert.rejects(collectOutgoingImages(marker(join(f.directory, '..', basename(outside))), f.directory, 100), /不在允许/);
   await assert.rejects(collectOutgoingImages('![relative](screen.png)', f.directory, 100), /绝对文件路径/);
 });
 
@@ -184,7 +204,7 @@ test('hard links, directories and missing declarations are refused with a clear 
   const hard = join(f.directory, 'hard.png');
   await link(source, hard);
   await assert.rejects(collectOutgoingImages(marker(hard), f.directory, 100), /普通文件/);
-  await assert.rejects(collectOutgoingImages(marker(f.directory), f.directory, 100), /不在本轮产物目录/);
+  await assert.rejects(collectOutgoingImages(marker(f.directory), f.directory, 100), /不在允许/);
   await assert.rejects(collectOutgoingImages(marker(join(f.directory, 'missing.png')), f.directory, 100), /图片回传失败.*ENOENT/);
 });
 
@@ -307,8 +327,9 @@ function message(id: string, text = '请截图', imagePaths: string[] = []): Bri
 
 async function managerFixture(t: TestContext) {
   const f = await temporary(t);
+  const workspace = join(f.root, 'workspace'); await mkdir(workspace);
   const config: BridgeConfig = {
-    token: 'NOT_GIVEN_TO_AGENT', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: f.root, proxyUrl: null,
+    token: 'NOT_GIVEN_TO_AGENT', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace, proxyUrl: null,
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } },
     dataDir: join(f.root, 'data'), attachmentsDir: join(f.root, 'attachments'), logsDir: join(f.root, 'logs'), maxImageBytes: 100,
   };
@@ -321,19 +342,19 @@ async function managerFixture(t: TestContext) {
   } };
   const manager = new SessionManager(config, { codex: adapter, claude: adapter }, sink);
   f.beforeCleanup.push(() => manager.close());
-  const directory = (id: string) => join(config.dataDir, 'outgoing', createHash('sha256').update(id).digest('hex'));
+  const directory = (_id: string) => config.workspace;
   return { ...f, config, adapter, replies, manager, directory, failImageOnce() { failImage = true; } };
 }
 
-test('manager keeps original text/input images, passes instructions separately and sends images together with the reply header', async t => {
+test('manager directly passes original text/input images without instructions or creating outgoing directories', async t => {
   const f = await managerFixture(t);
   const input = ['user-input.png'];
   await f.manager.handle(message('first', '用户原文', input));
   await until(() => f.adapter.turns.length === 1);
   const turn = f.adapter.turns[0]!;
   assert.equal(turn.text, '用户原文'); assert.deepEqual(turn.imagePaths, input);
-  assert(turn.deliveryInstructions?.includes('最终回复'));
-  assert(!turn.deliveryInstructions?.includes(f.config.token));
+  assert.equal(Object.hasOwn(turn, 'deliveryInstructions'), false);
+  await assert.rejects(stat(join(f.config.dataDir, 'outgoing')), { code: 'ENOENT' });
   const image = join(f.directory('first'), 'shot.png');
   await writeFile(image, PNG);
   f.adapter.finish(0, `已检查。\n${marker(image)}`);
@@ -382,7 +403,7 @@ test('validation failure sends only a clear error, retains the completed native 
   const outside = join(f.root, 'private.png'); await writeFile(outside, PNG);
   f.adapter.finish(0, `${marker(good)}\n${marker(outside)}`);
   await until(() => f.replies.length === 1);
-  assert.match(f.replies[0]!.text, /图片回传失败.*不在本轮/);
+  assert.match(f.replies[0]!.text, /图片回传失败.*不在允许/);
   assert(!f.replies[0]!.options?.images);
   const inspect = new SessionStore(f.config.dataDir);
   try { assert.equal(inspect.getMessage('invalid')!.state, 'completed'); assert.equal(inspect.getLastDelivery('owner', 'dm'), null); }
@@ -391,7 +412,7 @@ test('validation failure sends only a clear error, retains the completed native 
   await f.manager.close();
 });
 
-test('a stopped turn cannot deliver late image output; the next turn has a distinct output directory', async t => {
+test('a stopped turn cannot deliver late image output; subsequent turns do not manufacture output directories', async t => {
   const f = await managerFixture(t);
   await f.manager.handle(message('old'));
   await until(() => f.adapter.turns.length === 1);
@@ -400,8 +421,8 @@ test('a stopped turn cannot deliver late image output; the next turn has a disti
   f.adapter.finish(0, marker(image));
   await f.manager.handle(message('new', '继续'));
   await until(() => f.adapter.turns.length === 2);
-  assert.notEqual(f.directory('old'), f.directory('new'));
-  assert.equal((await stat(f.directory('new'))).isDirectory(), true);
+  assert.equal(f.directory('old'), f.directory('new'));
+  await assert.rejects(stat(join(f.config.dataDir, 'outgoing')), { code: 'ENOENT' });
   f.adapter.finish(1, '本轮无需图片');
   await until(() => f.replies.length === 2);
   assert(f.replies.every(reply => !reply.options?.images));
@@ -409,17 +430,18 @@ test('a stopped turn cannot deliver late image output; the next turn has a disti
   await f.manager.close();
 });
 
-test('stopping while the per-turn directory is being prepared prevents any agent invocation', async t => {
+test('ordinary text turns and arbitrary message IDs create no output paths or delivery instruction fields', async t => {
   const f = await managerFixture(t);
-  await f.manager.handle(message('preparing'));
-  await f.manager.handle(message('stop-prepare', '/stop'));
+  await f.manager.handle(message('../../unexpected-directory', '普通文字'));
+  await until(() => f.adapter.turns.length === 1);
+  assert.equal(f.adapter.turns[0]!.text, '普通文字');
+  assert.equal(Object.hasOwn(f.adapter.turns[0]!, 'deliveryInstructions'), false);
+  f.adapter.finish(0, '文字回复');
   await until(() => (Reflect.get(f.manager, 'workers') as Map<string, unknown>).size === 0);
-  assert.equal(f.adapter.turns.length, 0);
   assert.equal(f.replies.length, 1);
-  assert.match(f.replies[0]!.text, /已停止/);
-  const inspect = new SessionStore(f.config.dataDir);
-  try { assert.equal(inspect.getMessage('preparing')!.state, 'cancelled'); }
-  finally { inspect.close(); }
+  assert(f.replies[0]!.text.endsWith('文字回复'));
+  assert.deepEqual(await readdir(f.config.workspace), []);
+  await assert.rejects(stat(join(f.config.dataDir, 'outgoing')), { code: 'ENOENT' });
 });
 
 test('stopping during attachment reads prevents a late sink call and leaves delivery continuity unset', async t => {
