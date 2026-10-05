@@ -71,8 +71,8 @@ test('回复头来自本轮实际 metadata 和最终 nativeId，不使用选择�
   await send('/model custom selected-alias');
   f.codex.plans.push({ initialNativeId: 'early-123456', nativeId: 'actual-abcdef', model: 'provider-model', effort: 'high' });
   const reply = await respond('[Claude · invented-model]\n模型自己写的正文');
-  assert.equal(reply.options?.repeatHeader, '[Codex · provider-model · high · …abcdef]');
-  assert.equal(reply.text, '[Codex · provider-model · high · …abcdef]\n\n[Claude · invented-model]\n模型自己写的正文');
+  assert.equal(reply.options?.repeatHeader, '[Codex · provider-model · 高 · cdef]');
+  assert.equal(reply.text, '[Codex · provider-model · 高 · cdef]\n\n[Claude · invented-model]\n模型自己写的正文');
   assert.equal(f.codex.turns[0]!.conversation.model, 'selected-alias');
   const active = inspect(store => store.getActive('owner')!);
   assert.equal(active.nativeId, 'actual-abcdef');
@@ -89,7 +89,7 @@ test('本轮未回报 metadata 时不把旧实际值、参考默认或已选别�
   await respond('first');
   await send('/model custom selected-alias');
   const reply = await respond('unconfirmed');
-  assert.match(reply.text, /^\[Codex · 模型未知 · 强度未知 · …[^\n]+ ✅\]\n\nunconfirmed$/);
+  assert.match(reply.text, /^\[Codex · 模型未知 · 强度未知 · [^\n]+✅\]\n\nunconfirmed$/);
   assert(!reply.text.includes('prior-model') && !reply.text.includes('selected-alias') && !reply.text.includes('reference-only-model'));
 });
 
@@ -174,7 +174,7 @@ test('/agent 菜单和选择当前 Agent 不重置，来回切换恢复原上下
   await send('/agent claude');
   assert.match(f.replies.at(-1)!.text, /已新建 Claude Code/);
   const claudeReply = await respond('claude context');
-  assert.match(claudeReply.text, /^\[Claude Code · 模型未知 · 强度未知/);
+  assert.match(claudeReply.text, /^\[Claude · 模型未知 · 强度未知/);
   assert(!claudeReply.text.includes('✅'));
   const claude = inspect(store => store.getActive('owner')!);
   await send('/agent codex');
@@ -208,6 +208,6 @@ test('不同 Agent 即使原生 ID 相同仍不标连续，头部 metadata 不�
   const previous = { conversationId: 'same', agent: 'codex' as const, nativeId: 'native-abcdef' };
   const identity = { ...previous, agent: 'claude' as const };
   const header = replyHeader(identity, previous, 'model\n@everyone', 'high\r\n');
-  assert.equal(header, '[Claude Code · model ＠everyone · high · …abcdef]');
+  assert.equal(header, '[Claude · model ＠everyone · 高 · cdef]');
   assert(!header.includes('\n') && !header.includes('✅'));
 });

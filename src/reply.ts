@@ -13,9 +13,11 @@ export function replyHeader(identity: DeliveredReply, previous: DeliveredReply |
   model: string | null, effort: string | null): string {
   const continuous = previous?.conversationId === identity.conversationId
     && previous.agent === identity.agent && previous.nativeId === identity.nativeId;
-  const name = identity.agent === 'codex' ? 'Codex' : 'Claude Code';
-  const actualModel = model ? headerValue(model) || '模型未知' : '模型未知';
+  const name = identity.agent === 'codex' ? 'Codex' : 'Claude';
+  const actualModel = model ? headerValue(model).replace(/^gpt-/i, '') || '模型未知' : '模型未知';
   const actualEffort = effort ? headerValue(effort) || '强度未知' : '强度未知';
-  const suffix = headerValue(identity.nativeId.slice(-6));
-  return `[${name} · ${actualModel} · ${actualEffort} · …${suffix}${continuous ? ' ✅' : ''}]`;
+  const effortLabels: Record<string, string> = { minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', none: '无' };
+  const shortEffort = Object.hasOwn(effortLabels, actualEffort.toLowerCase()) ? effortLabels[actualEffort.toLowerCase()]! : actualEffort;
+  const suffix = headerValue(identity.nativeId.slice(-4));
+  return `[${name} · ${actualModel} · ${shortEffort} · ${suffix}${continuous ? '✅' : ''}]`;
 }
