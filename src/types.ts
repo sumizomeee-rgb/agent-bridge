@@ -27,6 +27,8 @@ export interface BridgeConfig {
   attachmentsDir: string;
   logsDir: string;
   maxImageBytes: number;
+  /** Outgoing ordinary files; defaults to 20 MiB, at most 24 MiB. */
+  maxFileBytes?: number;
   /** Reference defaults for display/fallback only, never an automatic CLI override. */
   defaultModels?: Partial<Record<AgentName, string>>;
   modelOptions?: Partial<Record<AgentName, string[]>>;
@@ -64,7 +66,13 @@ export interface OutgoingImage {
   data: Uint8Array;
   description?: string;
 }
-export interface ReplyOptions { repeatHeader?: string; images?: OutgoingImage[]; signal?: AbortSignal }
+export interface OutgoingFile {
+  filename: string;
+  contentType: string;
+  data: Uint8Array;
+  description?: string;
+}
+export interface ReplyOptions { repeatHeader?: string; images?: OutgoingImage[]; files?: OutgoingFile[]; signal?: AbortSignal }
 export interface ReplySink { sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> }
 export interface DiscordAttachment {
   id: string;

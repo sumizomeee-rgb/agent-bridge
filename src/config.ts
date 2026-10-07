@@ -58,6 +58,10 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
       }
     }
   }
+  const maxFileBytes = raw.maxFileBytes ?? 20 * 1024 * 1024;
+  if (!Number.isSafeInteger(maxFileBytes) || (maxFileBytes as number) <= 0 || (maxFileBytes as number) > 24 * 1024 * 1024) {
+    throw new Error('maxFileBytes 必须是 1–25165824 的整数（单个回传文件大小上限）。');
+  }
   const config: BridgeConfig = {
     token, allowedUserIds: raw.allowedUserIds.map(String), defaultAgent,
     workspace: localPath(raw.workspace, '.local/workspace'), proxyUrl,
@@ -65,7 +69,7 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
     dataDir: localPath(raw.dataDir, '.local/data'),
     attachmentsDir: localPath(raw.attachmentsDir, '.local/data/attachments'),
     logsDir: localPath(raw.logsDir, '.local/logs'), maxImageBytes: 20 * 1024 * 1024,
-    defaultModels, modelOptions,
+    defaultModels, modelOptions, maxFileBytes: maxFileBytes as number,
   };
   for (const p of [config.workspace, config.dataDir, config.attachmentsDir, config.logsDir]) mkdirSync(p, { recursive: true });
   return config;

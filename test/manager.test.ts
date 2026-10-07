@@ -375,6 +375,6 @@ test('忙中切换 Agent 取消旧任务和队列，旧结果不发到新 Agent 
   assert(f.sink.replies.every(reply => !reply.text.includes('stale old agent answer')));
   assert.equal(f.codex.calls.length, 1);
   const reply = f.sink.replies.at(-1)!.text;
-  assert.match(reply, /^\[Claude Code ·/);
+  assert.match(reply, /^\[Claude ·/);
   assert(!reply.includes('✅'));
 });

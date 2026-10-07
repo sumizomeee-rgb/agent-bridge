@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
-import type { BridgeConfig, DiscordAttachment, IncomingDM, OutgoingImage, ReplyOptions } from './types.js';
+import type { BridgeConfig, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
@@ -37,7 +37,7 @@ const fatalGatewayCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const cdnHosts = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
 const mib = 1024 * 1024;
 const outgoingBatchBytes = 24 * mib; // Leave room below Discord's 25 MiB request limit.
-interface PreparedImage { filename: string; blob: Blob; description?: string }
+interface PreparedAttachment { filename: string; blob: Blob; description?: string }
 
 class DiscordRestError extends Error {
   constructor(public readonly status: number) { super(`Discord REST 请求失败（HTTP ${status}）。`); }
@@ -76,46 +76,67 @@ function validImage(header: Buffer, extension: string): boolean {
   }
 }
 
-function prepareOutgoingImages(images: OutgoingImage[], maxImageBytes: number): PreparedImage[][] {
-  if (!Array.isArray(images) || images.length > 10) throw new Error('单次回复最多发送 10 张图片。');
+function safeOutgoingFilename(filename: unknown): filename is string {
+  return typeof filename === 'string' && filename.length > 0 && filename.length <= 200
+    && filename === filename.trim() && !/[\x00-\x1f\x7f/\\:*?"<>|]/.test(filename)
+    && !filename.endsWith('.') && filename !== '.' && filename !== '..'
+    && !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(filename);
+}
+
+function prepareOutgoingAttachments(images: OutgoingImage[], files: OutgoingFile[],
+  maxImageBytes: number, maxFileBytes: number): PreparedAttachment[][] {
+  if (!Array.isArray(images) || !Array.isArray(files)) throw new Error('回复附件列表无效。');
+  if (images.length + files.length > 10) {
+    throw new Error(files.length ? '单次回复最多发送 10 个附件（图片与文件合计）。' : '单次回复最多发送 10 张图片。');
+  }
   const perImageLimit = Math.min(maxImageBytes, 10 * mib);
+  const perFileLimit = Math.min(maxFileBytes, outgoingBatchBytes);
+  const attachments = [...images, ...files];
   let totalBytes = 0;
   // Validate the entire logical reply before copying bytes or sending any text.
-  for (const image of images) {
-    if (!image || typeof image.filename !== 'string' || !image.filename.length || image.filename.length > 200
-      || image.filename !== image.filename.trim() || /[\x00-\x1f\x7f/\\:*?"<>|]/.test(image.filename)
-      || image.filename.endsWith('.') || image.filename === '.' || image.filename === '..') {
-      throw new Error('回复图片的文件名无效，必须是安全的文件名。');
+  for (const [index, attachment] of attachments.entries()) {
+    const isImage = index < images.length;
+    if (!attachment || !safeOutgoingFilename(attachment.filename)) {
+      throw new Error('回复附件的文件名无效，必须是安全的文件名。');
     }
-    const extension = imageTypes[image.contentType];
-    const filenameExtension = image.filename.split('.').at(-1)?.toLowerCase();
-    if (!extension || (filenameExtension === 'jpeg' ? 'jpg' : filenameExtension) !== extension) {
-      throw new Error('回复图片仅支持扩展名与类型一致的 JPG、PNG、WebP 和 GIF。');
+    if (typeof attachment.contentType !== 'string' || attachment.contentType.length > 255
+      || !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(attachment.contentType)) {
+      throw new Error('回复附件的 MIME 类型无效。');
     }
-    if (!(image.data instanceof Uint8Array) || image.data.byteLength === 0 || image.data.byteLength > perImageLimit) {
-      throw new Error('回复图片为空或大小超过上限。');
+    const extension = isImage ? imageTypes[attachment.contentType] : undefined;
+    if (isImage) {
+      const filenameExtension = attachment.filename.split('.').at(-1)?.toLowerCase();
+      if (!extension || (filenameExtension === 'jpeg' ? 'jpg' : filenameExtension) !== extension) {
+        throw new Error('回复图片仅支持扩展名与类型一致的 JPG、PNG、WebP 和 GIF。');
+      }
     }
-    totalBytes += image.data.byteLength;
-    if (totalBytes > 100 * mib) throw new Error('单次回复的图片总大小超过 100 MiB。');
-    if (!validImage(Buffer.from(image.data.buffer, image.data.byteOffset, Math.min(image.data.byteLength, 12)), extension)) {
+    if (!(attachment.data instanceof Uint8Array) || (isImage && attachment.data.byteLength === 0)
+      || attachment.data.byteLength > (isImage ? perImageLimit : perFileLimit)) {
+      throw new Error(isImage ? '回复图片为空或大小超过上限。' : '回复文件为空或大小超过上限。');
+    }
+    totalBytes += attachment.data.byteLength;
+    if (totalBytes > 100 * mib) throw new Error('单次回复的附件总大小超过 100 MiB。');
+    if (isImage && !validImage(Buffer.from(attachment.data.buffer, attachment.data.byteOffset,
+      Math.min(attachment.data.byteLength, 12)), extension!)) {
       throw new Error('回复图片内容不是声明的图片格式。');
     }
-    if (image.description !== undefined && (typeof image.description !== 'string'
-      || image.description.length > 1024 || image.description.includes('\0'))) {
-      throw new Error('回复图片说明无效或超过 1024 字。');
+    if (attachment.description !== undefined && (typeof attachment.description !== 'string'
+      || attachment.description.length > 1024 || attachment.description.includes('\0'))) {
+      throw new Error('回复附件说明无效或超过 1024 字。');
     }
   }
-  const batches: PreparedImage[][] = [];
-  let batch: PreparedImage[] = [];
+  const batches: PreparedAttachment[][] = [];
+  let batch: PreparedAttachment[] = [];
   let batchBytes = 0;
-  for (const image of images) {
-    if (batch.length && batchBytes + image.data.byteLength > outgoingBatchBytes) {
+  for (const attachment of attachments) {
+    if (batch.length && batchBytes + attachment.data.byteLength > outgoingBatchBytes) {
       batches.push(batch); batch = []; batchBytes = 0;
     }
     // A Blob snapshots the supplied view so queued sends and retries are immutable.
-    batch.push({ filename: image.filename, blob: new Blob([new Uint8Array(image.data)], { type: image.contentType }),
-      ...(image.description === undefined ? {} : { description: image.description }) });
-    batchBytes += image.data.byteLength;
+    batch.push({ filename: attachment.filename,
+      blob: new Blob([new Uint8Array(attachment.data)], { type: attachment.contentType }),
+      ...(attachment.description === undefined ? {} : { description: attachment.description }) });
+    batchBytes += attachment.data.byteLength;
   }
   if (batch.length) batches.push(batch);
   return batches;
@@ -193,6 +214,9 @@ export class DiscordTransport {
     if (!Number.isSafeInteger(config.maxImageBytes) || config.maxImageBytes <= 0) {
       throw new Error('maxImageBytes 必须是正整数。');
     }
+    if (config.maxFileBytes !== undefined && (!Number.isSafeInteger(config.maxFileBytes) || config.maxFileBytes <= 0)) {
+      throw new Error('maxFileBytes 必须是正整数。');
+    }
     // REST, Gateway and CDN each explicitly use the configured proxy.
     if (config.proxyUrl) {
       this.restDispatcher = new ProxyAgent(config.proxyUrl);
@@ -219,25 +243,27 @@ export class DiscordTransport {
     if (this.closed) throw new Error('Discord transport 已关闭。');
     const signal = options?.signal;
     signal?.throwIfAborted();
-    const imageBatches = prepareOutgoingImages(options?.images ?? [], this.config.maxImageBytes);
-    if (!text.length && !imageBatches.length) return;
+    const attachmentBatches = prepareOutgoingAttachments(options?.images ?? [], options?.files ?? [],
+      this.config.maxImageBytes, this.config.maxFileBytes ?? 20 * mib);
+    const caption = options?.files?.length ? '附件' : '图片';
+    if (!text.length && !attachmentBatches.length) return;
     const prefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
     if (prefix && (prefix.length >= 1998 || (text.length > 0 && !text.startsWith(prefix)))) throw new Error('回复头过长或与正文不一致。');
     const parts = prefix ? chunks(text.slice(prefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : chunks(text);
     const previous = this.sendQueues.get(channelId) ?? Promise.resolve();
     const job = previous.catch(() => undefined).then(async () => {
       signal?.throwIfAborted();
-      for (let index = 0; index < Math.max(parts.length, imageBatches.length); index++) {
+      for (let index = 0; index < Math.max(parts.length, attachmentBatches.length); index++) {
         signal?.throwIfAborted();
-        const images = imageBatches[index];
-        const content = parts[index] ?? `${prefix}${chunks(`图片 ${index + 1}/${imageBatches.length}`, 2000 - prefix.length)[0]}`;
+        const attachments = attachmentBatches[index];
+        const content = parts[index] ?? `${prefix}${chunks(`${caption} ${index + 1}/${attachmentBatches.length}`, 2000 - prefix.length)[0]}`;
         // A nonce prevents duplicate delivery if a server retries a message internally.
         await this.rest(`/channels/${channelId}/messages`, 'POST', {
           content, allowed_mentions: { parse: [] },
           nonce: randomUUID().replaceAll('-', '').slice(0, 24), enforce_nonce: true,
-          ...(images ? { attachments: images.map((image, id) => ({ id, filename: image.filename,
-            ...(image.description === undefined ? {} : { description: image.description }) })) } : {}),
-        }, channelId, images, signal);
+          ...(attachments ? { attachments: attachments.map((attachment, id) => ({ id, filename: attachment.filename,
+            ...(attachment.description === undefined ? {} : { description: attachment.description }) })) } : {}),
+        }, channelId, attachments, signal);
       }
     });
     this.sendQueues.set(channelId, job);
@@ -621,7 +647,7 @@ export class DiscordTransport {
   }
 
   private async rest(path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown, channelId?: string,
-    images?: PreparedImage[], turnSignal?: AbortSignal): Promise<unknown> {
+    attachments?: PreparedAttachment[], turnSignal?: AbortSignal): Promise<unknown> {
     const cancel = turnSignal ? AbortSignal.any([this.shutdown.signal, turnSignal]) : this.shutdown.signal;
     let localWaitUntil = 0;
     for (let attempt = 0; attempt < 10; attempt++) {
@@ -631,11 +657,11 @@ export class DiscordTransport {
       if (wait > 0) await delay(wait, undefined, { signal: cancel });
       cancel.throwIfAborted();
       let form: FormData | undefined;
-      if (images?.length) {
+      if (attachments?.length) {
         // Rebuild multipart for every attempt; a consumed request body is never reused.
         form = new FormData();
         form.set('payload_json', JSON.stringify(body));
-        images.forEach((image, index) => form!.append(`files[${index}]`, image.blob, image.filename));
+        attachments.forEach((attachment, index) => form!.append(`files[${index}]`, attachment.blob, attachment.filename));
       }
       const requestSignal = AbortSignal.any([cancel, AbortSignal.timeout(30_000)]);
       const response = await this.httpFetch(`${this.restBase}${path}`, {

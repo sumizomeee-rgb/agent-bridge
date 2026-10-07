@@ -72,6 +72,9 @@ manager = new SessionManager(config, adapters, {
       ...(options.images ? { images: options.images.map(image => ({ ...image,
         ...(image.description ? { description: redactText(image.description, [config.token]) } : {}),
       })) } : {}),
+      ...(options.files ? { files: options.files.map(file => ({ ...file,
+        ...(file.description ? { description: redactText(file.description, [config.token]) } : {}),
+      })) } : {}),
     } : undefined),
 });
 let closing = false;

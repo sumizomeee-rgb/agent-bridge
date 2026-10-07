@@ -30,3 +30,23 @@ test('redaction preserves long replies while limiting diagnostic errors', () => 
   assert.equal(safeError(long, ['secret']).length, 1500);
   assert.ok(!redactText('Bot abc.def secret', ['secret']).includes('abc.def'));
 });
+
+test('ordinary file limit defaults to 20 MiB and validates configuration before startup', () => {
+  const root = mkdtempSync(join(tmpdir(), 'bridge-config-'));
+  try {
+    const path = join(root, 'config.json');
+    const base = { token: 'private-test-value', allowedUserIds: ['123456789012345678'], workspace: join(root, 'workspace'),
+      dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'),
+      commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } };
+    writeFileSync(path, JSON.stringify(base));
+    assert.equal(loadConfig(['--config', path]).maxFileBytes, 20 * 1024 * 1024);
+    for (const limit of [1, 1024, 24 * 1024 * 1024]) {
+      writeFileSync(path, JSON.stringify({ ...base, maxFileBytes: limit }));
+      assert.equal(loadConfig(['--config', path]).maxFileBytes, limit);
+    }
+    for (const limit of [0, -1, 1.5, '100', 24 * 1024 * 1024 + 1]) {
+      writeFileSync(path, JSON.stringify({ ...base, maxFileBytes: limit }));
+      assert.throws(() => loadConfig(['--config', path]), /maxFileBytes/);
+    }
+  } finally { rmSync(root, { recursive: true }); }
+});

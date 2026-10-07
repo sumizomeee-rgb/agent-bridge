@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { SessionStore } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
-import { collectOutgoingImages } from './artifacts.js';
+import { collectOutgoingAttachments } from './artifacts.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
 
 interface RunningTurn {
@@ -321,13 +321,15 @@ export class SessionManager {
           && this.running.get(item.userId) === turn
           && this.store.getActive(item.userId)?.id === conversationId
           && this.store.getMessage(item.id)?.state === 'completed';
-        const outgoing = await collectOutgoingImages(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
-          this.config.maxImageBytes, controller.signal);
+        const outgoing = await collectOutgoingAttachments(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
+          this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
         if (!delivering()) continue;
         const identity = { conversationId, agent: target.agent, nativeId: result.nativeId };
         const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort);
-        await this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || (outgoing.images.length ? '图片已附上。' : '本轮完成（没有文本输出）。')}`,
-          { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}) });
+        const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '本轮完成（没有文本输出）。';
+        await this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
+          { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
+            ...(outgoing.files.length ? { files: outgoing.files } : {}) });
         if (!delivering()) continue;
         // Failed or partially delivered replies never establish successful continuity.
         this.store.saveDelivery(item.userId, item.channelId, identity);

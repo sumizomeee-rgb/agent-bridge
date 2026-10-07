@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { FormData, Headers, ProxyAgent, Request, Response, type Dispatcher } from 'undici';
 import { DiscordTransport } from '../src/discord.js';
-import type { BridgeConfig, OutgoingImage } from '../src/types.js';
+import type { BridgeConfig, OutgoingFile, OutgoingImage } from '../src/types.js';
 
 const mib = 1024 * 1024;
 const pngHeader = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -13,6 +13,10 @@ function png(size = 16): Uint8Array {
 }
 function image(changes: Partial<OutgoingImage> = {}): OutgoingImage {
   return { filename: 'screenshot.png', contentType: 'image/png', data: png(), ...changes };
+}
+
+function file(changes: Partial<OutgoingFile> = {}): OutgoingFile {
+  return { filename: 'report.pdf', contentType: 'application/pdf', data: new Uint8Array(Buffer.from('%PDF-1.7\nreport')), ...changes };
 }
 interface SentFile { field: string; filename: string; contentType: string; size: number; header: Uint8Array }
 interface Sent {
@@ -370,4 +374,176 @@ test('cancelling an active multipart upload reaches its HTTP signal and no furth
   await delay(20);
   assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0]!.signal!.aborted, true);
+});
+
+test('PDF and ZIP files share one multipart reply with accurate MIME and binary payloads', async t => {
+  const f = fixture(t);
+  const files = [file({ description: '导出的报告' }), file({ filename: 'source.zip', contentType: 'application/zip',
+    data: new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0xff, 0x80]),
+  })];
+  await f.transport.sendText('222', '文件如下。', { files });
+  assert.equal(f.sent.length, 1);
+  const sent = f.sent[0]!;
+  assert.equal(sent.payload.content, '文件如下。');
+  assert.deepEqual(sent.payload.attachments, [{ id: 0, filename: 'report.pdf', description: '导出的报告' },
+    { id: 1, filename: 'source.zip' }]);
+  assert.deepEqual(sent.files.map(attachment => attachment.contentType), ['application/pdf', 'application/zip']);
+  const wire = new Request('https://outgoing.test.invalid/api', { method: 'POST', headers: sent.headers, body: sent.form });
+  const decoded = await wire.formData();
+  for (const [index, attachment] of files.entries()) {
+    const actual = decoded.get(`files[${index}]`) as File;
+    assert.equal(actual.name, attachment.filename);
+    assert.equal(actual.type, attachment.contentType);
+    assert.deepEqual(new Uint8Array(await actual.arrayBuffer()), attachment.data);
+  }
+  assert.deepEqual(sent.payload.allowed_mentions, { parse: [] });
+  assert(!JSON.stringify(sent.payload).includes(f.config.token));
+});
+
+test('ordinary files accept empty bytes and do not require an image or document signature', async t => {
+  const f = fixture(t);
+  const header = '[Codex · model · medium · …abcdef]';
+  await f.transport.sendText('222', '', { repeatHeader: header, files: [
+    file({ filename: 'empty.txt', contentType: 'text/plain', data: new Uint8Array() }),
+    file({ filename: 'output.bin', contentType: 'application/octet-stream', data: new Uint8Array([0, 255, 7]) }),
+    file({ data: new Uint8Array([1, 2, 3]) }),
+  ] });
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0]!.payload.content, `${header}\n\n附件 1/1`);
+  assert.deepEqual(f.sent[0]!.files.map(attachment => attachment.size), [0, 3, 3]);
+  assert.deepEqual(f.sent[0]!.files.map(attachment => attachment.contentType),
+    ['text/plain', 'application/octet-stream', 'application/pdf']);
+});
+
+test('mixed pictures and files share 24 MiB batches and later captions keep the header', async t => {
+  const f = fixture(t);
+  const header = '[Codex · model · high · …abcdef]';
+  await f.transport.sendText('222', `${header}\n\n完成。`, { repeatHeader: header,
+    images: [image({ data: png(8 * mib) })],
+    files: [file({ data: new Uint8Array(16 * mib) }), file({ filename: 'more.zip', contentType: 'application/zip' })],
+  });
+  assert.equal(f.sent.length, 2);
+  assert.deepEqual(f.sent.map(message => message.files.map(attachment => attachment.filename)),
+    [['screenshot.png', 'report.pdf'], ['more.zip']]);
+  assert.equal(f.sent[0]!.payload.content, `${header}\n\n完成。`);
+  assert.equal(f.sent[1]!.payload.content, `${header}\n\n附件 2/2`);
+  assert.deepEqual(f.sent[1]!.payload.attachments, [{ id: 0, filename: 'more.zip' }]);
+  for (const message of f.sent) assert(message.files.reduce((total, attachment) => total + attachment.size, 0) <= 24 * mib);
+});
+
+test('invalid file names, MIME, data and descriptions reject the whole logical reply before HTTP', async t => {
+  const f = fixture(t);
+  const invalid: OutgoingFile[] = [
+    ...['../report.pdf', '..\report.pdf', 'C:\report.pdf', '/report.pdf', ' report.pdf', 'report.pdf ',
+      'report.pdf.', 'report\n.pdf', 'report\0.pdf', 'report".pdf', '', '.', '..', 'CON.pdf', 'lpt1.zip',
+      'x'.repeat(201)].map(filename => file({ filename })),
+    ...['', 'pdf', 'application/pdf\r\nInjected: yes', 'application/pdf; charset=utf-8', ' application/pdf',
+      'application/*', 'application/' + 'x'.repeat(250)].map(contentType => file({ contentType })),
+    file({ data: 'not bytes' as unknown as Uint8Array }),
+    file({ contentType: 4 as unknown as string }),
+    file({ description: 'x'.repeat(1025) }), file({ description: 'unsafe\0description' }),
+  ];
+  for (const attachment of invalid) {
+    await assert.rejects(f.transport.sendText('222', 'x'.repeat(5000), { images: [image()], files: [file(), attachment] }));
+  }
+  assert.equal(f.sent.length, 0);
+  assert.deepEqual(f.logs, []);
+});
+
+test('file size defaults to 20 MiB, configured limits apply and 24 MiB is the hard cap', async t => {
+  const f = fixture(t);
+  await f.transport.sendText('222', 'default boundary', { files: [file({ data: new Uint8Array(20 * mib) })] });
+  await assert.rejects(f.transport.sendText('222', 'oversize', { files: [file({ data: new Uint8Array(20 * mib + 1) })] }), /大小/);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0]!.files[0]!.size, 20 * mib);
+  const strict = fixture(t, { maxFileBytes: 32 });
+  await assert.rejects(strict.transport.sendText('222', 'oversize', { files: [file({ data: new Uint8Array(33) })] }), /大小/);
+  assert.equal(strict.sent.length, 0);
+  const generous = fixture(t, { maxFileBytes: 100 * mib });
+  await generous.transport.sendText('222', 'hard boundary', { files: [file({ data: new Uint8Array(24 * mib) })] });
+  await assert.rejects(generous.transport.sendText('222', 'oversize', { files: [file({ data: new Uint8Array(24 * mib + 1) })] }), /大小/);
+  assert.equal(generous.sent.length, 1);
+  assert.equal(generous.sent[0]!.files[0]!.size, 24 * mib);
+  for (const maxFileBytes of [0, -1, 1.5, Infinity, NaN]) assert.throws(() => fixture(t, { maxFileBytes }), /maxFileBytes/);
+});
+
+test('attachment count and 100 MiB total include both images and ordinary files before sending', async t => {
+  const f = fixture(t, { maxFileBytes: 24 * mib });
+  await assert.rejects(f.transport.sendText('222', 'too many', {
+    images: Array.from({ length: 6 }, () => image()), files: Array.from({ length: 5 }, () => file()),
+  }), /10 个附件/);
+  const large = new Uint8Array(21 * mib);
+  await assert.rejects(f.transport.sendText('222', 'too large', {
+    files: Array.from({ length: 5 }, (_, n) => file({ filename: `part${n}.zip`, contentType: 'application/zip', data: large })),
+  }), /100 MiB/);
+  assert.equal(f.sent.length, 0);
+  await f.transport.sendText('222', 'ten', {
+    images: Array.from({ length: 5 }, (_, n) => image({ filename: `screen${n}.png` })),
+    files: Array.from({ length: 5 }, (_, n) => file({ filename: `part${n}.pdf` })),
+  });
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0]!.files.length, 10);
+});
+
+test('queued ordinary files snapshot the exact byte view and mutable metadata before waiting', async t => {
+  const f = fixture(t);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.handler = async (_sent, index) => {
+    if (index === 0) await blocked;
+    return new Response('{"id":"555"}', { status: 200 });
+  };
+  const first = f.transport.sendText('222', 'first');
+  await eventually(() => f.sent.length === 1);
+  const backing = new Uint8Array([9, 9, 1, 2, 3, 4, 9]);
+  const attachment = file({ data: backing.subarray(2, 6), description: 'original description' });
+  const queued = f.transport.sendText('222', 'queued', { files: [attachment] });
+  backing.fill(0); attachment.filename = 'changed.zip'; attachment.contentType = 'application/zip';
+  attachment.description = 'changed description'; attachment.data = new Uint8Array([7]);
+  release();
+  await Promise.all([first, queued]);
+  const sent = f.sent[1]!;
+  assert.deepEqual(sent.payload.attachments, [{ id: 0, filename: 'report.pdf', description: 'original description' }]);
+  assert.equal(sent.files[0]!.contentType, 'application/pdf');
+  assert.deepEqual(sent.files[0]!.header, new Uint8Array([1, 2, 3, 4]));
+  assert.equal(sent.files[0]!.size, 4);
+});
+
+test('ordinary file 429 retries only its batch with the same nonce, rebuilt form and immutable bytes', async t => {
+  const f = fixture(t);
+  const bytes = new Uint8Array(13 * mib); bytes.set([1, 2, 3, 4]);
+  f.handler = (_sent, index) => {
+    if (index === 0) bytes.fill(0);
+    return index === 1 ? new Response('{"retry_after":0.005,"global":false}', { status: 429 })
+      : new Response('{"id":"555"}', { status: 200 });
+  };
+  await f.transport.sendText('222', 'three files', { files: [1, 2, 3].map(n => file({ filename: `part${n}.pdf`, data: bytes })) });
+  assert.deepEqual(f.sent.map(message => message.files.map(attachment => attachment.filename)),
+    [['part1.pdf'], ['part2.pdf'], ['part2.pdf'], ['part3.pdf']]);
+  assert.equal(f.sent[1]!.payload.nonce, f.sent[2]!.payload.nonce);
+  assert.notEqual(f.sent[0]!.payload.nonce, f.sent[1]!.payload.nonce);
+  assert.notEqual(f.sent[1]!.form, f.sent[2]!.form);
+  assert.deepEqual(f.sent[1]!.payload, f.sent[2]!.payload);
+  assert.deepEqual(f.sent[1]!.files, f.sent[2]!.files);
+  assert(f.sent.every(message => Buffer.from(message.files[0]!.header).subarray(0, 4).equals(Buffer.from([1, 2, 3, 4]))));
+});
+
+test('cancelling queued file-only output prevents every attachment and preserves later channel order', async t => {
+  const f = fixture(t);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  f.handler = async (_sent, index) => {
+    if (index === 0) await blocked;
+    return new Response('{"id":"555"}', { status: 200 });
+  };
+  const first = f.transport.sendText('222', 'first');
+  await eventually(() => f.sent.length === 1);
+  const controller = new AbortController();
+  const cancelled = f.transport.sendText('222', '', { files: [file()], signal: controller.signal });
+  const rejection = assert.rejects(cancelled, error => error instanceof Error && error.name === 'AbortError');
+  controller.abort(); await rejection;
+  const after = f.transport.sendText('222', 'after');
+  await delay(20); assert.equal(f.sent.length, 1);
+  release(); await Promise.all([first, after]);
+  assert.deepEqual(f.sent.map(message => message.payload.content), ['first', 'after']);
 });

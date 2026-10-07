@@ -2,17 +2,21 @@ import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { OutgoingImage } from './types.js';
+import type { OutgoingFile, OutgoingImage } from './types.js';
 
 const MAX_IMAGES = 10;
+const DEFAULT_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
 
 export interface CollectedImages { text: string; images: OutgoingImage[] }
-interface ImageMarker { start: number; end: number; destination: string; description: string }
+export interface CollectedAttachments extends CollectedImages { files: OutgoingFile[] }
+interface ImageMarker { start: number; end: number; destination: string; description: string; image: boolean }
 type CodeContainer = { kind: 'quote' } | { kind: 'list'; width: number };
 
-function failed(reason: string): Error { return new Error(`图片回传失败：${reason}`); }
+class ArtifactReadError extends Error {}
+function failed(reason: string): Error { return new ArtifactReadError(reason); }
 function contained(root: string, path: string): boolean {
   const part = relative(root, path);
   return part !== '' && part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part);
@@ -108,12 +112,15 @@ function escaped(text: string, index: number): boolean {
   return count % 2 === 1;
 }
 
-function markers(text: string): ImageMarker[] {
+function markers(text: string, includeFiles = false): ImageMarker[] {
   const source = maskCode(text);
   const result: ImageMarker[] = [];
   for (let start = 0; start < source.length - 3; start++) {
-    if (source[start] !== '!' || source[start + 1] !== '[' || escaped(source, start)) continue;
-    let cursor = start + 2;
+    const image = source[start] === '!' && source[start + 1] === '[' && !escaped(source, start);
+    const file = includeFiles && source[start] === '[' && !escaped(source, start) && source[start - 1] !== '!';
+    if (!image && !file) continue;
+    const labelStart = start + (image ? 2 : 1);
+    let cursor = labelStart;
     let depth = 1;
     for (; cursor < source.length && depth; cursor++) {
       if (escaped(source, cursor)) continue;
@@ -121,11 +128,12 @@ function markers(text: string): ImageMarker[] {
       if (source[cursor] === ']') depth--;
     }
     if (depth || source[cursor] !== '(') continue;
-    const description = text.slice(start + 2, cursor - 1).replace(/\\([\[\]\\])/g, '$1').replace(/[\x00-\x1f\x7f]+/g, ' ').slice(0, 1024);
+    const description = text.slice(labelStart, cursor - 1).replace(/\\([\[\]\\])/g, '$1').replace(/[\x00-\x1f\x7f]+/g, ' ').slice(0, 1024);
     cursor++;
     while (/\s/.test(source[cursor] ?? '') && cursor < source.length) cursor++;
     let destination = '';
-    if (source[cursor] === '<') {
+    const bracketed = source[cursor] === '<';
+    if (bracketed) {
       const begin = ++cursor;
       while (cursor < source.length && (source[cursor] !== '>' || escaped(source, cursor))) cursor++;
       if (cursor >= source.length) continue;
@@ -152,21 +160,26 @@ function markers(text: string): ImageMarker[] {
       while (/\s/.test(source[cursor] ?? '') && cursor < source.length) cursor++;
     }
     if (!destination || source[cursor] !== ')') continue;
-    result.push({ start, end: cursor + 1, destination, description });
+    if (!image && !bracketed) { start = cursor; continue; }
+    result.push({ start, end: cursor + 1, destination, description, image });
     start = cursor;
   }
   return result;
 }
 
-function localPath(destination: string): string | null {
+function localPath(destination: string, image = true): string | null {
   if (/^https?:\/\//i.test(destination)) return null;
+  // Source-location references are navigation, not file-transfer declarations.
+  if (!image && (/:\d+(?::\d+)?$/.test(destination)
+    || /#(?:L\d+(?:C\d+)?(?:-L?\d+)?|line=\d+)$/i.test(destination))) return null;
   let path = destination;
   if (/^file:/i.test(path)) {
     try { path = fileURLToPath(path); } catch { throw failed('图片的本地文件 URL 无效。'); }
   }
   // Codex desktop Markdown sometimes adds a slash before an otherwise absolute Windows drive path.
   if (/^\/[A-Za-z]:[\/\\]/.test(path)) path = path.slice(1);
-  if (!isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw failed('本地图片必须使用允许目录内的绝对文件路径。');
+  if (!image && !isAbsolute(path)) return null; // Relative links and other URL schemes remain ordinary text.
+  if (!isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw failed('本地产物必须使用允许目录内的绝对文件路径。');
   return resolve(path);
 }
 
@@ -182,17 +195,33 @@ function imageType(path: string, header: Buffer): OutgoingImage['contentType'] {
   throw failed(`${basename(path)} 的文件内容不是 PNG/JPG/WebP/GIF 图片。`);
 }
 
-/** Only explicitly declared final-reply images are read; unrelated files are never enumerated. */
+function fileType(path: string): string {
+  const types: Record<string, string> = {
+    '.pdf': 'application/pdf', '.zip': 'application/zip', '.txt': 'text/plain', '.md': 'text/markdown',
+    '.csv': 'text/csv', '.json': 'application/json', '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.ppt': 'application/vnd.ms-powerpoint', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  };
+  return types[extname(path).toLowerCase()] ?? 'application/octet-stream';
+}
+
+/** Only explicitly declared final-reply attachments are read; unrelated files are never enumerated. */
 async function collect(finalText: string, rootDirectory: string | string[], maxImageBytes: number,
-  signal?: AbortSignal): Promise<CollectedImages> {
+  signal?: AbortSignal, maxFileBytes?: number): Promise<CollectedAttachments> {
   if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes <= 0) throw failed('图片大小上限配置无效。');
+  if (maxFileBytes !== undefined && (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0 || maxFileBytes > MAX_FILE_BYTES)) {
+    throw failed('文件大小上限必须是 1–25165824 的整数。');
+  }
   signal?.throwIfAborted();
-  const declared = markers(finalText).map(marker => ({ marker, path: localPath(marker.destination) })).filter(item => item.path !== null);
-  if (!declared.length) return { text: finalText, images: [] };
+  const declared = markers(finalText, maxFileBytes !== undefined).map(marker => ({ marker,
+    path: localPath(marker.destination, marker.image) })).filter(item => item.path !== null);
+  if (!declared.length) return { text: finalText, images: [], files: [] };
   signal?.throwIfAborted();
   const roots = [...new Set((Array.isArray(rootDirectory) ? rootDirectory : [rootDirectory]).map(root => resolve(root)))];
   const actualRoots = new Map<string, string>();
   const images: OutgoingImage[] = [];
+  const files: OutgoingFile[] = [];
   const seen = new Set<string>();
   const names = new Set<string>();
   let total = 0;
@@ -200,7 +229,7 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
   for (const { marker, path } of declared) {
     signal?.throwIfAborted();
     const root = path ? roots.find(candidate => contained(candidate, path)) : undefined;
-    if (!root) throw failed('声明的图片不在允许的工作目录或历史产物目录内，未上传任何图片。');
+    if (!root) throw failed('声明的附件不在允许的工作目录或历史产物目录内，未上传任何附件。');
     let actualRoot = actualRoots.get(root);
     if (!actualRoot) {
       // Only validate a root used by this declaration. A missing legacy output
@@ -209,23 +238,27 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
       actualRoot = await realpath(root);
       actualRoots.set(root, actualRoot);
     }
-    if (!path) throw failed('图片路径无效。');
+    if (!path) throw failed('附件路径无效。');
     await directoryChain(dirname(path));
     const before = await lstat(path);
-    if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1) throw failed('图片必须是普通文件，不能使用链接或目录。');
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1) throw failed('附件必须是普通文件，不能使用链接或目录。');
     const actual = await realpath(path);
-    if (!contained(actualRoot, actual)) throw failed('图片真实路径越过允许的目录。');
+    if (!contained(actualRoot, actual)) throw failed('附件真实路径越过允许的目录。');
     const key = process.platform === 'win32' ? actual.toLowerCase() : actual;
     if (seen.has(key)) continue;
-    if (images.length >= MAX_IMAGES) throw failed('本轮最多回传 10 张图片。');
-    if (!Number.isSafeInteger(before.size) || before.size <= 0 || before.size > limit || total + before.size > MAX_TOTAL_BYTES) {
-      throw failed(`${basename(path)} 超过图片大小上限（单图最多 ${limit} 字节，每轮最多 100 MiB）。`);
+    if (images.length + files.length >= MAX_IMAGES) {
+      throw failed(maxFileBytes === undefined ? '本轮最多回传 10 张图片。' : '本轮图片和文件合计最多回传 10 个附件。');
+    }
+    const byteLimit = marker.image ? limit : maxFileBytes!;
+    if (!Number.isSafeInteger(before.size) || before.size < 0 || (marker.image && before.size === 0)
+      || before.size > byteLimit || total + before.size > MAX_TOTAL_BYTES) {
+      throw failed(`${basename(path)} 超过${marker.image ? '图片' : '文件'}大小上限（${marker.image ? '单图' : '单个文件'}最多 ${byteLimit} 字节，每轮最多 100 MiB）。`);
     }
     const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     let data: Buffer;
     try {
       const info = await file.stat();
-      if (!info.isFile() || info.nlink > 1 || info.dev !== before.dev || info.ino !== before.ino || info.size !== before.size) throw failed('读取前图片文件发生变化。');
+      if (!info.isFile() || info.nlink > 1 || info.dev !== before.dev || info.ino !== before.ino || info.size !== before.size) throw failed('读取前附件文件发生变化。');
       // One extra byte detects growth, while allocations and reads remain bounded by the prior size limit.
       const bounded = Buffer.alloc(info.size + 1);
       let bytes = 0;
@@ -240,17 +273,21 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
       const final = await lstat(path);
       if (bytes !== info.size || after.size !== info.size || after.mtimeMs !== info.mtimeMs || final.isSymbolicLink()
         || final.dev !== info.dev || final.ino !== info.ino || final.nlink > 1 || !contained(actualRoot, await realpath(path))) {
-        throw failed('读取期间图片文件或路径发生变化，未上传任何图片。');
+        throw failed('读取期间附件文件或路径发生变化，未上传任何附件。');
       }
       data = bounded.subarray(0, bytes);
     } finally { await file.close(); }
     signal?.throwIfAborted();
-    const contentType = imageType(path, data.subarray(0, 12));
-    const extension = contentType === 'image/jpeg' ? '.jpg' : `.${contentType.slice(6)}`;
-    let filename = `${basename(path, extname(path))}${extension}`;
-    if (names.has(filename.toLowerCase())) filename = `${images.length + 1}-${filename}`;
+    const contentType = marker.image ? imageType(path, data.subarray(0, 12)) : fileType(path);
+    const extension = marker.image ? (contentType === 'image/jpeg' ? '.jpg' : `.${contentType.slice(6)}`) : extname(path);
+    const originalName = `${basename(path, extname(path))}${extension}`;
+    let filename = originalName;
+    let number = images.length + files.length + 1;
+    while (names.has(filename.toLowerCase())) filename = `${number++}-${originalName}`;
     names.add(filename.toLowerCase());
-    images.push({ filename, contentType, data, ...(marker.description ? { description: marker.description } : {}) });
+    const attachment = { filename, contentType, data, ...(marker.description ? { description: marker.description } : {}) };
+    if (marker.image) images.push(attachment as OutgoingImage);
+    else files.push(attachment);
     seen.add(key);
     total += data.length;
   }
@@ -259,15 +296,30 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
     const marker = declared[index]!.marker;
     text = text.slice(0, marker.start) + text.slice(marker.end);
   }
-  return { text: text.trim(), images };
+  return { text: text.trim(), images, files };
 }
 
 export async function collectOutgoingImages(finalText: string, rootDirectory: string | string[], maxImageBytes: number,
   signal?: AbortSignal): Promise<CollectedImages> {
-  try { return await collect(finalText, rootDirectory, maxImageBytes, signal); }
+  try {
+    const { text, images } = await collect(finalText, rootDirectory, maxImageBytes, signal);
+    return { text, images };
+  } catch (error) { return attachmentFailure(error, signal, '图片回传失败'); }
+}
+
+function attachmentFailure(error: unknown, signal: AbortSignal | undefined, label: string): never {
+  if (signal?.aborted) throw error;
+  if (error instanceof ArtifactReadError) throw new Error(`${label}：${error.message}`);
+  const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '未知文件错误';
+  throw new Error(`${label}：无法读取明确声明的附件（${code}），未上传任何附件。请确认文件已保存到允许目录。`);
+}
+
+export async function collectOutgoingAttachments(finalText: string, rootDirectory: string | string[], maxImageBytes: number,
+  maxFileBytes = DEFAULT_FILE_BYTES, signal?: AbortSignal): Promise<CollectedAttachments> {
+  try { return await collect(finalText, rootDirectory, maxImageBytes, signal, maxFileBytes); }
   catch (error) {
-    if (signal?.aborted || (error instanceof Error && error.message.startsWith('图片回传失败：'))) throw error;
-    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '未知文件错误';
-    throw failed(`无法读取明确声明的图片（${code}），未上传任何图片。请确认文件已保存到允许目录。`);
+    const filesDeclared = markers(finalText, true).some(marker => !marker.image
+      && (/^file:/i.test(marker.destination) || isAbsolute(marker.destination) || /^\/[A-Za-z]:[\/\\]/.test(marker.destination)));
+    return attachmentFailure(error, signal, filesDeclared ? '文件回传失败' : '图片回传失败');
   }
 }
