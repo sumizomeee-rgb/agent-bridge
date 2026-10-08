@@ -43,9 +43,31 @@ steer 超时（10 秒）、连接断开、内部错误、响应损坏或返回�
 
 这些是项目限额，实际上传还受 Discord 限制：[官方文件上传文档](https://docs.discord.com/developers/reference#uploading-files)目前列出单文件默认 20 MiB，可按目标上下文提高；[发送消息接口](https://docs.discord.com/developers/resources/message#create-message)的单请求上限是 25 MiB，包含正文和 multipart 开销。调大 `maxFileBytes` 不会提高 Discord 的实际额度，每轮 100 MiB 也不等于单请求可发 100 MiB。文件不存在、越界、图片格式无效、超过限额或 Discord 拒绝上传时会明确报错，保留原会话，不重跑模型、截图或其他工具。
 
-只有配置中的用户白名单可以操作；只接收私聊。每轮发送最终回复，程序在正文前添加紧凑回复头，例如 `[Codex · 6.1-sol · 中 · b2c3✅]`。回复头省略模型的 `gpt-` 前缀，推理强度使用中文短标签，会话 ID 仅显示末 4 位；完整模型 ID 和会话 ID 保持原样。模型和推理强度取本轮 CLI 回报，未确认时显示“模型未知”或“强度未知”，不会猜测或覆盖 CLI 默认配置；Claude 的强度目前未确认。会话尾号来自真实原生会话 ID；`/chats` 显示的桥会话短 ID 仅供查看，是另一种标识。
+只有配置中的用户白名单可以操作；只接收私聊。每轮发送最终回复，程序在正文前添加紧凑回复头，例如 `[Codex · 6.1-sol · 中 · b2c3]`。回复头省略模型的 `gpt-` 前缀，推理强度使用中文短标签，会话 ID 仅显示末 4 位；完整模型 ID 和会话 ID 保持原样。模型和推理强度取本轮 CLI 回报，未确认时显示“模型未知”或“强度未知”，不会猜测或覆盖 CLI 默认配置；Claude 的强度目前未确认。会话尾号来自真实原生会话 ID；`/chats` 显示的桥会话短 ID 仅供查看，是另一种标识。
 
-✅ 表示同一私聊中与上一条成功投递的模型回复属于同一个 Agent、桥会话及完整原生会话 ID；该记录重启后保留。首次回复、新会话、切换 Agent、原生 ID 改变、投递失败都不会建立新的连续标记，命令菜单和失败反馈不会改变上一条成功回复记录。长回复按 Discord 长度限制分段，每段带同一个回复头；不会把逐字生成片段或工具协议发成消息。新会话会取消旧会话未完成的任务，迟到结果不会串到新会话。崩溃中正在执行的任务不自动重做，避免重复执行操作；重启后会提醒用户确认结果。
+长回复按 Discord 长度限制分段，每段带同一个回复头；不会把逐字生成片段或工具协议发成消息。新会话会取消旧会话未完成的任务，迟到结果不会串到新会话。崩溃中正在执行的任务不自动重做，避免重复执行操作；重启后会提醒用户确认结果。
+
+## 后台 Agent 任务
+
+本轮结束后仍需继续执行的本机或 SSH 子 Agent，由父 Agent 自己派发，并先登记任务、设置完成监听。桥不负责 SSH 派发，也不把普通任务自动拆成子 Agent；没有登记的后台进程不会计数或主动汇报。使用规则放在工作目录的 `AGENTS.md`。
+
+桥启动父 CLI 时，仅通过 `BRIDGE_TASK_CONTEXT` 环境变量提供本轮的登记凭据文件。该文件包含 `nodePath`、`helperPath`；Agent 可用它们调用任务工具，不需要输入父会话 ID：
+
+```powershell
+$ctx = Get-Content -LiteralPath $env:BRIDGE_TASK_CONTEXT -Raw | ConvertFrom-Json
+$job = & $ctx.nodePath $ctx.helperPath register --title '工位检查' `
+  --exit-file 'E:\任务目录\exit.txt' --result-file 'E:\任务目录\result.txt' `
+  --ssh-config 'C:\SuchProject\Other\ssh-project\hosts\11032022110008\ssh_config' --ssh-host administrator |
+  ConvertFrom-Json
+```
+
+`register` 必须在父 Agent 本轮结束前执行。可在登记时直接附上监听参数，或之后用 `watch --task-id $job.taskId` 设置同样的参数。普通任务完成时先写 UTF-8 结果，再原子写入退出码文件；退出码 0 表示成功，非 0 会汇报失败。SSH 监听中的结果路径指向目标电脑，SSH 配置路径指向笔记本。
+
+也可使用签名回执：登记时指定 `--completion-file`，把登记返回的 `ticketPath` 复制到执行任务的电脑，再用仓库的 `scripts/task-complete.ps1 -TicketPath <票据路径> -OutputPath <完成文件路径> -Status completed -ResultFile <结果文件路径>` 生成回执；失败用 `failed`。有 Node 运行时的目标机也可调用 `task-cli.js complete --ticket ... --output ... --status completed --result-file ...`。每份票据只对应一个任务，不能用于登记新任务；上下文和票据是私有运行数据，不要发进 Discord 或提交 Git。
+
+任务终态持久化后，桥会在父 Agent 空闲时续接原来的完整原生会话，让父 Agent 核对工具结果并主动回复同一私聊。普通用户消息优先；完成事件不会伪装成人类消息或新增用户授权。重复回执只汇总一次。`/new`、`/cwd`、切换 Agent 或 `/stop` 会取消旧任务的自动续接，远端任务可以继续运行，完成后只发送带来源的结果通知。正在生成或投递汇总时崩溃，重启会提醒核对，不自动重跑。
+
+当前会话最新一条普通消息上的 `1️⃣`–`9️⃣`、`🔟` 表示仍在执行的已登记任务数量；超过 10 个显示 `🔟➕`，`/status` 显示准确数量。新普通消息到来时转移计数，任务完成时减少，归零后移除。原来的 ⏳ 收件及 ✅ 回复送达标记继续保留；父 Agent 首次回复完成后，后台任务数字仍会更新。
 
 ## 部署
 
@@ -76,6 +98,8 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 - `.local/config.json`：机器人的凭据、白名单和机器路径，应限制文件 ACL。
 - `.local/runtime/win-x64/node.exe`：Node 24.13.0 便携运行时。
 - `.local/data/bridge.sqlite`：会话、当前绑定、消息去重、队列和上一条成功回复标识，含私聊数据，应备份。
+- `.local/data/tasks.sqlite`：后台任务及完成事件；与会话数据库一起备份。
+- `.local/data/contexts/`、`.local/data/tickets/`：父轮次登记凭据和单任务回执票据，只供桥及授权子任务使用。
 - `.local/data/attachments/`：会话图片，不应在会话仍使用时删除。
 - `.local/data/outgoing/`：之前回传的图片及普通文件，继续支持明确引用；不自动扫描、上传或为新消息创建目录。
 - `.local/logs/`：运行状态；日志不主动保存机器人 Token。

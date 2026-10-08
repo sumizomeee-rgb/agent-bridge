@@ -89,32 +89,42 @@ test('本轮未回报 metadata 时不把旧实际值、参考默认或已选别�
   await respond('first');
   await send('/model custom selected-alias');
   const reply = await respond('unconfirmed');
-  assert.match(reply.text, /^\[Codex · 模型未知 · 强度未知 · [^\n]+✅\]\n\nunconfirmed$/);
+  assert.match(reply.text, /^\[Codex · 模型未知 · 强度未知 · [^\n]+\]\n\nunconfirmed$/);
   assert(!reply.text.includes('prior-model') && !reply.text.includes('selected-alias') && !reply.text.includes('reference-only-model'));
 });
 
-test('连续标记比较完整 ID，命令不改变记录，同尾号的新原生会话不误标', async t => {
-  const { f, send, respond } = fixture(t);
+test('回复头不含连续绿勾，命令不改变投递记录，同尾号原生会话仍记录完整 ID', async t => {
+  const { f, send, respond, inspect } = fixture(t);
   f.codex.plans.push({ nativeId: 'first-abcdef' });
-  assert(!((await respond('first')).text.includes('✅')));
+  const first = await respond('first');
+  assert.equal(first.options?.repeatHeader, '[Codex · 模型未知 · 强度未知 · cdef]');
+  const prior = inspect(store => store.getLastDelivery('owner', 'owner-dm'));
+  assert.equal(prior?.nativeId, 'first-abcdef');
   await send('/help');
-  assert((await respond('second')).text.includes('✅'));
+  assert.deepEqual(inspect(store => store.getLastDelivery('owner', 'owner-dm')), prior);
+  assert.equal((await respond('second')).options?.repeatHeader, first.options?.repeatHeader);
   f.codex.plans.push({ nativeId: 'different-abcdef' });
-  assert(!((await respond('changed')).text.includes('✅')));
-  assert((await respond('continued')).text.includes('✅'));
+  assert.equal((await respond('changed')).options?.repeatHeader, first.options?.repeatHeader);
+  assert.equal(inspect(store => store.getLastDelivery('owner', 'owner-dm'))?.nativeId, 'different-abcdef');
+  assert(!((await respond('continued')).text.includes('✅')));
 });
 
-test('/new 即使 Agent 返回相同原生 ID 也不会假标连续', async t => {
-  const { f, send, respond } = fixture(t);
+test('/new 后不显示连续标记，同一个原生 ID 仍绑定新桥会话', async t => {
+  const { f, send, respond, inspect } = fixture(t);
   f.codex.plans.push({ nativeId: 'same-native-abcdef' });
   await respond('old');
+  const prior = inspect(store => store.getLastDelivery('owner', 'owner-dm'))!;
   await send('/new');
   f.codex.plans.push({ nativeId: 'same-native-abcdef' });
   assert(!((await respond('new')).text.includes('✅')));
-  assert((await respond('continue new')).text.includes('✅'));
+  const current = inspect(store => store.getLastDelivery('owner', 'owner-dm'))!;
+  assert.equal(current.nativeId, prior.nativeId);
+  assert.notEqual(current.conversationId, prior.conversationId);
+  assert(!((await respond('continue new')).text.includes('✅')));
+  assert.deepEqual(inspect(store => store.getLastDelivery('owner', 'owner-dm')), current);
 });
 
-test('上一条成功投递身份持久化，桥重启后同一原生会话仍能确认连续', async t => {
+test('上一条成功投递身份持久化，桥重启后仍保存身份且不显示连续绿勾', async t => {
   const { f, respond, inspect } = fixture(t);
   await respond('before');
   const prior = inspect(store => store.getLastDelivery('owner', 'owner-dm'));
@@ -122,7 +132,7 @@ test('上一条成功投递身份持久化，桥重启后同一原生会话仍�
   await f.manager.close();
   f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink);
   await f.manager.recover();
-  assert((await respond('after')).text.includes('✅'));
+  assert(!((await respond('after')).text.includes('✅')));
   assert.deepEqual(inspect(store => store.getLastDelivery('owner', 'owner-dm')), prior);
 });
 
@@ -133,7 +143,7 @@ test('第一次回复投递失败或只投递部分时不建立连续记录，�
   assert.equal(inspect(store => store.getLastDelivery('owner', 'owner-dm')), null);
   assert(!((await respond('first successful')).text.includes('✅')));
   assert.equal(f.codex.turns.length, 2);
-  assert((await respond('next successful')).text.includes('✅'));
+  assert(!((await respond('next successful')).text.includes('✅')));
 });
 
 test('失败的原生会话变化不覆盖上一条成功投递身份，Agent 失败也不更新', async t => {
@@ -146,7 +156,7 @@ test('失败的原生会话变化不覆盖上一条成功投递身份，Agent �
   assert.match((await respond('agent failed')).text, /^执行或回复失败：/);
   assert.equal(inspect(store => store.getLastDelivery('owner', 'owner-dm'))!.nativeId, 'delivered-abcdef');
   f.codex.plans.push({ nativeId: 'delivered-abcdef' });
-  assert((await respond('back to delivered')).text.includes('✅'));
+  assert(!((await respond('back to delivered')).text.includes('✅')));
 });
 
 test('用户和私聊的投递历史独立，另一个 channel 的回复不会替换原私聊记录', async t => {
@@ -154,7 +164,7 @@ test('用户和私聊的投递历史独立，另一个 channel 的回复不会�
   await respond('owner first');
   assert(!((await respond('other first', 'other')).text.includes('✅')));
   assert(!((await respond('another channel first', 'owner', 'second-dm')).text.includes('✅')));
-  assert((await respond('owner continue')).text.includes('✅'));
+  assert(!((await respond('owner continue')).text.includes('✅')));
   assert(inspect(store => store.getLastDelivery('other', 'other-dm')));
   assert(inspect(store => store.getLastDelivery('owner', 'second-dm')));
 });
@@ -170,7 +180,7 @@ test('/agent 菜单和选择当前 Agent 不重置，来回切换恢复原上下
   const codex = inspect(store => store.getActive('owner')!);
   await send('/agent codex');
   assert.equal(inspect(store => store.getActive('owner'))!.id, codex.id);
-  assert((await respond('same agent')).text.includes('✅'));
+  assert(!((await respond('same agent')).text.includes('✅')));
   await send('/agent claude');
   assert.match(f.replies.at(-1)!.text, /已新建 Claude Code/);
   const claudeReply = await respond('claude context');
@@ -204,7 +214,7 @@ test('/agent 按用户、Agent 和 cwd 精确恢复，超过会话列表上限�
   assert.equal(f.claude.turns.length, 0);
 });
 
-test('不同 Agent 即使原生 ID 相同仍不标连续，头部 metadata 不允许换行刷消息', () => {
+test('头部不拼连续绿勾，metadata 不允许换行刷消息', () => {
   const previous = { conversationId: 'same', agent: 'codex' as const, nativeId: 'native-abcdef' };
   const identity = { ...previous, agent: 'claude' as const };
   const header = replyHeader(identity, previous, 'model\n@everyone', 'high\r\n');

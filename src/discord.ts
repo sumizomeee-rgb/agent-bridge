@@ -35,6 +35,8 @@ const imageTypes: Record<string, string> = {
 };
 const fatalGatewayCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const cdnHosts = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+const taskNumberEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
+const taskCountEmoji = new Set([...taskNumberEmoji, '🔟', '➕'].map(emoji => emoji.replaceAll('\ufe0f', '')));
 const mib = 1024 * 1024;
 const outgoingBatchBytes = 24 * mib; // Leave room below Discord's 25 MiB request limit.
 interface PreparedAttachment { filename: string; blob: Blob; description?: string }
@@ -179,6 +181,8 @@ export class DiscordTransport {
   private readonly channelWaitUntil = new Map<string, number>();
   private readonly seenMessages = new Set<string>();
   private readonly pendingReceipts = new Map<string, Promise<void>>();
+  private readonly taskReactionQueues = new Map<string, Promise<void>>();
+  private readonly taskReactions = new Map<string, Set<string>>();
   private readonly seenInteractions = new Set<string>();
   private readonly deliveryQueues = new Map<string, Promise<void>>();
   private applicationId: string | undefined;
@@ -349,11 +353,65 @@ export class DiscordTransport {
     }));
   }
 
+  /** Counts belong to registered background tasks, independently of reply delivery. */
+  async setTaskCount(message: Pick<BridgeMessage, 'id' | 'channelId'>, count: number): Promise<void> {
+    if (this.closed || !snowflake(message.channelId) || !snowflake(message.id)
+      || this.seenInteractions.has(message.id) || !Number.isSafeInteger(count) || count < 0) return;
+    const key = `${message.channelId}:${message.id}`;
+    const previous = this.taskReactionQueues.get(key) ?? Promise.resolve();
+    const update = previous.catch(() => undefined).then(async () => {
+      try {
+        // Keep task markers behind the initial receipt; final ✅ does not clear them.
+        await this.pendingReceipts.get(key);
+        if (this.closed) return;
+        const endpoint = `/channels/${message.channelId}/messages/${message.id}/reactions`;
+        let current = this.taskReactions.get(key);
+        if (!current) {
+          // Reconcile our own persisted reactions after restart, without touching users'.
+          const data = await this.rest(`/channels/${message.channelId}/messages/${message.id}`, 'GET',
+            undefined, undefined, undefined, AbortSignal.timeout(5000));
+          current = new Set<string>();
+          if (record(data) && Array.isArray(data.reactions)) {
+            for (const reaction of data.reactions) {
+              if (record(reaction) && reaction.me === true && record(reaction.emoji)
+                && typeof reaction.emoji.name === 'string'
+                && taskCountEmoji.has(reaction.emoji.name.replaceAll('\ufe0f', ''))) {
+                current.add(reaction.emoji.name);
+              }
+            }
+          }
+          this.taskReactions.set(key, current);
+        }
+        const wanted = count === 0 ? [] : count < 10 ? [taskNumberEmoji[count - 1]!]
+          : count === 10 ? ['🔟'] : ['🔟', '➕'];
+        const desired = new Set(wanted.map(emoji => emoji.replaceAll('\ufe0f', '')));
+        for (const emoji of wanted) {
+          if ([...current].some(existing => existing.replaceAll('\ufe0f', '') === emoji.replaceAll('\ufe0f', ''))) continue;
+          await this.rest(`${endpoint}/${encodeURIComponent(emoji)}/@me`, 'PUT',
+            undefined, undefined, undefined, AbortSignal.timeout(5000));
+          current.add(emoji);
+        }
+        for (const emoji of current) {
+          if (desired.has(emoji.replaceAll('\ufe0f', ''))) continue;
+          await this.rest(`${endpoint}/${encodeURIComponent(emoji)}/@me`, 'DELETE',
+            undefined, undefined, undefined, AbortSignal.timeout(5000));
+          current.delete(emoji);
+        }
+        // Bound completed-message state while keeping active task markers reconcilable.
+        if (current.size === 0 && this.taskReactions.size > 5000) this.taskReactions.delete(key);
+      } catch { if (!this.closed) this.log('任务数量表情更新失败，对话和任务继续处理。'); }
+    });
+    this.taskReactionQueues.set(key, update);
+    await update;
+    if (this.taskReactionQueues.get(key) === update) this.taskReactionQueues.delete(key);
+  }
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.shutdown.abort();
     this.pendingReceipts.clear();
+    this.taskReactionQueues.clear();
+    this.taskReactions.clear();
     this.clearConnectionTimers();
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.readyTimer);

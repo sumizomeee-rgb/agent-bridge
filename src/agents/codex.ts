@@ -53,7 +53,8 @@ export class CodexAdapter implements AgentAdapter {
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Codex 会话仍在执行任务。');
 
-    const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], turn.conversation.cwd, this.env);
+    const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], turn.conversation.cwd,
+      { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) });
     const rpc = new JsonRpcClient(transport);
     const completed = deferred<AgentResult>();
     const replies = new Map<string, { text: string; phase: unknown }>();

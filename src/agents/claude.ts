@@ -77,7 +77,8 @@ export class ClaudeAdapter implements AgentAdapter {
       '--verbose', '--include-partial-messages', '--dangerously-skip-permissions'];
     if (turn.conversation.nativeId) args.push('--resume', turn.conversation.nativeId);
     if (turn.conversation.model) args.push('--model', turn.conversation.model);
-    const transport = new JsonLineProcess(this.command, args, turn.conversation.cwd, this.env);
+    const transport = new JsonLineProcess(this.command, args, turn.conversation.cwd,
+      { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) });
     const completed = deferred<AgentResult>();
     let nativeId = turn.conversation.nativeId;
     let cancelled = false;

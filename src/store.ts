@@ -198,6 +198,11 @@ export class SessionStore {
       .all(conversationId).map(inbox);
   }
 
+  latestMessage(conversationId: string): InboxItem | null {
+    const row = this.db.prepare('SELECT * FROM inbox WHERE conversation_id = ? ORDER BY sequence DESC LIMIT 1').get(conversationId);
+    return row ? inbox(row) : null;
+  }
+
   setReplyState(ids: string[], state: InboxItem['replyState']): void {
     const update = this.db.prepare('UPDATE inbox SET reply_state = ?, updated_at = ? WHERE id = ?');
     for (const id of ids) update.run(state, new Date().toISOString(), id);

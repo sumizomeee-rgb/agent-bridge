@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const readline = require('node:readline');
 const trace = (value) => fs.appendFileSync(process.env.FAKE_TRACE, JSON.stringify(value) + '\n');
 trace({ argv: process.argv.slice(2), proxy: process.env.HTTPS_PROXY, http: process.env.HTTP_PROXY,
-  all: process.env.ALL_PROXY, noProxy: process.env.NO_PROXY, cwd: process.cwd() });
+  all: process.env.ALL_PROXY, noProxy: process.env.NO_PROXY, cwd: process.cwd(), taskContext: process.env.BRIDGE_TASK_CONTEXT });
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
 const mode = process.env.FAKE_MODE;
 const codex = process.argv.includes('app-server');
@@ -120,6 +120,23 @@ async function fixture(agent: AgentName, mode = 'success') {
   };
   const cleanup = async () => { await adapter.close(); await rm(directory, { recursive: true, force: true }); };
   return { adapter, controller, turn, progress, nativeIds, traces, waitStarted, cleanup, image };
+}
+
+for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent} 的任务登记上下文只属于本轮，CLI 工具可读取且不会泄漏到下一轮`, async () => {
+    const f = await fixture(agent);
+    const inherited = process.env.BRIDGE_TASK_CONTEXT;
+    try {
+      const context = join(f.turn.conversation.cwd, '本轮 context.json');
+      await f.adapter.run({ ...f.turn, taskContextPath: context });
+      await f.adapter.run(f.turn);
+      const launches = (await f.traces()).filter(value => Array.isArray(value.argv));
+      assert.equal(launches.length, 2);
+      assert.equal(launches[0]!.taskContext, context);
+      assert.equal(launches[1]!.taskContext, inherited);
+      assert.equal(process.env.BRIDGE_TASK_CONTEXT, inherited);
+    } finally { await f.cleanup(); }
+  });
 }
 
 test('Codex 新会话：图片、最高权限、显式代理、先保存 ID，再返回最终回答', async () => {

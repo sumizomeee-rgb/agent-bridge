@@ -8,6 +8,7 @@ import { ClaudeAdapter } from './agents/claude.js';
 import { SessionManager } from './manager.js';
 import { DiscordTransport } from './discord.js';
 import { OrderedInbox } from './inbox.js';
+import { TaskRegistry, TaskService } from './tasks.js';
 import type { IncomingDM } from './types.js';
 
 if (process.argv.includes('--help')) {
@@ -49,10 +50,19 @@ const stopFile = join(config.dataDir, 'stop.request');
 if (existsSync(stopFile)) unlinkSync(stopFile);
 writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), main: process.argv[1] }));
 const env = agentEnvironment(config);
+const tasks = new TaskRegistry(config.dataDir);
 const adapters = { codex: new CodexAdapter(config.commands.codex, env), claude: new ClaudeAdapter(config.commands.claude, env) };
 let manager: SessionManager;
+const taskService = new TaskService(tasks, {
+  onCompletion: () => manager.completionAvailable(),
+  onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
+  onError: error => log(`TASKS ${safeError(error)}`),
+});
+let releaseStartup!: () => void;
+const startupReady = new Promise<void>(resolve => { releaseStartup = resolve; });
 const preparationEpochs = new Map<string, number>();
 const inbox = new OrderedInbox<IncomingDM & { revision: number }>(message => message.userId, async message => {
+  await startupReady;
   if (closing) return;
   if (manager.hasMessage(message.id)) {
     if (message.interaction) await discord.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
@@ -79,6 +89,7 @@ const discord = new DiscordTransport(config, message => {
 }, { logger: message => log(`DISCORD ${message}`) });
 manager = new SessionManager(config, adapters, {
   markReplyDelivered: messages => discord.markReplyDelivered(messages),
+  setTaskCount: (message, count) => discord.setTaskCount(message, count),
   sendText: (channelId, text, options) => discord.sendText(channelId, redactText(text, [config.token]),
     options ? {
       ...options,
@@ -90,14 +101,17 @@ manager = new SessionManager(config, adapters, {
         ...(file.description ? { description: redactText(file.description, [config.token]) } : {}),
       })) } : {}),
     } : undefined),
-});
+}, { taskRegistry: tasks });
 let closing = false;
 async function shutdown(): Promise<void> {
   if (closing) return;
   closing = true;
+  releaseStartup();
   clearInterval(stopPoll);
   log('STOPPING');
+  await taskService.close().catch(e => log(`tasks close: ${safeError(e)}`));
   await manager.close().catch(e => log(`close: ${safeError(e)}`));
+  tasks.close();
   await discord.close().catch(e => log(`discord close: ${safeError(e)}`));
   guard.close();
   if (existsSync(pidFile)) unlinkSync(pidFile);
@@ -113,6 +127,8 @@ try {
   log(`READY bot=${discord.botUser?.username ?? 'unknown'} agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'}`);
   void discord.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, [config.token])}`));
   await manager.recover();
+  if (!closing) taskService.start();
+  releaseStartup();
 } catch (error) {
   log(`START_FAILED ${safeError(error)}`);
   await shutdown();

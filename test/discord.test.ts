@@ -271,9 +271,196 @@ test('原生斜杠交互不使用消息 reaction，关闭后也不新增反应�
   await eventually(() => received.length === 1);
   assert(received[0]!.interaction);
   await f.transport.markReplyDelivered([{ id: '405', channelId: '222' }]);
+  await f.transport.setTaskCount({ id: '405', channelId: '222' }, 2);
   await f.transport.close();
   await f.transport.markReplyDelivered([{ id: '406', channelId: '222' }]);
+  await f.transport.setTaskCount({ id: '406', channelId: '222' }, 2);
   assert.deepEqual(reactionPaths, []);
+});
+
+test('登记 Agent 数量按最新值更新、重复值不重发、归零只移除自己的数字', async t => {
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  const f = await fixture(t, undefined, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      return options?.method === 'GET' ? new Response('{"reactions":[]}', { status: 200 })
+        : new Response(null, { status: 204 });
+    },
+  });
+  const target = { id: '501', channelId: '222' };
+  await f.transport.setTaskCount(target, 1);
+  await f.transport.setTaskCount(target, 1);
+  await f.transport.setTaskCount(target, 3);
+  await f.transport.setTaskCount(target, 0);
+  await f.transport.setTaskCount(target, 0);
+  assert.deepEqual(calls, [
+    { path: '/channels/222/messages/501', method: 'GET' },
+    { path: '/channels/222/messages/501/reactions/1️⃣/@me', method: 'PUT' },
+    { path: '/channels/222/messages/501/reactions/3️⃣/@me', method: 'PUT' },
+    { path: '/channels/222/messages/501/reactions/1️⃣/@me', method: 'DELETE' },
+    { path: '/channels/222/messages/501/reactions/3️⃣/@me', method: 'DELETE' },
+  ]);
+  assert.equal(f.posts.length, 0);
+});
+
+test('十个 Agent 用 🔟，超过十个用 🔟 和 ➕，下降时及时移除额外标记', async t => {
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  const f = await fixture(t, undefined, {
+    fetch: async (input, options) => {
+      calls.push({ path: decodeURIComponent(new URL(String(input)).pathname), method: options?.method });
+      return options?.method === 'GET' ? new Response('{"reactions":[]}', { status: 200 })
+        : new Response(null, { status: 204 });
+    },
+  });
+  const target = { id: '502', channelId: '222' };
+  await f.transport.setTaskCount(target, 11);
+  await f.transport.setTaskCount(target, 12);
+  await f.transport.setTaskCount(target, 10);
+  await f.transport.setTaskCount(target, 2);
+  assert.deepEqual(calls.slice(1).map(call => [call.method, call.path.split('/reactions/')[1]]), [
+    ['PUT', '🔟/@me'], ['PUT', '➕/@me'], ['DELETE', '➕/@me'], ['PUT', '2️⃣/@me'], ['DELETE', '🔟/@me'],
+  ]);
+});
+
+test('重启后的首次计数读取现有反应，仅修正机器人自己的数字并保留用户、沙漏和完成反应', async t => {
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  const f = await fixture(t, undefined, {
+    fetch: async (input, options) => {
+      calls.push({ path: decodeURIComponent(new URL(String(input)).pathname), method: options?.method });
+      return options?.method === 'GET' ? new Response(JSON.stringify({ reactions: [
+        { me: true, emoji: { name: '3⃣' } }, { me: false, emoji: { name: '8️⃣' } },
+        { me: true, emoji: { name: '➕' } }, { me: true, emoji: { name: '⏳' } },
+        { me: true, emoji: { name: '✅' } }, { me: true, emoji: { name: 'custom-marker', id: '444' } },
+      ] }), { status: 200 }) : new Response(null, { status: 204 });
+    },
+  });
+  await f.transport.setTaskCount({ id: '503', channelId: '222' }, 2);
+  assert.deepEqual(calls.slice(1), [
+    { path: '/channels/222/messages/503/reactions/2️⃣/@me', method: 'PUT' },
+    { path: '/channels/222/messages/503/reactions/3⃣/@me', method: 'DELETE' },
+    { path: '/channels/222/messages/503/reactions/➕/@me', method: 'DELETE' },
+  ]);
+  assert(calls.filter(call => call.method === 'DELETE').every(call => call.path.endsWith('/@me')));
+});
+
+test('同一消息的并发计数严格按调用顺序完成，不会留下过期数字', async t => {
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  let release!: (response: Response) => void;
+  const f = await fixture(t, undefined, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      if (path.endsWith('/reactions/1️⃣/@me') && options?.method === 'PUT') {
+        return new Promise<Response>(resolve => { release = resolve; });
+      }
+      return options?.method === 'GET' ? new Response('{"reactions":[]}', { status: 200 })
+        : new Response(null, { status: 204 });
+    },
+  });
+  const target = { id: '504', channelId: '222' };
+  const first = f.transport.setTaskCount(target, 1);
+  const second = f.transport.setTaskCount(target, 2);
+  const third = f.transport.setTaskCount(target, 0);
+  await eventually(() => calls.length === 2);
+  await delay(20);
+  assert.equal(calls.length, 2);
+  release(new Response(null, { status: 204 }));
+  await Promise.all([first, second, third]);
+  assert.deepEqual(calls.slice(1).map(call => [call.method, call.path.split('/reactions/')[1]]), [
+    ['PUT', '1️⃣/@me'], ['PUT', '2️⃣/@me'], ['DELETE', '1️⃣/@me'], ['DELETE', '2️⃣/@me'],
+  ]);
+});
+
+test('任务计数等待初始收件完成，父回复完成后仍保留运行子任务数字', async t => {
+  const received: IncomingDM[] = [];
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  let release!: (response: Response) => void;
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      if (path.endsWith('/reactions/⏳/@me') && options?.method === 'PUT') {
+        return new Promise<Response>(resolve => { release = resolve; });
+      }
+      return options?.method === 'GET' ? new Response('{"reactions":[]}', { status: 200 })
+        : new Response(null, { status: 204 });
+    },
+  });
+  await f.transport.start();
+  f.dispatch({ id: '505' });
+  await eventually(() => received.length === 1);
+  const target = { id: '505', channelId: '222' };
+  const pending = f.transport.setTaskCount(target, 2);
+  await delay(20);
+  assert.equal(calls.length, 1);
+  release(new Response(null, { status: 204 }));
+  await pending;
+  await f.transport.markReplyDelivered([target]);
+  assert(calls.some(call => call.method === 'PUT' && call.path.endsWith('/reactions/2️⃣/@me')));
+  assert(calls.some(call => call.method === 'PUT' && call.path.endsWith('/reactions/✅/@me')));
+  assert(!calls.some(call => call.method === 'DELETE' && call.path.endsWith('/reactions/2️⃣/@me')));
+  await f.transport.setTaskCount(target, 0);
+  assert(calls.at(-1)!.path.endsWith('/reactions/2️⃣/@me'));
+  assert.equal(calls.at(-1)!.method, 'DELETE');
+});
+
+test('计数读取或反应失败不会阻断对话，后续调用能重试并清理已成功的部分', async t => {
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  let rejectGet = true, rejectPlus = true, rejectDelete = true;
+  const f = await fixture(t, undefined, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      if (options?.method === 'GET') {
+        if (rejectGet) { rejectGet = false; return new Response('{}', { status: 403 }); }
+        return new Response('{"reactions":[]}', { status: 200 });
+      }
+      if (options?.method === 'PUT' && path.endsWith('/reactions/➕/@me') && rejectPlus) {
+        rejectPlus = false; return new Response('{}', { status: 403 });
+      }
+      if (options?.method === 'DELETE' && rejectDelete) {
+        rejectDelete = false; return new Response('{}', { status: 403 });
+      }
+      return new Response(null, { status: 204 });
+    },
+  });
+  const target = { id: '506', channelId: '222' };
+  await f.transport.setTaskCount(target, 11);
+  await f.transport.setTaskCount(target, 11);
+  await f.transport.setTaskCount(target, 11);
+  await f.transport.setTaskCount(target, 0);
+  await f.transport.setTaskCount(target, 0);
+  assert.equal(calls.filter(call => call.method === 'GET').length, 2);
+  assert.equal(calls.filter(call => call.method === 'PUT' && call.path.endsWith('/reactions/🔟/@me')).length, 1);
+  assert.equal(calls.filter(call => call.method === 'PUT' && call.path.endsWith('/reactions/➕/@me')).length, 2);
+  assert.equal(calls.filter(call => call.method === 'DELETE' && call.path.endsWith('/reactions/🔟/@me')).length, 2);
+  assert.equal(calls.filter(call => call.method === 'DELETE' && call.path.endsWith('/reactions/➕/@me')).length, 1);
+  assert.equal(f.posts.length, 0);
+});
+
+test('不同消息计数不相互阻塞，非法 ID 或计数不发网络请求', async t => {
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  let release!: (response: Response) => void;
+  const f = await fixture(t, undefined, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      if (path === '/channels/222/messages/507') return new Promise<Response>(resolve => { release = resolve; });
+      return options?.method === 'GET' ? new Response('{"reactions":[]}', { status: 200 })
+        : new Response(null, { status: 204 });
+    },
+  });
+  await f.transport.setTaskCount({ id: 'bad', channelId: '222' }, 1);
+  await f.transport.setTaskCount({ id: '507', channelId: 'bad' }, 1);
+  for (const count of [-1, 0.5, NaN, Infinity]) await f.transport.setTaskCount({ id: '507', channelId: '222' }, count);
+  assert.equal(calls.length, 0);
+  const first = f.transport.setTaskCount({ id: '507', channelId: '222' }, 1);
+  await eventually(() => calls.length === 1);
+  await f.transport.setTaskCount({ id: '508', channelId: '223' }, 2);
+  assert(calls.some(call => call.path === '/channels/223/messages/508/reactions/2️⃣/@me'));
+  release(new Response('{"reactions":[]}', { status: 200 }));
+  await first;
 });
 
 test('READY exposes bot identity, only allowed human DMs are delivered, replay is deduplicated', async t => {

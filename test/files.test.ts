@@ -177,7 +177,7 @@ test('manager sends ordinary files with the reply header and continues the same 
   await f.manager.handle(f.message('next', '再发一次')); await until(() => f.adapter.turns.length === 2);
   assert.equal(f.adapter.turns[1]!.conversation.nativeId, `native-${f.adapter.turns[0]!.conversation.id}`);
   f.adapter.finish(1, `再次附上。\n${fileMarker(path)}`); await until(() => f.replies.length === 2);
-  assert(f.replies[1]!.text.includes('✅'));
+  assert(!f.replies[1]!.text.includes('✅'));
 });
 
 test('file upload failure keeps completed native state without replay or falsely marking continuity', async t => {

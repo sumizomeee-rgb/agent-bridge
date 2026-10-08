@@ -324,12 +324,13 @@ test('new chat 取消旧队列，迟到结果和进度不会回复新会话', as
   const old = f.codex.calls[0]!;
   await f.manager.handle(message('new-command', 'new chat'));
   await f.manager.handle(message('fresh', 'fresh work'));
+  assert.equal(f.codex.calls.length, 1, '新会话等待旧 CLI 退出，不并行启动同用户 turn');
+  f.codex.finish(0, 'stale result');
   await waitFor(() => f.codex.calls.length === 2);
   assert.equal(old.signal.aborted, true);
   assert.notEqual(f.codex.calls[1]!.conversation.id, old.conversation.id);
   assert.equal(f.codex.calls[1]!.conversation.nativeId, null);
   old.onProgress('stale progress');
-  f.codex.finish(0, 'stale result');
   f.codex.finish(1, 'fresh result');
   await waitFor(() => f.sink.replies.some(item => item.text.includes('fresh result')));
   assert.ok(f.codex.interrupts.includes(old.conversation.id));
@@ -572,8 +573,9 @@ test('忙中切换 Agent 取消旧任务和队列，旧结果不发到新 Agent 
   await f.manager.handle(message('switch-busy-agent', '/agent claude'));
   assert.equal(f.codex.calls[0]!.signal.aborted, true);
   await f.manager.handle(message('new-agent-running', 'fresh'));
-  await waitFor(() => f.claude.calls.length === 1);
+  assert.equal(f.claude.calls.length, 0, '切换 Agent 等待旧 CLI 退出');
   f.codex.finish(0, 'stale old agent answer');
+  await waitFor(() => f.claude.calls.length === 1);
   f.claude.finish(0, 'fresh Claude answer');
   await waitFor(() => f.sink.replies.some(reply => reply.text.endsWith('\n\nfresh Claude answer')));
   assert(f.sink.replies.every(reply => !reply.text.includes('stale old agent answer')));

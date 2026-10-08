@@ -44,6 +44,8 @@ export interface AgentTurn {
   imagePaths: string[];
   /** 连续消息保留文字与图片的交错顺序。 */
   input?: AgentInput[];
+  /** Bridge-scoped registration capability; passed to CLI tools through the environment. */
+  taskContextPath?: string;
   /** app-server 确认活动 turn 后通知桥尝试补充。 */
   onReady?: () => void;
   signal: AbortSignal;
@@ -84,6 +86,8 @@ export interface OutgoingFile {
 export interface ReplyOptions { repeatHeader?: string; images?: OutgoingImage[]; files?: OutgoingFile[]; signal?: AbortSignal }
 export interface ReplySink {
   sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void>;
+  /** Registered background agents on the latest ordinary message; zero removes the counter. */
+  setTaskCount?(message: Pick<BridgeMessage, 'id' | 'channelId'>, count: number): Promise<void>;
   /** Best effort indication on the original messages, after successful reply delivery. */
   markReplyDelivered?(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void>;
 }

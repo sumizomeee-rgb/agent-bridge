@@ -155,9 +155,10 @@ test('new chat 后旧任务迟到失败不发消息，新会话回复头不假�
   await until(() => f.adapter.turns.length === 1);
   await f.manager.handle(message('new-command', 'new chat'));
   await f.manager.handle(message('new-turn'));
-  await until(() => f.adapter.turns.length === 2);
+  assert.equal(f.adapter.turns.length, 1, '新会话等待旧 CLI 退出');
   f.adapter.turns[0]!.onProgress('old delta');
   f.adapter.pending[0]!.reject(new Error('old late failure'));
+  await until(() => f.adapter.turns.length === 2);
   f.adapter.turns[1]!.onProgress('new delta');
   f.adapter.finish(1, '新会话回复');
   await until(() => f.replies.length === 2);
