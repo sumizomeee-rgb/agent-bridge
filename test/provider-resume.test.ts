@@ -42,6 +42,18 @@ input.on('line', line => {
     const provider = Object.hasOwn(options, 'returnedProvider') ? options.returnedProvider :
       message.params.modelProvider || options.historicalProvider || 'openai';
     const result = { thread: { id: threadId }, model: message.params.model || 'configured-model', reasoningEffort: 'medium' };
+    if (options.threadMode === 'large-history' && message.method === 'thread/resume') {
+      // A real resume can return old browser screenshots in one large JSON envelope.
+      result.thread.turns = message.params.excludeTurns === true ? [] : [{
+        id: 'historical-turn', status: 'completed', items: [{
+          id: 'historical-screenshot', type: 'mcpToolCall', server: 'browser', tool: 'screenshot',
+          arguments: {}, status: 'completed', result: { content: [{
+            type: 'image', mimeType: 'image/png', data: 'A'.repeat(17 * 1024 * 1024),
+          }] },
+        }],
+      }];
+    }
+    if (options.threadMode === 'oversized-metadata') result.thread.preview = 'x'.repeat(17 * 1024 * 1024);
     if (options.providerResponseMode !== 'missing') result.modelProvider = provider;
     reply(message, result);
     return;
@@ -81,7 +93,7 @@ interface FixtureOptions {
   returnedProvider?: unknown;
   providerResponseMode?: 'normal' | 'missing';
   returnedId?: string;
-  threadMode?: 'normal' | 'error' | 'hold';
+  threadMode?: 'normal' | 'error' | 'hold' | 'large-history' | 'oversized-metadata';
   turnMode?: 'normal' | 'error-after-tool' | 'hold';
 }
 interface Trace {
@@ -162,6 +174,7 @@ test('新 thread 使用本轮 config/read 的 custom provider，并保留用户�
   assert.deepEqual(requests(trace, 'config/read')[0]!.params, { includeLayers: false, cwd: f.turn.conversation.cwd });
   assert.equal(requests(trace, 'thread/start')[0]!.params!.modelProvider, 'custom');
   assert.equal(requests(trace, 'thread/start')[0]!.params!.model, 'selected-model');
+  assert.equal(Object.hasOwn(requests(trace, 'thread/start')[0]!.params!, 'excludeTurns'), false);
   assert.equal(requests(trace, 'turn/start')[0]!.params!.model, 'selected-model');
   assert.deepEqual(f.nativeIds, ['native-new']);
 });
@@ -178,6 +191,45 @@ test('resume 明确覆盖历史 provider 为当前 custom，原 native ID 和上
   assert.equal(requests(trace, 'thread/start').length, 0);
   assert.equal(requests(trace, 'turn/start')[0]!.params!.threadId, 'native-original');
   assert.deepEqual(f.nativeIds, ['native-original']);
+});
+
+test('大量图片工具历史通过 excludeTurns 轻量续接，同 native ID/provider 且只提交一次本轮', async t => {
+  const f = await fixture(t, { threadMode: 'large-history', provider: 'custom', historicalProvider: 'openai' });
+  const result = await f.adapter.run(f.turn);
+  assert.deepEqual(result, { nativeId: 'native-original', text: 'continued reply' });
+  const trace = await f.traces();
+  const resume = requests(trace, 'thread/resume');
+  assert.equal(resume.length, 1);
+  assert.equal(resume[0]!.params!.threadId, 'native-original');
+  assert.equal(resume[0]!.params!.modelProvider, 'custom');
+  assert.equal(resume[0]!.params!.excludeTurns, true);
+  assert.equal(Object.hasOwn(resume[0]!.params!, 'history'), false, 'Never replace the saved history');
+  assert.equal(Object.hasOwn(resume[0]!.params!, 'path'), false, 'Resume the original ID without an alternate rollout');
+  assert.equal(requests(trace, 'thread/start').length, 0);
+  const turns = requests(trace, 'turn/start');
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]!.params!.threadId, 'native-original');
+  assert.deepEqual(turns[0]!.params!.input, [{ type: 'text', text: f.turn.text, text_elements: [] }]);
+  assert.deepEqual(f.nativeIds, ['native-original']);
+  assert.equal(f.turn.conversation.nativeId, 'native-original');
+});
+
+test('excludeTurns 后其他超大元数据仍触发16MiB上限，不归咎供应商且不重建或提交本轮', async t => {
+  const f = await fixture(t, { threadMode: 'oversized-metadata' });
+  await assert.rejects(f.adapter.run(f.turn), (error: unknown) => {
+    assert(error instanceof Error);
+    assert.match(error.message, /单条输出超过限制/);
+    assert.match(error.message, /原会话.*保留|保留.*原会话/);
+    assert.match(error.message, /尚未提交/);
+    assert.doesNotMatch(error.message, /CC Switch|供应商/);
+    return true;
+  });
+  const trace = await f.traces();
+  assert.equal(requests(trace, 'thread/resume').length, 1);
+  assert.equal(requests(trace, 'thread/resume')[0]!.params!.excludeTurns, true);
+  noGeneratedOrNewThread(trace);
+  assert.equal(f.turn.conversation.nativeId, 'native-original');
+  assert.deepEqual(f.nativeIds, []);
 });
 
 for (const mode of ['null', 'missing'] as const) {
@@ -255,6 +307,7 @@ test('真实 resume RPC 错误明确保留原会话，不自动新建、不重�
   await assert.rejects(f.adapter.run(f.turn), (error: unknown) => {
     assert(error instanceof Error);
     assert.match(error.message, /fixture saved thread is unavailable/);
+    assert.doesNotMatch(error.message, /CC Switch|供应商/);
     assert.match(error.message, /原会话.*保留|保留.*原会话/);
     assert.match(error.message, /尚未提交/);
     return true;

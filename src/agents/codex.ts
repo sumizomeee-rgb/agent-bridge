@@ -163,18 +163,19 @@ export class CodexAdapter implements AgentAdapter {
         throw new Error('Codex 当前供应商配置无效，本轮任务尚未提交。');
       }
       const modelProvider = typeof configuredProvider === 'string' ? configuredProvider : 'openai';
+      // Resume full server-side context, without copying its image/tool history back into stdio.
       const resumeId = nativeId;
       let thread: JsonObject;
       try {
         thread = await rpc.request(resumeId ? 'thread/resume' : 'thread/start', {
-          ...(resumeId ? { threadId: resumeId } : {}), modelProvider,
+          ...(resumeId ? { threadId: resumeId, excludeTurns: true } : {}), modelProvider,
           cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
           ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
         });
       } catch (error) {
         if (cancelled) throw abortError();
         if (!resumeId) throw error;
-        throw new Error(`Codex 无法在当前供应商下续接；原会话已保留，本轮任务尚未提交。检查 CC Switch 配置后直接继续对话即可。原因：${safeError(error instanceof Error ? error.message : error, '续接失败')}`);
+        throw new Error(`Codex 续接失败；原会话已保留，本轮任务尚未提交。原因：${safeError(error instanceof Error ? error.message : error, '续接失败')}`);
       }
       if (cancelled) throw abortError();
       if (!isObject(thread.thread) || typeof thread.thread.id !== 'string' || !thread.thread.id) {
