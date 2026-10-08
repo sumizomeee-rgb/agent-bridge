@@ -58,10 +58,15 @@ export class ClaudeAdapter implements AgentAdapter {
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');
     const content: JsonObject[] = [];
-    if (turn.text) content.push({ type: 'text', text: turn.text });
-    for (const path of turn.imagePaths) {
-      const bytes = await readFile(path);
-      content.push({ type: 'image', source: { type: 'base64', media_type: imageMediaType(bytes), data: bytes.toString('base64') } });
+    for (const value of turn.input ?? [
+      ...(turn.text ? [{ type: 'text' as const, text: turn.text }] : []),
+      ...turn.imagePaths.map(path => ({ type: 'localImage' as const, path })),
+    ]) {
+      if (value.type === 'text') content.push(value);
+      else {
+        const bytes = await readFile(value.path);
+        content.push({ type: 'image', source: { type: 'base64', media_type: imageMediaType(bytes), data: bytes.toString('base64') } });
+      }
     }
     if (!content.length) throw new Error('消息没有文字或图片。');
     if (turn.signal.aborted) throw abortError();

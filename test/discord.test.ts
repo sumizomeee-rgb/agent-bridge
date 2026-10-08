@@ -137,6 +137,44 @@ async function fixture(t: TestContext, onMessage: (message: IncomingDM) => Promi
   };
 }
 
+test('👀 只标记白名单普通私聊，重放去重且不等待表情请求', async t => {
+  const received: IncomingDM[] = [];
+  const reactions: Array<{ url: string; method: string | undefined }> = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async (input, options) => {
+      const url = String(input);
+      if (url.includes('/reactions/')) {
+        reactions.push({ url, method: options?.method });
+        return new Promise(() => {});
+      }
+      throw new Error('测试不允许其他 REST 请求');
+    },
+  });
+  await f.transport.start();
+  f.dispatch({ guild_id: '333' });
+  f.dispatch({ author: { id: '444' } });
+  f.dispatch({ author: { id: '111', bot: true } });
+  f.dispatch({ id: '200' });
+  f.dispatch({ id: '200' });
+  f.dispatch({ id: '201' });
+  await eventually(() => received.length === 2 && f.heartbeats >= 2);
+  assert.equal(reactions.length, 2);
+  assert.equal(reactions[0]!.method, 'PUT');
+  assert.equal(new URL(reactions[0]!.url).pathname, '/channels/222/messages/200/reactions/%F0%9F%91%80/@me');
+});
+
+test('👀 请求被拒绝不阻挡收件，也不发多余错误私聊', async t => {
+  const received: IncomingDM[] = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async () => new Response('{}', { status: 403 }),
+  });
+  await f.transport.start();
+  f.dispatch({ id: '300' });
+  await eventually(() => received.length === 1);
+  await delay(20);
+  assert.equal(f.posts.length, 0);
+});
+
 test('READY exposes bot identity, only allowed human DMs are delivered, replay is deduplicated', async t => {
   const received: IncomingDM[] = [];
   const f = await fixture(t, async dm => { received.push(dm); });

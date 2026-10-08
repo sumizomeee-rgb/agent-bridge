@@ -1,17 +1,20 @@
-import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn } from '../types.js';
-import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, safeError, type JsonObject } from './process.js';
+import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
+import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, safeError, type JsonObject, type RpcTransport } from './process.js';
 
 /** App-server v2 stdio protocol, verified against Codex rust-v0.160.0. */
 export class CodexAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
+  private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
-  private readonly metadataProcesses = new Set<JsonLineProcess>();
+  private readonly metadataProcesses = new Set<RpcTransport>();
 
-  constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv) {}
+  constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
+    private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport =
+      (command, args, cwd, env) => new JsonLineProcess(command, args, cwd, env)) {}
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
-    const transport = new JsonLineProcess(this.command, ['app-server', '--listen', 'stdio://'], cwd, this.env);
+    const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], cwd, this.env);
     this.metadataProcesses.add(transport);
     const rpc = new JsonRpcClient(transport);
     let success = false;
@@ -50,7 +53,7 @@ export class CodexAdapter implements AgentAdapter {
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Codex 会话仍在执行任务。');
 
-    const transport = new JsonLineProcess(this.command, ['app-server', '--listen', 'stdio://'], turn.conversation.cwd, this.env);
+    const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], turn.conversation.cwd, this.env);
     const rpc = new JsonRpcClient(transport);
     const completed = deferred<AgentResult>();
     const replies = new Map<string, { text: string; phase: unknown }>();
@@ -120,6 +123,23 @@ export class CodexAdapter implements AgentAdapter {
       })();
       return cancelling;
     };
+    // 0.160.0 generate-ts：TurnSteerParams / TurnSteerResponse，非实验协议。
+    this.supplements.set(conversationId, async message => {
+      if (cancelled || completed.settled || !nativeId || !turnId) return { status: 'queued' };
+      const expectedTurnId = turnId;
+      try {
+        const response = await rpc.request('turn/steer', {
+          threadId: nativeId, expectedTurnId,
+          input: message.input.map(value => value.type === 'text' ? { ...value, text_elements: [] } : value),
+        }, 10_000);
+        if (response.turnId !== expectedTurnId) return { status: 'uncertain', reason: 'Codex 补充响应未确认目标 turn。' };
+        return { status: 'accepted' };
+      } catch (error) {
+        // 仅服务端的明确拒绝可以安全接下一轮；断线/超时可能已执行。
+        if (error instanceof JsonRpcError && [-32600, -32601, -32602].includes(error.code ?? 0)) return { status: 'queued' };
+        return { status: 'uncertain', reason: safeError(error instanceof Error ? error.message : error, '补充结果未知') };
+      }
+    });
     this.active.set(conversationId, cancel);
     const onAbort = () => { void cancel().catch(() => {}); };
     turn.signal.addEventListener('abort', onAbort, { once: true });
@@ -174,8 +194,10 @@ export class CodexAdapter implements AgentAdapter {
       }
       if (cancelled) throw abortError();
       const input: JsonObject[] = [];
-      if (turn.text) input.push({ type: 'text', text: turn.text, text_elements: [] });
-      for (const path of turn.imagePaths) input.push({ type: 'localImage', path });
+      for (const value of turn.input ?? [
+        ...(turn.text ? [{ type: 'text' as const, text: turn.text }] : []),
+        ...turn.imagePaths.map(path => ({ type: 'localImage' as const, path })),
+      ]) input.push(value.type === 'text' ? { ...value, text_elements: [] } : value);
       if (!input.length) throw new Error('消息没有文字或图片。');
       const started = await rpc.request('turn/start', {
         threadId: nativeId, input, cwd: turn.conversation.cwd,
@@ -185,6 +207,7 @@ export class CodexAdapter implements AgentAdapter {
       if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 没有返回任务标识。');
       turnId = started.turn.id;
       if (cancelled) throw abortError();
+      if (!completed.settled) turn.onReady?.();
       const result = await completed.promise;
       success = true;
       return result;
@@ -196,8 +219,13 @@ export class CodexAdapter implements AgentAdapter {
       if (cancelling) await cancelling;
       else await transport.stop(success);
       removeMessage(); removeFailure(); rpc.close();
+      this.supplements.delete(conversationId);
       this.active.delete(conversationId);
     }
+  }
+
+  async steer(conversationId: string, message: AgentSupplement): Promise<SteerResult> {
+    return this.supplements.get(conversationId)?.(message) ?? { status: 'queued' };
   }
 
   async interrupt(conversationId: string): Promise<void> { await this.active.get(conversationId)?.(); }

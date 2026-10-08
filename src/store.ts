@@ -4,10 +4,11 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { AgentName, BridgeMessage, Conversation } from './types.js';
 
-export type InboxState = 'command' | 'queued' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
+export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
 export interface InboxItem extends BridgeMessage {
   conversationId: string | null;
   state: InboxState;
+  replyState: 'pending' | 'delivered' | 'failed' | 'cancelled' | null;
 }
 export interface DeliveredReply {
   conversationId: string;
@@ -31,6 +32,7 @@ function inbox(row: Row): InboxItem {
     text: String(row.text), imagePaths: JSON.parse(String(row.images_json)) as string[],
     conversationId: row.conversation_id === null ? null : String(row.conversation_id),
     state: String(row.state) as InboxState,
+    replyState: row.reply_state == null ? null : String(row.reply_state) as InboxItem['replyState'],
   };
 }
 
@@ -77,6 +79,8 @@ export class SessionStore {
     if (!columns.has('model')) this.db.exec('ALTER TABLE conversations ADD COLUMN model TEXT');
     if (!columns.has('actual_model')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_model TEXT');
     if (!columns.has('actual_effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_effort TEXT');
+    const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
+    if (!inboxColumns.has('reply_state')) this.db.exec('ALTER TABLE inbox ADD COLUMN reply_state TEXT');
   }
 
   hasMessage(id: string): boolean {
@@ -189,6 +193,16 @@ export class SessionStore {
     return row ? inbox(row) : null;
   }
 
+  queuedBatch(conversationId: string): InboxItem[] {
+    return this.db.prepare("SELECT * FROM inbox WHERE conversation_id = ? AND state = 'queued' ORDER BY sequence")
+      .all(conversationId).map(inbox);
+  }
+
+  setReplyState(ids: string[], state: InboxItem['replyState']): void {
+    const update = this.db.prepare('UPDATE inbox SET reply_state = ?, updated_at = ? WHERE id = ?');
+    for (const id of ids) update.run(state, new Date().toISOString(), id);
+  }
+
   getMessage(id: string): InboxItem | null {
     const row = this.db.prepare('SELECT * FROM inbox WHERE id = ?').get(id);
     return row ? inbox(row) : null;
@@ -201,7 +215,7 @@ export class SessionStore {
 
   cancelPending(conversationId: string): number {
     return Number(this.db.prepare(`UPDATE inbox SET state = 'cancelled', updated_at = ?
-      WHERE conversation_id = ? AND state IN ('queued', 'running')`)
+      WHERE conversation_id = ? AND state IN ('queued', 'running', 'steering')`)
       .run(new Date().toISOString(), conversationId).changes);
   }
 
@@ -211,9 +225,16 @@ export class SessionStore {
     return Number(row?.total ?? 0);
   }
 
+  unfinishedReplies(): InboxItem[] {
+    const items = this.db.prepare("SELECT * FROM inbox WHERE state = 'completed' AND reply_state = 'pending' ORDER BY sequence")
+      .all().map(inbox);
+    for (const item of items) this.setReplyState([item.id], 'failed');
+    return items;
+  }
+
   interruptRunning(): InboxItem[] {
-    const items = this.db.prepare("SELECT * FROM inbox WHERE state = 'running' ORDER BY sequence").all().map(inbox);
-    this.db.prepare("UPDATE inbox SET state = 'interrupted', updated_at = ? WHERE state = 'running'")
+    const items = this.db.prepare("SELECT * FROM inbox WHERE state IN ('running', 'steering') ORDER BY sequence").all().map(inbox);
+    this.db.prepare("UPDATE inbox SET state = 'interrupted', updated_at = ? WHERE state IN ('running', 'steering')")
       .run(new Date().toISOString());
     return items;
   }

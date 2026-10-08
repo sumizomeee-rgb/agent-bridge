@@ -10,6 +10,10 @@ interface RunningTurn {
   messageId: string;
   conversationId: string;
   controller: AbortController;
+  messageIds: string[];
+  ready: boolean;
+  executing: boolean;
+  supplements: Promise<void>;
 }
 const HELP = `直接发送文字或图片即可继续当前会话。
 /new [codex|claude] 或 new chat：新会话
@@ -38,12 +42,21 @@ export class SessionManager {
   private readonly modelChanges = new Set<string>();
   private closed = false;
   private recovered = false;
+  private readonly receipts = new Map<string, number>();
+  private readonly revisions = new Map<string, number>();
 
   constructor(
     private readonly config: BridgeConfig,
     private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly sink: ReplySink,
+    private readonly options: { mergeDelayMs?: number; receiptIntervalMs?: number } = {},
   ) { this.store = new SessionStore(config.dataDir); }
+
+  revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
+
+  discard(message: BridgeMessage): void {
+    if (!this.closed && this.config.allowedUserIds.includes(message.userId)) this.store.addMessage(message, null, 'cancelled');
+  }
 
   hasMessage(id: string): boolean { return this.store.hasMessage(id); }
 
@@ -77,16 +90,27 @@ export class SessionManager {
     if (!this.store.addMessage(message, active.id, 'queued')) return;
     this.store.nameConversation(active.id, message.text);
     this.wake(active.id);
+    const running = this.running.get(message.userId);
+    if (running?.conversationId === active.id && running.executing && !running.controller.signal.aborted) {
+      if (this.adapters[active.agent].steer && running.ready) this.pumpSupplements(active, running);
+      else this.receipt(message.channelId, active.id, this.adapters[active.agent].steer
+        ? '已收到补充，等待当前任务确认；无法补入时接下一轮。'
+        : '已收到补充，当前后端会在本轮结束后继续处理。');
+    }
   }
 
   async recover(): Promise<void> {
     if (this.closed || this.recovered) return;
     this.recovered = true;
-    for (const item of this.store.interruptRunning()) {
+    const notices = new Set<string>();
+    for (const item of [...this.store.interruptRunning(), ...this.store.unfinishedReplies()]) {
       if (this.closed) return;
       if (!this.config.allowedUserIds.includes(item.userId)) continue;
+      const key = `${item.channelId}:${item.conversationId}`;
+      if (notices.has(key)) continue;
+      notices.add(key);
       await this.sink.sendText(item.channelId,
-        `会话 ${item.conversationId?.slice(0, 8) ?? ''} 上次执行因桥重启而中断，未自动重做。请先确认执行结果，再决定继续。`)
+        `会话 ${item.conversationId?.slice(0, 8) ?? ''} 上次执行或回复因桥重启而中断，未自动重做。请先确认执行结果，再决定继续。`)
         .catch(() => undefined);
     }
     if (this.closed) return;
@@ -102,6 +126,7 @@ export class SessionManager {
   }
 
   private cancel(conversation: Conversation): number {
+    this.revisions.set(conversation.userId, this.revision(conversation.userId) + 1);
     let total = this.store.cancelPending(conversation.id);
     const current = this.running.get(conversation.userId);
     if (current?.conversationId === conversation.id) {
@@ -109,6 +134,7 @@ export class SessionManager {
       // Preserve that terminal state, but still count and cancel this unfinished delivery.
       if (!current.controller.signal.aborted && this.store.getMessage(current.messageId)?.state === 'completed') total++;
       current.controller.abort();
+      this.store.setReplyState(current.messageIds, 'cancelled');
       const interruption = Promise.resolve().then(() => this.adapters[conversation.agent].interrupt(conversation.id))
         .catch(() => undefined).finally(() => this.interruptPromises.delete(interruption));
       this.interruptPromises.add(interruption);
@@ -203,6 +229,9 @@ export class SessionManager {
   private async handleCommand(message: BridgeMessage, name: string, argument: string,
     reply: (text: string) => Promise<void>): Promise<void> {
     const current = this.store.getActive(message.userId);
+    if (!current && ['stop', 'new', 'cwd', 'agent'].includes(name)) {
+      this.revisions.set(message.userId, this.revision(message.userId) + 1);
+    }
     switch (name) {
       case 'help': await reply(HELP); return;
       case 'model': await this.handleModel(message, argument, reply); return;
@@ -268,6 +297,55 @@ export class SessionManager {
     }
   }
 
+  private receipt(channelId: string, key: string, text: string): void {
+    const now = Date.now();
+    if (now - (this.receipts.get(key) ?? -Infinity) < (this.options.receiptIntervalMs ?? 15_000)) return;
+    this.receipts.set(key, now);
+    void this.sink.sendText(channelId, text).catch(() => undefined);
+  }
+
+  private pumpSupplements(target: Conversation, turn: RunningTurn): void {
+    turn.supplements = turn.supplements.then(async () => {
+      const adapter = this.adapters[target.agent];
+      if (!adapter.steer || !turn.ready || !turn.executing || turn.controller.signal.aborted || this.closed) return;
+      for (const item of this.store.queuedBatch(target.id)) {
+        if (!turn.executing || turn.controller.signal.aborted || this.closed
+          || this.store.getActive(item.userId)?.id !== target.id) return;
+        // 在 RPC 写入前持久化；崩溃后 steering 不能按 queued 自动重做。
+        this.store.setState(item.id, 'steering');
+        let result;
+        try { result = await adapter.steer(target.id, { id: item.id, input: this.input([item]) }); }
+        catch (error) { result = { status: 'uncertain' as const, reason: String(error) }; }
+        if (this.closed || turn.controller.signal.aborted || this.store.getMessage(item.id)?.state !== 'steering') return;
+        if (result.status === 'accepted') {
+          turn.messageIds.push(item.id);
+          this.store.setState(item.id, turn.executing ? 'running' : 'completed');
+          if (!turn.executing) this.store.setReplyState([item.id], 'pending');
+          this.receipt(item.channelId, target.id, '已收到补充，已交给当前 Codex 任务。');
+        } else if (result.status === 'queued') {
+          this.store.setState(item.id, 'queued');
+          turn.ready = false;
+          this.receipt(item.channelId, target.id, '已收到补充，将在本轮结束后继续处理。');
+          return;
+        } else {
+          this.store.setState(item.id, 'uncertain', result.reason);
+          // 不确定消息单独提示，不能被普通收件反馈节流吞掉。
+          void this.sink.sendText(item.channelId, '补充是否已进入当前任务无法确认，未自动重发。请先核对本轮结果，再决定是否重新发送。')
+            .catch(() => undefined);
+          turn.ready = false;
+          return;
+        }
+      }
+    });
+  }
+
+  private input(items: BridgeMessage[]) {
+    return items.flatMap(item => [
+      ...(item.text ? [{ type: 'text' as const, text: item.text }] : []),
+      ...item.imagePaths.map(path => ({ type: 'localImage' as const, path })),
+    ]);
+  }
+
   private wake(conversationId: string): void {
     if (this.closed || this.workers.has(conversationId) || this.modelChanges.has(conversationId)) return;
     const worker = Promise.resolve().then(() => this.processQueue(conversationId)).finally(() => {
@@ -280,6 +358,8 @@ export class SessionManager {
   }
 
   private async processQueue(conversationId: string): Promise<void> {
+    // 首条消息后固定短窗口，避免连续输入无限延长启动时间。
+    if (this.options.mergeDelayMs !== 0) await new Promise<void>(resolve => setTimeout(resolve, this.options.mergeDelayMs ?? 1000));
     while (!this.closed && !this.modelChanges.has(conversationId)) {
       const item = this.store.nextQueued(conversationId);
       if (!item) return;
@@ -289,9 +369,11 @@ export class SessionManager {
         this.store.setState(item.id, 'cancelled'); continue;
       }
       const controller = new AbortController();
-      const turn: RunningTurn = { messageId: item.id, conversationId, controller };
+      const batch = this.options.mergeDelayMs === 0 ? [item] : this.store.queuedBatch(conversationId);
+      const turn: RunningTurn = { messageId: item.id, messageIds: batch.map(value => value.id),
+        conversationId, controller, ready: false, executing: true, supplements: Promise.resolve() };
       this.running.set(item.userId, turn);
-      this.store.setState(item.id, 'running');
+      for (const value of batch) this.store.setState(value.id, 'running');
       const current = () => !this.closed && !controller.signal.aborted
         && this.running.get(item.userId) === turn
         && this.store.getActive(item.userId)?.id === conversationId
@@ -300,7 +382,9 @@ export class SessionManager {
       let actualEffort: string | null = null;
       try {
         const result = await this.adapters[target.agent].run({
-          conversation: target, text: item.text, imagePaths: item.imagePaths,
+          conversation: target, text: batch.map(value => value.text).filter(Boolean).join('\n\n'),
+          imagePaths: batch.flatMap(value => value.imagePaths), input: this.input(batch),
+          onReady: () => { turn.ready = true; this.pumpSupplements(target, turn); },
           signal: controller.signal,
           onNativeId: nativeId => { if (current() && nativeId) this.store.saveNativeId(conversationId, nativeId); },
           onModel: model => {
@@ -313,10 +397,20 @@ export class SessionManager {
           // Only the completed reply is user-facing; no asynchronous sends can linger after cancellation.
           onProgress: () => {},
         });
-        if (!current()) continue;
-        if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
-        this.store.saveNativeId(conversationId, result.nativeId);
-        this.store.setState(item.id, 'completed');
+        turn.executing = false;
+        if (current()) {
+          if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
+          this.store.saveNativeId(conversationId, result.nativeId);
+          // 模型已经执行完成；即使在途补充确认/回复期间取消也不能改成待重做。
+          for (const id of turn.messageIds) this.store.setState(id, 'completed');
+          this.store.setReplyState(turn.messageIds, 'pending');
+        }
+        await turn.supplements;
+        if (this.closed || controller.signal.aborted || this.running.get(item.userId) !== turn
+          || this.store.getActive(item.userId)?.id !== conversationId
+          || this.store.getMessage(item.id)?.state !== 'completed') continue;
+        for (const id of turn.messageIds) this.store.setState(id, 'completed');
+        this.store.setReplyState(turn.messageIds, 'pending');
         const delivering = () => !this.closed && !controller.signal.aborted
           && this.running.get(item.userId) === turn
           && this.store.getActive(item.userId)?.id === conversationId
@@ -333,17 +427,24 @@ export class SessionManager {
         if (!delivering()) continue;
         // Failed or partially delivered replies never establish successful continuity.
         this.store.saveDelivery(item.userId, item.channelId, identity);
+        this.store.setReplyState(turn.messageIds, 'delivered');
       } catch (error) {
+        turn.executing = false;
+        await turn.supplements;
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
-          if (this.store.getMessage(item.id)?.state === 'running') this.store.setState(item.id, 'cancelled');
+          for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') this.store.setState(id, 'cancelled');
+          this.store.setReplyState(turn.messageIds, 'cancelled');
         } else {
           // A completed model turn is never retried merely because reply delivery failed.
-          if (this.store.getMessage(item.id)?.state === 'running') this.store.setState(item.id, 'failed', String(error));
+          for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') this.store.setState(id, 'failed', String(error));
+          this.store.setReplyState(turn.messageIds, 'failed');
           await this.sink.sendText(item.channelId,
             `执行或回复失败：${error instanceof Error ? error.message : String(error)}`)
             .catch(() => undefined);
         }
       } finally {
+        turn.executing = false;
+        await turn.supplements;
         if (this.running.get(item.userId) === turn) this.running.delete(item.userId);
       }
     }
@@ -352,7 +453,10 @@ export class SessionManager {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    for (const turn of this.running.values()) turn.controller.abort();
+    for (const turn of this.running.values()) {
+      turn.controller.abort();
+      this.store.setReplyState(turn.messageIds, 'cancelled');
+    }
     await Promise.allSettled(Object.values(this.adapters).map(adapter => adapter.close()));
     await Promise.allSettled([...this.workers.values(), ...this.interruptPromises]);
     this.store.close();

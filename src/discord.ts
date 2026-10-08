@@ -536,6 +536,10 @@ export class DiscordTransport {
         !snowflake(author.id) || !this.allowedUsers.has(author.id) || !snowflake(data.id) ||
         !snowflake(data.channel_id) || this.seenMessages.has(data.id)) return;
     this.seenMessages.add(data.id);
+    // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
+    void this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('👀')}/@me`,
+      'PUT', undefined, undefined, undefined, AbortSignal.timeout(5000))
+      .catch(() => this.log('收件表情添加失败，消息继续处理。'));
     if (this.seenMessages.size > 5000) this.seenMessages.delete(this.seenMessages.values().next().value!);
     const attachments: DiscordAttachment[] = [];
     if (Array.isArray(data.attachments)) {

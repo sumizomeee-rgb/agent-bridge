@@ -167,6 +167,13 @@ export class JsonLineProcess {
   }
 }
 
+/** 保留明确的 RPC 拒绝，与超时、断线及损坏响应区分。 */
+export class JsonRpcError extends Error {
+  constructor(readonly code: number | null, message: string) { super(message); }
+}
+
+export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'>;
+
 export class JsonRpcClient {
   private nextId = 1;
   private readonly pending = new Map<number, {
@@ -176,14 +183,14 @@ export class JsonRpcClient {
   private readonly removeMessage: () => void;
   private readonly removeFailure: () => void;
 
-  constructor(readonly transport: JsonLineProcess) {
+  constructor(readonly transport: RpcTransport) {
     this.removeMessage = transport.onMessage((message) => {
       if (typeof message.id !== 'number' || typeof message.method === 'string') return;
       const request = this.pending.get(message.id);
       if (!request) return;
       this.pending.delete(message.id);
       clearTimeout(request.timeout);
-      if (isObject(message.error)) request.reject(new Error(`Codex 请求失败：${safeError(message.error.message, '协议错误')}`));
+      if (isObject(message.error)) request.reject(new JsonRpcError(typeof message.error.code === 'number' ? message.error.code : null, `Codex 请求失败：${safeError(message.error.message, '协议错误')}`));
       else if (isObject(message.result)) request.resolve(message.result);
       else request.reject(new Error('Codex 返回了无效的请求结果。'));
     });

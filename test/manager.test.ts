@@ -53,7 +53,7 @@ function fixture(t: TestContext, auto = true) {
   const codex = new FakeAdapter('codex', auto);
   const claude = new FakeAdapter('claude', auto);
   const sink = new FakeSink();
-  const f = { root, config, codex, claude, sink, manager: new SessionManager(config, { codex, claude }, sink) };
+  const f = { root, config, codex, claude, sink, manager: new SessionManager(config, { codex, claude }, sink, { mergeDelayMs: 0 }) };
   t.after(async () => { await f.manager.close(); rmSync(root, { recursive: true, force: true }); });
   return f;
 }
@@ -101,7 +101,7 @@ test('重启恢复 active binding、nativeId 和去重记录', async t => {
   await f.manager.close();
   const codex = new FakeAdapter('codex');
   const claude = new FakeAdapter('claude');
-  f.manager = new SessionManager(f.config, { codex, claude }, f.sink);
+  f.manager = new SessionManager(f.config, { codex, claude }, f.sink, { mergeDelayMs: 0 });
   await f.manager.recover();
   assert.equal(f.manager.hasMessage('before'), true);
   await f.manager.handle(message('before', 'duplicate'));

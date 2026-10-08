@@ -103,6 +103,23 @@ function sentBlocks(agent: AgentName, traces: Trace[]): unknown[] {
 }
 
 for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent}: 连续消息合并后的文字图片交错顺序保留到 CLI`, async () => {
+    const f = await fixture(agent);
+    try {
+      f.turn.input = [
+        { type: 'text', text: '第一条' }, { type: 'localImage', path: f.turn.imagePaths[0]! },
+        { type: 'text', text: '第二条' }, { type: 'localImage', path: f.turn.imagePaths[1]! },
+      ];
+      await f.adapter.run(f.turn);
+      const image = (path: string) => agent === 'codex' ? { type: 'localImage', path }
+        : { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png.toString('base64') } };
+      const text = (value: string) => agent === 'codex' ? { type: 'text', text: value, text_elements: [] }
+        : { type: 'text', text: value };
+      assert.deepEqual(sentBlocks(agent, await f.traces()), [
+        text('第一条'), image(f.turn.imagePaths[0]!), text('第二条'), image(f.turn.imagePaths[1]!),
+      ]);
+    } finally { await f.cleanup(); }
+  });
   test(`${agent}: text and image input contains only the original user content and preserves native resume`, async () => {
     const f = await fixture(agent);
     try {

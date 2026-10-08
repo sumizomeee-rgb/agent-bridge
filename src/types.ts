@@ -35,10 +35,17 @@ export interface BridgeConfig {
 }
 export interface AgentModel { id: string; displayName: string; description?: string; isDefault?: boolean }
 export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | null }
+export type AgentInput = { type: 'text'; text: string } | { type: 'localImage'; path: string };
+export interface AgentSupplement { id: string; input: AgentInput[] }
+export type SteerResult = { status: 'accepted' } | { status: 'queued' } | { status: 'uncertain'; reason: string };
 export interface AgentTurn {
   conversation: Conversation;
   text: string;
   imagePaths: string[];
+  /** 连续消息保留文字与图片的交错顺序。 */
+  input?: AgentInput[];
+  /** app-server 确认活动 turn 后通知桥尝试补充。 */
+  onReady?: () => void;
   signal: AbortSignal;
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;
@@ -48,6 +55,8 @@ export interface AgentTurn {
 export interface AgentResult { nativeId: string; text: string }
 export interface AgentAdapter {
   run(turn: AgentTurn): Promise<AgentResult>;
+  /** queued 必须表示尚未提交或收到明确拒绝；不确定结果禁止自动重发。 */
+  steer?(conversationId: string, supplement: AgentSupplement): Promise<SteerResult>;
   interrupt(conversationId: string): Promise<void>;
   close(): Promise<void>;
   /** Metadata only: never sends a user prompt or starts a generated turn. */

@@ -51,19 +51,32 @@ writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().
 const env = agentEnvironment(config);
 const adapters = { codex: new CodexAdapter(config.commands.codex, env), claude: new ClaudeAdapter(config.commands.claude, env) };
 let manager: SessionManager;
-const inbox = new OrderedInbox<IncomingDM>(message => message.userId, async message => {
+const preparationEpochs = new Map<string, number>();
+const inbox = new OrderedInbox<IncomingDM & { revision: number }>(message => message.userId, async message => {
   if (closing) return;
   if (manager.hasMessage(message.id)) {
     if (message.interaction) await discord.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
     return;
   }
-  const imagePaths = await discord.downloadImages(message);
+  const control = /^(?:\/(?:stop|new|agent|cwd)(?:\s|$)|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
+  const imagePaths = control ? [] : await discord.downloadImages(message);
+  const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths };
+  if (!control && message.revision !== (preparationEpochs.get(message.userId) ?? 0)) {
+    manager.discard(prepared);
+    return;
+  }
   const commandReply = message.interaction
     ? (text: string) => discord.sendInteractionText(message.interaction!, redactText(text, [config.token, message.interaction!.token]))
     : undefined;
-  await manager.handle({ id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths }, commandReply);
+  await manager.handle(prepared, commandReply);
 });
-const discord = new DiscordTransport(config, message => inbox.handle(message), { logger: message => log(`DISCORD ${message}`) });
+const discord = new DiscordTransport(config, message => {
+  const control = /^(?:\/(?:stop|new|agent|cwd)(?:\s|$)|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
+  // 收件时同步推进 epoch；命令后的新消息不会带着旧准备版本被误取消。
+  const revision = (preparationEpochs.get(message.userId) ?? 0) + (control ? 1 : 0);
+  preparationEpochs.set(message.userId, revision);
+  return inbox.handle({ ...message, revision }, control);
+}, { logger: message => log(`DISCORD ${message}`) });
 manager = new SessionManager(config, adapters, {
   sendText: (channelId, text, options) => discord.sendText(channelId, redactText(text, [config.token]),
     options ? {
