@@ -82,7 +82,11 @@ export interface OutgoingFile {
   description?: string;
 }
 export interface ReplyOptions { repeatHeader?: string; images?: OutgoingImage[]; files?: OutgoingFile[]; signal?: AbortSignal }
-export interface ReplySink { sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> }
+export interface ReplySink {
+  sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void>;
+  /** Best effort indication on the original messages, after successful reply delivery. */
+  markReplyDelivered?(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void>;
+}
 export interface DiscordAttachment {
   id: string;
   filename: string;

@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
-import type { BridgeConfig, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
+import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
@@ -178,6 +178,7 @@ export class DiscordTransport {
   private readonly sendQueues = new Map<string, Promise<void>>();
   private readonly channelWaitUntil = new Map<string, number>();
   private readonly seenMessages = new Set<string>();
+  private readonly pendingReceipts = new Map<string, Promise<void>>();
   private readonly seenInteractions = new Set<string>();
   private readonly deliveryQueues = new Map<string, Promise<void>>();
   private applicationId: string | undefined;
@@ -329,10 +330,30 @@ export class DiscordTransport {
     }
   }
 
+  /** Final replies are already delivered; reaction updates are best effort and independent. */
+  async markReplyDelivered(messages: ReadonlyArray<Pick<BridgeMessage, 'id' | 'channelId'>>): Promise<void> {
+    const unique = new Map(messages.map(message => [`${message.channelId}:${message.id}`, message]));
+    await Promise.all([...unique].map(async ([key, message]) => {
+      if (this.closed || !snowflake(message.channelId) || !snowflake(message.id) || this.seenInteractions.has(message.id)) return;
+      try {
+        // A fast reply must not race a slow initial PUT and leave the hourglass behind.
+        await this.pendingReceipts.get(key);
+        if (this.closed) return;
+        const endpoint = `/channels/${message.channelId}/messages/${message.id}/reactions`;
+        // Keep the pending marker if adding the completion marker fails.
+        await this.rest(`${endpoint}/${encodeURIComponent('✅')}/@me`, 'PUT',
+          undefined, undefined, undefined, AbortSignal.timeout(5000));
+        await this.rest(`${endpoint}/${encodeURIComponent('⏳')}/@me`, 'DELETE',
+          undefined, undefined, undefined, AbortSignal.timeout(5000));
+      } catch { if (!this.closed) this.log('完成表情更新失败，已发送的回复不受影响。'); }
+    }));
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.shutdown.abort();
+    this.pendingReceipts.clear();
     this.clearConnectionTimers();
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.readyTimer);
@@ -537,9 +558,13 @@ export class DiscordTransport {
         !snowflake(data.channel_id) || this.seenMessages.has(data.id)) return;
     this.seenMessages.add(data.id);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
-    void this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('👀')}/@me`,
+    const receiptKey = `${data.channel_id}:${data.id}`;
+    const receipt = this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
       'PUT', undefined, undefined, undefined, AbortSignal.timeout(5000))
-      .catch(() => this.log('收件表情添加失败，消息继续处理。'));
+      .then(() => {})
+      .catch(() => { if (!this.closed) this.log('收件表情添加失败，消息继续处理。'); });
+    this.pendingReceipts.set(receiptKey, receipt);
+    void receipt.then(() => { if (this.pendingReceipts.get(receiptKey) === receipt) this.pendingReceipts.delete(receiptKey); });
     if (this.seenMessages.size > 5000) this.seenMessages.delete(this.seenMessages.values().next().value!);
     const attachments: DiscordAttachment[] = [];
     if (Array.isArray(data.attachments)) {
@@ -650,7 +675,7 @@ export class DiscordTransport {
     throw new Error('Discord 交互持续限流，请稍后重试。');
   }
 
-  private async rest(path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown, channelId?: string,
+  private async rest(path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: unknown, channelId?: string,
     attachments?: PreparedAttachment[], turnSignal?: AbortSignal): Promise<unknown> {
     const cancel = turnSignal ? AbortSignal.any([this.shutdown.signal, turnSignal]) : this.shutdown.signal;
     let localWaitUntil = 0;

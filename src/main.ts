@@ -78,6 +78,7 @@ const discord = new DiscordTransport(config, message => {
   return inbox.handle({ ...message, revision }, control);
 }, { logger: message => log(`DISCORD ${message}`) });
 manager = new SessionManager(config, adapters, {
+  markReplyDelivered: messages => discord.markReplyDelivered(messages),
   sendText: (channelId, text, options) => discord.sendText(channelId, redactText(text, [config.token]),
     options ? {
       ...options,

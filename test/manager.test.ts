@@ -58,6 +58,210 @@ function fixture(t: TestContext, auto = true) {
   return f;
 }
 
+test('回复全部送达并持久化后，合并及 accepted 补充的原始消息只标完成一次', async t => {
+  t.after(() => inspect.close());
+  const f = fixture(t, false);
+  await f.manager.close();
+  const completions: Array<Pick<BridgeMessage, 'id' | 'channelId'>[]> = [];
+  let release!: () => void;
+  const delivery = new Promise<void>(resolve => { release = resolve; });
+  let deliveryStarted = false;
+  const inspect = new SessionStore(f.config.dataDir);
+  const adapter: AgentAdapter = {
+    run(turn) { const result = f.codex.run(turn); turn.onReady?.(); return result; },
+    async steer() { return { status: 'accepted' }; },
+    interrupt: id => f.codex.interrupt(id),
+    close: () => f.codex.close(),
+  };
+  f.manager = new SessionManager(f.config, { codex: adapter, claude: f.claude }, {
+    async sendText(channelId, text) {
+      if (text.startsWith('[Codex')) { deliveryStarted = true; await delivery; }
+      await f.sink.sendText(channelId, text);
+    },
+    async markReplyDelivered(messages) {
+      for (const item of messages) assert.equal(inspect.getMessage(item.id)?.replyState, 'delivered');
+      assert.equal(inspect.getLastDelivery('u1', 'first-channel')?.nativeId, f.codex.result(f.codex.calls[0]!).nativeId);
+      completions.push(messages);
+    },
+  }, { mergeDelayMs: 20 });
+  await f.manager.handle({ ...message('merged-a', 'first'), channelId: 'first-channel' });
+  await f.manager.handle({ ...message('merged-b', 'second'), channelId: 'second-channel' });
+  await waitFor(() => f.codex.calls.length === 1);
+  await f.manager.handle({ ...message('accepted-c', 'supplement'), channelId: 'third-channel' });
+  await waitFor(() => inspect.getMessage('accepted-c')?.state === 'running');
+  assert.equal(completions.length, 0);
+  f.codex.finish(0);
+  await waitFor(() => deliveryStarted);
+  assert.equal(inspect.getMessage('merged-a')?.state, 'completed');
+  assert.equal(inspect.getMessage('accepted-c')?.replyState, 'pending');
+  assert.equal(completions.length, 0);
+  release();
+  await waitFor(() => completions.length === 1);
+  await f.manager.handle(message('merged-a', 'duplicate'));
+  assert.deepEqual(completions, [[
+    { id: 'merged-a', channelId: 'first-channel' },
+    { id: 'merged-b', channelId: 'second-channel' },
+    { id: 'accepted-c', channelId: 'third-channel' },
+  ]]);
+  assert.equal(f.codex.calls.length, 1);
+});
+
+test('部分投递后失败的模型回复不标完成', async t => {
+  const f = fixture(t);
+  await f.manager.close();
+  let completions = 0;
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, {
+    async sendText(channelId, text) {
+      if (text.startsWith('[Codex')) {
+        await f.sink.sendText(channelId, 'first chunk delivered');
+        throw new Error('later chunk failed');
+      }
+      await f.sink.sendText(channelId, text);
+    },
+    async markReplyDelivered() { completions++; },
+  }, { mergeDelayMs: 0 });
+  await f.manager.handle(message('partial-reply', 'work'));
+  await waitFor(() => f.sink.replies.some(item => item.text.includes('later chunk failed')));
+  const inspect = new SessionStore(f.config.dataDir);
+  try {
+    assert.equal(inspect.getMessage('partial-reply')?.state, 'completed');
+    assert.equal(inspect.getMessage('partial-reply')?.replyState, 'failed');
+    assert.equal(inspect.getLastDelivery('u1', 'dm-u1'), null);
+  } finally { inspect.close(); }
+  assert.equal(completions, 0);
+  assert.equal(f.codex.calls.length, 1);
+});
+
+for (const reaction of ['throw', 'reject', 'pending'] as const) {
+  test(`完成 reaction ${reaction} 不改变成功投递，也不阻塞下一轮`, async t => {
+    const f = fixture(t);
+    await f.manager.close();
+    const marked: string[][] = [];
+    f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, {
+      sendText: (channelId, text) => f.sink.sendText(channelId, text),
+      markReplyDelivered(messages) {
+        marked.push(messages.map(item => item.id));
+        if (reaction === 'throw') throw new Error('reaction threw');
+        if (reaction === 'reject') return Promise.reject(new Error('reaction rejected'));
+        return new Promise<void>(() => {});
+      },
+    }, { mergeDelayMs: 0 });
+    await f.manager.handle(message('reaction-first', 'first'));
+    await f.manager.handle(message('reaction-second', 'second'));
+    await waitFor(() => marked.length === 2);
+    const inspect = new SessionStore(f.config.dataDir);
+    try {
+      for (const id of ['reaction-first', 'reaction-second']) assert.equal(inspect.getMessage(id)?.replyState, 'delivered');
+    } finally { inspect.close(); }
+    assert.equal(f.codex.calls.length, 2);
+    assert.deepEqual(marked, [['reaction-first'], ['reaction-second']]);
+    assert.equal(f.sink.replies.filter(item => item.text.startsWith('[Codex')).length, 2);
+    assert(f.sink.replies.every(item => !item.text.includes('失败')));
+  });
+}
+
+test('没有文字或图片的提示回复送达后也标完成，不启动 Agent', async t => {
+  const f = fixture(t);
+  await f.manager.close();
+  const marked: string[] = [];
+  let release!: () => void;
+  const delivery = new Promise<void>(resolve => { release = resolve; });
+  let started = false;
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, {
+    async sendText(channelId, text) { started = true; await delivery; await f.sink.sendText(channelId, text); },
+    async markReplyDelivered(messages) { marked.push(...messages.map(item => item.id)); },
+  });
+  const handling = f.manager.handle(message('empty-message', ''));
+  await waitFor(() => started);
+  assert.deepEqual(marked, []);
+  release();
+  await handling;
+  await waitFor(() => marked.length === 1);
+  assert.deepEqual(marked, ['empty-message']);
+  assert.equal(f.codex.calls.length + f.claude.calls.length, 0);
+});
+
+test('文字命令回复成功后才标完成，命令失败不标完成', async t => {
+  const f = fixture(t);
+  await f.manager.close();
+  const completed: string[] = [];
+  let release!: () => void;
+  const delivery = new Promise<void>(resolve => { release = resolve; });
+  let deliveryStarted = false;
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, {
+    async sendText(channelId, text) {
+      if (!text.startsWith('命令失败')) { deliveryStarted = true; await delivery; }
+      await f.sink.sendText(channelId, text);
+    },
+    async markReplyDelivered(messages) { completed.push(...messages.map(item => item.id)); },
+  });
+  const command = f.manager.handle(message('command-success', '/help'));
+  await waitFor(() => deliveryStarted);
+  assert.deepEqual(completed, []);
+  release();
+  await command;
+  await waitFor(() => completed.length === 1);
+  await f.manager.handle(message('command-failed', `/cwd ${join(f.root, 'missing-directory')}`));
+  assert.deepEqual(completed, ['command-success']);
+  const inspect = new SessionStore(f.config.dataDir);
+  try { assert.equal(inspect.getMessage('command-failed')?.state, 'failed'); }
+  finally { inspect.close(); }
+  assert.equal(f.codex.calls.length, 0);
+});
+
+test('uncertain 补充不随已送达的主消息标完成', async t => {
+  const f = fixture(t, false);
+  await f.manager.close();
+  const marked: string[][] = [];
+  const adapter: AgentAdapter = {
+    run(turn) { const result = f.codex.run(turn); turn.onReady?.(); return result; },
+    async steer() { return { status: 'uncertain', reason: 'timeout' }; },
+    interrupt: id => f.codex.interrupt(id),
+    close: () => f.codex.close(),
+  };
+  f.manager = new SessionManager(f.config, { codex: adapter, claude: f.claude }, {
+    sendText: (channelId, text) => f.sink.sendText(channelId, text),
+    async markReplyDelivered(messages) { marked.push(messages.map(item => item.id)); },
+  }, { mergeDelayMs: 0 });
+  await f.manager.handle(message('main-delivery', 'first'));
+  await waitFor(() => f.codex.calls.length === 1);
+  await f.manager.handle(message('uncertain-supplement', 'supplement'));
+  const inspect = new SessionStore(f.config.dataDir);
+  try {
+    await waitFor(() => inspect.getMessage('uncertain-supplement')?.state === 'uncertain');
+    f.codex.finish(0);
+    await waitFor(() => marked.length === 1);
+    assert.deepEqual(marked, [['main-delivery']]);
+    assert.equal(inspect.getMessage('uncertain-supplement')?.replyState, null);
+  } finally { inspect.close(); }
+});
+
+test('模型已完成但投递期间取消，不标原始消息完成', async t => {
+  const f = fixture(t);
+  await f.manager.close();
+  const marked: string[][] = [];
+  let release!: () => void;
+  const delivery = new Promise<void>(resolve => { release = resolve; });
+  let deliveryStarted = false;
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, {
+    async sendText(channelId, text) {
+      if (text.startsWith('[Codex')) { deliveryStarted = true; await delivery; }
+      await f.sink.sendText(channelId, text);
+    },
+    async markReplyDelivered(messages) { marked.push(messages.map(item => item.id)); },
+  }, { mergeDelayMs: 0 });
+  await f.manager.handle(message('cancelled-delivery', 'work'));
+  await waitFor(() => deliveryStarted);
+  await f.manager.handle(message('stop-delivery', '/stop'));
+  release();
+  const inspect = new SessionStore(f.config.dataDir);
+  try {
+    await waitFor(() => inspect.getMessage('cancelled-delivery')?.replyState === 'cancelled');
+    assert.equal(inspect.getLastDelivery('u1', 'dm-u1'), null);
+  } finally { inspect.close(); }
+  assert.deepEqual(marked, [['stop-delivery']]);
+});
+
 test('普通消息和图片持续同一会话，重复消息不会重复执行', async t => {
   const f = fixture(t);
   const first = message('first', 'hello', 'u1', [join(f.root, 'one.png')]);

@@ -137,7 +137,7 @@ async function fixture(t: TestContext, onMessage: (message: IncomingDM) => Promi
   };
 }
 
-test('👀 只标记白名单普通私聊，重放去重且不等待表情请求', async t => {
+test('⏳ 只标记白名单普通私聊，重放去重且不等待表情请求', async t => {
   const received: IncomingDM[] = [];
   const reactions: Array<{ url: string; method: string | undefined }> = [];
   const f = await fixture(t, async dm => { received.push(dm); }, {
@@ -160,10 +160,10 @@ test('👀 只标记白名单普通私聊，重放去重且不等待表情请求
   await eventually(() => received.length === 2 && f.heartbeats >= 2);
   assert.equal(reactions.length, 2);
   assert.equal(reactions[0]!.method, 'PUT');
-  assert.equal(new URL(reactions[0]!.url).pathname, '/channels/222/messages/200/reactions/%F0%9F%91%80/@me');
+  assert.equal(new URL(reactions[0]!.url).pathname, '/channels/222/messages/200/reactions/%E2%8F%B3/@me');
 });
 
-test('👀 请求被拒绝不阻挡收件，也不发多余错误私聊', async t => {
+test('⏳ 请求被拒绝不阻挡收件，也不发多余错误私聊', async t => {
   const received: IncomingDM[] = [];
   const f = await fixture(t, async dm => { received.push(dm); }, {
     fetch: async () => new Response('{}', { status: 403 }),
@@ -173,6 +173,107 @@ test('👀 请求被拒绝不阻挡收件，也不发多余错误私聊', async 
   await eventually(() => received.length === 1);
   await delay(20);
   assert.equal(f.posts.length, 0);
+});
+
+test('快速回复等待初始沙漏请求完成后再改成完成，不阻挡收件和心跳', async t => {
+  const received: IncomingDM[] = [];
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  let release!: (response: Response) => void;
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      if (path.endsWith('/reactions/⏳/@me') && options?.method === 'PUT') {
+        return new Promise<Response>(resolve => { release = resolve; });
+      }
+      return new Response(null, { status: 204 });
+    },
+  });
+  await f.transport.start();
+  f.dispatch({ id: '400' });
+  await eventually(() => received.length === 1 && calls.length === 1);
+  const completion = f.transport.markReplyDelivered([{ id: '400', channelId: '222' }]);
+  await eventually(() => f.heartbeats >= 2);
+  assert.equal(calls.length, 1, 'Completion cannot overtake the pending receipt');
+  release(new Response(null, { status: 204 }));
+  await completion;
+  assert.deepEqual(calls, [
+    { path: '/channels/222/messages/400/reactions/⏳/@me', method: 'PUT' },
+    { path: '/channels/222/messages/400/reactions/✅/@me', method: 'PUT' },
+    { path: '/channels/222/messages/400/reactions/⏳/@me', method: 'DELETE' },
+  ]);
+  assert.equal(f.posts.length, 0, 'Reaction updates do not add chat messages');
+});
+
+test('完成表情添加失败保留沙漏，反应错误不变成额外私聊', async t => {
+  const received: IncomingDM[] = [];
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      return new Response(null, { status: path.endsWith('/reactions/✅/@me') ? 403 : 204 });
+    },
+  });
+  await f.transport.start();
+  f.dispatch({ id: '401' });
+  await eventually(() => received.length === 1);
+  await f.transport.markReplyDelivered([{ id: '401', channelId: '222' }]);
+  assert.deepEqual(calls.map(call => call.method), ['PUT', 'PUT']);
+  assert(calls[0]!.path.endsWith('/reactions/⏳/@me'));
+  assert(calls[1]!.path.endsWith('/reactions/✅/@me'));
+  assert.equal(f.posts.length, 0);
+});
+
+test('批次完成按各自 channel 和原消息 ID 更新，重复 ID 去重，初始反应失败也可标完成', async t => {
+  const received: IncomingDM[] = [];
+  const calls: Array<{ path: string; method: string | undefined }> = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async (input, options) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      calls.push({ path, method: options?.method });
+      return new Response(null, { status: options?.method === 'PUT' && path.endsWith('/reactions/⏳/@me') ? 403 : 204 });
+    },
+  });
+  await f.transport.start();
+  f.dispatch({ id: '402' });
+  f.dispatch({ id: '403', channel_id: '223' });
+  await eventually(() => received.length === 2);
+  await f.transport.markReplyDelivered([
+    { id: '402', channelId: '222' }, { id: '403', channelId: '223' }, { id: '402', channelId: '222' },
+  ]);
+  const completion = calls.filter(call => call.path.endsWith('/reactions/✅/@me'));
+  assert.deepEqual(completion, [
+    { path: '/channels/222/messages/402/reactions/✅/@me', method: 'PUT' },
+    { path: '/channels/223/messages/403/reactions/✅/@me', method: 'PUT' },
+  ]);
+  assert.equal(calls.filter(call => call.method === 'DELETE').length, 2);
+});
+
+test('原生斜杠交互不使用消息 reaction，关闭后也不新增反应请求', async t => {
+  const received: IncomingDM[] = [];
+  const reactionPaths: string[] = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, {
+    fetch: async input => {
+      const path = new URL(String(input)).pathname;
+      if (path.includes('/reactions/')) reactionPaths.push(path);
+      return new Response(null, { status: 204 });
+    },
+  });
+  await f.transport.start();
+  f.sockets.at(-1)!.send(JSON.stringify({
+    op: 0, t: 'INTERACTION_CREATE', s: 10, d: {
+      type: 2, id: '405', application_id: '999', token: 'fake-local-interaction',
+      channel_id: '222', context: 1, user: { id: '111', bot: false },
+      data: { name: 'status', type: 1 },
+    },
+  }));
+  await eventually(() => received.length === 1);
+  assert(received[0]!.interaction);
+  await f.transport.markReplyDelivered([{ id: '405', channelId: '222' }]);
+  await f.transport.close();
+  await f.transport.markReplyDelivered([{ id: '406', channelId: '222' }]);
+  assert.deepEqual(reactionPaths, []);
 });
 
 test('READY exposes bot identity, only allowed human DMs are delivered, replay is deduplicated', async t => {

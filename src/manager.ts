@@ -72,6 +72,7 @@ export class SessionManager {
         await this.handleCommand(message, parsed.name, parsed.argument, reply);
         if (this.closed) return;
         this.store.setState(message.id, 'completed');
+        this.markReplyDelivered([message.id]);
       } catch (error) {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
@@ -83,6 +84,7 @@ export class SessionManager {
       if (this.store.addMessage(message, null, 'command')) {
         this.store.setState(message.id, 'completed');
         await this.sink.sendText(message.channelId, '请发送文字或图片；/help 查看帮助。');
+        this.markReplyDelivered([message.id]);
       }
       return;
     }
@@ -297,6 +299,21 @@ export class SessionManager {
     }
   }
 
+  private markReplyDelivered(messageIds: string[]): void {
+    if (!this.sink.markReplyDelivered) return;
+    try {
+      const messages = messageIds.flatMap(id => {
+        const message = this.store.getMessage(id);
+        return message ? [{ id: message.id, channelId: message.channelId }] : [];
+      });
+      if (messages.length) void Promise.resolve()
+        .then(() => this.sink.markReplyDelivered?.(messages))
+        .catch(() => undefined);
+    } catch {
+      // Reactions are best effort and never change a successfully delivered reply.
+    }
+  }
+
   private receipt(channelId: string, key: string, text: string): void {
     const now = Date.now();
     if (now - (this.receipts.get(key) ?? -Infinity) < (this.options.receiptIntervalMs ?? 15_000)) return;
@@ -428,6 +445,7 @@ export class SessionManager {
         // Failed or partially delivered replies never establish successful continuity.
         this.store.saveDelivery(item.userId, item.channelId, identity);
         this.store.setReplyState(turn.messageIds, 'delivered');
+        this.markReplyDelivered(turn.messageIds);
       } catch (error) {
         turn.executing = false;
         await turn.supplements;
