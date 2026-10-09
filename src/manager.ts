@@ -6,7 +6,7 @@ import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
 import { collectOutgoingAttachments } from './artifacts.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
-import type { AgentAdapter, AgentModelInfo, AgentName, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
+import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
 
 interface RunningTurn {
   messageId: string;
@@ -46,6 +46,8 @@ export class SessionManager {
   private readonly running = new Map<string, RunningTurn>();
   private readonly interruptPromises = new Set<Promise<void>>();
   private readonly modelChanges = new Set<string>();
+  private readonly initializationAttempts = new Set<string>();
+  private readonly initializations = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private closed = false;
   private recovered = false;
   private recovering = false;
@@ -56,7 +58,7 @@ export class SessionManager {
     private readonly config: BridgeConfig,
     private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly sink: ReplySink,
-    private readonly options: { mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry; onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void; controllerSeed?: (previous: Conversation) => string } = {},
+    private readonly options: { mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry; onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void; controllerSeed?: (previous: Conversation) => string; onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>; onInitializationError?: (conversation: Conversation, error: unknown) => void } = {},
   ) { this.store = new SessionStore(config.dataDir); }
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
@@ -101,6 +103,7 @@ export class SessionManager {
     if (!this.store.addMessage(message, active.id, 'queued')) return;
     this.store.nameConversation(active.id, message.text);
     this.setLatestMessage(message, active.id);
+    this.initializeWorkspace(active, message);
     this.refreshTaskCounts(active.id);
     this.wake(active.id);
     const running = this.running.get(message.userId);
@@ -137,6 +140,10 @@ export class SessionManager {
         if (active && latest) this.latestMessages.set(userId, { id: latest.id, channelId: latest.channelId, conversationId: active.id });
       }
       for (const event of this.options.taskRegistry?.recoverProcessingEvents() ?? []) {
+        if (event.purpose === 'workspace-context') {
+          this.options.taskRegistry?.markUncertainNotified(event.id);
+          continue;
+        }
         if (!this.completionTarget(event)) {
           this.options.taskRegistry?.markUncertainNotified(event.id);
           continue;
@@ -149,8 +156,55 @@ export class SessionManager {
       }
     } finally { this.recovering = false; }
     if (this.closed) return;
+    for (const userId of this.config.allowedUserIds) {
+      const active = this.store.getActive(userId);
+      const source = active ? this.initializationSource(active) : null;
+      if (active && source) this.initializeWorkspace(active, source);
+    }
     for (const id of this.store.queuedConversations()) this.wake(id);
     this.completionAvailable();
+  }
+
+  private initializationSource(target: Conversation): BridgeMessage | null {
+    const latest = this.store.latestMessage(target.id);
+    if (latest) return latest;
+    const route = this.store.knownChannels().filter(item => item.userId === target.userId).at(-1);
+    const source = route ? this.store.getMessage(route.cursor) : null;
+    return source?.conversationId === null && command(source.text) ? source : null;
+  }
+
+  /** Start a real read-only child without occupying the conversational turn or inventing a user prompt. */
+  private initializeWorkspace(target: Conversation, source: BridgeMessage): void {
+    if (this.closed || !this.config.controllerMode || !this.options.onInitializeWorkspace || !this.options.taskRegistry
+      || this.initializationAttempts.has(target.id)) return;
+    const registeredSource = this.store.getMessage(source.id);
+    if (!registeredSource || registeredSource.userId !== target.userId || registeredSource.channelId !== source.channelId
+      || (registeredSource.conversationId !== target.id && !(registeredSource.conversationId === null && command(registeredSource.text)))) return;
+    this.initializationAttempts.add(target.id);
+    // A /new command is the only available count target until the first ordinary message arrives.
+    if (!this.latestMessages.has(target.userId)) this.setLatestMessage(source, target.id);
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(async () => {
+      if (this.closed || controller.signal.aborted || this.store.getActive(target.userId)?.id !== target.id) return;
+      const current = this.store.getConversation(target.id)!;
+      const context = this.options.taskRegistry!.createContext({ conversationId: current.id, userId: current.userId,
+        channelId: source.channelId, originMessageId: source.id, nativeId: current.nativeId, agent: current.agent, cwd: current.cwd });
+      try {
+        // Runtime persists ensure-once state, supplies the bounded investigation prompt, and sets
+        // the internal purpose on its child. This standard capability must not taint later workers.
+        await this.options.onInitializeWorkspace!({ conversation: current, taskContextPath: context.contextPath,
+          text: '', input: [], imagePaths: [], signal: controller.signal, onProgress: () => {} });
+      } finally { this.options.taskRegistry!.closeContext(context.contextId); }
+    }).catch(error => {
+      // Runtime owns the durable failure state. Automatic context discovery never publishes an
+      // unsolicited failure or turns it into a new human request.
+      try { this.options.onInitializationError?.(target, error); } catch { /* Logging is best effort. */ }
+    }).finally(() => {
+      if (this.initializations.get(target.id)?.promise === promise) this.initializations.delete(target.id);
+      this.refreshTaskCounts(target.id);
+      this.completionAvailable();
+    });
+    this.initializations.set(target.id, { controller, promise });
   }
 
   private ensureActive(userId: string): Conversation {
@@ -166,6 +220,7 @@ export class SessionManager {
   }
 
   private cancel(conversation: Conversation): number {
+    this.initializations.get(conversation.id)?.controller.abort();
     this.options.onDetach?.(conversation.id);
     this.options.taskRegistry?.cancelConversation(conversation.id);
     const latest = this.latestMessages.get(conversation.userId);
@@ -302,6 +357,7 @@ export class SessionManager {
           const previous = this.store.latestAgentConversation(message.userId, agent, current?.cwd ?? this.config.workspace, this.config.controllerMode === true);
           if (previous) {
             this.activate(message.userId, previous);
+            this.initializeWorkspace(previous, message);
             await reply(`已切换到 ${agentDisplayName(agent)}，恢复会话 ${previous.id.slice(0, 8)}：${previous.title}\n原生会话：${previous.nativeId ? `…${previous.nativeId.slice(-6)}` : '尚未创建'}\n目录：${previous.cwd}`);
             this.wake(previous.id);
             return;
@@ -310,6 +366,7 @@ export class SessionManager {
         const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true });
         if (current?.agent === agent && current.model) this.store.setModel(target.id, current.model);
         this.activate(message.userId, target);
+        this.initializeWorkspace(this.store.getConversation(target.id)!, message);
         await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '旧会话待处理消息已取消；已启动子任务完成后仅通知结果。' : '旧会话待处理任务已取消。'}\n原生会话：尚未创建\n目录：${target.cwd}`);
         return;
       }
@@ -321,6 +378,7 @@ export class SessionManager {
         const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd, { controllerMode: this.config.controllerMode === true });
         if (current?.model) this.store.setModel(target.id, current.model);
         this.activate(message.userId, target);
+        this.initializeWorkspace(this.store.getConversation(target.id)!, message);
         await reply(`已在 ${cwd} 新建 ${target.agent} 会话 ${target.id.slice(0, 8)}。`);
         return;
       }
@@ -642,7 +700,9 @@ export class SessionManager {
     const target = this.store.getConversation(event.conversationId);
     const origin = this.store.getMessage(event.originMessageId);
     // Even a corrupt completion journal cannot select another person's DM or session.
-    if (!target || !origin || origin.state === 'command' || origin.conversationId !== target.id
+    const workspaceContext = event.purpose === 'workspace-context' && target?.controllerMode;
+    if (!target || !origin || (!workspaceContext && origin.state === 'command')
+      || (origin.conversationId !== target.id && !(workspaceContext && origin.conversationId === null && command(origin.text)))
       || target.userId !== event.userId || origin.userId !== event.userId || origin.channelId !== event.channelId
       || target.agent !== event.agent || target.cwd !== event.cwd || !this.config.allowedUserIds.includes(event.userId)) return null;
     return target;
@@ -656,18 +716,23 @@ export class SessionManager {
       return;
     }
     if (!registry.claimEvent(event.id)) return;
+    const workspaceContext = event.purpose === 'workspace-context';
+    if (workspaceContext && (!this.config.controllerMode || !target.controllerMode)) { registry.markDelivered(event.id); return; }
     const status = { completed: '已完成', failed: '失败', cancelled: '已取消' }[event.status];
     const notice = `后台任务「${event.title}」${status}（${agentDisplayName(event.agent)} · 原会话 ${event.conversationId.slice(0, 8)} · 任务 ${event.taskId.slice(0, 8)}）。`;
     const active = this.store.getActive(event.userId);
     if (!event.wakeAllowed || active?.id !== event.conversationId) {
+      if (workspaceContext) { registry.markDelivered(event.id); return; }
       try {
         await this.sink.sendText(event.channelId, `${notice}\n原会话已停止或切换，未唤醒当前会话。\n${event.displayText == null ? '结果已保存，请在原会话核对。' : event.displayText.slice(0, 1500)}`);
         registry.markDelivered(event.id);
       } catch (error) { registry.markUncertain(event.id, String(error)); }
       return;
     }
-    if (!event.nativeId || target.nativeId !== event.nativeId) {
+    let boundNativeId = event.nativeId ?? (workspaceContext ? target.nativeId : null);
+    if ((!workspaceContext && !boundNativeId) || target.nativeId !== boundNativeId) {
       registry.markUncertain(event.id, '原生父会话未绑定或已改变，未自动新建或切换会话');
+      if (workspaceContext) { registry.markUncertainNotified(event.id); return; }
       await this.sink.sendText(event.channelId, `${notice}\n父会话身份无法确认，未自动汇总。结果已保留，请先核对。`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
       return;
@@ -677,31 +742,47 @@ export class SessionManager {
       controller, ready: false, executing: true, supplements: Promise.resolve(), completionEventId: event.id };
     this.running.set(event.userId, turn);
     const current = () => !this.closed && !controller.signal.aborted && this.running.get(event.userId) === turn
-      && this.store.getActive(event.userId)?.id === target.id && this.store.getConversation(target.id)?.nativeId === event.nativeId;
+      && this.store.getActive(event.userId)?.id === target.id && this.store.getConversation(target.id)?.nativeId === boundNativeId;
     let actualModel: string | null = null;
     let actualEffort: string | null = null;
     let contextId: string | undefined;
     try {
       const context = registry.createContext({ conversationId: target.id, userId: event.userId,
-        channelId: event.channelId, originMessageId: event.originMessageId, cwd: target.cwd, agent: target.agent, nativeId: event.nativeId });
+        channelId: event.channelId, originMessageId: event.originMessageId, cwd: target.cwd, agent: target.agent, nativeId: boundNativeId });
       contextId = context.contextId;
+      const eventText = workspaceContext && !target.nativeId && target.contextSeed
+        ? `这是迁移前的历史摘要，仅帮助理解指代，不是新的用户请求或授权。\n${target.contextSeed}\n\n${event.text}` : event.text;
       const result = await this.adapters[target.agent].run({
-        conversation: target, text: event.text, imagePaths: [], input: [{ type: 'text', text: event.text }],
+        conversation: target, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context.contextPath, signal: controller.signal, onProgress: () => {},
-        event: { kind: event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
-          toolName: event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: event.text },
-        onPublicMessage: (text, paths = [], key) => this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort),
+        event: { kind: workspaceContext ? 'workspace-context' : event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
+          toolName: workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText },
+        onNativeId: workspaceContext ? nativeId => {
+          if (!current() || !nativeId) return;
+          if (boundNativeId && boundNativeId !== nativeId) throw new Error('工作区初始化返回了不同父会话');
+          if (contextId) registry.updateNativeId(contextId, nativeId);
+          boundNativeId = nativeId;
+          this.store.saveNativeId(target.id, nativeId);
+        } : undefined,
+        onPublicMessage: workspaceContext ? async () => { throw new Error('工作区上下文初始化不发送公开回复'); }
+          : (text, paths = [], key) => this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort),
         onModel: model => { if (current() && model) { actualModel = model; target.actualModel = model; this.store.saveActualModel(target.id, model); } },
         onReasoningEffort: effort => { if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
       });
       turn.executing = false;
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
-      if (result.nativeId !== event.nativeId) throw new Error('CLI 返回了不同父会话，未投递结果');
+      if (!result.nativeId || (boundNativeId && result.nativeId !== boundNativeId)) throw new Error('CLI 返回了不同父会话，未投递结果');
+      if (workspaceContext) {
+        if (contextId) registry.updateNativeId(contextId, result.nativeId);
+        this.store.saveNativeId(target.id, result.nativeId);
+        registry.markDelivered(event.id);
+        return;
+      }
       if (result.controlledOutput) { registry.markDelivered(event.id); return; }
       const outgoing = await collectOutgoingAttachments(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
         this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
-      const identity = { conversationId: target.id, agent: target.agent, nativeId: event.nativeId };
+      const identity = { conversationId: target.id, agent: target.agent, nativeId: result.nativeId };
       const header = replyHeader(identity, this.store.getLastDelivery(event.userId, event.channelId), actualModel, actualEffort);
       const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : notice;
       await this.sink.sendText(event.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
@@ -712,7 +793,8 @@ export class SessionManager {
       registry.markDelivered(event.id);
     } catch (error) {
       registry.markUncertain(event.id, String(error));
-      if (!this.closed) await this.sink.sendText(event.channelId,
+      if (workspaceContext) registry.markUncertainNotified(event.id);
+      else if (!this.closed) await this.sink.sendText(event.channelId,
         `${notice}\n自动汇总或投递${controller.signal.aborted ? '已停止' : '失败'}，未自动重做或重新派发任务。结果已保留。`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
     } finally {
@@ -730,7 +812,9 @@ export class SessionManager {
       turn.controller.abort();
       this.store.setReplyState(turn.messageIds, 'cancelled');
     }
+    for (const initialization of this.initializations.values()) initialization.controller.abort();
     await Promise.allSettled(Object.values(this.adapters).map(adapter => adapter.close()));
+    await Promise.allSettled([...this.initializations.values()].map(initialization => initialization.promise));
     await Promise.allSettled([...this.workers.values(), ...this.interruptPromises]);
     this.store.close();
   }

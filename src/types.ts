@@ -58,7 +58,7 @@ export interface AgentTurn {
   /** Only this explicit channel may publish coordinating-agent output. */
   onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string) => Promise<void>;
   /** Standalone background input, never a human authorization. */
-  event?: { kind: 'worker-result' | 'wake'; toolName?: string; text: string };
+  event?: { kind: 'worker-result' | 'wake' | 'workspace-context'; toolName?: string; text: string };
   /** Optional explicit worker effort inherited from the coordinating turn. */
   effort?: string;
   onModel?: (model: string) => void;

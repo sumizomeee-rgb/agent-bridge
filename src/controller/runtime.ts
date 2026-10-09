@@ -7,6 +7,8 @@ import { ControllerStore } from './store.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerWake, ControllerWorker } from './runtime-types.js';
 
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
+const workspaceWorkerInstruction = '你是桥已登记并管理的工作区上下文调查子 Agent。只完成下面的只读调查，不执行新的工程或生活任务，不自行登记桥后台任务、发 Discord 消息或伪造完成回执。\n\n';
+const workspacePrompt = '这是当前父会话的一次性工作区上下文调查。只读当前工作目录中的 AGENTS.md、README.md；若理解它们确实需要，可读取它们明确指向的简短本机导航。不要扫描技能目录、自动读取远程工作习惯全文、连接远程电脑、联网检查、修改文件或启动新工作。缺失文件如实说明，不猜测环境。返回精简的可复用上下文：用户职责和偏好、当前电脑用途、已声明的主机/SSH/浏览器等入口与状态、后续按需阅读的指导路径。区分文件中已声明的信息与本次实际核实的信息，保留必要路径，不复制冗长指南；仅将调查结果作为本任务回执返回。';
 const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_list_workers']);
 function pathKey(value: string): string { const result = resolve(value); return process.platform === 'win32' ? result.toLowerCase() : result; }
 function text(value: unknown, label: string, limit: number): string {
@@ -110,13 +112,24 @@ export class ControllerRuntime {
     }, this.callbacks.pollIntervalMs ?? 1000);
     this.timer.unref();
   }
+  /** One trusted, silent workspace-reading child per parent, including parents created before this feature. */
+  async initializeWorkspace(turn: AgentTurn): Promise<unknown> {
+    return this.dispatch(turn, 'bridge_start_worker', { title: '工作区上下文', prompt: workspacePrompt, imagePaths: [] }, undefined, true);
+  }
   async invoke(turn: AgentTurn, name: string, input: unknown, callId?: string): Promise<unknown> {
+    return this.dispatch(turn, name, input, callId);
+  }
+  private async dispatch(turn: AgentTurn, name: string, input: unknown, callId?: string, workspaceInitialization = false): Promise<unknown> {
     if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
     if (!tools.has(name)) throw new Error('未知桥调度工具');
-    const origin = this.origin(turn);
-    const key = callId === undefined ? null : `${origin.conversationId}:${text(callId, '工具调用编号', 512)}`;
+    const contextOrigin = this.origin(turn);
+    const origin: TaskOrigin = workspaceInitialization ? { ...contextOrigin, purpose: 'workspace-context' } : contextOrigin;
+    const key = workspaceInitialization || callId === undefined ? null : `${origin.conversationId}:${text(callId, '工具调用编号', 512)}`;
     const fingerprint = createHash('sha256').update(canonical({ name, input })).digest('hex');
-    if (key) {
+    if (workspaceInitialization) {
+      const previous = this.store.getWorkspaceInitialization(origin.conversationId);
+      if (previous !== undefined) { if (!this.started) await this.start(); return previous; }
+    } else if (key) {
       const previous = this.store.getCall(key, fingerprint);
       if (previous !== undefined) return previous;
     }
@@ -179,7 +192,8 @@ export class ControllerRuntime {
         }), wakes: this.store.wakes(origin.conversationId).filter(wake => wake.origin.userId === origin.userId && wake.status === 'pending')
           .map(wake => ({ wakeId: wake.id, dueAt: wake.dueAt, text: wake.text })) };
       }
-      if (key) this.store.saveCall(key, fingerprint, result);
+      if (workspaceInitialization) this.store.saveWorkspaceInitialization(origin.conversationId, result);
+      else if (key) this.store.saveCall(key, fingerprint, result);
       return result;
     });
     if (!this.started) await this.start();
@@ -228,7 +242,7 @@ export class ControllerRuntime {
       const conversation: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent, nativeId: worker.nativeId,
         model: worker.model, actualModel: worker.actualModel, actualEffort: worker.effort, title: worker.title, cwd: worker.cwd,
         createdAt: worker.createdAt, updatedAt: this.timestamp() };
-      const turn: AgentTurn = { conversation, text: workerInstruction + job.prompt, imagePaths: job.imagePaths,
+      const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction) + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), signal: state.abort.signal, onProgress: () => {},
         onNativeId: nativeId => this.nativeId(worker, nativeId),
         onModel: actualModel => { const current = this.store.getWorker(worker.id)!; current.actualModel = actualModel; this.store.saveWorker(current); },

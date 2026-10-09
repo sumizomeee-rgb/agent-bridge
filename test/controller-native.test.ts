@@ -105,6 +105,41 @@ test('background evidence uses standalone tool output and may quietly continue',
     assert.deepEqual(start.input, []); assert.deepEqual(start.toolOutput, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
   } finally { await s.cleanup(); }
 });
+
+test('workspace bootstrap stays private and feeds evidence into the same native conversation', async () => {
+  const s = setup(); try {
+    const turn = s.makeTurn();
+    turn.event = { kind: 'workspace-context', toolName: 'bridge_workspace_context', text: '工位 11032022110008；工作习惯读取 MyHaruSkills README。' };
+    const initialized = await s.adapter.run(turn);
+    assert.equal(s.published.length, 0);
+    const params = s.transports[0]!.written.find(message => message.method === 'turn/start')!.params as JsonObject;
+    assert.deepEqual(params.input, []);
+    assert.deepEqual(params.toolOutput, { name: 'bridge_workspace_context', namespace: null, output: turn.event.text });
+    const next = s.makeTurn(); next.conversation.nativeId = initialized.nativeId;
+    const result = await s.adapter.run(next);
+    assert.equal(result.nativeId, initialized.nativeId);
+    assert.equal(s.transports.length, 1);
+    assert.equal(s.published.length, 1);
+  } finally { await s.cleanup(); }
+});
+
+test('workspace evidence cannot cause a new task, wake, cancellation or public attachment', async () => {
+  const s = setup(); s.setMode('hold'); try {
+    const turn = s.makeTurn(); turn.event = { kind: 'workspace-context', toolName: 'bridge_workspace_context', text: 'Internal navigation only.' };
+    const pending = s.adapter.run(turn);
+    await until(() => s.transports[0]?.turns === 1);
+    const transport = s.transports[0]!;
+    for (const [index, name] of ['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_send_user'].entries()) {
+      tool(transport, 3000 + index, `bootstrap-${index}`, name, { text: 'must stay private', attachmentPaths: [join(s.dir, 'private.txt')] });
+    }
+    await until(() => transport.written.filter(message => typeof message.id === 'number' && message.id >= 3000).length === 5);
+    transport.complete(); await pending;
+    assert.deepEqual(s.invokes, []); assert.deepEqual(s.published, []);
+    for (const response of transport.written.filter(message => typeof message.id === 'number' && message.id >= 3000)) {
+      assert.ok(JSON.stringify(response).includes('internal evidence only'));
+    }
+  } finally { await s.cleanup(); }
+});
 test('CC Switch changes rebuild the process while retaining the original native session', async () => {
   const s = setup(); try {
     const turn = s.makeTurn(), first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;

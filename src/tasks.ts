@@ -10,6 +10,8 @@ export interface TaskOrigin {
   conversationId: string; userId: string; channelId: string; originMessageId: string;
   nativeId: string | null; agent: AgentName; cwd: string;
   helperPath?: string; nodePath?: string;
+  /** Program-created internal workspace initialization, never a user/tool parameter. */
+  purpose?: 'workspace-context';
 }
 export interface TaskContextFile {
   version: 1; registryDir: string; contextId: string; token: string; helperPath: string; nodePath: string;

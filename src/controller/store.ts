@@ -46,6 +46,12 @@ export class ControllerStore {
     if (String(row.fingerprint) !== fingerprint) throw new Error('重复工具调用的参数发生变化，拒绝再次派发');
     return JSON.parse(String(row.result_json));
   }
+  getWorkspaceInitialization(conversationId: string): unknown | undefined {
+    return this.getCall(`workspace-context:${conversationId}`, 'workspace-context-once');
+  }
+  saveWorkspaceInitialization(conversationId: string, result: unknown): void {
+    this.saveCall(`workspace-context:${conversationId}`, 'workspace-context-once', result);
+  }
   saveCall(id: string, fingerprint: string, result: unknown): void {
     this.db.prepare('INSERT INTO controller_calls (id,fingerprint,result_json) VALUES (?,?,?)').run(id, fingerprint, JSON.stringify(result));
   }

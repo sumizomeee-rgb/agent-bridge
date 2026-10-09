@@ -58,6 +58,119 @@ async function launch(runtime: ControllerRuntime, turn: AgentTurn, args: Record<
   return await runtime.invoke(turn, 'bridge_start_worker', { title: '温度调查', prompt: '检查温度', ...args }, callId) as Handle;
 }
 
+test('workspace initialization uses one durable child with the parent backend/model/effort and ordinary counts/receipts', async () => {
+  const f = fixture(); f.turn.imagePaths = [join(f.dir, 'unrelated-user-picture.png')]; f.turn.text = 'USER_TASK_MUST_NOT_BE_EXECUTED'; f.turn.effort = 'high';
+  try {
+    const [first, duplicate] = await Promise.all([f.runtime.initializeWorkspace(f.turn), f.runtime.initializeWorkspace(f.turn)]) as Handle[];
+    assert.deepEqual(duplicate, first); await flush();
+    assert.equal(f.runtime.store.workers().length, 1); assert.equal(f.runtime.store.jobs().length, 1); assert.equal(f.codex.turns.length, 1);
+    const worker = f.runtime.store.getWorker(first!.workerId)!; const job = f.runtime.store.getJob(first!.jobId)!;
+    assert.equal(worker.origin.purpose, 'workspace-context'); assert.equal(job.origin.conversationId, 'parent-A');
+    assert.equal(job.origin.nativeId, 'native-parent'); assert.equal(job.origin.channelId, 'dm-A');
+    const child = f.codex.turns[0]!;
+    assert.equal(child.conversation.model, 'gpt-6.1-sol'); assert.equal(child.effort, 'high'); assert.deepEqual(child.imagePaths, []);
+    assert.match(child.text, /AGENTS\.md、README\.md/); assert.match(child.text, /不要扫描技能目录、自动读取远程工作习惯全文/);
+    assert.match(child.text, /不自行登记桥后台任务、发 Discord 消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
+    assert.equal(child.taskContextPath, undefined); assert.equal(child.onPublicMessage, undefined); assert.equal(f.registry.activeCount('parent-A'), 1);
+    f.codex.finish(first!.workerId, '主机和导航已阅读；Chrome 登录状态仅依据 README 声明。'); await flush();
+    assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.events.length, 1); assert.equal(f.events[0]!.purpose, 'workspace-context');
+    assert.equal(f.events[0]!.displayText, '主机和导航已阅读；Chrome 登录状态仅依据 README 声明。'); assert.deepEqual(f.errors, []);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('completed workspace initialization survives restart and later model/effort changes without rereading', async () => {
+  const f = fixture(); let second: ControllerRuntime | undefined;
+  try {
+    const first = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush(); f.codex.finish(first.workerId, '已整理工作区'); await flush();
+    await f.runtime.close(); f.turn.conversation.model = 'another-model'; f.turn.effort = 'low';
+    const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
+    assert.deepEqual(await second.initializeWorkspace(f.turn), first); await flush();
+    assert.equal(adapter.turns.length, 0); assert.equal(second.store.workers().length, 1); assert.equal(second.store.getJob(first.jobId)?.status, 'completed');
+    assert.equal(f.events.length, 1); assert.equal(f.registry.activeCount('parent-A'), 0);
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('unknown workspace initialization remains uncertain after restart instead of starting another child', async () => {
+  const f = fixture(); let second: ControllerRuntime | undefined;
+  try {
+    const first = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush(); await f.runtime.close();
+    const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
+    await second.start(); assert.deepEqual(await second.initializeWorkspace(f.turn), first); await flush();
+    assert.equal(adapter.turns.length, 0); assert.equal(second.store.getJob(first.jobId)?.status, 'uncertain'); assert.equal(second.store.workers().length, 1);
+    assert.equal(f.events.length, 1); assert.equal(f.events[0]!.purpose, 'workspace-context'); assert.equal(f.events[0]!.status, 'failed');
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('failed workspace initialization is not retried by later human messages', async () => {
+  const f = fixture();
+  try {
+    const first = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush(); f.codex.terminate(first.workerId); await flush();
+    assert.equal(f.runtime.store.getJob(first.jobId)?.status, 'failed'); assert.equal(f.events[0]!.purpose, 'workspace-context');
+    assert.deepEqual(await f.runtime.initializeWorkspace(f.turn), first); await flush();
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.runtime.store.jobs().length, 1); assert.equal(f.registry.activeCount('parent-A'), 0);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('a persisted initialization queued before process startup resumes its single saved dispatch', async () => {
+  const f = fixture(); let second: ControllerRuntime | undefined;
+  try {
+    await f.runtime.close(); const store = new ControllerStore(f.dir);
+    const origin = { ...f.registry.getContextOrigin(JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile), purpose: 'workspace-context' as const };
+    const handle: Handle = { workerId: 'workspace-queued', jobId: randomUUID(), status: 'queued' };
+    store.transaction(() => {
+      store.addWorker({ id: handle.workerId, origin, agent: 'codex', model: 'gpt-6.1-sol', actualModel: null, effort: 'medium', cwd: f.dir,
+        title: '工作区上下文', nativeId: null, imagePaths: [], wakeAllowed: true, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+      store.addJob({ id: handle.jobId, workerId: handle.workerId, origin, prompt: '只读 AGENTS.md 与 README.md', imagePaths: [], status: 'queued',
+        taskId: null, result: null, cancelReason: null, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+      store.saveWorkspaceInitialization('parent-A', handle);
+    }); store.close();
+    const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
+    assert.deepEqual(await second.initializeWorkspace(f.turn), handle); await flush();
+    assert.equal(adapter.turns.length, 1); assert.equal(adapter.turns[0]!.conversation.id, handle.workerId); assert.equal(second.store.workers().length, 1);
+    assert.equal(f.registry.activeCount('parent-A'), 1); adapter.finish(handle.workerId, '恢复了唯一调查任务'); await flush();
+    assert.equal(f.events.length, 1); assert.equal(f.events[0]!.purpose, 'workspace-context'); assert.equal(f.registry.activeCount('parent-A'), 0);
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('a new parent initializes independently using its selected Claude alias and origin while an old parent stays deduplicated', async () => {
+  const f = fixture();
+  try {
+    const first = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush(); f.codex.finish(first.workerId); await flush();
+    const context = f.registry.createContext({ conversationId: 'parent-new', userId: 'user-A', channelId: 'dm-A', originMessageId: 'new-message',
+      nativeId: null, agent: 'claude', cwd: f.dir });
+    const next: AgentTurn = { ...f.turn, taskContextPath: context.contextPath, effort: 'low', conversation: {
+      ...f.turn.conversation, id: 'parent-new', nativeId: null, agent: 'claude', model: 'haiku' } };
+    const second = await f.runtime.initializeWorkspace(next) as Handle; await flush();
+    assert.notEqual(second.workerId, first.workerId); assert.equal(f.claude.turns.length, 1); assert.equal(f.claude.turns[0]!.conversation.model, 'haiku');
+    assert.equal(f.claude.turns[0]!.effort, 'low'); assert.equal(f.runtime.store.getJob(second.jobId)!.origin.conversationId, 'parent-new');
+    assert.equal(f.runtime.store.getJob(second.jobId)!.origin.nativeId, null); assert.equal(f.registry.activeCount('parent-new'), 1);
+    f.claude.finish(second.workerId); await flush(); assert.deepEqual(await f.runtime.initializeWorkspace(f.turn), first);
+    assert.equal(f.runtime.store.workers().length, 2); assert.equal(f.events[1]!.purpose, 'workspace-context');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('workspace initialization requires a matching trusted context before writing its once marker', async () => {
+  const f = fixture();
+  try {
+    await assert.rejects(f.runtime.initializeWorkspace({ ...f.turn, taskContextPath: undefined }), /可信任务上下文/);
+    await assert.rejects(f.runtime.initializeWorkspace({ ...f.turn, conversation: { ...f.turn.conversation, id: 'untrusted-parent' } }), /不匹配/);
+    assert.equal(f.runtime.store.getWorkspaceInitialization('parent-A'), undefined); assert.equal(f.runtime.store.workers().length, 0);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('workspace once markers use a separate persistent key and roll back together with the dispatch transaction', async () => {
+  const f = fixture(); let store: ControllerStore | undefined;
+  try {
+    const handle = { workerId: 'saved-worker', jobId: 'saved-job', status: 'queued' };
+    f.runtime.store.saveCall('parent-A:workspace-context', 'native-call', { native: true });
+    assert.throws(() => f.runtime.store.transaction(() => { f.runtime.store.saveWorkspaceInitialization('parent-A', handle); throw new Error('simulate-crash'); }), /simulate-crash/);
+    assert.equal(f.runtime.store.getWorkspaceInitialization('parent-A'), undefined);
+    f.runtime.store.saveWorkspaceInitialization('parent-A', handle); await f.runtime.close(); store = new ControllerStore(f.dir);
+    assert.deepEqual(store.getWorkspaceInitialization('parent-A'), handle); assert.deepEqual(store.getCall('parent-A:workspace-context', 'native-call'), { native: true });
+    assert.equal(store.getWorkspaceInitialization('parent-B'), undefined);
+  } finally { store?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
 test('dispatch returns before child completion; one child serializes turns and preserves session/model/effort', async () => {
   const f = fixture();
   try {

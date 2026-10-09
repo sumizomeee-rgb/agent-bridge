@@ -155,6 +155,8 @@ manager = new SessionManager(config, adapters, {
     } : undefined),
 }, { taskRegistry: tasks, ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
   ...(runtime ? { onStop: id => runtime.cancelConversation(id), onDetach: id => runtime.detachConversation(id),
+    onInitializeWorkspace: turn => runtime.initializeWorkspace(turn),
+    onInitializationError: (_conversation, error) => log('workspace initialization: ' + safeError(error)),
     controllerSeed: conversation => migrationSeeds.get(conversation.id) ?? '' } : {}),
 });
 for (const channel of manager.knownChannels()) if (config.allowedUserIds.includes(channel.userId)) ingress.seedChannel(channel);
