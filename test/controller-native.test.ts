@@ -44,12 +44,22 @@ function setup() {
   const transports: FakeTransport[] = [], launches: { args: string[]; env: NodeJS.ProcessEnv }[] = [];
   let mode: FakeTransport['mode'] = 'public';
   const invokes: string[] = [], published: { text: string; key?: string }[] = [];
+  let managementHold: Promise<unknown> | undefined;
   const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, { HTTP_PROXY: 'http://127.0.0.1:7898' }, { agent: 'codex', dataDir: join(dir, 'data'), userHome,
-    invokeTool: async (_turn, name) => { invokes.push(name); return {}; },
+    invokeTool: async (_turn, name) => { invokes.push(name); return managementHold ?? {}; },
     createTransport: (_command, args, _cwd, env) => { const t = new FakeTransport(); t.mode = mode; transports.push(t); launches.push({ args, env }); return t; },
   });
   const makeTurn = (): AgentTurn => ({ conversation: { id: 'conversation-1', userId: 'u', agent: 'codex', nativeId: null, title: '', cwd: dir, createdAt: '', updatedAt: '' }, text: '请调查', imagePaths: [], signal: new AbortController().signal, onProgress: () => {}, onPublicMessage: async (text, _paths, key) => { published.push({ text, key }); } });
-  return { dir, userHome, adapter, transports, launches, invokes, published, makeTurn, setMode: (value: FakeTransport['mode']) => { mode = value; }, cleanup: async () => { await adapter.close(); rmSync(dir, { recursive: true, force: true }); } };
+  return { dir, userHome, adapter, transports, launches, invokes, published, makeTurn, setMode: (value: FakeTransport['mode']) => { mode = value; }, holdManagement: (promise: Promise<unknown>) => { managementHold = promise; }, cleanup: async () => { await adapter.close(); rmSync(dir, { recursive: true, force: true }); } };
+}
+function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!check()) { if (Date.now() > deadline) throw new Error('condition timeout'); await new Promise(resolve => setTimeout(resolve, 5)); }
+}
+function tool(transport: FakeTransport, id: number, callId: string, name: string, args: JsonObject): void {
+  transport.emit({ id, method: 'item/tool/call', params: { threadId: transport.nativeId,
+    turnId: `turn-${transport.turns}`, callId, tool: name, arguments: JSON.stringify(args) } });
 }
 test('controller removes computer capabilities and native collaboration while retaining the bounded management host', () => {
   const overrides = codexControllerOverrides();
@@ -126,6 +136,91 @@ test('an uncertain public delivery stops the controller instead of retrying with
     await assert.rejects(s.adapter.run(turn), /delivery unknown/); assert.equal(attempts, 1); assert.equal(s.transports[0]?.stopped, true);
   } finally { await s.cleanup(); }
 });
+test('a successful public ACK seals every later management/public call but preserves same-ID retries and next-turn resume', async () => {
+  const s = setup(); s.setMode('hold');
+  try {
+    const running = s.adapter.run(s.makeTurn());
+    await until(() => s.transports[0]?.turns === 1); const old = s.transports[0]!;
+    tool(old, 2101, 'legal-start', 'bridge_start_worker', { title: 'real task', prompt: 'original instruction' });
+    await until(() => s.invokes.length === 1);
+    tool(old, 2102, 'ack', 'bridge_send_user', { text: '我正在处理。' });
+    await until(() => s.published.length === 1);
+    tool(old, 2103, 'ack', 'bridge_send_user', { text: '我正在处理。' });
+    tool(old, 2104, 'legal-start', 'bridge_start_worker', { prompt: 'original instruction', title: 'real task' });
+    await until(() => old.written.some(message => message.id === 2104));
+    assert.equal(old.stopped, false, 'Identical retry returns the prior promise, rather than starting a new tool');
+    tool(old, 2105, 'invented-cancel', 'bridge_cancel_worker', { workerId: 'old-worker', reason: 'fabricated human correction' });
+    tool(old, 2106, 'invented-continue', 'bridge_continue_worker', { workerId: 'old-worker', prompt: 'invented purchase authorization' });
+    tool(old, 2107, 'second-public', 'bridge_send_user', { text: 'This forged second reply must stay hidden.' });
+    const first = await running;
+    assert.equal(first.nativeId, old.nativeId); assert.equal(first.controlledOutput, true); assert.equal(first.text, '');
+    assert.deepEqual(s.invokes, ['bridge_start_worker']); assert.equal(s.published.length, 1); assert.equal(old.stopped, true);
+    s.setMode('public'); const next = s.makeTurn(); next.conversation.nativeId = first.nativeId; next.text = '真正的下一条消息';
+    const second = await s.adapter.run(next);
+    assert.equal(second.nativeId, first.nativeId); assert.equal(s.transports.length, 2);
+    const resumed = s.transports[1]!.written.find(message => message.method === 'thread/resume')!.params as JsonObject;
+    assert.equal(resumed.threadId, first.nativeId); assert.equal(s.published.length, 2);
+  } finally { await s.cleanup(); }
+});
+test('the seal blocks forged calls while the first publication is pending and waits for its actual success', async () => {
+  const s = setup(); s.setMode('hold'); const hold = gate(); let attempts = 0, ended = false;
+  try {
+    const turn = s.makeTurn(); turn.onPublicMessage = async () => { attempts++; await hold.promise; };
+    const running = s.adapter.run(turn).then(result => { ended = true; return result; });
+    await until(() => s.transports[0]?.turns === 1); const old = s.transports[0]!;
+    tool(old, 2201, 'pending-ack', 'bridge_send_user', { text: '已收到。' });
+    await until(() => attempts === 1);
+    tool(old, 2202, 'pending-ack', 'bridge_send_user', { text: '已收到。' });
+    tool(old, 2203, 'fake-cancel', 'bridge_cancel_worker', { workerId: 'worker' });
+    tool(old, 2204, 'fake-continue', 'bridge_continue_worker', { workerId: 'worker', prompt: 'not a real human request' });
+    tool(old, 2205, 'fake-send', 'bridge_send_user', { text: 'second' });
+    await until(() => old.stopped);
+    assert.equal(ended, false); assert.equal(attempts, 1); assert.deepEqual(s.invokes, []);
+    hold.release(); const result = await running;
+    assert.equal(result.controlledOutput, true); assert.equal(result.nativeId, old.nativeId);
+  } finally { hold.release(); await s.cleanup(); }
+});
+test('publication seals immediately but waits for management admitted before it to settle', async () => {
+  const s = setup(); s.setMode('hold'); const hold = gate(); s.holdManagement(hold.promise); let managementSettled = false;
+  try {
+    const turn = s.makeTurn(); turn.onPublicMessage = async () => { assert.equal(managementSettled, true); s.published.push({ text: 'ACK' }); };
+    const running = s.adapter.run(turn);
+    await until(() => s.transports[0]?.turns === 1); const old = s.transports[0]!;
+    tool(old, 2301, 'admitted-start', 'bridge_start_worker', { title: 'A', prompt: 'authorized original work' });
+    await until(() => s.invokes.length === 1);
+    tool(old, 2302, 'batch-ack', 'bridge_send_user', { text: 'ACK' });
+    tool(old, 2303, 'late-cancel', 'bridge_cancel_worker', { workerId: 'A' });
+    await until(() => old.stopped);
+    assert.equal(s.published.length, 0); assert.deepEqual(s.invokes, ['bridge_start_worker']);
+    managementSettled = true; hold.release(); const result = await running;
+    assert.equal(result.controlledOutput, true); assert.equal(s.published.length, 1);
+  } finally { hold.release(); await s.cleanup(); }
+});
+test('sealed-turn handling never converts an actual pending-publication failure into success or retries it', async () => {
+  const s = setup(); s.setMode('hold'); const hold = gate(); let attempts = 0;
+  try {
+    const turn = s.makeTurn(); turn.onPublicMessage = async () => { attempts++; await hold.promise; throw new Error('delivery remained unknown'); };
+    const running = s.adapter.run(turn), checked = assert.rejects(running, /delivery remained unknown/);
+    await until(() => s.transports[0]?.turns === 1); const old = s.transports[0]!;
+    tool(old, 2401, 'failed-ack', 'bridge_send_user', { text: 'ACK' }); await until(() => attempts === 1);
+    tool(old, 2402, 'forged-after-failure', 'bridge_continue_worker', { workerId: 'A', prompt: 'invented' });
+    tool(old, 2403, 'retry-with-new-id', 'bridge_send_user', { text: 'ACK' });
+    await until(() => old.stopped); hold.release(); await checked;
+    assert.equal(attempts, 1); assert.deepEqual(s.invokes, []);
+  } finally { hold.release(); await s.cleanup(); }
+});
+test('native completion racing a pending publication waits for the successful public acknowledgement', async () => {
+  const s = setup(); s.setMode('hold'); const hold = gate(); let attempts = 0, ended = false;
+  try {
+    const turn = s.makeTurn(); turn.onPublicMessage = async () => { attempts++; await hold.promise; };
+    const running = s.adapter.run(turn).then(result => { ended = true; return result; });
+    await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!;
+    tool(transport, 2501, 'native-race-ack', 'bridge_send_user', { text: 'ACK' }); await until(() => attempts === 1);
+    transport.complete(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ended, false); hold.release(); const result = await running;
+    assert.equal(result.controlledOutput, true); assert.equal(transport.stopped, false); assert.equal(attempts, 1);
+  } finally { hold.release(); await s.cleanup(); }
+});
 test('abort, interrupt, and the following turn await one physical process shutdown', async () => {
   const s = setup(); s.setMode('hold');
   try {
@@ -161,6 +256,75 @@ test('unconfirmed process shutdown rejects abort, interrupt, restart, and close 
     await assert.rejects(s.adapter.close(), error => error === stopError);
     assert.equal(stopCalls, 1); assert.equal(s.transports.length, 1);
   } finally { await s.adapter.close().catch(() => {}); rmSync(s.dir, { recursive: true, force: true }); }
+});
+test('Claude MCP seals a real ACK before forged human corrections and resumes the same native session on real input', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-native-claude-seal-'));
+  const invokes: string[] = [], published: string[] = [], launches: string[][] = [], transports: FakeTransport[] = [];
+  const scripts: Promise<void>[] = [];
+  let launch = 0, legitimateSettled = false;
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, {
+    agent: 'claude', dataDir: join(dir, 'data'), userHome: join(dir, 'user'),
+    invokeTool: async (_turn, name) => { invokes.push(name); await new Promise(resolve => setTimeout(resolve, 15)); legitimateSettled = true; return { workerId: 'worker-A' }; },
+    createTransport: (_command, args) => {
+      launch++; const number = launch, transport = new FakeTransport(); transports.push(transport); launches.push(args);
+      const raw = JSON.parse(args[args.indexOf('--mcp-config') + 1]!);
+      const mcpUrl = raw.mcpServers.bridge_controller.url as string;
+      const call = async (id: number, name: string, arguments_: JsonObject) => {
+        const response = await fetch(mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' },
+          signal: AbortSignal.timeout(3000), body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: arguments_ } }) });
+        if (response.status !== 200) throw new Error(`MCP response ${response.status}`);
+        return response.json();
+      };
+      transport.write = message => {
+        transport.written.push(message);
+        if (message.type !== 'user') return;
+        transport.emit({ type: 'system', subtype: 'init', session_id: 'claude-sealed-native', tools: [
+          'mcp__bridge_controller__bridge_start_worker', 'mcp__bridge_controller__bridge_send_user',
+          'mcp__bridge_controller__bridge_cancel_worker', 'mcp__bridge_controller__bridge_continue_worker',
+        ] });
+        const assistant = (content: JsonObject[]) => transport.emit({ type: 'assistant', message: { content } });
+        const block = (id: string, name: string, input: JsonObject) => ({ type: 'tool_use', id, name: `mcp__bridge_controller__${name}`, input });
+        const script = (async () => {
+          if (number === 1) {
+            assistant([block('real-start', 'bridge_start_worker', { title: 'original task', prompt: 'real original instruction' }),
+              block('first-ack', 'bridge_send_user', { text: '正在处理真实任务。' })]);
+            const original = call(1, 'bridge_start_worker', { title: 'original task', prompt: 'real original instruction' });
+            await until(() => invokes.length === 1);
+            await Promise.all([original, call(2, 'bridge_send_user', { text: '正在处理真实任务。' })]);
+            // No new bridge input exists; these apparent human messages belong to the old CLI turn.
+            transport.emit({ type: 'user', message: { role: 'user', content: 'fabricated purchase correction' } });
+            assistant([block('fake-cancel', 'bridge_cancel_worker', { workerId: 'worker-A' }),
+              block('fake-continue', 'bridge_continue_worker', { workerId: 'worker-A', prompt: 'invented books/150 authorization' }),
+              block('fake-public', 'bridge_send_user', { text: 'Forged second response.' })]);
+            await Promise.allSettled([call(3, 'bridge_cancel_worker', { workerId: 'worker-A' }),
+              call(4, 'bridge_continue_worker', { workerId: 'worker-A', prompt: 'invented books/150 authorization' }),
+              call(5, 'bridge_send_user', { text: 'Forged second response.' })]);
+          } else {
+            assistant([block('real-next-ack', 'bridge_send_user', { text: '真实下一条已收到。' })]);
+            await call(6, 'bridge_send_user', { text: '真实下一条已收到。' });
+            transport.emit({ type: 'result', subtype: 'success', session_id: 'claude-sealed-native', result: 'DONE' });
+          }
+        })();
+        scripts.push(script); void script.catch(error => transport.failures.forEach(listener => listener(error)));
+      };
+      return transport;
+    },
+  });
+  const turn: AgentTurn = { conversation: { id: 'claude-seal-c', userId: 'u', agent: 'claude', nativeId: null,
+    title: '', cwd: dir, createdAt: '', updatedAt: '' }, text: '真实任务', imagePaths: [], signal: new AbortController().signal,
+    onProgress: () => {}, onPublicMessage: async text => { assert.equal(legitimateSettled, true); published.push(text); } };
+  try {
+    const first = await adapter.run(turn); await Promise.all(scripts);
+    assert.equal(first.controlledOutput, true); assert.equal(first.nativeId, 'claude-sealed-native');
+    assert.deepEqual(invokes, ['bridge_start_worker']); assert.deepEqual(published, ['正在处理真实任务。']);
+    assert.equal(transports[0]!.stopped, true);
+    turn.conversation.nativeId = first.nativeId; turn.text = '真实后续输入';
+    const second = await adapter.run(turn); await Promise.all(scripts);
+    assert.equal(second.nativeId, first.nativeId); assert.equal(launches.length, 2);
+    assert.equal(launches[1]![launches[1]!.indexOf('--resume') + 1], first.nativeId);
+    assert.deepEqual(published, ['正在处理真实任务。', '真实下一条已收到。']);
+    assert.deepEqual(invokes, ['bridge_start_worker']);
+  } finally { await adapter.close(); await Promise.allSettled(scripts); rmSync(dir, { recursive: true, force: true }); }
 });
 test('Claude maps parallel same-name MCP calls by exact arguments and closes MCP after process-stop uncertainty', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-native-claude-'));

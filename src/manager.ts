@@ -310,7 +310,7 @@ export class SessionManager {
         const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true });
         if (current?.agent === agent && current.model) this.store.setModel(target.id, current.model);
         this.activate(message.userId, target);
-        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。旧会话待处理任务已取消。\n原生会话：尚未创建\n目录：${target.cwd}`);
+        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '旧会话待处理消息已取消；已启动子任务完成后仅通知结果。' : '旧会话待处理任务已取消。'}\n原生会话：尚未创建\n目录：${target.cwd}`);
         return;
       }
       case 'cwd': {
@@ -661,7 +661,7 @@ export class SessionManager {
     const active = this.store.getActive(event.userId);
     if (!event.wakeAllowed || active?.id !== event.conversationId) {
       try {
-        await this.sink.sendText(event.channelId, `${notice}\n原会话已停止或切换，仅通知结果，没有唤醒当前会话。\n${event.text.slice(0, 1500)}`);
+        await this.sink.sendText(event.channelId, `${notice}\n原会话已停止或切换，未唤醒当前会话。\n${event.displayText == null ? '结果已保存，请在原会话核对。' : event.displayText.slice(0, 1500)}`);
         registry.markDelivered(event.id);
       } catch (error) { registry.markUncertain(event.id, String(error)); }
       return;

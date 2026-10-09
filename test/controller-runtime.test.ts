@@ -73,6 +73,7 @@ test('dispatch returns before child completion; one child serializes turns and p
     assert.equal(f.registry.activeCount('parent-A'), 1); f.codex.finish(handle.workerId, 'CPU 20%'); await flush();
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.events.length, 2); assert.deepEqual(f.errors, []);
     assert.ok(f.events.every(event => event.nativeId === 'native-parent')); assert.match(f.events[1]!.text, /CPU 20%/);
+    assert.equal(f.events[1]!.displayText, 'CPU 20%'); assert.match(f.events[1]!.text, /workerId:/);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
@@ -180,6 +181,12 @@ test('shutdown stops a running CLI, persists uncertainty, and retains queued wor
     const listed = await second.invoke(f.turn, 'bridge_list_workers', {}) as { workers: { blocked: boolean; lastStatus: string }[] };
     assert.equal(listed.workers[0]?.blocked, true); assert.equal(listed.workers[0]?.lastStatus, 'uncertain');
     assert.equal(second.store.jobs(a.workerId)[0]?.status, 'uncertain');
+    await second.invoke(f.turn, 'bridge_cancel_worker', { workerId: a.workerId, reason: '取消未知任务的排队后续' });
+    assert.equal(second.store.jobs(a.workerId)[1]?.status, 'cancelled');
+    await assert.rejects(second.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '取消后仅查状态' }), error => {
+      assert.ok(error instanceof Error); assert.match(error.message, /旧任务不会自动重做/); assert.doesNotMatch(error.message, /保留/); return true;
+    });
+    assert.equal(adapter.turns.length, 0);
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });
 
@@ -191,7 +198,7 @@ test('overdue alarms survive restart, fire exactly once, and never count as runn
     await f.runtime.close(); f.advance(31000);
     second = new ControllerRuntime(f.config, { codex: new FakeAdapter(), claude: new FakeAdapter() }, f.registry, f.callbacks);
     await second.start(); await second.poll(); await second.poll();
-    assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /查看温度/); assert.equal(f.registry.activeCount('parent-A'), 0);
+    assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /查看温度/); assert.equal(f.events[0]!.displayText, '查看温度'); assert.match(f.events[0]!.text, /wakeId:/); assert.equal(f.registry.activeCount('parent-A'), 0);
     assert.deepEqual(f.counts, []); assert.equal(second.store.wakes()[0]?.status, 'fired');
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });

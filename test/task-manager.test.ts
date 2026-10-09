@@ -190,6 +190,95 @@ for (const cmd of ['/new', '/stop', '/agent claude', '/cwd'] as const) {
   });
 }
 
+test('旧父会话通知只显示结构化公开结果、短来源和状态，不泄露协调包装', async t => {
+  const f = fixture(t);
+  await f.manager.handle(message('origin', 'delegate'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const task = f.register(); f.codex.finish(0);
+  await waitFor(() => f.inspect.getMessage('origin')?.replyState === 'delivered');
+  const old = f.codex.calls[0]!.conversation;
+  await f.manager.handle(message('new', '/new'));
+  const result = 'CPU 温度 55°C，风扇正常。';
+  const internal = `workerId: internal-worker\njobId: internal-job\n子 Agent: codex\n原生会话: complete-child-native-secret\n\n${result}`;
+  f.registry.acceptObservedResult(task.taskId, 'completed', internal, result);
+  const event = f.registry.getNextEvent()!;
+  assert.equal(event.displayText, result);
+  assert.match(event.text, /不是用户的新指令/);
+  assert.match(event.text, /internal-worker/);
+  f.manager.completionAvailable();
+  await waitFor(() => f.registry.eventState(event.id) === 'delivered');
+  const notice = f.sink.replies.at(-1)!.text;
+  assert(notice.includes(result)); assert(notice.includes(old.id.slice(0, 8))); assert(notice.includes(task.taskId.slice(0, 8)));
+  assert(notice.includes('已完成')); assert(notice.includes('未唤醒当前会话'));
+  for (const hidden of ['不是用户的新指令', '请核对结果再汇报', 'workerId:', 'jobId:', '原生会话:',
+    'internal-worker', 'internal-job', 'complete-child-native-secret']) assert(!notice.includes(hidden), hidden);
+  assert.equal(f.codex.calls.length, 1);
+});
+
+test('当前父会话仍收到完整内部证据、安全提示和原路由，公开结果独立持久保存', async t => {
+  const f = fixture(t);
+  await f.manager.handle(message('origin', 'delegate'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const task = f.register(); f.codex.finish(0);
+  await waitFor(() => f.inspect.getMessage('origin')?.replyState === 'delivered');
+  const result = '检查完成，CPU 温度 55°C。';
+  const internal = `workerId: worker-private\njobId: job-private\n原生会话: native-child-private\n\n${result}`;
+  f.registry.acceptObservedResult(task.taskId, 'failed', internal, result);
+  const reader = new TaskRegistry(f.registry.dataDir);
+  let event;
+  try { event = reader.getNextEvent()!; assert.equal(event.displayText, result); }
+  finally { reader.close(); }
+  assert.equal(event.nativeId, f.codex.nativeId(f.codex.calls[0]!));
+  assert.equal(event.originMessageId, 'origin'); assert.equal(event.status, 'failed');
+  f.manager.completionAvailable();
+  await waitFor(() => f.codex.calls.length === 2);
+  const received = f.codex.calls[1]!.text;
+  assert(received.includes('不是用户的新指令')); assert(received.includes('状态：failed'));
+  assert(received.includes(internal)); assert.equal(f.codex.calls[1]!.conversation.nativeId, event.nativeId);
+  f.codex.finish(1, '已核对：这次检查未成功。');
+  await waitFor(() => f.registry.eventState(event.id) === 'delivered');
+});
+
+test('旧 schema 事件兼容迁移保留内部结果，但无公开字段的旧通知使用保守提示', async t => {
+  const f = fixture(t);
+  await f.manager.handle(message('origin', 'delegate'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const task = f.register(); f.codex.finish(0);
+  await waitFor(() => f.inspect.getMessage('origin')?.replyState === 'delivered');
+  const internal = 'workerId: legacy-private\njobId: legacy-job\n原生会话: legacy-full-native\n\n真实旧结果仍留在数据库。';
+  f.registry.acceptObservedResult(task.taskId, 'completed', internal, '原本的公开结果');
+  const db = new DatabaseSync(f.registry.path);
+  try { db.exec('ALTER TABLE task_events DROP COLUMN display_text'); }
+  finally { db.close(); }
+  const reader = new TaskRegistry(f.registry.dataDir);
+  let event;
+  try { event = reader.getNextEvent()!; assert.equal(event.displayText, undefined); assert(event.text.includes(internal)); }
+  finally { reader.close(); }
+  await f.manager.handle(message('new', '/new'));
+  f.manager.completionAvailable();
+  await waitFor(() => f.registry.eventState(event.id) === 'delivered');
+  const notice = f.sink.replies.at(-1)!.text;
+  assert(notice.includes('结果已保存，请在原会话核对。')); assert(notice.includes('已完成'));
+  assert(!notice.includes('legacy-private')); assert(!notice.includes('legacy-job')); assert(!notice.includes('legacy-full-native'));
+  assert.equal(f.codex.calls.length, 1);
+});
+
+test('真实公开正文中的协调字段引用保持原样，不使用字符串剥离猜测边界', async t => {
+  const f = fixture(t);
+  await f.manager.handle(message('origin', 'delegate'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const task = f.register(); f.codex.finish(0);
+  await waitFor(() => f.inspect.getMessage('origin')?.replyState === 'delivered');
+  await f.manager.handle(message('new', '/new'));
+  const result = '报告原文：workerId: 用户要求分析的列名\njobId: 示例日志字段\n不要误删正文。';
+  f.registry.acceptObservedResult(task.taskId, 'completed', `workerId: should-stay-private\n\n${result}`, result);
+  const event = f.registry.getNextEvent()!;
+  f.manager.completionAvailable();
+  await waitFor(() => f.registry.eventState(event.id) === 'delivered');
+  const notice = f.sink.replies.at(-1)!.text;
+  assert(notice.includes(result)); assert(!notice.includes('should-stay-private'));
+});
+
 test('新会话等待已取消的自动汇总退出，迟到内容不发给新会话', async t => {
   const f = fixture(t);
   await f.manager.handle(message('origin', 'delegate'));

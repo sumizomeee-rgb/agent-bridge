@@ -153,7 +153,7 @@ export class ControllerRuntime {
       } else if (name === 'bridge_continue_worker') {
         const args = object(input, ['workerId', 'prompt', 'imagePaths']);
         const worker = this.ownedWorker(origin, args.workerId);
-        if (worker.blocked) throw new Error('此子 Agent 上一轮结果未知，已暂停；不能自动续接旧原生会话。请新起核查子 Agent，确认进程及已发生的操作。旧排队任务保留但不重做。');
+        if (worker.blocked) throw new Error('此子 Agent 上一轮结果未知，已暂停；不能自动续接旧原生会话。请新起核查子 Agent，确认进程及已发生的操作。旧任务不会自动重做。');
         const images = this.images(turn, args.imagePaths, worker);
         const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), images);
         worker.imagePaths = [...new Set([...worker.imagePaths, ...images])]; worker.updatedAt = this.timestamp();
@@ -267,7 +267,7 @@ export class ControllerRuntime {
     const current = this.store.getWorker(worker.id)!;
     if (status === 'uncertain') { current.blocked = true; this.store.saveWorker(current); }
     const changed = this.registry.acceptObservedResult(taskId, terminal,
-      `workerId: ${worker.id}\njobId: ${job.id}\n子 Agent: ${worker.agent}\n原生会话: ${current.nativeId ?? '尚未建立'}\n\n${result}`);
+      `workerId: ${worker.id}\njobId: ${job.id}\n子 Agent: ${worker.agent}\n原生会话: ${current.nativeId ?? '尚未建立'}\n\n${result}`, result);
     await this.count(job.origin.conversationId);
     if (changed) await this.notify(taskId);
   }
@@ -322,7 +322,7 @@ export class ControllerRuntime {
           this.store.setWake(wake.id, 'firing', taskId);
         } finally { this.registry.closeContext(created.contextId); }
       }
-      const changed = this.registry.acceptObservedResult(taskId, 'completed', `这是主控此前登记的预约触发。\nwakeId: ${wake.id}\n预约时间: ${wake.dueAt}\n提示: ${wake.text}`);
+      const changed = this.registry.acceptObservedResult(taskId, 'completed', `这是主控此前登记的预约触发。\nwakeId: ${wake.id}\n预约时间: ${wake.dueAt}\n提示: ${wake.text}`, wake.text);
       this.store.setWake(wake.id, 'fired', taskId);
       // register + complete are synchronous: a sleeping alarm never appears as a running agent.
       if (changed) await this.notify(taskId);
