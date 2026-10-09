@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -33,8 +33,10 @@ class Controller implements AgentAdapter {
   readonly turns: AgentTurn[] = [];
   readonly facts = new Map<string, string>();
   readonly gates = new Map<string, { promise: Promise<void>; release: () => void }>();
-  tryPublicOnContext = false;
   uncontrolledContext = false;
+  contextResultText = 'UNSOLICITED_FALLBACK';
+  contextHook?: (turn: AgentTurn) => Promise<void>;
+  replyText?: (turn: AgentTurn) => string;
   hook?: (turn: AgentTurn) => Promise<void>;
   hold(text: string): () => void {
     let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; });
@@ -46,12 +48,12 @@ class Controller implements AgentAdapter {
     turn.onNativeId?.(nativeId); turn.onModel?.('gpt-6.1-sol'); turn.onReasoningEffort?.('medium');
     if (turn.event?.kind === 'workspace-context') {
       this.facts.set(nativeId, turn.event.text);
-      if (this.tryPublicOnContext) await assert.rejects(turn.onPublicMessage!('UNSOLICITED_INIT_REPLY'), /不发送公开回复/);
-      return { nativeId, text: this.uncontrolledContext ? 'UNSOLICITED_FALLBACK' : 'DONE', controlledOutput: !this.uncontrolledContext };
+      await this.contextHook?.(turn);
+      return { nativeId, text: this.uncontrolledContext ? this.contextResultText : 'DONE', controlledOutput: !this.uncontrolledContext };
     }
     await this.gates.get(turn.text)?.promise;
     await this.hook?.(turn);
-    await turn.onPublicMessage?.(turn.event ? '普通任务结果。' : `收到：${turn.text}`, [], `public-${this.turns.length}`);
+    await turn.onPublicMessage?.(turn.event ? '普通任务结果。' : this.replyText?.(turn) ?? `收到：${turn.text}`, [], `public-${this.turns.length}`);
     return { nativeId, text: 'DONE', controlledOutput: true };
   }
   async interrupt(): Promise<void> { for (const gate of this.gates.values()) gate.release(); }
@@ -136,18 +138,103 @@ test('/new 立即派背景任务；没有隐式用户话，初始化回传可静
   assert.equal(f.inspect.getMessage('new')?.conversationId, null);
   assert.equal(f.initializations[0]!.conversation.nativeId, null);
   await until(() => f.counts.some(item => item.id === 'new' && item.count === 1));
-  f.controller.tryPublicOnContext = true; f.controller.uncontrolledContext = true;
+  f.controller.uncontrolledContext = true;
   f.children.finish(0);
   await until(() => f.controller.turns.length === 1 && f.inspect.getActive('user')!.nativeId !== null);
   const native = f.inspect.getActive('user')!.nativeId;
   assert.equal(f.controller.turns[0]!.event?.kind, 'workspace-context');
   assert.equal(f.controller.turns[0]!.conversation.nativeId, null);
-  assert.equal(f.replies.length, 1, '公开和fallback两条路都保持静默');
+  assert.equal(f.controller.turns[0]!.taskContextPath, undefined, '未有真实 human 时不给初始化回执额外派工能力');
+  assert.equal(f.replies.length, 1, '没有显式发送，fallback保持静默');
   assert(!f.replies.some(item => /UNSOLICITED|看看/.test(item.text)));
   await f.send('hello', '你好'); await until(() => f.controller.turns.length === 2 && f.replies.length === 2);
   assert.equal(f.controller.turns[1]!.conversation.nativeId, native);
   assert.equal(f.controller.turns[1]!.text, '你好');
   assert.equal(f.children.turns.length, 1);
+});
+
+test('相关真实问题先获临时答复，初始化回执仅通过显式发送补答一次且仍属同原生父', async t => {
+  const f = fixture(t); const question = '你了解工位上下文吗？';
+  f.controller.replyText = () => '还在读取工作区导航，暂时未了解工位上下文。';
+  f.controller.uncontrolledContext = true;
+  f.controller.contextHook = async turn => {
+    assert(f.controller.turns.some(previous => !previous.event && previous.text === question));
+    assert.match(turn.event!.text, /WORKSTATION_FACTS/);
+    await turn.onPublicMessage!('补充刚才的问题：已读到工位导航，工作细节以工位仓库 README 为准。', [], 'answer-prior-question');
+    await turn.onPublicMessage!('补充刚才的问题：已读到工位导航，工作细节以工位仓库 README 为准。', [], 'answer-prior-question');
+  };
+  await f.send('question', question);
+  await until(() => f.children.turns.length === 1 && f.replies.length === 1 && f.inspect.getMessage('question')?.state === 'completed');
+  const parent = f.inspect.getActive('user')!; const before = f.inspect.getMessage('question');
+  assert.match(f.replies[0]!.text, /暂时未了解/);
+  f.children.finish(0, 'WORKSTATION_FACTS');
+  await until(() => f.controller.turns.length === 2 && f.registry.queuedEvents().length === 0);
+  assert.equal(f.replies.length, 2, '同一显式发送 key 只投递一份补答，不追加 fallback');
+  assert.match(f.replies[1]!.text, /补充刚才的问题/);
+  assert(!f.replies[1]!.text.includes('WORKSTATION_FACTS'));
+  assert.deepEqual(f.controller.turns.map(turn => turn.event?.kind ?? turn.text), [question, 'workspace-context']);
+  assert.equal(f.controller.turns[1]!.conversation.nativeId, parent.nativeId);
+  assert.equal(f.inspect.getLastDelivery('user', 'dm')!.nativeId, parent.nativeId);
+  assert.deepEqual(f.inspect.getMessage('question'), before, '补答不改写原 human 的处理或投递状态');
+  assert.equal(f.inspect.latestMessage(parent.id)!.id, 'question');
+  assert.equal(f.inspect.knownChannels()[0]!.cursor, 'question');
+  assert.equal(f.inspect.pendingCount(parent.id), 0);
+  assert.equal(f.initializations.length, 1); assert.equal(f.children.turns.length, 1);
+});
+
+test('无关普通问题之后初始化仍静默，未受控最终文字与附件声明不会自动公开', async t => {
+  const f = fixture(t); const question = '今晚吃什么？'; const file = join(f.root, 'private-context.txt');
+  writeFileSync(file, 'PRIVATE_CONTEXT_FACTS');
+  f.controller.uncontrolledContext = true;
+  f.controller.contextResultText = `UNSOLICITED_FALLBACK [附件](<${file}>)`;
+  f.controller.contextHook = async turn => {
+    assert.equal(f.controller.turns.filter(previous => !previous.event)[0]!.text, question);
+    assert.match(turn.event!.text, /PRIVATE_CONTEXT_FACTS/);
+    // This fake controller chooses no explicit publication for an unrelated human question.
+  };
+  await f.send('unrelated', question); await until(() => f.children.turns.length === 1 && f.replies.length === 1);
+  const before = f.inspect.getMessage('unrelated');
+  f.children.finish(0, 'PRIVATE_CONTEXT_FACTS');
+  await until(() => f.controller.turns.length === 2 && f.registry.queuedEvents().length === 0);
+  assert.equal(f.replies.length, 1);
+  assert(!f.replies.some(reply => /PRIVATE_CONTEXT|UNSOLICITED/.test(reply.text)));
+  assert(!f.replies.some(reply => reply.options?.images?.length || reply.options?.files?.length));
+  assert.deepEqual(f.inspect.getMessage('unrelated'), before);
+  assert.equal(f.inspect.knownChannels()[0]!.cursor, 'unrelated');
+  assert.equal(f.children.turns.length, 1);
+});
+
+test('/new 后相关 human 问题驱动 init 轮普通工作，其来源与回执绑定真实 human 而非新会话命令', async t => {
+  const f = fixture(t); const question = '按工位上下文继续核对我刚才的问题';
+  f.controller.contextHook = async turn => {
+    const context = JSON.parse(readFileSync(turn.taskContextPath!, 'utf8')) as TaskContextFile;
+    const origin = f.registry.getContextOrigin(context);
+    assert.equal(origin.originMessageId, 'human-question');
+    assert.equal(origin.conversationId, turn.conversation.id);
+    assert.equal(origin.nativeId, turn.conversation.nativeId);
+    assert.equal(origin.purpose, undefined);
+    await f.runtime.invoke(turn, 'bridge_start_worker', { title: '相关问题继续核对', prompt: 'RELATED_HUMAN_FOLLOWUP' }, 'followup-from-init');
+  };
+  await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
+  await f.send('human-question', question); await until(() => f.replies.length === 2);
+  const parent = f.inspect.getActive('user')!; const before = f.inspect.getMessage('human-question');
+  f.children.finish(0); await until(() => f.children.turns.length === 2 && f.controller.turns.length === 2);
+  const ordinary = f.runtime.store.workers().find(worker => worker.origin.purpose === undefined)!;
+  assert.equal(ordinary.title, '相关问题继续核对');
+  assert.equal(ordinary.origin.originMessageId, 'human-question');
+  assert.equal(ordinary.origin.nativeId, parent.nativeId);
+  assert.equal(f.inspect.getMessage('new')!.conversationId, null);
+  assert.equal(f.replies.length, 2, 'init 结果不会自动公开');
+  const followup = f.children.turns.findIndex(turn => turn.text.includes('RELATED_HUMAN_FOLLOWUP'));
+  f.children.finish(followup, 'RELATED_FOLLOWUP_RESULT');
+  await until(() => f.controller.turns.length === 3 && f.registry.queuedEvents().length === 0 && f.replies.length === 3);
+  assert.equal(f.controller.turns[2]!.event!.kind, 'worker-result');
+  assert.equal(f.controller.turns[2]!.conversation.nativeId, parent.nativeId);
+  assert.match(f.replies[2]!.text, /普通任务结果/);
+  assert.equal(f.runtime.store.jobs().filter(job => job.origin.purpose === undefined)[0]!.status, 'completed');
+  assert.deepEqual(f.inspect.getMessage('human-question'), before);
+  assert.equal(f.inspect.latestMessage(parent.id)!.id, 'human-question');
+  assert.equal(f.initializations.length, 1); assert.equal(f.children.turns.length, 2);
 });
 
 test('/cwd 和新建 Agent 会话各派一次，恢复已有会话不重新调查', async t => {

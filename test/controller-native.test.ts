@@ -106,8 +106,8 @@ test('background evidence uses standalone tool output and may quietly continue',
   } finally { await s.cleanup(); }
 });
 
-test('workspace bootstrap stays private and feeds evidence into the same native conversation', async () => {
-  const s = setup(); try {
+test('workspace bootstrap can finish quietly and feeds evidence into the same native conversation', async () => {
+  const s = setup(); s.setMode('silent'); try {
     const turn = s.makeTurn();
     turn.event = { kind: 'workspace-context', toolName: 'bridge_workspace_context', text: '工位 11032022110008；工作习惯读取 MyHaruSkills README。' };
     const initialized = await s.adapter.run(turn);
@@ -115,6 +115,7 @@ test('workspace bootstrap stays private and feeds evidence into the same native 
     const params = s.transports[0]!.written.find(message => message.method === 'turn/start')!.params as JsonObject;
     assert.deepEqual(params.input, []);
     assert.deepEqual(params.toolOutput, { name: 'bridge_workspace_context', namespace: null, output: turn.event.text });
+    s.transports[0]!.mode = 'public';
     const next = s.makeTurn(); next.conversation.nativeId = initialized.nativeId;
     const result = await s.adapter.run(next);
     assert.equal(result.nativeId, initialized.nativeId);
@@ -123,23 +124,26 @@ test('workspace bootstrap stays private and feeds evidence into the same native 
   } finally { await s.cleanup(); }
 });
 
-test('workspace evidence cannot cause a new task, wake, cancellation or public attachment', async () => {
+test('workspace evidence may explicitly answer an existing question and obeys normal publication sealing', async () => {
   const s = setup(); s.setMode('hold'); try {
-    const turn = s.makeTurn(); turn.event = { kind: 'workspace-context', toolName: 'bridge_workspace_context', text: 'Internal navigation only.' };
+    const turn = s.makeTurn(); turn.event = { kind: 'workspace-context', toolName: 'bridge_workspace_context', text: 'Verified workstation navigation.' };
     const pending = s.adapter.run(turn);
     await until(() => s.transports[0]?.turns === 1);
     const transport = s.transports[0]!;
-    for (const [index, name] of ['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_send_user'].entries()) {
-      tool(transport, 3000 + index, `bootstrap-${index}`, name, { text: 'must stay private', attachmentPaths: [join(s.dir, 'private.txt')] });
-    }
-    await until(() => transport.written.filter(message => typeof message.id === 'number' && message.id >= 3000).length === 5);
-    transport.complete(); await pending;
-    assert.deepEqual(s.invokes, []); assert.deepEqual(s.published, []);
-    for (const response of transport.written.filter(message => typeof message.id === 'number' && message.id >= 3000)) {
-      assert.ok(JSON.stringify(response).includes('internal evidence only'));
-    }
+    tool(transport, 3000, 'status', 'bridge_list_workers', {});
+    await until(() => s.invokes.length === 1);
+    tool(transport, 3001, 'answer', 'bridge_send_user', { text: '已收到导航，工位是 11032022110008。' });
+    await until(() => s.published.length === 1);
+    assert.deepEqual(s.invokes, ['bridge_list_workers']);
+    assert.equal(s.published[0]!.text, '已收到导航，工位是 11032022110008。');
+    tool(transport, 3002, 'late-work', 'bridge_start_worker', { title: 'not admitted', prompt: 'not admitted' });
+    const result = await pending;
+    assert.equal(result.controlledOutput, true);
+    assert.deepEqual(s.invokes, ['bridge_list_workers']);
+    assert.equal(s.published.length, 1);
   } finally { await s.cleanup(); }
 });
+
 test('CC Switch changes rebuild the process while retaining the original native session', async () => {
   const s = setup(); try {
     const turn = s.makeTurn(), first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;

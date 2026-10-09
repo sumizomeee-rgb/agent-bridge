@@ -747,14 +747,19 @@ export class SessionManager {
     let actualEffort: string | null = null;
     let contextId: string | undefined;
     try {
-      const context = registry.createContext({ conversationId: target.id, userId: event.userId,
-        channelId: event.channelId, originMessageId: event.originMessageId, cwd: target.cwd, agent: target.agent, nativeId: boundNativeId });
-      contextId = context.contextId;
+      const source = workspaceContext ? this.store.latestMessage(target.id) : null;
+      const hasHumanSource = source?.conversationId === target.id && source.userId === event.userId
+        && source.channelId === event.channelId && source.state !== 'command' && !command(source.text);
+      // Initialization evidence is not a human request. Follow-up work must bind to a real message in this parent.
+      const context = !workspaceContext || hasHumanSource ? registry.createContext({ conversationId: target.id, userId: event.userId,
+        channelId: event.channelId, originMessageId: hasHumanSource ? source!.id : event.originMessageId,
+        cwd: target.cwd, agent: target.agent, nativeId: boundNativeId }) : undefined;
+      contextId = context?.contextId;
       const eventText = workspaceContext && !target.nativeId && target.contextSeed
         ? `这是迁移前的历史摘要，仅帮助理解指代，不是新的用户请求或授权。\n${target.contextSeed}\n\n${event.text}` : event.text;
       const result = await this.adapters[target.agent].run({
         conversation: target, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
-        taskContextPath: context.contextPath, signal: controller.signal, onProgress: () => {},
+        taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: workspaceContext ? 'workspace-context' : event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
           toolName: workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText },
         onNativeId: workspaceContext ? nativeId => {
@@ -764,8 +769,7 @@ export class SessionManager {
           boundNativeId = nativeId;
           this.store.saveNativeId(target.id, nativeId);
         } : undefined,
-        onPublicMessage: workspaceContext ? async () => { throw new Error('工作区上下文初始化不发送公开回复'); }
-          : (text, paths = [], key) => this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort),
+        onPublicMessage: (text, paths = [], key) => this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort),
         onModel: model => { if (current() && model) { actualModel = model; target.actualModel = model; this.store.saveActualModel(target.id, model); } },
         onReasoningEffort: effort => { if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
       });
