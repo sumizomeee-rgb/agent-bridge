@@ -62,6 +62,7 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
   if (!Number.isSafeInteger(maxFileBytes) || (maxFileBytes as number) <= 0 || (maxFileBytes as number) > 24 * 1024 * 1024) {
     throw new Error('maxFileBytes 必须是 1–25165824 的整数（单个回传文件大小上限）。');
   }
+  if (raw.controllerMode != null && typeof raw.controllerMode !== 'boolean') throw new Error('controllerMode 必须是布尔值');
   const config: BridgeConfig = {
     token, allowedUserIds: raw.allowedUserIds.map(String), defaultAgent,
     workspace: localPath(raw.workspace, '.local/workspace'), proxyUrl,
@@ -70,6 +71,7 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
     attachmentsDir: localPath(raw.attachmentsDir, '.local/data/attachments'),
     logsDir: localPath(raw.logsDir, '.local/logs'), maxImageBytes: 20 * 1024 * 1024,
     defaultModels, modelOptions, maxFileBytes: maxFileBytes as number,
+    controllerMode: raw.controllerMode === true,
   };
   for (const p of [config.workspace, config.dataDir, config.attachmentsDir, config.logsDir]) mkdirSync(p, { recursive: true });
   return config;

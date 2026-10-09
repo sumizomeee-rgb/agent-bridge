@@ -11,6 +11,8 @@ export interface Conversation {
   /** Most recently reported reasoning effort; null means the CLI did not confirm it. */
   actualEffort?: string | null;
   title: string;
+  controllerMode?: boolean;
+  contextSeed?: string | null;
   cwd: string;
   createdAt: string;
   updatedAt: string;
@@ -27,6 +29,8 @@ export interface BridgeConfig {
   attachmentsDir: string;
   logsDir: string;
   maxImageBytes: number;
+  /** Short coordinating turns with independently running execution agents. */
+  controllerMode?: boolean;
   /** Outgoing ordinary files; defaults to 20 MiB, at most 24 MiB. */
   maxFileBytes?: number;
   /** Reference defaults for display/fallback only, never an automatic CLI override. */
@@ -51,10 +55,16 @@ export interface AgentTurn {
   signal: AbortSignal;
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;
+  /** Only this explicit channel may publish coordinating-agent output. */
+  onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string) => Promise<void>;
+  /** Standalone background input, never a human authorization. */
+  event?: { kind: 'worker-result' | 'wake'; toolName?: string; text: string };
+  /** Optional explicit worker effort inherited from the coordinating turn. */
+  effort?: string;
   onModel?: (model: string) => void;
   onReasoningEffort?: (effort: string | null) => void;
 }
-export interface AgentResult { nativeId: string; text: string }
+export interface AgentResult { nativeId: string; text: string; controlledOutput?: boolean }
 export interface AgentAdapter {
   run(turn: AgentTurn): Promise<AgentResult>;
   /** queued 必须表示尚未提交或收到明确拒绝；不确定结果禁止自动重发。 */

@@ -205,6 +205,7 @@ export class CodexAdapter implements AgentAdapter {
         threadId: nativeId, input, cwd: turn.conversation.cwd,
         approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
         ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
+        ...(turn.effort ? { effort: turn.effort } : {}),
       });
       if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 没有返回任务标识。');
       turnId = started.turn.id;

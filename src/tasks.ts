@@ -153,12 +153,28 @@ export class TaskRegistry {
     if (!allowClosed && Number(row.open) !== 1) throw new Error('父 Agent 本轮已结束，不能继续登记新任务');
     return row;
   }
-  register(context: TaskContextFile, title: string): { taskId: string; ticketPath: string } {
+  /** Trusted bridge services resolve the existing capability; the returned origin is a copy. */
+  getContextOrigin(context: TaskContextFile, options: { allowClosed?: boolean } = {}): TaskOrigin {
+    const row = this.authorize(context, options.allowClosed === true);
+    return JSON.parse(String(row.origin_json)) as TaskOrigin;
+  }
+  register(context: TaskContextFile, title: string, requestedTaskId?: string): { taskId: string; ticketPath: string } {
+    if (requestedTaskId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(requestedTaskId)) throw new Error('任务登记 ID 无效');
     if (!title.trim() || Buffer.byteLength(title, 'utf8') > 1024) throw new Error('任务名称为空或过长');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const source = this.authorize(context);
-      const taskId = randomUUID(); const token = randomBytes(32).toString('hex');
+      const taskId = requestedTaskId ?? randomUUID();
+      const existing = this.db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
+      if (existing) {
+        const oldOrigin = JSON.parse(String(existing.origin_json)) as TaskOrigin;
+        const newOrigin = JSON.parse(String(source.origin_json)) as TaskOrigin;
+        const keys: Array<keyof TaskOrigin> = ['conversationId','userId','channelId','originMessageId','nativeId','agent','cwd'];
+        if (existing.title !== title.trim() || keys.some(key => oldOrigin[key] !== newOrigin[key])) throw new Error('任务登记 ID 已用于其他来源或内容');
+        this.db.exec('COMMIT');
+        return { taskId, ticketPath: String(existing.ticket_path) };
+      }
+      const token = randomBytes(32).toString('hex');
       const ticketPath = join(this.dataDir, 'tickets', `${taskId}.json`);
       this.db.prepare(`INSERT INTO tasks (id,context_id,token,title,status,origin_json,ticket_path,wake_allowed,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)`).run(taskId, context.contextId, token, title.trim(), 'registered',
@@ -237,6 +253,10 @@ export class TaskRegistry {
         VALUES (?,?,?,?,?,?,?)`).run(randomUUID(), taskId, String(task.origin_json), limited(text), status, timestamp(), timestamp());
       this.db.exec('COMMIT'); return true;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  /** Disable only this registered task's automatic parent wake. */
+  disableTaskWake(taskId: string): void {
+    this.db.prepare('UPDATE tasks SET wake_allowed=0,updated_at=? WHERE id=?').run(timestamp(), taskId);
   }
   cancelConversation(conversationId: string): void {
     // Wake cancellation is not a claim that the remote worker was killed.

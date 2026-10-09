@@ -99,13 +99,17 @@ test('ordinary source references and file-location links never read or upload re
   assert.deepEqual(await collectOutgoingAttachments(text, join(f.root, 'nonexistent'), 100), { text, images: [], files: [] });
 });
 
-test('an outside, missing, directory or junction file declaration prevents the whole reply from uploading', async t => {
+test('outside physical files upload; missing, directory and junction files prevent partial delivery', async t => {
   const f = await fixture(t);
   const image = join(f.workspace, 'good.png'); await writeFile(image, PNG);
   const privateDir = join(f.root, 'outside'); await mkdir(privateDir);
   const outside = join(privateDir, 'private.txt'); await writeFile(outside, 'private');
   const alias = join(f.workspace, 'shortcut'); await symlink(privateDir, alias, 'junction'); f.links.push(alias);
-  for (const path of [outside, join(f.workspace, 'missing.pdf'), privateDir, join(alias, 'private.txt')]) {
+  const result = await collectOutgoingAttachments(fileMarker(outside), join(f.root, 'missing-workspace'), 100);
+  assert.equal(result.files[0]!.filename, 'private.txt');
+  assert.deepEqual(Buffer.from(result.files[0]!.data), Buffer.from('private'));
+  await assert.rejects(collectOutgoingAttachments(fileMarker(outside), f.workspace, 100, 3), /大小上限/);
+  for (const path of [join(f.workspace, 'missing.pdf'), privateDir, join(alias, 'private.txt')]) {
     await assert.rejects(collectOutgoingAttachments(`${imageMarker(image)}\n${fileMarker(path)}`, f.workspace, 100), /文件回传失败/);
   }
 });

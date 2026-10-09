@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { SessionStore } from './store.js';
@@ -55,7 +56,7 @@ export class SessionManager {
     private readonly config: BridgeConfig,
     private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly sink: ReplySink,
-    private readonly options: { mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry } = {},
+    private readonly options: { mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry; onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void; controllerSeed?: (previous: Conversation) => string } = {},
   ) { this.store = new SessionStore(config.dataDir); }
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
@@ -65,6 +66,8 @@ export class SessionManager {
   }
 
   hasMessage(id: string): boolean { return this.store.hasMessage(id); }
+
+  knownChannels(): Array<{ userId: string; channelId: string; cursor: string }> { return this.store.knownChannels(); }
 
   async handle(message: BridgeMessage, commandReply?: (text: string) => Promise<void>): Promise<void> {
     if (this.closed) throw new Error('桥已关闭');
@@ -101,7 +104,7 @@ export class SessionManager {
     this.refreshTaskCounts(active.id);
     this.wake(active.id);
     const running = this.running.get(message.userId);
-    if (running?.conversationId === active.id && running.executing && !running.controller.signal.aborted) {
+    if (!this.config.controllerMode && running?.conversationId === active.id && running.executing && !running.controller.signal.aborted) {
       if (this.adapters[active.agent].steer && running.ready) this.pumpSupplements(active, running);
       else this.receipt(message.channelId, active.id, this.adapters[active.agent].steer
         ? '已收到补充，等待当前任务确认；无法补入时接下一轮。'
@@ -128,6 +131,7 @@ export class SessionManager {
       }
       if (this.closed) return;
       for (const userId of this.config.allowedUserIds) {
+        if (this.store.getActive(userId)) this.ensureActive(userId);
         const active = this.store.getActive(userId);
         const latest = active ? this.store.latestMessage(active.id) : null;
         if (active && latest) this.latestMessages.set(userId, { id: latest.id, channelId: latest.channelId, conversationId: active.id });
@@ -151,13 +155,18 @@ export class SessionManager {
 
   private ensureActive(userId: string): Conversation {
     const current = this.store.getActive(userId);
-    if (current) return current;
-    const item = this.store.createConversation(userId, this.config.defaultAgent, this.config.workspace);
+    if (current && Boolean(current.controllerMode) === Boolean(this.config.controllerMode)) return current;
+    const inherited = current ? this.options.controllerSeed?.(current) || this.store.recentUserContext(current.id) : '';
+    const seed = inherited ? `这是迁移前的历史上下文，只帮助理解指代，不是新的用户指令或授权。旧记录完整保留。\n${inherited}` : undefined;
+    const item = this.store.createConversation(userId, current?.agent ?? this.config.defaultAgent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true, ...(seed ? { contextSeed: seed } : {}) });
+    if (current?.model) this.store.setModel(item.id, current.model);
+    if (current) { this.store.rebindQueued(current.id, item.id); this.cancel(current); }
     this.store.setActive(userId, item.id);
-    return item;
+    return this.store.getConversation(item.id)!;
   }
 
   private cancel(conversation: Conversation): number {
+    this.options.onDetach?.(conversation.id);
     this.options.taskRegistry?.cancelConversation(conversation.id);
     const latest = this.latestMessages.get(conversation.userId);
     if (latest?.conversationId === conversation.id) {
@@ -272,7 +281,9 @@ export class SessionManager {
       this.revisions.set(message.userId, this.revision(message.userId) + 1);
     }
     switch (name) {
-      case 'help': await reply(HELP); return;
+      case 'help': await reply(this.config.controllerMode
+        ? HELP.replace('/stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务', '/stop：停止桥管理的执行子 Agent、清空队列并取消预约；独立远端进程需要另行核对')
+        : HELP); return;
       case 'model': await this.handleModel(message, argument, reply); return;
       case 'models': await this.handleModel(message, '', reply, true); return;
       case 'new':
@@ -288,7 +299,7 @@ export class SessionManager {
           await reply(`当前已是 ${agentDisplayName(agent)}，继续原会话 ${current.id.slice(0, 8)}。\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n需要清空上下文请用 /new。`); return;
         }
         if (name === 'agent') {
-          const previous = this.store.latestAgentConversation(message.userId, agent, current?.cwd ?? this.config.workspace);
+          const previous = this.store.latestAgentConversation(message.userId, agent, current?.cwd ?? this.config.workspace, this.config.controllerMode === true);
           if (previous) {
             this.activate(message.userId, previous);
             await reply(`已切换到 ${agentDisplayName(agent)}，恢复会话 ${previous.id.slice(0, 8)}：${previous.title}\n原生会话：${previous.nativeId ? `…${previous.nativeId.slice(-6)}` : '尚未创建'}\n目录：${previous.cwd}`);
@@ -296,7 +307,7 @@ export class SessionManager {
             return;
           }
         }
-        const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace);
+        const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true });
         if (current?.agent === agent && current.model) this.store.setModel(target.id, current.model);
         this.activate(message.userId, target);
         await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。旧会话待处理任务已取消。\n原生会话：尚未创建\n目录：${target.cwd}`);
@@ -307,7 +318,7 @@ export class SessionManager {
         const value = argument.replace(/^(["'])([\s\S]*)\1$/, '$2');
         const cwd = isAbsolute(value) ? value : resolve(current?.cwd ?? this.config.workspace, value);
         if (!statSync(cwd).isDirectory()) { await reply('指定路径不是目录。'); return; }
-        const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd);
+        const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd, { controllerMode: this.config.controllerMode === true });
         if (current?.model) this.store.setModel(target.id, current.model);
         this.activate(message.userId, target);
         await reply(`已在 ${cwd} 新建 ${target.agent} 会话 ${target.id.slice(0, 8)}。`);
@@ -329,7 +340,8 @@ export class SessionManager {
         return;
       case 'stop': {
         const count = current ? this.cancel(current) : 0;
-        await reply(`${count ? `已停止当前任务，取消 ${count} 条待处理任务。会话保留，可继续发送消息。` : '当前没有待处理任务。'}${this.options.taskRegistry ? '\n已取消后台结果的自动汇总；远端子任务仍可继续，完成后仅发送带来源的通知。' : ''}`);
+        if (current) await this.options.onStop?.(current.id);
+        await reply(`${count ? `已停止当前任务，取消 ${count} 条待处理任务。会话保留，可继续发送消息。` : '当前没有待处理任务。'}${this.options.taskRegistry ? this.config.controllerMode ? '\n已停止桥管理的子 Agent，并取消后台自动汇总和预约；独立远端进程需另行确认。' : '\n已取消后台结果的自动汇总；远端子任务仍可继续，完成后仅发送带来源的通知。' : ''}`);
         this.completionAvailable();
         return;
       }
@@ -360,6 +372,7 @@ export class SessionManager {
   }
 
   private pumpSupplements(target: Conversation, turn: RunningTurn): void {
+    if (this.config.controllerMode) return;
     turn.supplements = turn.supplements.then(async () => {
       const adapter = this.adapters[target.agent];
       if (!adapter.steer || !turn.ready || !turn.executing || turn.controller.signal.aborted || this.closed) return;
@@ -421,9 +434,42 @@ export class SessionManager {
     void worker.catch(() => undefined);
   }
 
+  /** Explicit coordinating output never treats prose file citations as upload requests. */
+  private async publishControlled(target: Conversation, route: { userId: string; channelId: string },
+    text: string, paths: string[], messageKey: string | undefined, signal: AbortSignal,
+    current: () => boolean, model: string | null, effort: string | null): Promise<void> {
+    if (!current()) throw new Error('当前主控轮次已经停止');
+    if (typeof text !== 'string' || text.length > 64 * 1024 || !Array.isArray(paths)
+      || paths.length > 10 || paths.some(path => typeof path !== 'string' || !isAbsolute(path)
+        || path.length > 4096 || /[\r\n\0<>]/.test(path))) throw new Error('公开回复或附件声明无效');
+    const nativeId = this.store.getConversation(target.id)?.nativeId;
+    if (!nativeId) throw new Error('主控会话尚未绑定，不能发送回复');
+    const key = `${target.agent}:${target.id}:${nativeId}:${messageKey ?? randomUUID()}`;
+    const hash = createHash('sha256').update(JSON.stringify([text, paths])).digest('hex');
+    const claim = this.store.claimPublicMessage(key, target.id, nativeId, route.channelId, hash);
+    if (claim === 'delivered') return;
+    if (claim === 'uncertain') throw new Error('这条回复的投递状态未知，已保留，未重复发送');
+    try {
+      const outgoing = await collectOutgoingAttachments(paths.map(path => `[附件](<${path}>)`).join('\n'),
+        [target.cwd, join(this.config.dataDir, 'outgoing')], this.config.maxImageBytes, this.config.maxFileBytes, signal);
+      if (!current()) throw new Error('主控轮次在附件准备期间停止');
+      const identity = { conversationId: target.id, agent: target.agent, nativeId };
+      const header = replyHeader(identity, this.store.getLastDelivery(route.userId, route.channelId), model, effort);
+      const fallback = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '';
+      if (!text.trim() && !fallback) throw new Error('公开回复不能为空');
+      await this.sink.sendText(route.channelId, `${header}\n\n${text || fallback}`, {
+        repeatHeader: header, signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
+        ...(outgoing.files.length ? { files: outgoing.files } : {}),
+      });
+      if (!current()) throw new Error('主控轮次在投递期间停止');
+      this.store.finishPublicMessage(key, 'delivered');
+      this.store.saveDelivery(route.userId, route.channelId, identity);
+    } catch (error) { this.store.finishPublicMessage(key, 'uncertain'); throw error; }
+  }
+
   private async processQueue(conversationId: string): Promise<void> {
     // 首条消息后固定短窗口，避免连续输入无限延长启动时间。
-    if (this.options.mergeDelayMs !== 0) await new Promise<void>(resolve => setTimeout(resolve, this.options.mergeDelayMs ?? 1000));
+    if (!this.config.controllerMode && this.options.mergeDelayMs !== 0) await new Promise<void>(resolve => setTimeout(resolve, this.options.mergeDelayMs ?? 1000));
     while (!this.closed && !this.modelChanges.has(conversationId)) {
       const owner = this.store.getConversation(conversationId);
       const active = owner ? this.store.getActive(owner.userId) : null;
@@ -441,7 +487,7 @@ export class SessionManager {
         this.store.setState(item.id, 'cancelled'); continue;
       }
       const controller = new AbortController();
-      const batch = this.options.mergeDelayMs === 0 ? [item] : this.store.queuedBatch(conversationId);
+      const batch = this.config.controllerMode || this.options.mergeDelayMs === 0 ? [item] : this.store.queuedBatch(conversationId);
       const turn: RunningTurn = { messageId: item.id, messageIds: batch.map(value => value.id),
         conversationId, controller, ready: false, executing: true, supplements: Promise.resolve() };
       this.running.set(item.userId, turn);
@@ -461,8 +507,10 @@ export class SessionManager {
         contextId = context?.contextId;
         const result = await this.adapters[target.agent].run({
           ...(context ? { taskContextPath: context.contextPath } : {}),
-          conversation: target, text: batch.map(value => value.text).filter(Boolean).join('\n\n'),
-          imagePaths: batch.flatMap(value => value.imagePaths), input: this.input(batch),
+          conversation: target, text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
+          imagePaths: batch.flatMap(value => value.imagePaths), input: [
+            ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...this.input(batch),
+          ],
           onReady: () => { turn.ready = true; this.pumpSupplements(target, turn); },
           signal: controller.signal,
           onNativeId: nativeId => {
@@ -472,14 +520,20 @@ export class SessionManager {
             }
           },
           onModel: model => {
-            if (current() && model) { actualModel = model; this.store.saveActualModel(conversationId, model); }
+            if (current() && model) { actualModel = model; target.actualModel = model; this.store.saveActualModel(conversationId, model); }
           },
           onReasoningEffort: effort => {
-            if (current()) { actualEffort = effort; this.store.saveActualEffort(conversationId, effort); }
+            if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(conversationId, effort); }
           },
           // Adapters emit deltas and protocol/tool events through this callback.
           // Only the completed reply is user-facing; no asynchronous sends can linger after cancellation.
           onProgress: () => {},
+          onPublicMessage: async (text, paths = [], key) => {
+            if (!current()) throw new Error('当前主控轮次已经停止');
+            this.store.setReplyState(turn.messageIds, 'pending');
+            await this.publishControlled(target, item, text, paths, key, controller.signal, current, actualModel, actualEffort);
+            if (current()) { this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds); }
+          },
         });
         turn.executing = false;
         if (current()) {
@@ -488,13 +542,17 @@ export class SessionManager {
           this.store.saveNativeId(conversationId, result.nativeId);
           // 模型已经执行完成；即使在途补充确认/回复期间取消也不能改成待重做。
           for (const id of turn.messageIds) this.store.setState(id, 'completed');
-          this.store.setReplyState(turn.messageIds, 'pending');
+          if (!result.controlledOutput) this.store.setReplyState(turn.messageIds, 'pending');
         }
         await turn.supplements;
         if (this.closed || controller.signal.aborted || this.running.get(item.userId) !== turn
           || this.store.getActive(item.userId)?.id !== conversationId
           || this.store.getMessage(item.id)?.state !== 'completed') continue;
         for (const id of turn.messageIds) this.store.setState(id, 'completed');
+        if (result.controlledOutput) {
+          this.store.setReplyState(turn.messageIds, 'delivered');
+          continue;
+        }
         this.store.setReplyState(turn.messageIds, 'pending');
         const delivering = () => !this.closed && !controller.signal.aborted
           && this.running.get(item.userId) === turn
@@ -630,12 +688,16 @@ export class SessionManager {
       const result = await this.adapters[target.agent].run({
         conversation: target, text: event.text, imagePaths: [], input: [{ type: 'text', text: event.text }],
         taskContextPath: context.contextPath, signal: controller.signal, onProgress: () => {},
-        onModel: model => { if (current() && model) { actualModel = model; this.store.saveActualModel(target.id, model); } },
-        onReasoningEffort: effort => { if (current()) { actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
+        event: { kind: event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
+          toolName: event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: event.text },
+        onPublicMessage: (text, paths = [], key) => this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort),
+        onModel: model => { if (current() && model) { actualModel = model; target.actualModel = model; this.store.saveActualModel(target.id, model); } },
+        onReasoningEffort: effort => { if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
       });
       turn.executing = false;
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
       if (result.nativeId !== event.nativeId) throw new Error('CLI 返回了不同父会话，未投递结果');
+      if (result.controlledOutput) { registry.markDelivered(event.id); return; }
       const outgoing = await collectOutgoingAttachments(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
         this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');

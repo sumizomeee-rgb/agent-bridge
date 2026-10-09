@@ -17,10 +17,6 @@ type CodeContainer = { kind: 'quote' } | { kind: 'list'; width: number };
 
 class ArtifactReadError extends Error {}
 function failed(reason: string): Error { return new ArtifactReadError(reason); }
-function contained(root: string, path: string): boolean {
-  const part = relative(root, path);
-  return part !== '' && part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part);
-}
 
 /** Check every component, including Windows junctions, without following a directory listing. */
 async function directoryChain(directory: string): Promise<void> {
@@ -179,7 +175,7 @@ function localPath(destination: string, image = true): string | null {
   // Codex desktop Markdown sometimes adds a slash before an otherwise absolute Windows drive path.
   if (/^\/[A-Za-z]:[\/\\]/.test(path)) path = path.slice(1);
   if (!image && !isAbsolute(path)) return null; // Relative links and other URL schemes remain ordinary text.
-  if (!isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw failed('本地产物必须使用允许目录内的绝对文件路径。');
+  if (!isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw failed('本地产物必须使用绝对文件路径。');
   return resolve(path);
 }
 
@@ -207,7 +203,7 @@ function fileType(path: string): string {
 }
 
 /** Only explicitly declared final-reply attachments are read; unrelated files are never enumerated. */
-async function collect(finalText: string, rootDirectory: string | string[], maxImageBytes: number,
+async function collect(finalText: string, _rootDirectory: string | string[], maxImageBytes: number,
   signal?: AbortSignal, maxFileBytes?: number): Promise<CollectedAttachments> {
   if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes <= 0) throw failed('图片大小上限配置无效。');
   if (maxFileBytes !== undefined && (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0 || maxFileBytes > MAX_FILE_BYTES)) {
@@ -218,8 +214,6 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
     path: localPath(marker.destination, marker.image) })).filter(item => item.path !== null);
   if (!declared.length) return { text: finalText, images: [], files: [] };
   signal?.throwIfAborted();
-  const roots = [...new Set((Array.isArray(rootDirectory) ? rootDirectory : [rootDirectory]).map(root => resolve(root)))];
-  const actualRoots = new Map<string, string>();
   const images: OutgoingImage[] = [];
   const files: OutgoingFile[] = [];
   const seen = new Set<string>();
@@ -228,22 +222,11 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
   const limit = Math.min(maxImageBytes, MAX_IMAGE_BYTES);
   for (const { marker, path } of declared) {
     signal?.throwIfAborted();
-    const root = path ? roots.find(candidate => contained(candidate, path)) : undefined;
-    if (!root) throw failed('声明的附件不在允许的工作目录或历史产物目录内，未上传任何附件。');
-    let actualRoot = actualRoots.get(root);
-    if (!actualRoot) {
-      // Only validate a root used by this declaration. A missing legacy output
-      // directory must not obstruct plain replies or images in an existing cwd.
-      await directoryChain(root);
-      actualRoot = await realpath(root);
-      actualRoots.set(root, actualRoot);
-    }
     if (!path) throw failed('附件路径无效。');
     await directoryChain(dirname(path));
     const before = await lstat(path);
-    if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1) throw failed('附件必须是普通文件，不能使用链接或目录。');
+    if (before.isSymbolicLink() || !before.isFile()) throw failed('附件必须是普通文件，不能使用链接或目录。');
     const actual = await realpath(path);
-    if (!contained(actualRoot, actual)) throw failed('附件真实路径越过允许的目录。');
     const key = process.platform === 'win32' ? actual.toLowerCase() : actual;
     if (seen.has(key)) continue;
     if (images.length + files.length >= MAX_IMAGES) {
@@ -258,7 +241,7 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
     let data: Buffer;
     try {
       const info = await file.stat();
-      if (!info.isFile() || info.nlink > 1 || info.dev !== before.dev || info.ino !== before.ino || info.size !== before.size) throw failed('读取前附件文件发生变化。');
+      if (!info.isFile() || info.dev !== before.dev || info.ino !== before.ino || info.size !== before.size) throw failed('读取前附件文件发生变化。');
       // One extra byte detects growth, while allocations and reads remain bounded by the prior size limit.
       const bounded = Buffer.alloc(info.size + 1);
       let bytes = 0;
@@ -272,7 +255,7 @@ async function collect(finalText: string, rootDirectory: string | string[], maxI
       await directoryChain(dirname(path));
       const final = await lstat(path);
       if (bytes !== info.size || after.size !== info.size || after.mtimeMs !== info.mtimeMs || final.isSymbolicLink()
-        || final.dev !== info.dev || final.ino !== info.ino || final.nlink > 1 || !contained(actualRoot, await realpath(path))) {
+        || final.dev !== info.dev || final.ino !== info.ino || await realpath(path) !== actual) {
         throw failed('读取期间附件文件或路径发生变化，未上传任何附件。');
       }
       data = bounded.subarray(0, bytes);
@@ -311,7 +294,7 @@ function attachmentFailure(error: unknown, signal: AbortSignal | undefined, labe
   if (signal?.aborted) throw error;
   if (error instanceof ArtifactReadError) throw new Error(`${label}：${error.message}`);
   const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '未知文件错误';
-  throw new Error(`${label}：无法读取明确声明的附件（${code}），未上传任何附件。请确认文件已保存到允许目录。`);
+  throw new Error(`${label}：无法读取明确声明的附件（${code}），未上传任何附件。请确认绝对路径指向本机可读取的物理文件。`);
 }
 
 export async function collectOutgoingAttachments(finalText: string, rootDirectory: string | string[], maxImageBytes: number,

@@ -7,6 +7,7 @@ import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
 import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
+import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
 export interface DiscordTransportOptions {
@@ -23,6 +24,10 @@ export interface DiscordTransportOptions {
   maxImages?: number;
   maxTotalImageBytes?: number;
   logger?: (message: string) => void;
+  /** Synchronous ordinary-DM journal hook, before receipts or queued preparation. */
+  onReceive?: (message: IncomingDM) => void;
+  /** Called on both READY and RESUMED; initial start waits for recovery to finish. */
+  onReady?: () => Promise<void>;
 }
 
 type RecordValue = Record<string, unknown>;
@@ -180,6 +185,7 @@ export class DiscordTransport {
   private readonly sendQueues = new Map<string, Promise<void>>();
   private readonly channelWaitUntil = new Map<string, number>();
   private readonly seenMessages = new Set<string>();
+  private readonly knownDMChannels = new Set<string>();
   private readonly pendingReceipts = new Map<string, Promise<void>>();
   private readonly taskReactionQueues = new Map<string, Promise<void>>();
   private readonly taskReactions = new Map<string, Set<string>>();
@@ -278,6 +284,39 @@ export class DiscordTransport {
       if (this.sendQueues.get(channelId) === job) this.sendQueues.delete(channelId);
     }).catch(() => undefined);
     await waitForSend(job, signal);
+  }
+
+  /** Read-only recovery endpoint. Raw page bounds retain bot-message positions. */
+  async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
+    if (!snowflake(channelId) || (options.after !== undefined && !snowflake(options.after)) ||
+        (options.before !== undefined && !snowflake(options.before)) || (options.after && options.before)) {
+      throw new Error('Discord 私聊历史游标无效。');
+    }
+    const limit = options.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Discord 历史页面大小无效。');
+    if (!this.knownDMChannels.has(channelId)) {
+      const channel = await this.rest(`/channels/${channelId}`, 'GET');
+      if (!record(channel) || channel.type !== 1 || !Array.isArray(channel.recipients) ||
+          !channel.recipients.some(user => record(user) && user.bot !== true &&
+            snowflake(user.id) && this.allowedUsers.has(user.id))) {
+        throw new Error('只允许补取已授权用户的普通私聊。');
+      }
+      this.knownDMChannels.add(channelId);
+    }
+    const query = new URLSearchParams({ limit: String(limit),
+      ...(options.after ? { after: options.after } : {}),
+      ...(options.before ? { before: options.before } : {}) });
+    const result = await this.rest(`/channels/${channelId}/messages?${query}`, 'GET');
+    if (!Array.isArray(result) || result.length > limit) throw new Error('Discord 私聊历史返回格式无效。');
+    const ids = result.flatMap(item => record(item) && snowflake(item.id) ? [item.id] : [])
+      .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
+    if (ids.length !== result.length) throw new Error('Discord 私聊历史消息标识无效。');
+    const messages = result.flatMap(item => {
+      if (!record(item) || item.channel_id !== channelId) return [];
+      const message = this.parseIncoming(item);
+      return message ? [message] : [];
+    });
+    return { messages, oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: result.length === limit };
   }
 
   async syncSlashCommands(): Promise<void> {
@@ -604,17 +643,29 @@ export class DiscordTransport {
     clearTimeout(this.readyTimer);
     clearTimeout(this.protocolTimer);
     this.reconnectAttempt = 0;
-    this.resolveReady?.();
-    this.resolveReady = undefined;
-    this.rejectReady = undefined;
+    // Invoke synchronously so recovery can pause its queue before another Gateway DM.
+    let recovery: Promise<void>;
+    try { recovery = this.options.onReady?.() ?? Promise.resolve(); }
+    catch (error) { recovery = Promise.reject(error); }
+    void recovery.then(() => {
+      if (this.closed) return;
+      this.resolveReady?.();
+      this.resolveReady = undefined;
+      this.rejectReady = undefined;
+    }, () => {
+      if (this.closed) return;
+      this.log('私聊历史补取失败，已持久保存的新消息等待恢复。');
+      if (this.rejectReady) this.fail(new Error('Discord 私聊历史补取失败。'));
+      else if (this.ws) this.reconnect(this.ws);
+    });
   }
 
   private incoming(data: RecordValue): void {
-    const author = data.author;
-    if (data.guild_id != null || data.webhook_id != null || !record(author) || author.bot === true ||
-        !snowflake(author.id) || !this.allowedUsers.has(author.id) || !snowflake(data.id) ||
-        !snowflake(data.channel_id) || this.seenMessages.has(data.id)) return;
-    this.seenMessages.add(data.id);
+    const message = this.parseIncoming(data);
+    if (!message || this.seenMessages.has(message.id)) return;
+    this.options.onReceive?.(message);
+    this.seenMessages.add(message.id);
+    this.knownDMChannels.add(message.channelId);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
     const receiptKey = `${data.channel_id}:${data.id}`;
     const receipt = this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
@@ -624,6 +675,20 @@ export class DiscordTransport {
     this.pendingReceipts.set(receiptKey, receipt);
     void receipt.then(() => { if (this.pendingReceipts.get(receiptKey) === receipt) this.pendingReceipts.delete(receiptKey); });
     if (this.seenMessages.size > 5000) this.seenMessages.delete(this.seenMessages.values().next().value!);
+    // Agent turns must never block Gateway heartbeats or subsequent incoming commands.
+    void this.deliverInOrder(message).catch(async () => {
+      this.log('私聊消息处理失败。');
+      if (!this.closed) {
+        await this.sendText(message.channelId, '这条消息处理失败，请稍后再试。').catch(() => this.log('错误反馈发送失败。'));
+      }
+    });
+  }
+
+  private parseIncoming(data: RecordValue): IncomingDM | null {
+    const author = data.author;
+    if (data.guild_id != null || data.webhook_id != null || !record(author) || author.bot === true ||
+        !snowflake(author.id) || !this.allowedUsers.has(author.id) || !snowflake(data.id) ||
+        !snowflake(data.channel_id)) return null;
     const attachments: DiscordAttachment[] = [];
     if (Array.isArray(data.attachments)) {
       for (const item of data.attachments) {
@@ -634,17 +699,8 @@ export class DiscordTransport {
         }
       }
     }
-    const message: IncomingDM = {
-      id: data.id, userId: author.id, channelId: data.channel_id,
-      text: typeof data.content === 'string' ? data.content : '', attachments,
-    };
-    // Agent turns must never block Gateway heartbeats or subsequent incoming commands.
-    void this.deliverInOrder(message).catch(async () => {
-      this.log('私聊消息处理失败。');
-      if (!this.closed) {
-        await this.sendText(message.channelId, '这条消息处理失败，请稍后再试。').catch(() => this.log('错误反馈发送失败。'));
-      }
-    });
+    return { id: data.id, userId: author.id, channelId: data.channel_id,
+      text: typeof data.content === 'string' ? data.content : '', attachments };
   }
 
   private async incomingInteraction(data: RecordValue): Promise<void> {

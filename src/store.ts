@@ -24,6 +24,7 @@ function conversation(row: Row): Conversation {
     model: row.model == null ? null : String(row.model), actualModel: row.actual_model == null ? null : String(row.actual_model),
     actualEffort: row.actual_effort == null ? null : String(row.actual_effort),
     cwd: String(row.cwd), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    controllerMode: Number(row.controller_mode ?? 0) === 1, contextSeed: row.context_seed == null ? null : String(row.context_seed),
   };
 }
 function inbox(row: Row): InboxItem {
@@ -67,6 +68,11 @@ export class SessionStore {
       );
       CREATE INDEX IF NOT EXISTS inbox_queue ON inbox(conversation_id, state, sequence);
       CREATE INDEX IF NOT EXISTS conversations_user ON conversations(user_id, updated_at);
+      CREATE TABLE IF NOT EXISTS controller_public_messages (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, native_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS delivered_replies (
         user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
         conversation_id TEXT NOT NULL REFERENCES conversations(id),
@@ -79,6 +85,8 @@ export class SessionStore {
     if (!columns.has('model')) this.db.exec('ALTER TABLE conversations ADD COLUMN model TEXT');
     if (!columns.has('actual_model')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_model TEXT');
     if (!columns.has('actual_effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_effort TEXT');
+    if (!columns.has('controller_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN controller_mode INTEGER NOT NULL DEFAULT 0');
+    if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
     const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
     if (!inboxColumns.has('reply_state')) this.db.exec('ALTER TABLE inbox ADD COLUMN reply_state TEXT');
   }
@@ -98,16 +106,56 @@ export class SessionStore {
     return Number(result.changes) === 1;
   }
 
-  createConversation(userId: string, agent: AgentName, cwd: string): Conversation {
+  /** Last persisted human message per known DM, used only to seed ingress recovery. */
+  knownChannels(): Array<{ userId: string; channelId: string; cursor: string }> {
+    const channels = new Map<string, { userId: string; channelId: string; cursor: string }>();
+    for (const row of this.db.prepare('SELECT user_id,channel_id,id FROM inbox ORDER BY sequence').all()) {
+      channels.set(`${row.user_id}:${row.channel_id}`, {
+        userId: String(row.user_id), channelId: String(row.channel_id), cursor: String(row.id),
+      });
+    }
+    return [...channels.values()];
+  }
+
+  claimPublicMessage(id: string, conversationId: string, nativeId: string, channelId: string,
+    contentHash: string): 'send' | 'delivered' | 'uncertain' {
+    const previous = this.db.prepare('SELECT * FROM controller_public_messages WHERE id=?').get(id);
+    if (previous) {
+      if (previous.conversation_id !== conversationId || previous.native_id !== nativeId
+        || previous.channel_id !== channelId || previous.content_hash !== contentHash) {
+        throw new Error('公开消息调用标识被复用于不同内容或会话');
+      }
+      return previous.state === 'delivered' ? 'delivered' : 'uncertain';
+    }
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO controller_public_messages
+      (id,conversation_id,native_id,channel_id,content_hash,state,created_at,updated_at)
+      VALUES (?,?,?,?,?,'pending',?,?)`).run(id, conversationId, nativeId, channelId, contentHash, now, now);
+    return 'send';
+  }
+  finishPublicMessage(id: string, state: 'delivered' | 'uncertain'): void {
+    this.db.prepare('UPDATE controller_public_messages SET state=?,updated_at=? WHERE id=?')
+      .run(state, new Date().toISOString(), id);
+  }
+
+  recentUserContext(conversationId: string): string {
+    const rows = this.db.prepare(`SELECT text FROM inbox WHERE conversation_id=? AND state='completed' ORDER BY sequence DESC LIMIT 16`).all(conversationId);
+    return rows.reverse().map(row => String(row.text).slice(0, 1600)).join('\n\n');
+  }
+  rebindQueued(oldId: string, newId: string): void {
+    this.db.prepare("UPDATE inbox SET conversation_id=?,updated_at=? WHERE conversation_id=? AND state='queued'")
+      .run(newId, new Date().toISOString(), oldId);
+  }
+  createConversation(userId: string, agent: AgentName, cwd: string, options: { controllerMode?: boolean; contextSeed?: string } = {}): Conversation {
     const now = new Date().toISOString();
     const item: Conversation = {
       id: randomUUID(), userId, agent, nativeId: null, model: null, actualModel: null, actualEffort: null,
-      title: '新会话', cwd, createdAt: now, updatedAt: now,
+      title: '新会话', cwd, createdAt: now, updatedAt: now, controllerMode: options.controllerMode === true, contextSeed: options.contextSeed ?? null,
     };
     this.db.prepare(`INSERT INTO conversations
-      (id, user_id, agent, native_id, title, cwd, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      item.id, userId, agent, null, item.title, cwd, now, now,
+      (id, user_id, agent, native_id, title, cwd, created_at, updated_at, controller_mode, context_seed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      item.id, userId, agent, null, item.title, cwd, now, now, item.controllerMode ? 1 : 0, item.contextSeed ?? null,
     );
     return item;
   }
@@ -122,9 +170,10 @@ export class SessionStore {
       ORDER BY updated_at DESC, rowid DESC LIMIT ?`).all(userId, limit).map(conversation);
   }
 
-  latestAgentConversation(userId: string, agent: AgentName, cwd: string): Conversation | null {
-    const row = this.db.prepare(`SELECT * FROM conversations WHERE user_id = ? AND agent = ? AND cwd = ?
-      ORDER BY updated_at DESC, rowid DESC LIMIT 1`).get(userId, agent, cwd);
+  latestAgentConversation(userId: string, agent: AgentName, cwd: string, controllerMode?: boolean): Conversation | null {
+    const modeFilter = controllerMode === undefined ? '' : ' AND controller_mode = ?';
+    const row = this.db.prepare(`SELECT * FROM conversations WHERE user_id = ? AND agent = ? AND cwd = ?${modeFilter}
+      ORDER BY updated_at DESC, rowid DESC LIMIT 1`).get(userId, agent, cwd, ...(controllerMode === undefined ? [] : [controllerMode ? 1 : 0]));
     return row ? conversation(row) : null;
   }
 

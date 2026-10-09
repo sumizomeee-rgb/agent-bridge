@@ -46,6 +46,14 @@ async function within(promise: Promise<unknown>, milliseconds: number): Promise<
   } finally { clearTimeout(timeout); }
 }
 
+export class AgentProcessStopError extends Error {
+  readonly processStillRunning = true;
+  constructor(readonly pid: number | undefined) {
+    super('未确认 Agent 进程已经结束，停止结果未知。');
+    this.name = 'AgentProcessStopError';
+  }
+}
+
 /** Newline-delimited JSON transport. Never log raw stdout or stderr. */
 export class JsonLineProcess {
   readonly child: ChildProcessWithoutNullStreams;
@@ -163,7 +171,7 @@ export class JsonLineProcess {
         catch { this.child.kill('SIGKILL'); }
       }
     } else this.child.kill();
-    await within(this.closed.promise, 1000);
+    if (!(await within(this.closed.promise, 1000))) throw new AgentProcessStopError(pid);
   }
 }
 

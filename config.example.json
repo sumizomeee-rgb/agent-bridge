@@ -2,6 +2,7 @@
   "token": "FILL_IN_YOUR_BOT_TOKEN",
   "allowedUserIds": ["FILL_IN_YOUR_DISCORD_USER_ID"],
   "defaultAgent": "codex",
+  "controllerMode": true,
   "workspace": "C:\\SuchProject\\AgentWorkspace",
   "proxyPort": 7898,
   "maxFileBytes": 20971520,

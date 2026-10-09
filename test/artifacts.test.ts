@@ -79,7 +79,7 @@ test('existing historical outgoing images remain allowed independently of the cu
   const result = await collectOutgoingImages(marker(image), [f.directory, outgoing], 100);
   assert.equal(result.images[0]!.filename, 'saved.png');
   const outside = join(f.root, 'private.png'); await writeFile(outside, PNG);
-  await assert.rejects(collectOutgoingImages(marker(outside), [f.directory, outgoing], 100), /不在允许/);
+  assert.equal((await collectOutgoingImages(marker(outside), [f.directory, outgoing], 100)).images[0]!.filename, 'private.png');
 });
 
 test('only explicitly declared PNG images are collected; HTTP images and normal text remain', async t => {
@@ -165,7 +165,7 @@ test('Windows slash-drive prefix is normalized only for a drive path', { skip: p
   assert.equal(result.text, '');
 });
 
-test('outside, sibling-prefix and traversal destinations fail before any images are returned', async t => {
+test('absolute files outside the workspace and sibling prefixes upload; relative paths are rejected', async t => {
   const f = await fixture(t);
   const local = join(f.directory, 'valid.png');
   const sibling = `${f.directory}-sibling`;
@@ -173,8 +173,9 @@ test('outside, sibling-prefix and traversal destinations fail before any images 
   await writeFile(local, PNG);
   const outside = join(sibling, 'private.png');
   await writeFile(outside, PNG);
-  await assert.rejects(collectOutgoingImages(`${marker(local)}\n${marker(outside)}`, f.directory, 100), /不在允许/);
-  await assert.rejects(collectOutgoingImages(marker(join(f.directory, '..', basename(outside))), f.directory, 100), /不在允许/);
+  assert.equal((await collectOutgoingImages(`${marker(local)}\n${marker(outside)}`, f.directory, 100)).images.length, 2);
+  const normalized = join(f.directory, '..', basename(sibling), basename(outside));
+  assert.equal((await collectOutgoingImages(marker(normalized), f.directory, 100)).images.length, 1);
   await assert.rejects(collectOutgoingImages('![relative](screen.png)', f.directory, 100), /绝对文件路径/);
 });
 
@@ -197,14 +198,14 @@ test('an output root that is itself a junction is refused', async t => {
   await assert.rejects(collectOutgoingImages(marker(join(alias, 'image.png')), alias, 100), /链接/);
 });
 
-test('hard links, directories and missing declarations are refused with a clear image failure', async t => {
+test('physical hard-linked files upload; directories and missing files are refused', async t => {
   const f = await fixture(t);
   const source = join(f.root, 'private.png');
   await writeFile(source, PNG);
   const hard = join(f.directory, 'hard.png');
   await link(source, hard);
-  await assert.rejects(collectOutgoingImages(marker(hard), f.directory, 100), /普通文件/);
-  await assert.rejects(collectOutgoingImages(marker(f.directory), f.directory, 100), /不在允许/);
+  assert.equal((await collectOutgoingImages(marker(hard), f.directory, 100)).images.length, 1);
+  await assert.rejects(collectOutgoingImages(marker(f.directory), f.directory, 100), /普通文件/);
   await assert.rejects(collectOutgoingImages(marker(join(f.directory, 'missing.png')), f.directory, 100), /图片回传失败.*ENOENT/);
 });
 
@@ -400,10 +401,10 @@ test('validation failure sends only a clear error, retains the completed native 
   await f.manager.handle(message('invalid'));
   await until(() => f.adapter.turns.length === 1);
   const good = join(f.directory('invalid'), 'good.png'); await writeFile(good, PNG);
-  const outside = join(f.root, 'private.png'); await writeFile(outside, PNG);
+  const outside = join(f.root, 'private.png'); await writeFile(outside, 'invalid image');
   f.adapter.finish(0, `${marker(good)}\n${marker(outside)}`);
   await until(() => f.replies.length === 1);
-  assert.match(f.replies[0]!.text, /图片回传失败.*不在允许/);
+  assert.match(f.replies[0]!.text, /图片回传失败.*文件内容不是/);
   assert(!f.replies[0]!.options?.images);
   const inspect = new SessionStore(f.config.dataDir);
   try { assert.equal(inspect.getMessage('invalid')!.state, 'completed'); assert.equal(inspect.getLastDelivery('owner', 'dm'), null); }
