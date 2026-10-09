@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { runTaskCli } from '../src/task-cli.js';
-import { TaskRegistry, type SignedTaskCompletion } from '../src/tasks.js';
+import { TaskRegistry, TaskService, signTaskCompletion, type TaskTicket, type SignedTaskCompletion } from '../src/tasks.js';
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-task-cli-test-'));
@@ -15,6 +15,52 @@ function fixture() {
     originMessageId: 'message', cwd: dir, agent: 'codex' });
   return { dir, registry, context, env: { BRIDGE_TASK_CONTEXT: context.contextPath } };
 }
+
+test('a later turn cancels an earlier task immediately, clears counts and deduplicates late results', async () => {
+  const { dir, registry, context, env } = fixture();
+  const service = new TaskService(registry);
+  try {
+    const task = runTaskCli(['register', '--title', 'old worker', '--exit-file', join(dir, 'absent.exit')], env) as { taskId: string; ticketPath: string };
+    registry.closeContext(context.contextId);
+    const next = registry.createContext({ conversationId: 'parent', nativeId: 'native', userId: 'user', channelId: 'dm',
+      originMessageId: 'later-message', cwd: dir, agent: 'codex' });
+    const laterEnv = { BRIDGE_TASK_CONTEXT: next.contextPath };
+    const result = runTaskCli(['cancel', '--task-id', task.taskId, '--text', 'worker verified stopped'], laterEnv) as { status: string; externalWorkerStopped: boolean };
+    assert.equal(result.status, 'cancelled');
+    assert.equal(result.externalWorkerStopped, false);
+    assert.equal(registry.activeCount('parent'), 0);
+    assert.equal(registry.watchingTasks().length, 0);
+    const event = registry.getNextEvent()!;
+    assert.equal(event.originMessageId, 'message');
+    assert.equal(event.status, 'cancelled');
+    runTaskCli(['cancel', '--task-id', task.taskId], laterEnv);
+    const ticket = JSON.parse(readFileSync(task.ticketPath, 'utf8')) as TaskTicket;
+    assert.equal(registry.acceptReceipt(signTaskCompletion(ticket, 'completed', 'late result')), false);
+    assert.equal(registry.queuedEvents().length, 1);
+    await service.poll();
+    assert.equal(registry.activeCount('parent'), 0);
+    assert.throws(() => runTaskCli(['cancel', '--task-id', task.taskId], env), /本轮已结束/);
+  } finally { await service.close(); registry.close(); }
+});
+
+test('cancel rejects forged contexts and other users, sessions, channels, agents or workspaces', () => {
+  const { dir, registry, context, env } = fixture();
+  try {
+    const task = runTaskCli(['register', '--title', 'owned'], env) as { taskId: string };
+    const origin = { conversationId: 'parent', nativeId: 'native', userId: 'user', channelId: 'dm',
+      originMessageId: 'next', cwd: dir, agent: 'codex' as const };
+    for (const change of [{ conversationId: 'other' }, { userId: 'other' }, { channelId: 'other' },
+      { cwd: join(dir, 'other') }, { agent: 'claude' as const }]) {
+      const other = registry.createContext({ ...origin, ...change });
+      assert.throws(() => runTaskCli(['cancel', '--task-id', task.taskId], { BRIDGE_TASK_CONTEXT: other.contextPath }), /不属于当前父会话/);
+    }
+    const forged = join(dir, 'forged-cancel.json');
+    writeFileSync(forged, JSON.stringify({ ...JSON.parse(readFileSync(context.contextPath, 'utf8')), token: 'wrong' }));
+    assert.throws(() => runTaskCli(['cancel', '--task-id', task.taskId], { BRIDGE_TASK_CONTEXT: forged }), /身份无效/);
+    assert.equal(registry.activeCount('parent'), 1);
+    assert.equal(registry.queuedEvents().length, 0);
+  } finally { registry.close(); }
+});
 
 test('CLI automatically binds registration, permits watch setup after turn closes, and completes via scoped ticket', () => {
   const { dir, registry, context, env } = fixture();

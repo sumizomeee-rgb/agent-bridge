@@ -63,6 +63,8 @@ $job = & $ctx.nodePath $ctx.helperPath register --title '工位检查' `
 
 `register` 必须在父 Agent 本轮结束前执行。可在登记时直接附上监听参数，或之后用 `watch --task-id $job.taskId` 设置同样的参数。普通任务完成时先写 UTF-8 结果，再原子写入退出码文件；退出码 0 表示成功，非 0 会汇报失败。SSH 监听中的结果路径指向目标电脑，SSH 配置路径指向笔记本。
 
+取消旧后台任务时，先使用对应 runner 停止并核实外部进程，再调用 `cancel --task-id <任务 ID> --text '取消原因及进程核查结果'`。`cancel` 使用当前 `BRIDGE_TASK_CONTEXT`，允许同一用户、同一会话跨轮取消旧任务，直接持久化取消状态并清除计数；不会停止外部进程。重复取消不会重复通知，已完成的任务不会改成取消。`watch` 和 `status` 仍需原注册轮次的上下文；不要用下一轮的上下文改旧任务监听。`complete` 仅生成签名回执文件，只有已登记监听读取该文件后才会更新状态，不能将“回执已生成”当作“取消已入库”。
+
 也可使用签名回执：登记时指定 `--completion-file`，把登记返回的 `ticketPath` 复制到执行任务的电脑，再用仓库的 `scripts/task-complete.ps1 -TicketPath <票据路径> -OutputPath <完成文件路径> -Status completed -ResultFile <结果文件路径>` 生成回执；失败用 `failed`。有 Node 运行时的目标机也可调用 `task-cli.js complete --ticket ... --output ... --status completed --result-file ...`。每份票据只对应一个任务，不能用于登记新任务；上下文和票据是私有运行数据，不要发进 Discord 或提交 Git。
 
 任务终态持久化后，桥会在父 Agent 空闲时续接原来的完整原生会话，让父 Agent 核对工具结果并主动回复同一私聊。普通用户消息优先；完成事件不会伪装成人类消息或新增用户授权。重复回执只汇总一次。`/new`、`/cwd`、切换 Agent 或 `/stop` 会取消旧任务的自动续接，远端任务可以继续运行，完成后只发送带来源的结果通知。正在生成或投递汇总时崩溃，重启会提醒核对，不自动重跑。

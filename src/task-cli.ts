@@ -51,6 +51,7 @@ export function runTaskCli(args: string[], environment: NodeJS.ProcessEnv = proc
       'register --title "任务名称" [--completion-file ABS_PATH | --exit-file ABS_PATH --result-file ABS_PATH] [--ssh-config ABS_PATH --ssh-host ALIAS]',
       'watch --task-id UUID (--completion-file PATH | --exit-file PATH [--result-file PATH]) [--ssh-config ABS_PATH --ssh-host ALIAS]',
       'status --task-id UUID',
+      'cancel --task-id UUID [--text REASON] (cancel tracking only; stop the external worker separately)',
       'complete --ticket ABS_PATH --output ABS_PATH --status completed|failed|cancelled [--text TEXT | --result-file ABS_PATH]',
     ], context: 'register/watch/status read BRIDGE_TASK_CONTEXT automatically; do not supply native Session IDs',
   };
@@ -70,7 +71,7 @@ export function runTaskCli(args: string[], environment: NodeJS.ProcessEnv = proc
     renameSync(temporary, output);
     return { taskId: ticket.taskId, status, completionFile: output };
   }
-  if (!['register', 'watch', 'status'].includes(command)) throw new Error('未知任务命令');
+  if (!['register', 'watch', 'status', 'cancel'].includes(command)) throw new Error('未知任务命令');
   const contextPath = environment.BRIDGE_TASK_CONTEXT;
   if (!contextPath) throw new Error('当前 CLI 没有桥登记上下文 BRIDGE_TASK_CONTEXT');
   const context = readJson(contextPath) as TaskContextFile;
@@ -85,8 +86,13 @@ export function runTaskCli(args: string[], environment: NodeJS.ProcessEnv = proc
       if (options.has('--completion-file') || options.has('--exit-file')) registry.setWatch(context, registration.taskId, parseWatch(options));
       return registration;
     }
-    checkOptions(options, command === 'watch' ? ['--task-id', ...watchKeys] : ['--task-id']);
+    checkOptions(options, command === 'watch' ? ['--task-id', ...watchKeys]
+      : command === 'cancel' ? ['--task-id', '--text'] : ['--task-id']);
     const taskId = required(options, '--task-id');
+    if (command === 'cancel') {
+      const task = registry.cancelTask(context, taskId, options.get('--text') ?? '');
+      return { taskId, title: task.title, status: task.status, externalWorkerStopped: false };
+    }
     if (command === 'watch') registry.setWatch(context, taskId, parseWatch(options));
     const task = registry.getAuthorizedTask(context, taskId);
     return { taskId, title: task.title, status: task.status, watch: task.watch, wakeAllowed: task.wakeAllowed };

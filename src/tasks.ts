@@ -192,6 +192,21 @@ export class TaskRegistry {
     if (!task || task.contextId !== context.contextId) throw new Error('任务不属于当前父上下文');
     return task;
   }
+  /** A live parent turn may cancel its own earlier task without changing the original result route. */
+  cancelTask(context: TaskContextFile, taskId: string, reason: string): RegisteredTask {
+    const source = this.authorize(context);
+    const row = this.db.prepare('SELECT origin_json FROM tasks WHERE id=?').get(taskId);
+    if (!row) throw new Error('未登记任务');
+    const current = JSON.parse(String(source.origin_json)) as TaskOrigin;
+    const original = JSON.parse(String(row.origin_json)) as TaskOrigin;
+    if (current.conversationId !== original.conversationId || current.userId !== original.userId
+      || current.channelId !== original.channelId || current.agent !== original.agent || current.cwd !== original.cwd) {
+      throw new Error('任务不属于当前父会话');
+    }
+    // This cancels tracking only; the caller must separately stop and verify the external worker.
+    this.finish(taskId, 'cancelled', reason.trim() || '父 Agent 已取消任务登记；不代表外部进程已终止。');
+    return this.getTask(taskId)!;
+  }
   watchingTasks(): RegisteredTask[] {
     return this.db.prepare("SELECT id FROM tasks WHERE status IN ('registered','running') AND watch_json IS NOT NULL")
       .all().map(row => this.getTask(String(row.id))!);
