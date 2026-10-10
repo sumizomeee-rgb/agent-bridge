@@ -10,6 +10,8 @@ export interface Conversation {
   actualModel?: string | null;
   /** Most recently reported reasoning effort; null means the CLI did not confirm it. */
   actualEffort?: string | null;
+  /** Explicit per-conversation effort; null uses the CLI default. */
+  effort?: string | null;
   title: string;
   controllerMode?: boolean;
   contextSeed?: string | null;
@@ -37,11 +39,11 @@ export interface BridgeConfig {
   defaultModels?: Partial<Record<AgentName, string>>;
   modelOptions?: Partial<Record<AgentName, string[]>>;
 }
-export interface AgentModel { id: string; displayName: string; description?: string; isDefault?: boolean }
+export interface AgentModel { id: string; displayName: string; description?: string; isDefault?: boolean; supportedEfforts?: string[] }
 export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | null }
 export type AgentInput = { type: 'text'; text: string } | { type: 'localImage'; path: string };
 export interface AgentSupplement { id: string; input: AgentInput[] }
-export type SteerResult = { status: 'accepted' } | { status: 'queued' } | { status: 'uncertain'; reason: string };
+export type SteerResult = { status: 'accepted' } | { status: 'queued'; reason?: string; unsupported?: boolean } | { status: 'uncertain'; reason: string };
 export interface AgentTurn {
   conversation: Conversation;
   text: string;
@@ -50,8 +52,14 @@ export interface AgentTurn {
   input?: AgentInput[];
   /** Bridge-scoped registration capability; passed to CLI tools through the environment. */
   taskContextPath?: string;
+  /** Stable dispatch identity for remote request deduplication and reconnect. */
+  dispatchId?: string;
+  /** Reattach to a previously dispatched remote job; never submit a fresh task. */
+  recovering?: boolean;
   /** app-server 确认活动 turn 后通知桥尝试补充。 */
   onReady?: () => void;
+  /** Bridge child accepts supplements through its current native transport. */
+  acceptSupplements?: boolean;
   signal: AbortSignal;
   onProgress: (text: string) => void;
   onNativeId?: (nativeId: string) => void;
@@ -70,6 +78,8 @@ export interface AgentAdapter {
   /** queued 必须表示尚未提交或收到明确拒绝；不确定结果禁止自动重发。 */
   steer?(conversationId: string, supplement: AgentSupplement): Promise<SteerResult>;
   interrupt(conversationId: string): Promise<void>;
+  /** Read-only reconciliation; true only after target-native exit was confirmed. */
+  confirmStopped?(conversationId: string): Promise<boolean>;
   close(): Promise<void>;
   /** Metadata only: never sends a user prompt or starts a generated turn. */
   getModelInfo?(cwd: string): Promise<AgentModelInfo>;

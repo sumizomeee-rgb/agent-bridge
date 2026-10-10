@@ -14,8 +14,8 @@ import type { AgentAdapter, AgentModelInfo, AgentName, AgentResult, AgentTurn, B
 
 const catalog: AgentModelInfo = {
   defaultModel: 'gpt-5.6-sol', models: [
-    { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', isDefault: true },
-    { id: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol' },
+    { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', isDefault: true, supportedEfforts: ['medium', 'xhigh'] },
+    { id: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol', supportedEfforts: ['medium'] },
   ],
 };
 async function waitFor(predicate: () => boolean) {
@@ -214,9 +214,10 @@ test('旧SQLite迁移保留active、nativeId和历史，新model列可重启恢�
   legacy.prepare('INSERT INTO active_conversations VALUES(?,?)').run('owner', 'old'); legacy.close();
   let store = new SessionStore(root);
   assert.equal(store.getActive('owner')!.nativeId, 'native-existing'); assert.equal(store.getActive('owner')!.model, null);
+  assert.equal(store.getActive('owner')!.effort, null); store.setEffort('old', 'xhigh');
   store.setModel('old', 'gpt-6-sol'); store.saveActualModel('old', 'gpt-6-sol'); store.close();
   store = new SessionStore(root);
-  try { assert.equal(store.getActive('owner')!.model, 'gpt-6-sol'); assert.equal(store.getActive('owner')!.actualModel, 'gpt-6-sol'); }
+  try { assert.equal(store.getActive('owner')!.effort, 'xhigh'); assert.equal(store.getActive('owner')!.model, 'gpt-6-sol'); assert.equal(store.getActive('owner')!.actualModel, 'gpt-6-sol'); }
   finally { store.close(); }
 });
 
@@ -250,10 +251,10 @@ rl.on('line',line=>{const m=JSON.parse(line);trace(m);
   if(m.method==='config/read')send({id:m.id,result:{config:{model:'gpt-5.6-sol'}}});
   if(m.method==='model/list')send({id:m.id,result:m.params.cursor
     ?{data:[{model:'gpt-5.6-sol',displayName:'5.6',isDefault:false}],nextCursor:null}
-    :{data:[{model:'gpt-6.1-sol',displayName:'6.1',isDefault:true}],nextCursor:'page2'}});
+    :{data:[{model:'gpt-6.1-sol',displayName:'6.1',isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'xhigh'}]}],nextCursor:'page2'}});
   if(m.method==='thread/resume'||m.method==='thread/start')send({id:m.id,result:{thread:{id:m.params.threadId||id},model:m.params.model||'gpt-5.6-sol',modelProvider:m.params.modelProvider,reasoningEffort:'high'}});
   if(m.method==='turn/start'){send({id:m.id,result:{turn:{id:'turn'}}});send({method:'model/rerouted',params:{threadId:'other-thread',turnId:'turn',toModel:'ignore-other-thread'}});send({method:'model/rerouted',params:{threadId:id,turnId:'turn',toModel:'provider-effective-model'}});send({method:'turn/completed',params:{threadId:id,turn:{id:'turn',status:'completed',items:[{type:'agentMessage',id:'reply',phase:'final_answer',text:'fake'}]}}});}
-  if(m.type==='control_request')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{models:[{value:'sonnet',displayName:'Sonnet'}],defaultModel:'claude-fixture-default'}}});
+  if(m.type==='control_request')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{models:[{value:'sonnet',displayName:'Sonnet',supportsEffort:true,supportedEffortLevels:['high']}],defaultModel:'claude-fixture-default'}}});
   if(m.type==='user'){const at=process.argv.indexOf('--model');send({type:'system',subtype:'init',session_id:id,model:at>=0?process.argv[at+1]:'claude-fixture-default'});send({type:'assistant',parent_tool_use_id:null,message:{model:'provider-effective-model'}});send({type:'assistant',parent_tool_use_id:'subagent-tool',message:{model:'ignore-subagent-model'}});send({type:'result',subtype:'success',session_id:id,result:'fake'});}
 });`;
 for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user/turn，真实spawn模型override与resume原生ID`, async t => {
@@ -268,13 +269,14 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user
   let trace: any[] = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert(!trace.some(message => message.method === 'thread/start' || message.method === 'turn/start' || message.type === 'user'));
   if (agent === 'codex') assert.equal(info.models.length, 2);
+  assert.deepEqual(info.models[0]!.supportedEfforts, agent === 'codex' ? ['xhigh'] : ['high']);
   const reported: string[] = [];
   const efforts: Array<string | null> = [];
   await adapter.run({ conversation: { id: 'conv', userId: 'owner', agent, nativeId: 'native-existing', model: 'gpt-6-sol',
     title: 'test', cwd: root, createdAt: 'before', updatedAt: 'now' }, text: 'fake', imagePaths: [], signal: new AbortController().signal,
     onProgress: () => {}, onModel: model => reported.push(model), onReasoningEffort: effort => efforts.push(effort) });
   assert.deepEqual(reported, ['gpt-6-sol', 'provider-effective-model']);
-  assert.deepEqual(efforts, agent === 'codex' ? ['high'] : []);
+  assert.deepEqual(efforts, agent === 'codex' ? ['high'] : [null]);
   trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   if (agent === 'codex') {
     const resume = trace.find(message => message.method === 'thread/resume');
@@ -284,4 +286,79 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user
     const args: string[] = trace.findLast(message => message.args).args;
     assert.equal(args[args.indexOf('--resume') + 1], 'native-existing'); assert.equal(args[args.indexOf('--model') + 1], 'gpt-6-sol');
   }
+});
+
+test('effort is per conversation, survives reopen, rejects incompatible model changes and preserves native ID', async t => {
+  const { f, send, inspect } = fixture(t);
+  await send('hello'); await waitFor(() => f.replies.length > 0);
+  const nativeId = inspect(s => s.getActive('owner')!.nativeId);
+  await send('/model gpt-6.1-sol'); await send('/effort xhigh');
+  assert.equal(inspect(s => s.getActive('owner')!.effort), 'xhigh');
+  assert.equal(inspect(s => s.getActive('owner')!.actualEffort), null);
+  assert.equal(inspect(s => s.getActive('owner')!.nativeId), nativeId);
+  assert.match(f.replies.at(-1)!.text, /尚未由 CLI 确认/);
+  await send('/effort'); assert.match(f.replies.at(-1)!.text, /强度选择：xhigh/);
+  await send('/model gpt-5.6-sol'); assert.equal(inspect(s => s.getActive('owner')!.model), 'gpt-6.1-sol');
+  await send('/effort xhigh', 'other'); assert.equal(inspect(s => s.getActive('other')!.effort), null);
+  await send('/effort default'); assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+});
+
+test('Claude rejects Codex xhigh and unconfirmed model capability, accepts native supported levels', async t => {
+  const { f, send, inspect } = fixture(t);
+  f.claude.metadata = async () => ({ defaultModel: 'sonnet', models: [{ id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['low', 'medium', 'high'] }, { id: 'haiku', displayName: 'Haiku', supportedEfforts: [] }] });
+  await send('/agent claude'); await send('/effort xhigh'); assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+  await send('/effort high'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'high');
+  await send('/model haiku'); assert.equal(inspect(s => s.getActive('owner')!.model), null);
+  await send('/effort max'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'high');
+  await send('/effort default'); await send('/model custom unknown'); await send('/effort high');
+  assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+});
+
+test('effort lookup races cannot overwrite a changed session or newly queued work', async t => {
+  const { f, send, inspect } = fixture(t);
+  await send('/model gpt-6.1-sol');
+  let accept!: (info: AgentModelInfo) => void;
+  f.codex.metadata = () => new Promise(resolve => { accept = resolve; });
+  const setting = send('/effort xhigh'); await waitFor(() => !!accept);
+  await send('queued'); accept(catalog); await setting;
+  assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+  await waitFor(() => f.codex.calls.length === 1);
+});
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} 强度元数据查询失败时保留选择和原生会话且不生成`, async t => {
+  const { f, send, inspect } = fixture(t);
+  if (agent === 'claude') {
+    f.claude.metadata = async () => ({ defaultModel: 'sonnet', models: [{ id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['high'] }] });
+    await send('/agent claude');
+  } else await send('/model gpt-6.1-sol');
+  const selected = agent === 'codex' ? 'xhigh' : 'high';
+  await send('建立原生会话'); await waitFor(() => f.replies.some(r => r.text.includes('reply:')));
+  await send(`/effort ${selected}`);
+  const nativeId = inspect(s => s.getActive('owner')!.nativeId);
+  const adapter = f[agent]; const generated = adapter.calls.length;
+  adapter.metadata = async () => { throw new Error('模型元数据查询超时'); };
+  await send('/effort');
+  assert.match(f.replies.at(-1)!.text, agent === 'claude' ? /CLI 尚未提供/ : /查询超时/);
+  await send(`/effort ${selected}`); assert.match(f.replies.at(-1)!.text, /命令失败.*查询超时/);
+  assert.equal(inspect(s => s.getActive('owner')!.effort), selected);
+  assert.equal(inspect(s => s.getActive('owner')!.nativeId), nativeId);
+  assert.equal(adapter.calls.length, generated);
+  await send('/effort default'); assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+});
+
+test('旧数据库迁移保留原生绑定，强度重开持久化且与实际回报分离', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-effort-migration-'));
+  const legacy = new DatabaseSync(join(dir, 'bridge.sqlite'));
+  legacy.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,agent TEXT NOT NULL,native_id TEXT,title TEXT NOT NULL,cwd TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+    INSERT INTO conversations VALUES ('legacy','owner','codex','original-native','旧会话','old-cwd','before','before');`);
+  legacy.close();
+  let store = new SessionStore(dir);
+  try {
+    store.setActive('owner', 'legacy'); store.setEffort('legacy', 'xhigh'); store.saveActualEffort('legacy', 'medium');
+    store.close(); store = new SessionStore(dir);
+    const resumed = store.getActive('owner')!;
+    assert.equal(resumed.nativeId, 'original-native'); assert.equal(resumed.effort, 'xhigh'); assert.equal(resumed.actualEffort, 'medium');
+    store.setEffort('legacy', null);
+    assert.equal(store.getActive('owner')!.actualEffort, null); assert.equal(store.getActive('owner')!.nativeId, 'original-native');
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

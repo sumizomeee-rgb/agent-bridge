@@ -81,8 +81,8 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
   };
 }
 
-test('native registry contains exactly the nine supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'models', 'status', 'stop', 'help']);
+test('native registry contains exactly the ten supported DM-only commands, never resume/startup', () => {
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'stop', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);
@@ -109,7 +109,7 @@ test('unsupported names, incomplete options, types, duplicates and unsafe line b
   assert(invalid.every(value => 'error' in value));
 });
 
-test('registration uses READY application ID and PUTs nine global BOT_DM definitions', async t => {
+test('registration uses READY application ID and PUTs ten global BOT_DM definitions', async t => {
   const f = await fixture(t);
   await f.transport.syncSlashCommands();
   assert.equal(f.requests.length, 1);
@@ -386,4 +386,12 @@ test('one user waiting for slash ACK does not block another user or Gateway hear
   assert.equal(f.received[0]!.userId, '444');
   release(); await until(() => f.received.length === 2);
   assert.equal(f.received[1]!.userId, '111');
+});
+
+test('effort slash uses level, supports query/default, and rejects unknown options', () => {
+  assert.deepEqual(result('effort'), { text: '/effort' });
+  assert.deepEqual(result('effort', [option('level', 'xhigh')]), { text: '/effort xhigh' });
+  assert.deepEqual(result('effort', [option('level', 'default')]), { text: '/effort default' });
+  assert.ok('error' in result('effort', [option('level', 'extreme')]));
+  assert.ok('error' in result('effort', [option('name', 'high')]));
 });

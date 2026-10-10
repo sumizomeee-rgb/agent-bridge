@@ -1,3 +1,4 @@
+import { selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, safeError, type JsonObject, type RpcTransport } from './process.js';
 
@@ -34,6 +35,7 @@ export class CodexAdapter implements AgentAdapter {
           if (!models.some(model => model.id === value.model)) models.push({
             id: value.model, displayName: typeof value.displayName === 'string' ? value.displayName : value.model,
             description: typeof value.description === 'string' ? value.description : '', isDefault: value.isDefault === true,
+            ...(Array.isArray(value.supportedReasoningEfforts) ? { supportedEfforts: value.supportedReasoningEfforts.filter(isObject).map(item => item.reasoningEffort).filter((item): item is string => typeof item === 'string') } : {}),
           });
         }
         cursor = typeof page.nextCursor === 'string' && page.nextCursor ? page.nextCursor : null;
@@ -50,6 +52,10 @@ export class CodexAdapter implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
+    const effort = selectedEffort(turn);
+    if (effort) await validateEffort(this, turn.conversation, effort);
+    if (turn.signal.aborted) throw abortError();
+    if (this.closed) throw new Error('Codex 适配器已关闭。');
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Codex 会话仍在执行任务。');
 
@@ -137,7 +143,7 @@ export class CodexAdapter implements AgentAdapter {
         return { status: 'accepted' };
       } catch (error) {
         // 仅服务端的明确拒绝可以安全接下一轮；断线/超时可能已执行。
-        if (error instanceof JsonRpcError && [-32600, -32601, -32602].includes(error.code ?? 0)) return { status: 'queued' };
+        if (error instanceof JsonRpcError && [-32600, -32601, -32602].includes(error.code ?? 0)) return { status: 'queued', ...(error.code === -32601 ? { unsupported: true, reason: '此 Codex CLI 不支持 turn/steer；未发送，可明确排队下一轮。' } : {}) };
         return { status: 'uncertain', reason: safeError(error instanceof Error ? error.message : error, '补充结果未知') };
       }
     });
@@ -171,6 +177,7 @@ export class CodexAdapter implements AgentAdapter {
         thread = await rpc.request(resumeId ? 'thread/resume' : 'thread/start', {
           ...(resumeId ? { threadId: resumeId, excludeTurns: true } : {}), modelProvider,
           cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
+          ...((effort ?? configured.config.model_reasoning_effort) ? { config: { model_reasoning_effort: effort ?? configured.config.model_reasoning_effort } } : {}),
           ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
         });
       } catch (error) {
@@ -188,12 +195,14 @@ export class CodexAdapter implements AgentAdapter {
       if (resumeId && thread.thread.id !== resumeId) {
         throw new Error('Codex 续接返回了不同会话；原会话已保留，本轮任务尚未提交。');
       }
+      if (effort && typeof thread.model === 'string' && thread.model !== turn.conversation.model) await validateEffort(this, { ...turn.conversation, model: thread.model }, effort);
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
       if (typeof thread.model === 'string' && thread.model) turn.onModel?.(thread.model);
-      if (typeof thread.reasoningEffort === 'string' || thread.reasoningEffort === null) {
+      if (!effort && (typeof thread.reasoningEffort === 'string' || thread.reasoningEffort === null)) {
         turn.onReasoningEffort?.(thread.reasoningEffort);
       }
+      if (effort) turn.onReasoningEffort?.(null);
       if (cancelled) throw abortError();
       const input: JsonObject[] = [];
       for (const value of turn.input ?? [
@@ -205,8 +214,15 @@ export class CodexAdapter implements AgentAdapter {
         threadId: nativeId, input, cwd: turn.conversation.cwd,
         approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
         ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
-        ...(turn.effort ? { effort: turn.effort } : {}),
+        ...(effort ? { effort } : {}),
       });
+      if (effort) {
+        try {
+          const configured = await rpc.request('thread/read', { includeTurns: false, threadId: nativeId });
+          const actual = isObject(configured.thread) ? configured.thread.reasoningEffort : null;
+          turn.onReasoningEffort?.(typeof actual === 'string' ? actual : null);
+        } catch { turn.onReasoningEffort?.(null); } // Metadata failure must not replay an already submitted turn.
+      }
       if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 没有返回任务标识。');
       turnId = started.turn.id;
       if (cancelled) throw abortError();

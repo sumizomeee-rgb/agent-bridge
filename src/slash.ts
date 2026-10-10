@@ -30,6 +30,9 @@ export const SLASH_COMMANDS: SlashDefinition[] = [
     { type: 3, name: 'name', description: '模型名；Claude 可填 haiku/sonnet/opus；list 列出，default 默认；留空查询', min_length: 1, max_length: 200 },
     { type: 5, name: 'custom', description: '网关自定义模型：跳过官方目录验证' },
   ] },
+  { type: 1, name: 'effort', description: '查看或设置当前会话推理强度，保留上下文', contexts: [1], options: [
+    { type: 3, name: 'level', description: '留空查询；default 使用 CLI 默认；可用值取决于后端和模型', choices: ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(value => ({ name: value, value })) },
+  ] },
   { type: 1, name: 'models', description: '列出当前 Agent 的模型选项', contexts: [1] },
   { type: 1, name: 'status', description: '查看当前模型、会话和排队情况', contexts: [1] },
   { type: 1, name: 'stop', description: '停止当前任务并清空其队列，保留上下文', contexts: [1] },
@@ -67,6 +70,7 @@ export function slashText(data: unknown): { text: string } | { error: string } {
   switch (definition.name) {
     case 'new':
     case 'agent': return { text: `/${definition.name}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
+    case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };
     case 'cwd': return { text: `/cwd ${values.get('path')}` };
     case 'model': {
       const name = values.get('name');

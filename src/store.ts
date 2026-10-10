@@ -22,6 +22,7 @@ function conversation(row: Row): Conversation {
     id: String(row.id), userId: String(row.user_id), agent: String(row.agent) as AgentName,
     nativeId: row.native_id === null ? null : String(row.native_id), title: String(row.title),
     model: row.model == null ? null : String(row.model), actualModel: row.actual_model == null ? null : String(row.actual_model),
+    effort: row.effort == null ? null : String(row.effort),
     actualEffort: row.actual_effort == null ? null : String(row.actual_effort),
     cwd: String(row.cwd), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
     controllerMode: Number(row.controller_mode ?? 0) === 1, contextSeed: row.context_seed == null ? null : String(row.context_seed),
@@ -84,6 +85,7 @@ export class SessionStore {
     const columns = new Set(this.db.prepare('PRAGMA table_info(conversations)').all().map(row => String(row.name)));
     if (!columns.has('model')) this.db.exec('ALTER TABLE conversations ADD COLUMN model TEXT');
     if (!columns.has('actual_model')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_model TEXT');
+    if (!columns.has('effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN effort TEXT');
     if (!columns.has('actual_effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_effort TEXT');
     if (!columns.has('controller_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN controller_mode INTEGER NOT NULL DEFAULT 0');
     if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
@@ -204,6 +206,11 @@ export class SessionStore {
   setModel(id: string, model: string): void {
     this.db.prepare('UPDATE conversations SET model = ?, updated_at = ? WHERE id = ?')
       .run(model, new Date().toISOString(), id);
+  }
+
+  setEffort(id: string, effort: string | null): void {
+    this.db.prepare('UPDATE conversations SET effort = ?, actual_effort = NULL, updated_at = ? WHERE id = ?')
+      .run(effort, new Date().toISOString(), id);
   }
 
   saveActualModel(id: string, model: string): void {

@@ -1,17 +1,14 @@
-# 笔记本助手导航
+# 工作区导航
 
-本机：`DESKTOP-6FVMGQD`，Windows，用户 `sumizome`。用于日常聊天、检查本机和安排远程工作。
+用户在实际工作区维护电脑用途、机器和项目入口、权威指导路径及适用范围。本模板不保存个人机器、项目或登录状态；桥不会自动复制模板或覆盖实际工作区。
 
-- 网络：`C:\SuchProject\Other\ssh-tunnel-proxy`，代理 `http://127.0.0.1:7898`。
-- 桥：`C:\SuchProject\Other\discord-agent-bridge`，数据在 `.local/data`，用户登录后自启。
-- 共用 skills：`C:\Users\sumizome\.agents\skills` → `.claude\skills`；登录及提供商在用户目录，通过 CC Switch 切换。
-- 飞书：优先本机 Chrome 的[网页版](https://www.feishu.cn/messenger/)。已登录（用户确认）；操作前核实当前账号和页面。
+## 工作区初始化
 
-SSH 库：`C:\SuchProject\Other\ssh-project`。用对应配置的 `-F` 连接，操作前核对 `hostname`。
+- 默认只读本目录 `AGENTS.md`、`README.md`。需要其他初始化资料时，在本节明确列出本机文件入口和读取范围；普通导航不表示初始化需要读全文。
+- 在此定义需要回传的最小上下文和摘要要求；仅保留后续会话需要的指导，区分文件声明与实际核实，不复制长指南或聊天历史。
+- 初始化只读，不扫描未指定目录或技能目录，不连接远程电脑、联网检查或启动新工作。
+- 主控模式下新会话异步初始化，首条消息可能先于上下文到达；`/new`、`/cwd` 使用新会话的当前工作区，正常续接去重。初始化事件不是新的用户请求或授权。
 
-| 目标 | 配置（相对 SSH 库） | 别名 |
-|---|---|---|
-| 工位 `11032022110008` | `hosts\11032022110008\ssh_config` | `administrator` |
-| 家里 `DESKTOP-HB47FVQ` | `hosts\DESKTOP-HB47FVQ-家里本机\ssh_config` | `sumizome` |
+## 按任务使用的导航
 
-工位工作习惯的唯一维护入口：工位 `E:\Such_Proj\Other\MyHaruSkills\README.md`。相关任务连接工位读取，日常聊天不套用工位流程；本目录不保存工作导航副本。
+在实际工作区填写所需的本机入口、远程连接配置及项目权威文档，并注明哪些资料应在相关任务中按需读取。用户级技能清单由 CLI 提供，不需要复制到此处或桥的基础 prompt。

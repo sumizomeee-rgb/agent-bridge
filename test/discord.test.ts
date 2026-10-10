@@ -2,16 +2,18 @@ import assert from 'node:assert/strict';
 import { lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { fetch, ProxyAgent, Response } from 'undici';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import WebSocket, { WebSocketServer } from 'ws';
-import { DiscordTransport, type DiscordTransportOptions } from '../src/discord.js';
+import { DiscordTransport, ImagePreparationError, ingressFailureText, type DiscordTransportOptions } from '../src/discord.js';
 import type { BridgeConfig, IncomingDM } from '../src/types.js';
 
 interface Packet { op: number; d?: Record<string, unknown> | number | null; t?: string; s?: number }
+const badHttpPorts = (createRequire(import.meta.url)('undici/lib/web/fetch/constants.js') as { badPortsSet: Set<string> }).badPortsSet;
 const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.alloc(8)]);
 const attachment = (changes: Record<string, unknown> = {}) => ({
   id: '888', filename: 'image.png', url: 'https://cdn.discordapp.com/attachments/123/888/image.png',
@@ -57,9 +59,16 @@ async function fixture(t: TestContext, onMessage: (message: IncomingDM) => Promi
       else { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{"id":"555"}'); }
     } else { response.writeHead(404); response.end(); }
   });
-  await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
-  const httpAddress = http.address();
-  assert(httpAddress && typeof httpAddress !== 'string');
+  let httpAddress: ReturnType<typeof http.address> = null;
+  // Windows may assign an ephemeral legacy service port that Fetch explicitly forbids.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+    const address = http.address();
+    assert(address && typeof address !== 'string');
+    if (!badHttpPorts.has(String(address.port))) { httpAddress = address; break; }
+    await new Promise<void>(resolve => http.close(() => resolve()));
+  }
+  assert(httpAddress && typeof httpAddress !== 'string', 'Could not allocate a safe local HTTP test port');
   const rest = `http://127.0.0.1:${httpAddress.port}`;
   const gateway = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>(resolve => gateway.once('listening', resolve));
@@ -136,6 +145,37 @@ async function fixture(t: TestContext, onMessage: (message: IncomingDM) => Promi
     set imageHandler(handler: typeof imageHandler) { imageHandler = handler; },
   };
 }
+
+test('Presence仅op3自定义state，去重并重连恢复当前状态，READY/RESUMED不伪造重启私信', async t => {
+  const f = await fixture(t);
+  f.transport.setPresence('idle'); await f.transport.start();
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
+  f.transport.setPresence('idle'); f.transport.setPresence('idle'); await delay(10);
+  assert.equal(f.packets.filter(packet => packet.op === 3).length, 1);
+  f.transport.setPresence('draining'); f.transport.setPresence('draining');
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
+  const first = f.packets.find(packet => packet.op === 3)!.d as Record<string, unknown>;
+  assert.equal(first.status, 'online');
+  assert.deepEqual(first.activities, [{ name: 'Bridge', type: 4, state: '空闲 · 随时可以聊天' }]);
+  f.sockets.at(-1)!.terminate();
+  await eventually(() => f.packets.some(packet => packet.op === 6) && f.packets.filter(packet => packet.op === 3).length === 3);
+  const restored = f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
+  assert.equal(restored.status, 'idle'); assert.deepEqual(restored.activities, [{ name: 'Bridge', type: 4, state: '准备重启 · 正在收尾' }]);
+  assert.equal(f.posts.length, 0);
+});
+
+test('Presence每个窗口最多5次，超限合并到最新状态，不发送限流通知私信', async t => {
+  const f = await fixture(t, async () => {}, { presenceWindowMs: 100 });
+  await f.transport.start(); await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
+  f.transport.setPresence('idle'); f.transport.setPresence('draining'); f.transport.setPresence('idle'); f.transport.setPresence('recovering');
+  f.transport.setPresence('failed'); f.transport.setPresence('draining');
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 5);
+  await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 5);
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 6);
+  const packet = f.packets.filter(item => item.op === 3).at(-1)!.d as Record<string, unknown>;
+  assert.deepEqual(packet.activities, [{ name: 'Bridge', type: 4, state: '准备重启 · 正在收尾' }]);
+  assert.equal(f.posts.length, 0);
+});
 
 test('⏳ 只标记白名单普通私聊，重放去重且不等待表情请求', async t => {
   const received: IncomingDM[] = [];
@@ -592,6 +632,48 @@ test('JPG, PNG, WebP and GIF file signatures are accepted', async t => {
     assert(paths[0]!.endsWith(`.${extension}`));
     assert.deepEqual(await readFile(paths[0]!), bytes);
   }
+});
+
+test('截图真实格式优先于文件名、附件声明及 HTTP Content-Type', async t => {
+  const f = await fixture(t);
+  f.config.maxImageBytes = 1024;
+  const screenshot = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ZkAAAAASUVORK5CYII=', 'base64');
+  const webp = Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA', 'base64');
+  for (const [bytes, filename, declaration, extension] of [
+    [screenshot, 'image.png', 'image/webp', 'png'],
+    [webp, 'image.png', 'image/png', 'webp'],
+    [screenshot, 'Screenshot.png', 'image/png', 'png'],
+    [screenshot, 'image.webp', 'application/octet-stream', 'png'],
+    [screenshot, 'image.jpeg', 'text/plain', 'png'],
+    [webp, 'image.png', undefined, 'webp'],
+    [screenshot, 'image.bin', 'image/unknown', 'png'],
+  ] as const) {
+    f.imageHandler = (_request, response) => { response.writeHead(200, { 'content-type': 'text/html' }); response.end(bytes); };
+    const paths = await f.transport.downloadImages(message({ attachments: [attachment({
+      filename, content_type: declaration, size: bytes.length,
+    })] }));
+    assert.equal(paths.length, 1);
+    assert(paths[0]!.endsWith(`.${extension}`), 'manifest 路径必须使用真实格式');
+    assert.deepEqual(await readFile(paths[0]!), bytes, '不转换或修改截图字节');
+  }
+});
+
+test('伪装图片被拒绝，错误提示说明附件已收到且隐藏下载凭据', async t => {
+  const f = await fixture(t);
+  f.imageHandler = (_request, response) => { response.writeHead(200); response.end('<script>alert(1)</script>'); };
+  for (const type of ['image/png', 'image/webp', 'image/svg+xml']) {
+    await assert.rejects(f.transport.downloadImages(message({ attachments: [attachment({ content_type: type })] })), error => {
+      assert(error instanceof ImagePreparationError);
+      const text = ingressFailureText(error);
+      assert.match(text, /桥已收到.*未能交给模型/);
+      assert.match(text, /不是支持的图片格式/);
+      return true;
+    });
+  }
+  assert.deepEqual(await readdir(f.config.attachmentsDir), []);
+  assert(!ingressFailureText(new ImagePreparationError(new Error('network https://cdn.discordapp.com/?secret=private'))).includes('secret'));
+  assert.match(ingressFailureText(new ImagePreparationError(new Error('图片下载失败（HTTP 403）。'))), /HTTP 403/);
+  assert.equal(ingressFailureText(new Error('unrelated')), '这条消息处理失败，请稍后再试。');
 });
 
 test('REST, CDN and Gateway each receive an explicit proxy agent', async t => {

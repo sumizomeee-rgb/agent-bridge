@@ -6,12 +6,15 @@ import { loadConfig, agentEnvironment, safeError, redactText } from './config.js
 import { CodexAdapter } from './agents/codex.js';
 import { ClaudeAdapter } from './agents/claude.js';
 import { SessionManager } from './manager.js';
-import { DiscordTransport } from './discord.js';
+import { DiscordTransport, ingressFailureText } from './discord.js';
 import { DurableIngress } from './ingress.js';
 import { NativeControllerAdapter } from './controller/native.js';
 import { ControllerRuntime } from './controller/runtime.js';
 import { TaskRegistry, TaskService } from './tasks.js';
 import type { IncomingDM } from './types.js';
+import { RestartService } from './restart.js';
+import { closeResources } from './shutdown.js';
+import { TargetCatalogService } from './remote/catalog.js';
 
 if (process.argv.includes('--help')) {
   console.log('启动：start.ps1 [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/agent、/stop');
@@ -55,11 +58,16 @@ const env = agentEnvironment(config);
 const tasks = new TaskRegistry(config.dataDir);
 // Executing children retain the user's ordinary CLI, skills, approvals and provider routing.
 const executionAdapters = { codex: new CodexAdapter(config.commands.codex, env), claude: new ClaudeAdapter(config.commands.claude, env) };
+const targetCatalog = new TargetCatalogService(config, executionAdapters);
 let manager: SessionManager;
+let restart: RestartService;
 const runtime = config.controllerMode ? new ControllerRuntime(config, executionAdapters, tasks, {
+  targetCatalog,
   onCompletion: () => manager.completionAvailable(),
   onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
   onError: error => log('CONTROLLER_WORKER ' + safeError(error)),
+  isDraining: () => restart?.isDraining() ?? false,
+  onRequestRestart: origin => restart.request(origin),
 }) : undefined;
 const adapters = runtime ? {
   codex: new NativeControllerAdapter(config.commands.codex, env, {
@@ -105,7 +113,7 @@ const ingress = new DurableIngress(config.dataDir, {
   handle: async message => {
     try {
       await startupReady;
-      if (closing) return;
+      if (closing || restart.isDraining()) return;
       if (manager.hasMessage(message.id)) {
         if (message.interaction) await discord.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
         return;
@@ -116,7 +124,7 @@ const ingress = new DurableIngress(config.dataDir, {
         return;
       }
       const imagePaths = control ? [] : await discord.downloadImages(message);
-      if (closing) return;
+      if (closing || restart.isDraining()) return;
       const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths };
       if (!control && messageRevisions.get(message.id) !== (preparationEpochs.get(message.userId) ?? 0)) {
         manager.discard(prepared);
@@ -129,15 +137,21 @@ const ingress = new DurableIngress(config.dataDir, {
     } finally { messageRevisions.delete(message.id); }
   },
   onError: (message, error) => {
-    if (closing) return;
+    if (closing || restart.isDraining()) return;
     log('INGRESS_PREPARATION_FAILED ' + safeError(error));
-    void discord.sendText(message.channelId, '这条消息处理失败，请稍后再试。').catch(() => log('收件错误反馈发送失败。'));
+    void discord.sendText(message.channelId, ingressFailureText(error)).catch(() => log('收件错误反馈发送失败。'));
   },
 });
-const discord: DiscordTransport = new DiscordTransport(config, message => ingress.receive(message), {
+const discord: DiscordTransport = new DiscordTransport(config, message => {
+  if (restart.isDraining()) {
+    if (!message.interaction) ingress.capture(message);
+    return Promise.resolve();
+  }
+  return ingress.receive(message);
+}, {
   logger: message => log('DISCORD ' + message),
   onReceive: message => { ingress.capture(message); },
-  onReady: () => ingress.recover((channelId, options) => discord.readDMHistory(channelId, options)),
+  onReady: () => restart.isDraining() ? Promise.resolve() : ingress.recover((channelId, options) => discord.readDMHistory(channelId, options)),
 });
 manager = new SessionManager(config, adapters, {
   markReplyDelivered: messages => discord.markReplyDelivered(messages),
@@ -159,30 +173,54 @@ manager = new SessionManager(config, adapters, {
     onInitializationError: (_conversation, error) => log('workspace initialization: ' + safeError(error)),
     controllerSeed: conversation => migrationSeeds.get(conversation.id) ?? '' } : {}),
 });
+restart = new RestartService(config.dataDir, {
+  supervised: process.env.BRIDGE_SUPERVISED === '1',
+  beginDrain: () => { ingress.pause(); manager.beginDrain(); runtime?.beginDrain(); },
+  isIdle: () => manager.isIdle() && (runtime?.isIdle() ?? true) && discord.isIdle(),
+  shutdown: () => shutdown(true),
+  onShutdownComplete: exitCode => { process.exitCode = exitCode; restart.close(); },
+  presence: phase => discord.setPresence(phase),
+  onError: error => log('RESTART ' + safeError(error)),
+});
+restart.beginRecovery();
 for (const channel of manager.knownChannels()) if (config.allowedUserIds.includes(channel.userId)) ingress.seedChannel(channel);
 let closing = false;
-async function shutdown(): Promise<void> {
+async function shutdown(plannedRestart = false): Promise<void> {
   if (closing) return;
   closing = true;
   releaseStartup();
   clearInterval(stopPoll);
-  log('STOPPING');
+  if (!plannedRestart) restart.cancel();
+  log(plannedRestart ? 'RESTART_STOPPING' : 'STOPPING');
   // Abort REST/backfill and stop fresh Gateway input before closing either journal.
-  await discord.close().catch(e => log('discord close: ' + safeError(e)));
-  await ingress.close().catch(e => log('ingress close: ' + safeError(e)));
-  await taskService.close().catch(e => log('tasks close: ' + safeError(e)));
-  await manager.close().catch(e => log('close: ' + safeError(e)));
-  await runtime?.close().catch(e => log('controller close: ' + safeError(e)));
-  await Promise.allSettled(Object.values(executionAdapters).map(adapter => adapter.close()));
-  tasks.close();
-  guard.close();
-  if (existsSync(pidFile)) unlinkSync(pidFile);
-  if (existsSync(stopFile)) unlinkSync(stopFile);
-  log('STOPPED');
+  try {
+    await closeResources([
+      { name: 'Discord', close: () => discord.close() },
+      { name: '收件', close: () => ingress.close() },
+      { name: '任务回执', close: () => taskService.close() },
+      { name: '主控', close: () => manager.close() },
+      { name: '执行任务', close: async () => { await runtime?.close(); } },
+      { name: '远程目录', close: () => targetCatalog.close() },
+      ...Object.entries(executionAdapters).map(([agent, adapter]) => ({ name: `${agent} 执行器`, close: () => adapter.close() })),
+      { name: '任务数据库', close: () => tasks.close() },
+      { name: '进程标识', close: () => {
+        guard.close();
+        if (existsSync(pidFile)) unlinkSync(pidFile);
+        if (existsSync(stopFile)) unlinkSync(stopFile);
+      } },
+    ]);
+    log('STOPPED');
+  } catch (error) {
+    log('STOP_FAILED ' + safeError(error));
+    if (plannedRestart) throw error;
+  } finally {
+    // RestartService records a planned failure before it releases the journal.
+    if (!plannedRestart) restart.close();
+  }
 }
 const stopPoll = setInterval(() => { if (existsSync(stopFile)) void shutdown(); }, 1000);
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) process.on(signal, () => void shutdown());
-process.on('uncaughtException', e => { log(`FATAL ${safeError(e)}`); void shutdown().finally(() => { process.exitCode = 1; }); });
+process.on('uncaughtException', e => { log(`FATAL ${safeError(e)}`); restart.failed(safeError(e)); void shutdown().finally(() => { if (process.exitCode !== 76) process.exitCode = 1; }); });
 process.on('unhandledRejection', e => log(`ERROR ${safeError(e)}`));
 try {
   await discord.start();
@@ -192,9 +230,10 @@ try {
   if (!closing) await runtime?.start();
   if (!closing) taskService.start();
   releaseStartup();
-  if (!closing) ingress.start();
+  if (!closing) { ingress.start(); restart.ready(); }
 } catch (error) {
   log(`START_FAILED ${safeError(error)}`);
+  restart.failed(safeError(error));
   await shutdown();
-  process.exitCode = 1;
+  if (process.exitCode !== 76) process.exitCode = 1;
 }

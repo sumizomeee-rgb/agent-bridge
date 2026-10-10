@@ -7,16 +7,19 @@ import test from 'node:test';
 import { ControllerRuntime } from '../src/controller/runtime.js';
 import { ControllerStore } from '../src/controller/store.js';
 import { TaskRegistry, type TaskCompletionEvent, type TaskContextFile } from '../src/tasks.js';
-import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig } from '../src/types.js';
+import type { AgentAdapter, AgentResult, AgentTurn, AgentSupplement, SteerResult, BridgeConfig } from '../src/types.js';
 
 class FakeAdapter implements AgentAdapter {
   turns: AgentTurn[] = [];
   interrupts: string[] = [];
   pending = new Map<string, { resolve: (value: AgentResult) => void; reject: (error: Error) => void }>();
   automaticClose = true;
+  steer?: (workerId: string, supplement: AgentSupplement) => Promise<SteerResult>;
+  ready = true;
   async run(turn: AgentTurn): Promise<AgentResult> {
     this.turns.push(turn);
     turn.onNativeId?.(turn.conversation.nativeId ?? `native-${turn.conversation.id}`);
+    if (this.ready) turn.onReady?.();
     return new Promise((resolve, reject) => { this.pending.set(turn.conversation.id, { resolve, reject }); });
   }
   finish(workerId: string, text = 'done'): void {
@@ -58,6 +61,113 @@ async function launch(runtime: ControllerRuntime, turn: AgentTurn, args: Record<
   return await runtime.invoke(turn, 'bridge_start_worker', { title: '温度调查', prompt: '检查温度', ...args }, callId) as Handle;
 }
 
+
+test('busy continue sends current input once, persists receipt and retains original job/count/result origin', async () => {
+  const f = fixture(); const received: AgentSupplement[] = [];
+  f.codex.steer = async (_id, value) => { received.push(value); return { status: 'accepted' }; };
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    const input = { workerId: a.workerId, prompt: '改为检查内存' };
+    const first = await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'current-1') as Handle & { supplementId: string; delivered: boolean; delivery: string };
+    assert.equal(first.jobId, a.jobId); assert.equal(first.delivery, 'current');
+    assert.equal(first.delivered, false); await flush();
+    const receipt = await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'current-1') as { status: string; delivered: boolean };
+    assert.equal(receipt.status, 'accepted'); assert.equal(receipt.delivered, true); assert.equal(received.length, 1);
+    assert.equal(received[0]!.input[0]!.type, 'text'); assert.equal(f.runtime.store.jobs().length, 1);
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.registry.activeCount('parent-A'), 1);
+    f.codex.finish(a.workerId, '内存已检查'); await flush();
+    assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /accepted/); assert.equal(f.events[0]!.originMessageId, 'message-A');
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.runtime.store.supplements(a.jobId)[0]!.status, 'accepted');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('busy preparation stores pending input until native readiness; cancellation never sends it', async () => {
+  const f = fixture(); f.codex.ready = false; let sent = 0;
+  f.codex.steer = async () => { sent++; return { status: 'accepted' }; };
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '补充1' }); await flush();
+    assert.equal(sent, 0); f.codex.turns[0]!.onReady?.(); await flush(); assert.equal(sent, 1);
+    f.codex.finish(a.workerId); await flush();
+    const b = await launch(f.runtime, f.turn); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: b.workerId, prompt: '不要发' });
+    await f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: b.workerId });
+    assert.equal(sent, 1); assert.equal(f.runtime.store.supplements(b.jobId)[0]!.status, 'cancelled');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('unsupported busy backend reports undelivered; explicit next remains serial and idle resume works', async () => {
+  const f = fixture();
+  try {
+    const a = await launch(f.runtime, f.turn, { agent: 'claude' }); await flush();
+    const result = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '当前补充' }) as { status: string; delivered: boolean; queueAvailable: boolean };
+    assert.equal(result.status, 'unsupported'); assert.equal(result.delivered, false); assert.equal(result.queueAvailable, true);
+    assert.equal(f.runtime.store.jobs().length, 1);
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '下一轮做', delivery: 'next' });
+    assert.equal(f.runtime.store.jobs().length, 2); assert.equal(f.claude.turns.length, 1);
+    f.claude.finish(a.workerId); await flush(); assert.equal(f.claude.turns.length, 2);
+    assert.equal(f.claude.turns[1]!.conversation.nativeId, `native-${a.workerId}`); f.claude.finish(a.workerId); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '空闲继续' }); await flush();
+    assert.equal(f.claude.turns.length, 3); f.claude.finish(a.workerId); await flush();
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '非法', delivery: 'invented' }), /delivery/);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('completion waits for in-flight receipt; accepted input is never replayed as a queued job', async () => {
+  const f = fixture(); let confirm!: (value: SteerResult) => void;
+  f.codex.steer = () => new Promise(resolve => { confirm = resolve; });
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '在途补充' }); await flush();
+    f.codex.finish(a.workerId); await flush(); assert.equal(f.events.length, 0);
+    const late = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '轮次已结束' }) as { status: string };
+    assert.equal(late.status, 'not_delivered'); confirm({ status: 'accepted' }); await flush();
+    assert.equal(f.events.length, 1); assert.equal(f.runtime.store.jobs().length, 1); assert.equal(f.codex.turns.length, 1);
+    assert.deepEqual(f.runtime.store.supplements(a.jobId).map(value => value.status), ['accepted', 'not_delivered']);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+for (const outcome of ['queued', 'unsupported', 'uncertain'] as const) test(`current input ${outcome} never auto-queues or retries`, async () => {
+  const f = fixture(); let sent = 0;
+  f.codex.steer = async () => { sent++; return outcome === 'uncertain' ? { status: 'uncertain', reason: '响应丢失' }
+    : { status: 'queued', ...(outcome === 'unsupported' ? { unsupported: true } : {}) }; };
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    const input = { workerId: a.workerId, prompt: '只发一次' };
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'uncertain-once'); await flush();
+    const response = await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'uncertain-once') as { status: string; delivered: boolean };
+    assert.equal(response.status, outcome === 'queued' ? 'not_delivered' : outcome); assert.equal(response.delivered, false);
+    f.codex.finish(a.workerId); await flush(); assert.equal(sent, 1); assert.equal(f.runtime.store.jobs().length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('cancel during an in-flight confirmation stops original work without replaying the supplement', async () => {
+  const f = fixture(); let confirm!: (value: SteerResult) => void;
+  f.codex.steer = () => new Promise(resolve => { confirm = resolve; });
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '取消竞态' }); await flush();
+    const cancellation = f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: a.workerId }); await flush();
+    confirm({ status: 'uncertain', reason: '取消前投递未确认' });
+    await cancellation; assert.equal(f.runtime.store.getJob(a.jobId)!.status, 'cancelled');
+    assert.equal(f.runtime.store.supplements(a.jobId)[0]!.status, 'uncertain'); assert.equal(f.runtime.store.jobs().length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('restart preserves accepted receipts and marks interrupted in-flight input uncertain without replay', async () => {
+  const f = fixture();
+  try {
+    const a = await launch(f.runtime, f.turn); await flush(); f.codex.finish(a.workerId); await flush();
+    const timestamp = new Date().toISOString();
+    for (const status of ['accepted', 'steering', 'pending'] as const) f.runtime.store.saveSupplement({ id: status, workerId: a.workerId,
+      jobId: a.jobId, origin: f.runtime.store.getJob(a.jobId)!.origin, prompt: '不重放', imagePaths: [], status, createdAt: timestamp, updatedAt: timestamp });
+    await f.runtime.close();
+    const next = new ControllerRuntime(f.config, { codex: f.codex, claude: f.claude }, f.registry, f.callbacks);
+    try { await next.start(); assert.deepEqual(next.store.supplements(a.jobId).map(value => value.status), ['accepted', 'uncertain', 'not_delivered']);
+      assert.equal(f.codex.turns.length, 1); } finally { await next.close(); }
+  } finally { f.registry.close(); }
+});
+
 test('workspace initialization uses one durable child with the parent backend/model/effort and ordinary counts/receipts', async () => {
   const f = fixture(); f.turn.imagePaths = [join(f.dir, 'unrelated-user-picture.png')]; f.turn.text = 'USER_TASK_MUST_NOT_BE_EXECUTED'; f.turn.effort = 'high';
   try {
@@ -69,7 +179,9 @@ test('workspace initialization uses one durable child with the parent backend/mo
     assert.equal(job.origin.nativeId, 'native-parent'); assert.equal(job.origin.channelId, 'dm-A');
     const child = f.codex.turns[0]!;
     assert.equal(child.conversation.model, 'gpt-6.1-sol'); assert.equal(child.effort, 'high'); assert.deepEqual(child.imagePaths, []);
-    assert.match(child.text, /AGENTS\.md、README\.md/); assert.match(child.text, /不要扫描技能目录、自动读取远程工作习惯全文/);
+    assert.match(child.text, /AGENTS\.md、README\.md/); assert.match(child.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
+    assert.match(child.text, /不要扫描未指定的目录或技能目录/); assert.match(child.text, /不连接远程电脑/);
+    assert(!child.text.includes('用户职责和偏好、当前电脑用途'));
     assert.match(child.text, /不自行登记桥后台任务、发 Discord 消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
     assert.equal(child.taskContextPath, undefined); assert.equal(child.onPublicMessage, undefined); assert.equal(f.registry.activeCount('parent-A'), 1);
     f.codex.finish(first!.workerId, '主机和导航已阅读；Chrome 登录状态仅依据 README 声明。'); await flush();
@@ -176,7 +288,7 @@ test('dispatch returns before child completion; one child serializes turns and p
   try {
     const handle = await launch(f.runtime, f.turn);
     await flush(); assert.equal(f.codex.turns.length, 1); assert.equal(f.registry.activeCount('parent-A'), 1);
-    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '检查 CPU 和内存' }) as Handle;
+    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '检查 CPU 和内存', delivery: 'next' }) as Handle;
     assert.notEqual(next.jobId, handle.jobId); await flush(); assert.equal(f.codex.turns.length, 1);
     assert.equal(f.runtime.store.getJob(next.jobId)?.status, 'queued'); assert.equal(f.registry.activeCount('parent-A'), 1);
     f.codex.finish(handle.workerId, '温度正常'); await flush();
@@ -220,7 +332,7 @@ test('native tool call ids deduplicate dispatch, continuation, alarms, and rejec
     const a = await launch(f.runtime, f.turn, {}, 'call-start');
     const duplicate = await launch(f.runtime, f.turn, {}, 'call-start'); assert.deepEqual(duplicate, a);
     await assert.rejects(launch(f.runtime, f.turn, { prompt: '改参数' }, 'call-start'), /参数发生变化/);
-    const input = { workerId: a.workerId, prompt: '下一轮' };
+    const input = { workerId: a.workerId, prompt: '下一轮', delivery: 'next' };
     const b = await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'call-continue');
     assert.deepEqual(await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'call-continue'), b);
     const wake = await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '查看下载' }, 'call-wake');
@@ -236,7 +348,7 @@ test('children reject other parents and user identities; only known picture refe
     const a = await launch(f.runtime, f.turn); await flush(); assert.deepEqual(f.codex.turns[0]?.imagePaths, [image]);
     await assert.rejects(launch(f.runtime, f.turn, { imagePaths: [join(f.dir, 'secret.png')] }), /当前附件/);
     f.turn.imagePaths = [];
-    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续看同一图', imagePaths: [image] });
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续看同一图', delivery: 'next', imagePaths: [image] });
     const otherContext = f.registry.createContext({ conversationId: 'parent-B', userId: 'user-B', channelId: 'dm-B', originMessageId: 'message-B',
       nativeId: 'native-B', agent: 'codex', cwd: f.dir });
     const other: AgentTurn = { ...f.turn, taskContextPath: otherContext.contextPath, conversation: { ...f.turn.conversation, id: 'parent-B', userId: 'user-B', nativeId: 'native-B' } };
@@ -250,7 +362,7 @@ test('cancellation waits for the actual run to close and cancels queued work wit
   const f = fixture(); f.codex.automaticClose = false;
   try {
     const a = await launch(f.runtime, f.turn); await flush();
-    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '不能启动' });
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '不能启动', delivery: 'next' });
     let returned = false;
     const cancellation = f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: a.workerId, reason: '用户改变要求' }, 'cancel-1').then(result => { returned = true; return result; });
     await flush(); assert.equal(returned, false); assert.equal(f.codex.turns[0]?.signal.aborted, true); assert.equal(f.registry.activeCount('parent-A'), 1);
@@ -281,7 +393,7 @@ test('shutdown stops a running CLI, persists uncertainty, and retains queued wor
   const f = fixture(); let second: ControllerRuntime | undefined;
   try {
     const a = await launch(f.runtime, f.turn); await flush();
-    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '独立的下一轮' });
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '独立的下一轮', delivery: 'next' });
     await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 60, text: '恢复下载检查' });
     await f.runtime.close(); assert.equal(f.codex.pending.size, 0); assert.equal(f.registry.activeCount('parent-A'), 0);
     const inspect = new ControllerStore(f.dir);
@@ -320,7 +432,7 @@ test('detaching a parent keeps engineering jobs running but suppresses future au
   const f = fixture();
   try {
     const a = await launch(f.runtime, f.turn); await flush();
-    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续工程' });
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续工程', delivery: 'next' });
     await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '旧会话预约' });
     f.runtime.detachConversation('parent-A'); assert.equal(f.codex.pending.size, 1);
     f.codex.finish(a.workerId); await flush(); f.codex.finish(a.workerId); await flush();
@@ -333,12 +445,12 @@ test('returning to a detached parent can continue the idle child without revivin
   const f = fixture();
   try {
     const a = await launch(f.runtime, f.turn); await flush();
-    const oldQueued = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '切走前排队任务' }) as Handle;
+    const oldQueued = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '切走前排队任务', delivery: 'next' }) as Handle;
     f.runtime.detachConversation('parent-A');
     const currentContext = f.registry.createContext({ conversationId: 'parent-A', userId: 'user-A', channelId: 'dm-A', originMessageId: 'message-return',
       nativeId: 'native-parent', agent: 'codex', cwd: f.dir });
     const returned = { ...f.turn, taskContextPath: currentContext.contextPath };
-    const newQueued = await f.runtime.invoke(returned, 'bridge_continue_worker', { workerId: a.workerId, prompt: '回来后明确续接' }) as Handle;
+    const newQueued = await f.runtime.invoke(returned, 'bridge_continue_worker', { workerId: a.workerId, prompt: '回来后明确续接', delivery: 'next' }) as Handle;
     const other = await launch(f.runtime, returned, { title: '回来后独立新任务' }); await flush();
     f.codex.finish(a.workerId); await flush();
     // Starting the old disabled queue item must not cancel this fresh parent context or other worker.
@@ -418,4 +530,75 @@ test('crash between saving a child result and registry completion repairs counts
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /已经写好了 diff/);
     assert.equal(second.store.getJob(jobId)?.status, 'completed');
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+for (const parentAgent of ['codex', 'claude'] as const) test(`跨后端子任务使用目标原生默认且保留${parentAgent}父强度`, async () => {
+  const f = fixture();
+  try {
+    if (parentAgent === 'claude') {
+      const created = f.registry.createContext({ conversationId: 'parent-A', userId: 'user-A', channelId: 'dm-A', originMessageId: 'message-A',
+        nativeId: 'native-parent', agent: 'claude', cwd: f.dir });
+      f.turn.taskContextPath = created.contextPath; f.turn.conversation.agent = 'claude'; f.turn.conversation.model = 'sonnet';
+    }
+    const ownEffort = parentAgent === 'codex' ? 'xhigh' : 'high';
+    f.turn.effort = ownEffort; f.turn.conversation.effort = ownEffort; f.turn.conversation.actualEffort = ownEffort;
+    const otherAgent = parentAgent === 'codex' ? 'claude' : 'codex';
+    const model = otherAgent === 'claude' ? 'haiku' : 'gpt-6.1-sol';
+    const handle = await launch(f.runtime, f.turn, { agent: otherAgent, model }); await flush();
+    const child = f[otherAgent].turns[0]!;
+    assert.equal(child.effort, undefined); assert.equal(child.conversation.effort, null); assert.equal(child.conversation.model, model);
+    assert.equal(f.runtime.store.getWorker(handle.workerId)!.effort, null);
+    assert.equal(f.turn.effort, ownEffort); assert.equal(f.turn.conversation.effort, ownEffort); assert.equal(f.turn.conversation.actualEffort, ownEffort);
+    child.onReasoningEffort?.('medium'); f[otherAgent].finish(handle.workerId); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '续接已有子会话' }); await flush();
+    assert.equal(f[otherAgent].turns[1]!.conversation.nativeId, `native-${handle.workerId}`);
+    assert.equal(f[otherAgent].turns[1]!.effort, undefined); assert.equal(f[otherAgent].turns[1]!.conversation.effort, null);
+    f[otherAgent].finish(handle.workerId); await flush();
+    const same = await launch(f.runtime, f.turn); await flush();
+    assert.equal(f[parentAgent].turns[0]!.effort, ownEffort); f[parentAgent].finish(same.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+test('Codex 仅实际回报 xhigh 时，Claude 新任务仍使用原生默认', async () => {
+  const f = fixture();
+  try {
+    f.turn.conversation.effort = null; f.turn.conversation.actualEffort = 'xhigh';
+    const handle = await launch(f.runtime, f.turn, { agent: 'claude', model: 'haiku' }); await flush();
+    assert.equal(f.runtime.store.getWorker(handle.workerId)!.effort, null); assert.equal(f.claude.turns[0]!.effort, undefined);
+    assert.equal(f.turn.conversation.effort, null); assert.equal(f.turn.conversation.actualEffort, 'xhigh');
+    f.claude.finish(handle.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+test('worker continuation preserves requested effort even when actual CLI metadata differs; new workers inherit current actual', async () => {
+  const f = fixture(); try {
+    f.turn.conversation.actualEffort = 'xhigh';
+    const handle = await launch(f.runtime, f.turn); await flush();
+    assert.equal(f.codex.turns[0]!.effort, 'xhigh');
+    f.codex.turns[0]!.onReasoningEffort?.('medium');
+    assert.equal(f.runtime.store.getWorker(handle.workerId)!.effort, 'xhigh');
+    assert.equal(f.runtime.store.getWorker(handle.workerId)!.actualEffort, 'medium');
+    f.codex.finish(handle.workerId); await flush();
+    f.turn.conversation.actualEffort = 'high';
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: 'continue' }); await flush();
+    assert.equal(f.codex.turns[1]!.effort, 'xhigh');
+    const fresh = await launch(f.runtime, f.turn); await flush();
+    assert.equal(f.codex.turns[2]!.effort, 'high');
+    f.codex.finish(handle.workerId); f.codex.finish(fresh.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+for (const selection of [
+  { saved: 'xhigh', actual: 'medium', explicit: undefined, expected: 'xhigh' },
+  { saved: 'high', actual: null, explicit: undefined, expected: 'high' },
+  { saved: 'xhigh', actual: 'medium', explicit: 'high', expected: 'high' },
+] as const) test(`子任务继承父会话显式选择，轮次覆盖优先：${JSON.stringify(selection)}`, async () => {
+  const f = fixture();
+  try {
+    f.turn.conversation.effort = selection.saved;
+    f.turn.conversation.actualEffort = selection.actual;
+    if (selection.explicit) f.turn.effort = selection.explicit;
+    const handle = await launch(f.runtime, f.turn); await flush();
+    assert.equal(f.runtime.store.getWorker(handle.workerId)!.effort, selection.expected);
+    assert.equal(f.codex.turns[0]!.effort, selection.expected);
+    f.codex.finish(handle.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
 });

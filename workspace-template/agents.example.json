@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "targets": [
+    {
+      "id": "workstation",
+      "label": "工作电脑",
+      "expectedHostname": "WORKSTATION",
+      "sshConfig": "C:\\AgentWorkspace\\ssh-project\\hosts\\WORKSTATION\\ssh_config",
+      "alias": "worker",
+      "remoteRoot": "C:\\AgentExecutor",
+      "nodePath": "C:\\AgentExecutor\\.local\\runtime\\win-x64\\node.exe",
+      "engines": {
+        "codex": {
+          "agentCommand": {
+            "command": "C:\\AgentExecutor\\.local\\runtime\\win-x64\\node.exe",
+            "args": ["C:\\Users\\worker\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js"]
+          },
+          "defaultCwd": "C:\\Projects"
+        },
+        "claude": {
+          "agentCommand": {
+            "command": "C:\\Users\\worker\\.local\\bin\\claude.exe",
+            "args": []
+          },
+          "defaultCwd": "C:\\Projects"
+        }
+      }
+    }
+  ]
+}

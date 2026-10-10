@@ -8,6 +8,57 @@ import type { JsonObject, RpcTransport } from '../src/agents/process.js';
 import { NativeControllerAdapter, codexControllerOverrides, isolatedCodexConfig } from '../src/controller/native.js';
 import { parse as parseTOML } from 'smol-toml';
 
+test('accepted restart can end internally without a public DM; unavailable restart still needs an honest ordinary answer', async () => {
+  for (const accepted of [true, false]) {
+    const s = setup(); s.setMode('hold'); s.holdManagement(Promise.resolve({ accepted, status: accepted ? 'draining' : 'supervisor_required' }));
+    try {
+      const running = s.adapter.run(s.makeTurn()); await until(() => !!s.transports[0]?.turns);
+      const transport = s.transports[0]!;
+      tool(transport, 8001, 'restart', 'bridge_request_restart', {});
+      await until(() => transport.written.some(message => message.id === 8001 && !message.method)); transport.complete();
+      if (accepted) { const result = await running; assert.equal(result.controlledOutput, true); }
+      else await assert.rejects(running, /没有通过公开通道/);
+      assert.equal(s.published.length, 0); assert.deepEqual(s.invokes, ['bridge_request_restart']);
+    } finally { await s.cleanup(); }
+  }
+});
+
+test('accepted restart does not forbid another genuine ordinary answer from the same request', async () => {
+  const s = setup(); s.setMode('hold'); s.holdManagement(Promise.resolve({ accepted: true, status: 'draining' }));
+  try {
+    const running = s.adapter.run(s.makeTurn()); await until(() => !!s.transports[0]?.turns);
+    const transport = s.transports[0]!;
+    tool(transport, 8001, 'restart', 'bridge_request_restart', {});
+    await until(() => transport.written.some(message => message.id === 8001 && !message.method));
+    tool(transport, 900 + transport.turns, 'ordinary-answer', 'bridge_send_user', { text: '刚才那个问题的答案是三台电脑。' });
+    await running; assert.equal(s.published.length, 1); assert.equal(s.published[0]!.text, '刚才那个问题的答案是三台电脑。');
+  } finally { await s.cleanup(); }
+});
+
+test('native controller exposes target, handoff and restart management through its bounded protocol before one public reply', async () => {
+  const s = setup(); s.setMode('hold');
+  try {
+    const running = s.adapter.run(s.makeTurn()); await until(() => !!s.transports[0]?.turns);
+    const transport = s.transports[0]!;
+    const start = transport.written.find(message => message.method === 'thread/start')?.params as JsonObject;
+    const names = (start.dynamicTools as { name: string }[]).map(value => value.name);
+    assert.ok(names.includes('bridge_list_targets')); assert.ok(names.includes('bridge_handoff_worker')); assert.ok(names.includes('bridge_request_restart'));
+    for (const [index, name, args] of [
+      [0, 'bridge_list_targets', {}],
+      [1, 'bridge_start_worker', { title: '工位任务', prompt: '授权任务', targetId: 'office', cwd: 'Z:\\remote-only' }],
+      [2, 'bridge_handoff_worker', { workerId: 'idle-native-child' }],
+      [3, 'bridge_request_restart', {}],
+    ] as const) {
+      tool(transport, 3000 + index, `management-${index}`, name, args);
+      await until(() => transport.written.some(message => message.id === 3000 + index && !message.method));
+    }
+    assert.deepEqual(s.invokes, ['bridge_list_targets', 'bridge_start_worker', 'bridge_handoff_worker', 'bridge_request_restart']);
+    tool(transport, 900 + transport.turns, 'public', 'bridge_send_user', { text: '已经登记。' });
+    await running; assert.equal(s.published.length, 1); assert.equal(s.published[0]!.text, '已经登记。');
+  } finally { await s.cleanup(); }
+});
+
+
 class FakeTransport implements RpcTransport {
   readonly messages = new Set<(message: JsonObject) => void>();
   readonly failures = new Set<(error: Error) => void>();
@@ -24,6 +75,7 @@ class FakeTransport implements RpcTransport {
     this.written.push(message);
     const params = message.params as JsonObject;
     if (message.method === 'initialize') this.emit({ id: message.id, result: {} });
+    else if (message.method === 'thread/read') this.emit({ id: message.id, result: { thread: { reasoningEffort: (this.written.findLast(m => m.method === 'turn/start')?.params as JsonObject)?.effort ?? null } } });
     else if (message.method === 'config/read') this.emit({ id: message.id, result: { config: { model_provider: 'current-provider', model: 'gpt-6.1-sol' } } });
     else if (message.method === 'thread/start' || message.method === 'thread/resume') this.emit({ id: message.id, result: { thread: { id: this.nativeId }, modelProvider: 'current-provider', model: 'gpt-6.1-sol', reasoningEffort: 'medium' } });
     else if (message.method === 'turn/start') {
@@ -46,6 +98,7 @@ function setup() {
   const invokes: string[] = [], published: { text: string; key?: string }[] = [];
   let managementHold: Promise<unknown> | undefined;
   const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, { HTTP_PROXY: 'http://127.0.0.1:7898' }, { agent: 'codex', dataDir: join(dir, 'data'), userHome,
+    metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => ({ defaultModel: 'gpt-6.1-sol', models: [{ id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['medium', 'xhigh'] }] }) },
     invokeTool: async (_turn, name) => { invokes.push(name); return managementHold ?? {}; },
     createTransport: (_command, args, _cwd, env) => { const t = new FakeTransport(); t.mode = mode; transports.push(t); launches.push({ args, env }); return t; },
   });
@@ -115,6 +168,12 @@ test('workspace bootstrap can finish quietly and feeds evidence into the same na
     const params = s.transports[0]!.written.find(message => message.method === 'turn/start')!.params as JsonObject;
     assert.deepEqual(params.input, []);
     assert.deepEqual(params.toolOutput, { name: 'bridge_workspace_context', namespace: null, output: turn.event.text });
+    const created = s.transports[0]!.written.find(message => message.method === 'thread/start')!.params as JsonObject;
+    const bridgePrompt = `${created.baseInstructions} ${created.developerInstructions}`;
+    assert(!bridgePrompt.includes(turn.event.text));
+    assert(!/Chinese|Haru|MyHaruSkills|SuchProject/.test(bridgePrompt));
+    assert.match(bridgePrompt, /user-maintained workspace-context input/);
+    assert.match(bridgePrompt, /Until its event arrives/);
     s.transports[0]!.mode = 'public';
     const next = s.makeTurn(); next.conversation.nativeId = initialized.nativeId;
     const result = await s.adapter.run(next);
@@ -260,6 +319,85 @@ test('native completion racing a pending publication waits for the successful pu
     assert.equal(result.controlledOutput, true); assert.equal(transport.stopped, false); assert.equal(attempts, 1);
   } finally { hold.release(); await s.cleanup(); }
 });
+for (const ending of ['complete', 'abort', 'close'] as const) test(`长主控轮次没有整体硬超时，仍可${ending}`, async t => {
+  const s = setup(); s.setMode('hold');
+  const controller = new AbortController(); const turn = s.makeTurn(); turn.signal = controller.signal;
+  let settled = false;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = s.adapter.run(turn);
+  void running.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    for (let i = 0; i < 60 && s.transports[0]?.turns !== 1; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(s.transports[0]?.turns, 1); const transport = s.transports[0]!;
+    t.mock.timers.tick(600_000); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false); assert.equal(transport.stopped, false);
+    t.mock.timers.reset();
+    if (ending === 'complete') {
+      tool(transport, 6001, 'late-public', 'bridge_send_user', { text: '长轮次正常完成。' });
+      await until(() => s.published.length === 1); transport.complete();
+      const result = await running; assert.equal(result.nativeId, transport.nativeId);
+      transport.mode = 'public'; const next = s.makeTurn(); next.conversation.nativeId = result.nativeId;
+      assert.equal((await s.adapter.run(next)).nativeId, result.nativeId); assert.equal(s.transports.length, 1);
+    } else {
+      const rejected = assert.rejects(running, error => error instanceof Error && error.name === 'AbortError');
+      if (ending === 'abort') controller.abort(); else await s.adapter.close();
+      await rejected; assert.equal(transport.stopped, true);
+    }
+  } finally { t.mock.timers.reset(); await s.cleanup(); }
+});
+
+test('公开回复已送达的长轮次不因墙钟经过而失败或重发', async t => {
+  const s = setup(); s.setMode('hold'); let settled = false;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = s.adapter.run(s.makeTurn()); void running.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    for (let i = 0; i < 60 && s.transports[0]?.turns !== 1; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(s.transports[0]?.turns, 1); const transport = s.transports[0]!;
+    tool(transport, 6002, 'delivered-before-wait', 'bridge_send_user', { text: '已派发。' });
+    for (let i = 0; i < 60 && s.published.length !== 1; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(s.published.length, 1); t.mock.timers.tick(600_000);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false); assert.equal(transport.stopped, false); assert.equal(s.published.length, 1);
+    transport.complete(); assert.equal((await running).controlledOutput, true); assert.equal(s.published.length, 1);
+  } finally { t.mock.timers.reset(); await s.cleanup(); }
+});
+
+test('Claude 主控长轮次等待真实完成，不设整体墙钟硬超时', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-claude-long-turn-')); const transport = new FakeTransport();
+  transport.write = message => {
+    transport.written.push(message);
+    if (message.type === 'user') transport.emit({ type: 'system', subtype: 'init', session_id: 'claude-long-native', tools: [] });
+  };
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'claude', dataDir: dir, userHome: dir,
+    invokeTool: async () => ({}), createTransport: () => transport });
+  const turn: AgentTurn = { conversation: { id: 'c', userId: 'u', agent: 'claude', nativeId: 'claude-long-native', cwd: dir, title: '', createdAt: '', updatedAt: '' },
+    text: '', imagePaths: [], event: { kind: 'wake', text: 'existing evidence' }, signal: new AbortController().signal, onProgress: () => {} };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let settled = false, failure: unknown; const running = adapter.run(turn); void running.then(() => { settled = true; }, error => { settled = true; failure = error; });
+  try {
+    for (let i = 0; i < 60 && !transport.written.some(message => message.type === 'user'); i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(transport.written.some(message => message.type === 'user'), true); t.mock.timers.tick(600_000);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, String(failure)); assert.equal(transport.stopped, false);
+    transport.emit({ type: 'result', subtype: 'success', session_id: 'claude-long-native', result: 'DONE' });
+    assert.equal((await running).nativeId, 'claude-long-native');
+  } finally { t.mock.timers.reset(); await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+test('主控保留单条 turn/start RPC 的响应超时', async t => {
+  const s = setup(); s.setMode('hold'); t.mock.timers.enable({ apis: ['setTimeout'] });
+  const originalFactory = (s.adapter as unknown as { options: { createTransport: (...args: unknown[]) => RpcTransport } }).options.createTransport;
+  (s.adapter as unknown as { options: { createTransport: (...args: unknown[]) => RpcTransport } }).options.createTransport = (...args) => {
+    const transport = originalFactory(...args) as FakeTransport; const originalWrite = transport.write.bind(transport);
+    transport.write = message => { if (message.method === 'turn/start') transport.written.push(message); else originalWrite(message); };
+    return transport;
+  };
+  const running = s.adapter.run(s.makeTurn()); const rejected = assert.rejects(running, /Codex turn\/start 等待响应超时/);
+  try {
+    for (let i = 0; i < 60 && !s.transports[0]?.written.some(message => message.method === 'turn/start'); i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(s.transports[0]?.written.some(message => message.method === 'turn/start'), true);
+    t.mock.timers.tick(20_001); await rejected; assert.equal(s.transports[0]!.stopped, true);
+  } finally { t.mock.timers.reset(); await s.cleanup(); }
+});
 test('abort, interrupt, and the following turn await one physical process shutdown', async () => {
   const s = setup(); s.setMode('hold');
   try {
@@ -403,4 +541,68 @@ test('Claude maps parallel same-name MCP calls by exact arguments and closes MCP
     await assert.rejects(adapter.close(), /process exit unconfirmed/);
     await assert.rejects(fetch(mcpUrl, { signal: AbortSignal.timeout(1000) }));
   } finally { await adapter.close().catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('controller effort changes resume original native thread and read CLI settings without guessing', async () => {
+  const s = setup(); try {
+    const turn = s.makeTurn(); const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
+    turn.conversation.effort = 'xhigh'; const reports: (string | null)[] = []; turn.onReasoningEffort = e => reports.push(e);
+    await s.adapter.run(turn);
+    assert.equal(s.transports.length, 2);
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject).threadId, first.nativeId);
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'turn/start')!.params as JsonObject).effort, 'xhigh');
+    assert.deepEqual(reports, [null, 'xhigh']);
+    turn.conversation.effort = null; await s.adapter.run(turn);
+    const resumed = s.transports[2]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject;
+    assert.equal(resumed.config, undefined);
+    const start = s.transports[2]!.written.find(m => m.method === 'turn/start')!.params as JsonObject;
+    assert.equal(start.effort, undefined);
+    turn.conversation.effort = 'ultra'; await assert.rejects(s.adapter.run(turn), /不支持/);
+  } finally { await s.cleanup(); }
+});
+
+test('Claude controller passes its own effort with same native resume and leaves actual effort unknown', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-claude-effort-')); const launches: string[][] = [];
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'claude', dataDir: dir, userHome: dir,
+    invokeTool: async () => ({}),
+    metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => ({ defaultModel: 'sonnet', models: [{ id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['high'] }] }) },
+    createTransport: (_command, args) => { launches.push(args); const transport = new FakeTransport();
+      transport.write = message => { if (message.type === 'user') {
+        transport.emit({ type: 'system', subtype: 'init', session_id: 'claude-original', model: 'sonnet', tools: [] });
+        transport.emit({ type: 'result', subtype: 'success', session_id: 'claude-original', result: 'DONE' });
+      } }; return transport; },
+  });
+  const reports: (string | null)[] = [];
+  const turn: AgentTurn = { conversation: { id: 'c', userId: 'u', agent: 'claude', nativeId: 'claude-original', effort: 'high', cwd: dir, title: '', createdAt: '', updatedAt: '' }, text: '', imagePaths: [], event: { kind: 'wake', text: 'evidence' }, signal: new AbortController().signal, onProgress: () => {}, onReasoningEffort: e => reports.push(e) };
+  try {
+    assert.equal((await adapter.run(turn)).nativeId, 'claude-original');
+    assert.equal(launches[0]![launches[0]!.indexOf('--effort') + 1], 'high');
+    assert.equal(launches[0]![launches[0]!.indexOf('--resume') + 1], 'claude-original');
+    assert.deepEqual(reports, [null]);
+    turn.conversation.effort = 'xhigh'; await assert.rejects(adapter.run(turn), /不支持/);
+    assert.equal(launches.length, 1);
+  } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('主控提交后读取强度失败或实际值不同，只更新真实回报且不重放', async () => {
+  const s = setup();
+  try {
+    const turn = s.makeTurn(); turn.conversation.effort = 'xhigh';
+    turn.conversation.nativeId = (await s.adapter.run(turn)).nativeId;
+    const transport = s.transports[0]!; const originalWrite = transport.write.bind(transport);
+    let failRead = false; const reports: (string | null)[] = [];
+    turn.onReasoningEffort = value => reports.push(value);
+    transport.write = message => {
+      if (message.method !== 'thread/read') { originalWrite(message); return; }
+      transport.written.push(message);
+      transport.emit(failRead ? { id: message.id, error: { code: -32000, message: '元数据不可用' } }
+        : { id: message.id, result: { thread: { reasoningEffort: 'medium' } } });
+    };
+    await s.adapter.run(turn); assert.deepEqual(reports, [null, 'medium']);
+    reports.length = 0; failRead = true;
+    const result = await s.adapter.run(turn);
+    assert.equal(result.nativeId, turn.conversation.nativeId); assert.deepEqual(reports, [null, null]);
+    assert.equal(turn.conversation.effort, 'xhigh'); assert.equal(s.transports.length, 1);
+    assert.equal(transport.written.filter(m => m.method === 'turn/start').length, 3);
+  } finally { await s.cleanup(); }
 });

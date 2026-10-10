@@ -1,10 +1,13 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { ControllerJob, ControllerJobStatus, ControllerWake, ControllerWorker } from './runtime-types.js';
+import type { ControllerJob, ControllerJobStatus, ControllerSupplement, ControllerWake, ControllerWorker } from './runtime-types.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
-function worker(row: Row): ControllerWorker { return JSON.parse(String(row.value_json)) as ControllerWorker; }
+function worker(row: Row): ControllerWorker {
+  const value = JSON.parse(String(row.value_json)) as ControllerWorker;
+  return { ...value, ownership: value.ownership ?? 'bridge' };
+}
 function job(row: Row): ControllerJob {
   const value = JSON.parse(String(row.value_json)) as ControllerJob;
   return { ...value, status: String(row.status) as ControllerJobStatus, taskId: row.task_id ? String(row.task_id) : null,
@@ -32,6 +35,8 @@ export class ControllerStore {
       CREATE TABLE IF NOT EXISTS controller_wakes (
         id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, status TEXT NOT NULL, due_at TEXT NOT NULL, task_id TEXT, value_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS controller_wake_due ON controller_wakes(status,due_at);
+      CREATE TABLE IF NOT EXISTS controller_supplements (
+        id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, job_id TEXT NOT NULL, value_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS controller_calls (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL);`);
   }
   close(): void { this.db.close(); }
@@ -96,6 +101,15 @@ export class ControllerStore {
       updatedAt: new Date().toISOString() };
     this.db.prepare('UPDATE controller_jobs SET status=?,task_id=?,result=?,cancel_reason=?,value_json=? WHERE id=?')
       .run(value.status, value.taskId, value.result, value.cancelReason, JSON.stringify(value), id);
+  }
+  saveSupplement(value: ControllerSupplement): void {
+    this.db.prepare('INSERT INTO controller_supplements (id,worker_id,job_id,value_json) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET value_json=excluded.value_json')
+      .run(value.id, value.workerId, value.jobId, JSON.stringify(value));
+  }
+  supplements(jobId?: string): ControllerSupplement[] {
+    const rows = jobId ? this.db.prepare('SELECT value_json FROM controller_supplements WHERE job_id=? ORDER BY rowid').all(jobId)
+      : this.db.prepare('SELECT value_json FROM controller_supplements ORDER BY rowid').all();
+    return rows.map(row => JSON.parse(String(row.value_json)) as ControllerSupplement);
   }
   addWake(value: ControllerWake): void {
     this.db.prepare('INSERT INTO controller_wakes (id,parent_id,status,due_at,task_id,value_json) VALUES (?,?,?,?,?,?)')

@@ -48,6 +48,7 @@ export class DurableIngress {
   private readonly interactions = new Map<string, { message: IncomingDM; promise: Promise<void>;
     resolve: () => void; reject: (error: unknown) => void }>();
   private started = false;
+  private paused = false;
   private closed = false;
   private recoveryBlocked = false;
   private recovering: Promise<void> | undefined;
@@ -91,19 +92,19 @@ export class DurableIngress {
     }
     if (!columns.has('is_interaction')) this.db.exec('ALTER TABLE messages ADD COLUMN is_interaction INTEGER NOT NULL DEFAULT 0');
     this.inbox = new OrderedInbox(message => message.userId, async message => {
-      if (this.closed) return;
+      if (this.closed || this.paused) return;
       if (message.interaction) { await this.options.handle(message); return; }
       if (this.options.hasMessage(message.id)) { this.setState(message.id, 'accepted'); return; }
       this.setState(message.id, 'processing');
       try {
         await this.options.handle(message);
-        if (!this.closed) this.setState(message.id, 'accepted');
+        if (!this.closed) this.setState(message.id, this.paused && !this.options.hasMessage(message.id) ? 'received' : 'accepted');
       } catch (error) {
         if (!this.closed) {
           // SessionManager owns recovery once it has accepted the message. Never rerun
           // an uncertain model request or reply because ingress preparation rejected.
-          this.setState(message.id, this.options.hasMessage(message.id) ? 'accepted' : 'failed');
-          this.options.onError?.(message, error);
+          this.setState(message.id, this.options.hasMessage(message.id) ? 'accepted' : this.paused ? 'received' : 'failed');
+          if (!this.paused) this.options.onError?.(message, error);
         }
       }
     });
@@ -155,7 +156,7 @@ export class DurableIngress {
         this.db.prepare(`UPDATE messages SET attachments_json = ?, updated_at = ?
           WHERE id = ? AND state = 'received'`).run(JSON.stringify(attachments), now, message.id);
       }
-      if (this.started && !this.recoveryBlocked && !this.recovering && channel) {
+      if (this.started && !this.paused && !this.recoveryBlocked && !this.recovering && channel) {
         this.db.prepare('UPDATE channels SET cursor = ? WHERE channel_id = ?')
           .run(later(String(channel.cursor), message.id), message.channelId);
       }
@@ -196,6 +197,9 @@ export class DurableIngress {
 
   /** Call after SessionManager.recover(); live input received during startup stays journaled. */
   start(): void { this.assertOpen(); this.started = true; this.kick(); }
+
+  /** Keep capture/backfill durable while leaving new preparation for the next process. */
+  pause(): void { this.assertOpen(); this.paused = true; }
 
   /** READY/RESUMED hook; new live input is journaled while older gaps are fetched. */
   recover(reader: DMHistoryReader): Promise<void> {
@@ -272,7 +276,7 @@ export class DurableIngress {
   }
 
   private kick(): void {
-    if (!this.started || this.closed || this.recoveryBlocked || this.recovering) return;
+    if (!this.started || this.paused || this.closed || this.recoveryBlocked || this.recovering) return;
     const rows = this.db.prepare(`SELECT id,state,is_control FROM messages WHERE state = 'received' OR is_control = 1`).all();
     const entries = new Map(rows.map(row => [String(row.id), row]));
     for (const [id, pending] of this.interactions) if (!entries.has(id)) {

@@ -12,10 +12,13 @@ import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, ReplyOptions }
 
 class Children implements AgentAdapter {
   readonly turns: AgentTurn[] = [];
+  onRun?: (turn: AgentTurn) => void;
   readonly pending = new Map<string, { resolve: (value: AgentResult) => void; reject: (error: Error) => void }>();
   async run(turn: AgentTurn): Promise<AgentResult> {
     this.turns.push(turn); turn.onNativeId?.(`child-native-${turn.conversation.id}`);
-    return new Promise((resolve, reject) => { this.pending.set(turn.conversation.id, { resolve, reject }); });
+    const result = new Promise<AgentResult>((resolve, reject) => { this.pending.set(turn.conversation.id, { resolve, reject }); });
+    this.onRun?.(turn);
+    return result;
   }
   finish(index: number, text = '已只读核对本机导航；Chrome 登录状态按 README 声明，未实际打开浏览器。'): void {
     const turn = this.turns[index]!; const result = this.pending.get(turn.conversation.id)!;
@@ -127,6 +130,43 @@ test('首条普通消息并行派只读初始化，真实任务计数且不改�
   assert.equal(delivered.conversation.nativeId, parent.nativeId);
   assert.equal(f.replies.length, 2, '自动调研完成不公开刷消息');
   await until(() => f.counts.filter(item => item.id === 'second').at(-1)?.count === 0);
+  assert.deepEqual(f.errors, []);
+});
+
+test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd 换入口、续聊去重（模拟只读子 Agent）', async t => {
+  const f = fixture(t);
+  const other = join(f.root, 'other'); mkdirSync(other);
+  writeFileSync(join(f.root, 'AGENTS.md'), '初始化按 README.md 的用户入口和范围读取。');
+  writeFileSync(join(f.root, 'README.md'), '初始化入口：context-a.md\n回传要求：只返回指定文件的执行规范。');
+  writeFileSync(join(f.root, 'context-a.md'), 'WORKSPACE_POLICY_A');
+  writeFileSync(join(other, 'AGENTS.md'), '初始化按 README.md 的用户入口和范围读取。');
+  writeFileSync(join(other, 'README.md'), '初始化入口：context-b.md\n回传要求：只返回指定文件的执行规范。');
+  writeFileSync(join(other, 'context-b.md'), 'WORKSPACE_POLICY_B');
+  const reads: string[] = [];
+  // Simulate the child's read tools; the bridge supplies a generic entry contract, not a file parser.
+  f.children.onRun = turn => {
+    assert.match(turn.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
+    assert(!/WORKSPACE_POLICY_[AB]/.test(turn.text));
+    const cwd = turn.conversation.cwd;
+    readFileSync(join(cwd, 'AGENTS.md'), 'utf8');
+    const guide = readFileSync(join(cwd, 'README.md'), 'utf8');
+    const entry = guide.match(/初始化入口：([^\r\n]+)/)![1]!;
+    const selected = join(cwd, entry); reads.push(selected);
+    f.children.finish(f.children.turns.indexOf(turn), readFileSync(selected, 'utf8'));
+  };
+  await f.send('new-a', '/new'); await until(() => f.controller.turns.length === 1);
+  assert.equal(f.controller.turns[0]!.event?.kind, 'workspace-context');
+  assert.match(f.controller.turns[0]!.event!.text, /WORKSPACE_POLICY_A/);
+  await f.send('human', 'SIMPLE_HUMAN_REQUEST'); await until(() => f.controller.turns.length === 2);
+  assert.equal(f.controller.turns[1]!.text, 'SIMPLE_HUMAN_REQUEST');
+  assert.equal(reads.length, 1);
+  writeFileSync(join(f.root, 'context-a.md'), 'WORKSPACE_POLICY_A_UPDATED');
+  await f.send('new-a-again', '/new'); await until(() => f.controller.turns.length === 3);
+  assert.match(f.controller.turns[2]!.event!.text, /WORKSPACE_POLICY_A_UPDATED/);
+  await f.send('cwd-b', `/cwd "${other}"`); await until(() => f.controller.turns.length === 4);
+  assert.match(f.controller.turns[3]!.event!.text, /WORKSPACE_POLICY_B/);
+  assert.deepEqual(reads, [join(f.root, 'context-a.md'), join(f.root, 'context-a.md'), join(other, 'context-b.md')]);
+  assert.equal(f.runtime.store.workers().length, 3);
   assert.deepEqual(f.errors, []);
 });
 

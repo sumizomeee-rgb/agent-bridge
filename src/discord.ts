@@ -22,6 +22,7 @@ export interface DiscordTransportOptions {
   identifyIntervalMs?: number;
   invalidSessionDelayMs?: number;
   maxImages?: number;
+  presenceWindowMs?: number;
   maxTotalImageBytes?: number;
   logger?: (message: string) => void;
   /** Synchronous ordinary-DM journal hook, before receipts or queued preparation. */
@@ -29,6 +30,8 @@ export interface DiscordTransportOptions {
   /** Called on both READY and RESUMED; initial start waits for recovery to finish. */
   onReady?: () => Promise<void>;
 }
+
+export type BridgePresence = 'idle' | 'draining' | 'recovering' | 'failed';
 
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): value is RecordValue =>
@@ -50,16 +53,31 @@ class DiscordRestError extends Error {
   constructor(public readonly status: number) { super(`Discord REST 请求失败（HTTP ${status}）。`); }
 }
 
-function imageExtension(attachment: DiscordAttachment): string | null {
-  if (attachment.content_type) {
-    const mediaType = attachment.content_type.split(';')[0]?.toLowerCase();
-    if (mediaType && imageTypes[mediaType]) return imageTypes[mediaType]!;
-    if (mediaType?.startsWith('image/')) throw new Error('仅支持 JPG、PNG、WebP 和 GIF 图片。');
-    if (mediaType !== 'application/octet-stream') return null;
+export class ImagePreparationError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : '图片准备失败。', { cause });
+    this.name = 'ImagePreparationError';
   }
+}
+
+export function ingressFailureText(error: unknown): string {
+  if (!(error instanceof ImagePreparationError)) return '这条消息处理失败，请稍后再试。';
+  // 只向用户展示已知的附件错误，网络异常可能包含签名下载地址。
+  const detail = /^(?:图片下载失败（HTTP \d+）。|图片实际大小超过上限。|图片大小超过上限或附件信息无效。|单条消息的图片(?:数量|总大小)超过上限。|附件不是支持的图片格式（PNG、JPEG、WebP、GIF），或图片内容已损坏。)$/.test(error.message)
+    ? error.message : '图片下载或准备失败，请稍后再试。';
+  return `桥已收到这条消息的附件，但图片未能交给模型：${detail}`;
+}
+
+function isImageAttachment(attachment: DiscordAttachment): boolean {
+  const mediaType = attachment.content_type?.split(';')[0]?.trim().toLowerCase();
   const extension = attachment.filename.split('.').at(-1)?.toLowerCase();
-  return extension === 'jpeg' ? 'jpg' :
-    extension && ['jpg', 'png', 'webp', 'gif'].includes(extension) ? extension : null;
+  // 声明仅用于挑选候选附件；接受与扩展名以实际内容为准。
+  return Boolean(mediaType?.startsWith('image/') ||
+    (extension && ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(extension)));
+}
+
+function detectedImageExtension(header: Buffer): string | null {
+  return Object.values(imageTypes).find(extension => validImage(header, extension)) ?? null;
 }
 
 function attachmentUrl(value: string): URL {
@@ -203,6 +221,11 @@ export class DiscordTransport {
   private identifyTimer: NodeJS.Timeout | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private readyTimer: NodeJS.Timeout | undefined;
+  private presenceTimer: NodeJS.Timeout | undefined;
+  private desiredPresence: BridgePresence = 'recovering';
+  private lastPresence: BridgePresence | undefined;
+  private gatewayReady = false;
+  private readonly presenceTimes: number[] = [];
   private heartbeatAcknowledged = true;
   private reconnectAttempt = 0;
   private nextReconnectDelay: number | undefined;
@@ -247,6 +270,33 @@ export class DiscordTransport {
       this.options.readyTimeoutMs ?? 120_000);
     void this.connect();
     return this.startPromise;
+  }
+
+  isIdle(): boolean { return this.sendQueues.size === 0; }
+
+  /** Presence is the only restart notification: no channel messages or broadcasts. */
+  setPresence(phase: BridgePresence): void {
+    this.desiredPresence = phase;
+    this.flushPresence();
+  }
+
+  private flushPresence(): void {
+    if (this.closed || !this.gatewayReady || !this.ws || this.ws.readyState !== WebSocket.OPEN
+      || this.lastPresence === this.desiredPresence) return;
+    const now = Date.now(); const window = this.options.presenceWindowMs ?? 20_000;
+    while (this.presenceTimes.length && this.presenceTimes[0]! <= now - window) this.presenceTimes.shift();
+    if (this.presenceTimes.length >= 5) {
+      if (!this.presenceTimer) this.presenceTimer = setTimeout(() => {
+        this.presenceTimer = undefined; this.flushPresence();
+      }, Math.max(1, this.presenceTimes[0]! + window - now));
+      return;
+    }
+    clearTimeout(this.presenceTimer); this.presenceTimer = undefined;
+    const state = { idle: '空闲 · 随时可以聊天', draining: '准备重启 · 正在收尾',
+      recovering: '会话恢复中', failed: '重启失败 · 等待检查' }[this.desiredPresence];
+    this.sendPacket(this.ws, 3, { since: null, activities: [{ name: 'Bridge', type: 4, state }],
+      status: this.desiredPresence === 'idle' ? 'online' : this.desiredPresence === 'failed' ? 'dnd' : 'idle', afk: false });
+    this.presenceTimes.push(now); this.lastPresence = this.desiredPresence;
   }
 
   async sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> {
@@ -342,11 +392,14 @@ export class DiscordTransport {
   }
 
   async downloadImages(message: IncomingDM): Promise<string[]> {
+    try { return await this.prepareImages(message); }
+    catch (error) { throw new ImagePreparationError(error); }
+  }
+
+  private async prepareImages(message: IncomingDM): Promise<string[]> {
     if (this.closed) throw new Error('Discord transport 已关闭。');
-    const images = message.attachments.flatMap(attachment => {
-      const extension = imageExtension(attachment);
-      return extension ? [{ attachment, extension, url: attachmentUrl(attachment.url) }] : [];
-    });
+    const images = message.attachments.filter(isImageAttachment)
+      .map(attachment => ({ attachment, url: attachmentUrl(attachment.url) }));
     const maxTotal = this.options.maxTotalImageBytes ?? Math.min(this.config.maxImageBytes * 10, 100 * 1024 * 1024);
     if (images.length > (this.options.maxImages ?? 10)) throw new Error('单条消息的图片数量超过上限。');
     let declaredBytes = 0;
@@ -362,7 +415,7 @@ export class DiscordTransport {
     try {
       if (images.length) await mkdir(this.config.attachmentsDir, { recursive: true });
       for (const image of images) {
-        const result = await this.downloadImage(image.url, image.extension, maxTotal - actualTotal);
+        const result = await this.downloadImage(image.url, maxTotal - actualTotal);
         actualTotal += result.bytes;
         downloaded.push(result.path);
       }
@@ -454,6 +507,7 @@ export class DiscordTransport {
     this.clearConnectionTimers();
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.readyTimer);
+    clearTimeout(this.presenceTimer); this.presenceTimer = undefined;
     this.rejectReady?.(new Error('Discord transport 已关闭。'));
     this.rejectReady = undefined;
     this.resolveReady = undefined;
@@ -556,6 +610,8 @@ export class DiscordTransport {
     this.heartbeat = undefined;
     this.protocolTimer = undefined;
     this.identifyTimer = undefined;
+    this.gatewayReady = false; this.lastPresence = undefined;
+    clearTimeout(this.presenceTimer); this.presenceTimer = undefined;
   }
 
   private sendPacket(socket: WebSocket, op: number, data: unknown): void {
@@ -643,6 +699,7 @@ export class DiscordTransport {
     clearTimeout(this.readyTimer);
     clearTimeout(this.protocolTimer);
     this.reconnectAttempt = 0;
+    this.gatewayReady = true; this.flushPresence();
     // Invoke synchronously so recovery can pause its queue before another Gateway DM.
     let recovery: Promise<void>;
     try { recovery = this.options.onReady?.() ?? Promise.resolve(); }
@@ -838,7 +895,7 @@ export class DiscordTransport {
     throw new Error('Discord 多次限流，请稍后再试。');
   }
 
-  private async downloadImage(url: URL, extension: string, remaining: number): Promise<{ path: string; bytes: number }> {
+  private async downloadImage(url: URL, remaining: number): Promise<{ path: string; bytes: number }> {
     let response: Awaited<ReturnType<typeof fetch>> | undefined;
     for (let redirects = 0; redirects <= 3; redirects++) {
       response = await this.httpFetch(url, { dispatcher: this.cdnDispatcher,
@@ -859,8 +916,8 @@ export class DiscordTransport {
       await response.body.cancel();
       throw new Error('图片实际大小超过上限。');
     }
-    const path = join(this.config.attachmentsDir, `${randomUUID()}.${extension}`);
-    const temporary = `${path}.part`;
+    const stem = join(this.config.attachmentsDir, randomUUID());
+    const temporary = `${stem}.part`;
     let file;
     try { file = await open(temporary, 'wx'); }
     catch (error) { await response.body.cancel(); throw error; }
@@ -880,7 +937,9 @@ export class DiscordTransport {
           await file.writeFile(buffer);
         }
       } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
-      if (!validImage(header, extension)) throw new Error('附件内容不是声明的图片格式。');
+      const extension = detectedImageExtension(header);
+      if (!extension) throw new Error('附件不是支持的图片格式（PNG、JPEG、WebP、GIF），或图片内容已损坏。');
+      const path = `${stem}.${extension}`;
       await file.close();
       await rename(temporary, path);
       complete = true;
