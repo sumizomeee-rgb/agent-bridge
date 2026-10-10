@@ -16,6 +16,11 @@ function text(value: unknown, label: string, limit: number): string {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value, 'utf8') > limit || value.includes('\0')) throw new Error(`${label}为空或超过限制`);
   return value.trim();
 }
+function listText(value: string, characters: number, bytes = Number.MAX_SAFE_INTEGER): string {
+  const candidate = value.slice(0, characters).replace(/[\uD800-\uDBFF]$/, '');
+  const buffer = Buffer.from(candidate, 'utf8');
+  return buffer.length <= bytes ? candidate : buffer.subarray(0, bytes).toString('utf8').replace(/\uFFFD$/, '');
+}
 function object(value: unknown, allowed: string[]): Record<string, unknown> {
   if (value == null) value = {};
   if (typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) throw new Error('工具参数必须是对象');
@@ -323,18 +328,37 @@ export class ControllerRuntime {
           text: text(args.text, '唤醒提示', 16 * 1024), status: 'pending', taskId: null, createdAt: this.timestamp() };
         this.store.addWake(wake); result = { wakeId: wake.id, dueAt: wake.dueAt, status: 'scheduled' };
       } else {
-        object(input, []);
-        result = { workers: this.store.workers(origin.conversationId).filter(worker => worker.origin.userId === origin.userId
-          && worker.origin.channelId === origin.channelId).map(worker => {
+        const args = object(input, ['workerId']);
+        const details = args.workerId !== undefined;
+        const workers = details ? [this.ownedWorker(origin, args.workerId)] : this.store.workers(origin.conversationId)
+          .filter(worker => worker.origin.userId === origin.userId && worker.origin.channelId === origin.channelId);
+        let previewBytes = 8 * 1024;
+        const preview = (value: string): string => {
+          const result = listText(value, 256, previewBytes); previewBytes -= Buffer.byteLength(result, 'utf8'); return result;
+        };
+        result = { workers: workers.map(worker => {
           const jobs = this.store.jobs(worker.id); const latest = jobs.at(-1);
+          const supplements = jobs.flatMap(job => this.store.supplements(job.id));
+          const supplementCounts: Record<string, number> = {};
+          for (const value of supplements) supplementCounts[value.status] = (supplementCounts[value.status] ?? 0) + 1;
+          const active = supplements.filter(value => ['pending', 'steering', 'uncertain'].includes(value.status));
+          const history = supplements.filter(value => !['pending', 'steering', 'uncertain'].includes(value.status));
+          const receipt = (value: ControllerSupplement) => ({ ...this.supplementResult(value) as Record<string, unknown>,
+            reason: value.reason ? listText(value.reason, 256) : null, reasonTruncated: (value.reason?.length ?? 0) > 256 });
+          const lastResultPreview = latest?.result == null ? null : preview(latest.result);
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
             target: worker.target ?? null, ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
-            lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastResult: latest?.result?.slice(0, 4096) ?? null,
-            supplements: jobs.flatMap(job => this.store.supplements(job.id).map(value => this.supplementResult(value))) };
-        }), wakes: this.store.wakes(origin.conversationId).filter(wake => wake.origin.userId === origin.userId && wake.status === 'pending')
-          .map(wake => ({ wakeId: wake.id, dueAt: wake.dueAt, text: wake.text })) };
+            lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
+            hasResult: latest?.result != null, lastResultPreview,
+            lastResultPreviewTruncated: latest?.result != null && lastResultPreview !== latest.result, supplementCounts,
+            ...(details ? { lastResult: latest?.result == null ? null : listText(latest.result, 4096),
+              lastResultTruncated: (latest?.result?.length ?? 0) > 4096, activeSupplements: active.map(receipt),
+              supplements: history.slice(-20).map(receipt), supplementsTotal: supplements.length,
+              supplementsTruncated: history.length > 20 } : {}) };
+        }), wakes: details ? [] : this.store.wakes(origin.conversationId).filter(wake => wake.origin.userId === origin.userId && wake.status === 'pending')
+          .map(wake => { const textPreview = preview(wake.text); return { wakeId: wake.id, dueAt: wake.dueAt, textPreview, textPreviewTruncated: textPreview !== wake.text }; }) };
       }
       if (workspaceInitialization) this.store.saveWorkspaceInitialization(origin.conversationId, result);
       else if (key) this.store.saveCall(key, fingerprint, result);

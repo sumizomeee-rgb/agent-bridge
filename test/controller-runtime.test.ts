@@ -62,6 +62,108 @@ async function launch(runtime: ControllerRuntime, turn: AgentTurn, args: Record<
 }
 
 
+test('worker list preserves routing, active work and attachment state while results are previews', async () => {
+  const f = fixture(); const image = join(f.dir, '用户附件.png'); f.turn.imagePaths = [image];
+  try {
+    const a = await launch(f.runtime, f.turn, { imagePaths: [image] }); await flush();
+    const result = '截图：' + image + '\n文件：' + join(f.dir, '报告.pdf') + '\n' + '结果'.repeat(3000);
+    f.codex.finish(a.workerId, result); await flush();
+    const stored = f.runtime.store.getWorker(a.workerId)!;
+    stored.target = { ...stored.target!, id: 'remote-box', label: '远端电脑', transport: 'ssh',
+      expectedHostname: 'remote-host', alias: 'remote-alias', sshConfig: 'G:\\SSH\\config', cwd: 'D:\\Workspace' };
+    stored.actualModel = 'actual-model'; stored.actualEffort = 'high'; stored.blocked = true;
+    f.runtime.store.saveWorker(stored);
+    const b = await launch(f.runtime, f.turn, { agent: 'claude', title: '仍在执行的任务' }); await flush();
+    const queued = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: b.workerId, prompt: '排队工作', delivery: 'next' }) as Handle;
+    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '预约说明'.repeat(1000) });
+    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as {
+      workers: Record<string, unknown>[]; wakes: Record<string, unknown>[];
+    };
+    assert.equal(listed.workers.length, 2);
+    const remote = listed.workers.find(value => value.workerId === a.workerId)!;
+    assert.deepEqual(remote.target, stored.target); assert.equal(remote.nativeId, stored.nativeId);
+    assert.equal(remote.model, stored.model); assert.equal(remote.actualModel, 'actual-model');
+    assert.equal(remote.effort, stored.effort); assert.equal(remote.actualEffort, 'high');
+    assert.equal(remote.blocked, true); assert.equal(remote.lastStatus, 'uncertain'); assert.equal(remote.lastJobId, a.jobId);
+    assert.equal(remote.hasResult, true); assert.ok((remote.lastResultPreview as string).length <= 256);
+    assert.equal(remote.lastResultPreviewTruncated, true); assert.equal('lastResult' in remote, false); assert.equal('supplements' in remote, false);
+    const busy = listed.workers.find(value => value.workerId === b.workerId)!;
+    assert.equal(busy.running, true); assert.equal(busy.queued, 1); assert.equal(busy.lastJobId, queued.jobId);
+    assert.equal(listed.wakes.length, 1); assert.equal('text' in listed.wakes[0]!, false);
+    assert.ok((listed.wakes[0]!.textPreview as string).length <= 256);
+    assert.deepEqual(f.runtime.store.getWorker(a.workerId)!.imagePaths, [image]);
+    assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.claude.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('one worker details retain every unresolved receipt and only recent bounded history', async () => {
+  const f = fixture();
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    const result = '已完成结果'.repeat(1500); f.codex.finish(a.workerId, result); await flush();
+    const worker = f.runtime.store.getWorker(a.workerId)!; const origin = f.runtime.store.getJob(a.jobId)!.origin;
+    for (let index = 0; index < 40; index++) f.runtime.store.saveSupplement({ id: 'history-' + index, workerId: a.workerId,
+      jobId: a.jobId, origin, prompt: '历史补充', imagePaths: [], status: 'accepted', reason: '说明'.repeat(500),
+      createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+    for (const status of ['pending', 'steering', 'uncertain'] as const) for (let index = 0; index < 9; index++) {
+      f.runtime.store.saveSupplement({ id: status + '-' + index, workerId: a.workerId, jobId: a.jobId, origin,
+        prompt: '未确认补充', imagePaths: [], status, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+    }
+    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: Record<string, unknown>[] };
+    assert.deepEqual(listed.workers[0]!.supplementCounts, { accepted: 40, pending: 9, steering: 9, uncertain: 9 });
+    assert.equal('activeSupplements' in listed.workers[0]!, false);
+    const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: a.workerId }) as { workers: {
+      workerId: string; lastResult: string; lastResultTruncated: boolean; supplementsTotal: number; supplementsTruncated: boolean;
+      supplements: { supplementId: string; reason: string; reasonTruncated: boolean }[];
+      activeSupplements: { supplementId: string; status: string }[];
+    }[]; wakes: unknown[] };
+    assert.equal(details.workers.length, 1); const value = details.workers[0]!;
+    assert.equal(value.workerId, a.workerId); assert.equal(value.lastResult.length, 4096); assert.equal(value.lastResultTruncated, true);
+    assert.equal(value.supplementsTotal, 67); assert.equal(value.supplementsTruncated, true);
+    assert.deepEqual(value.supplements.map(receipt => receipt.supplementId), Array.from({ length: 20 }, (_unused, index) => 'history-' + (index + 20)));
+    assert.ok(value.supplements.every(receipt => receipt.reason.length <= 256 && receipt.reasonTruncated));
+    assert.equal(value.activeSupplements.length, 27);
+    for (const status of ['pending', 'steering', 'uncertain']) assert.equal(value.activeSupplements.filter(receipt => receipt.status === status).length, 9);
+    assert.deepEqual(details.wakes, []); assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
+    f.runtime.store.addWorker({ ...worker, id: 'foreign-worker', origin: { ...origin, userId: 'user-B' } });
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: 'foreign-worker' }), /不属于/);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: '' }), /workerId/);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: 123 }), /workerId/);
+    assert.equal(f.codex.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('all-worker result and wake previews share an 8 KiB budget without dropping identities', async t => {
+  const f = fixture();
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    const result = '结果🙂'.repeat(1400); f.codex.finish(a.workerId, result); await flush();
+    const worker = f.runtime.store.getWorker(a.workerId)!; const job = f.runtime.store.getJob(a.jobId)!;
+    for (let index = 1; index < 40; index++) {
+      const workerId = 'retained-' + index;
+      f.runtime.store.addWorker({ ...worker, id: workerId, nativeId: 'native-' + workerId });
+      f.runtime.store.addJob({ ...job, id: 'retained-job-' + index, workerId });
+    }
+    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '唤醒说明'.repeat(1000) });
+    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: {
+      workerId: string; nativeId: string; lastResultPreview: string; lastResultPreviewTruncated: boolean;
+    }[]; wakes: { wakeId: string; textPreview: string; textPreviewTruncated: boolean }[] };
+    assert.equal(listed.workers.length, 40); assert.equal(new Set(listed.workers.map(value => value.workerId)).size, 40);
+    assert.ok(listed.workers.every(value => value.nativeId && value.lastResultPreviewTruncated));
+    const previews = [...listed.workers.map(value => value.lastResultPreview), ...listed.wakes.map(value => value.textPreview)];
+    assert.ok(previews.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0) <= 8 * 1024);
+    assert.ok(previews.every(value => !value.includes('\uFFFD')));
+    const previous = { workers: listed.workers.map(({ lastResultPreview: _preview, lastResultPreviewTruncated: _truncated, ...value }) =>
+      ({ ...value, lastResult: result.slice(0, 4096), supplements: [] })),
+    wakes: listed.wakes.map(value => ({ wakeId: value.wakeId, text: '唤醒说明'.repeat(1000) })) };
+    const before = Buffer.byteLength(JSON.stringify(previous), 'utf8'); const after = Buffer.byteLength(JSON.stringify(listed), 'utf8');
+    assert.ok(after < before * 0.15, 'large histories no longer dominate the default response');
+    t.diagnostic('同样40个任务与1个预约：默认返回由 ' + before + ' 字节降至 ' + after + ' 字节。');
+    assert.equal(f.runtime.store.jobs().length, 40); assert.equal(f.codex.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
 test('busy continue sends current input once, persists receipt and retains original job/count/result origin', async () => {
   const f = fixture(); const received: AgentSupplement[] = [];
   f.codex.steer = async (_id, value) => { received.push(value); return { status: 'accepted' }; };
