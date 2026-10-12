@@ -15,6 +15,7 @@ import type { IncomingDM } from './types.js';
 import { RestartService } from './restart.js';
 import { closeResources } from './shutdown.js';
 import { TargetCatalogService } from './remote/catalog.js';
+import { CapabilityHealthService } from './capabilities.js';
 
 if (process.argv.includes('--help')) {
   console.log('启动：start.ps1 [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/agent、/stop');
@@ -37,6 +38,9 @@ async function checkProxy(): Promise<void> {
     socket.once('error', reject);
   });
 }
+const capabilityHealth = new CapabilityHealthService(config);
+try { log(capabilityHealth.startupSummary(await capabilityHealth.refresh(config.workspace))); }
+catch (error) { log('CAPABILITY_HEALTH_FAILED ' + safeError(error)); }
 await checkProxy();
 if (process.argv.includes('--check')) {
   log(`CONFIG_OK agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'} allowedUsers=${config.allowedUserIds.length} workspace=${config.workspace}`);
@@ -63,6 +67,12 @@ let manager: SessionManager;
 let restart: RestartService;
 const runtime = config.controllerMode ? new ControllerRuntime(config, executionAdapters, tasks, {
   targetCatalog,
+  onCheckCapabilities: (workspace, args) => capabilityHealth.query(workspace, args),
+  onStall: event => {
+    if (!event.taskId) return;
+    const text = `观察时间：${event.observedAt}\n目标：${event.targetId}；workerId：${event.workerId}；jobId：${event.jobId}\n工具：${event.tool.toolName ?? '未知'}；已等待约 ${Math.floor(event.waitingMs / 1000)} 秒。任务仍在执行，未自动停止或重做。`;
+    if (tasks.observeTask(event.taskId, event.observationKey, text)) manager.completionAvailable();
+  },
   onCompletion: () => manager.completionAvailable(),
   onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
   onError: error => log('CONTROLLER_WORKER ' + safeError(error)),

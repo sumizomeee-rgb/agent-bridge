@@ -6,12 +6,21 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { parseTargetRegistry } from '../src/remote/catalog.js';
+import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['AGENTS.md', 'CLAUDE.md', 'README.md', 'agents.json', 'agents.example.json'];
+const templates = ['AGENTS.md', 'CLAUDE.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
+
+test('workspace capability skeleton and inactive example use the current registry schema', () => {
+  const skeleton = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities.json'), 'utf8')));
+  assert.deepEqual(skeleton, []);
+  const example = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities.example.json'), 'utf8')));
+  assert.equal(example.length, 3);
+  assert.ok(example.every(item => !item.acceptance), 'An untested example must not claim an accepted capability.');
+});
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'bridge-workspace-init-'));
@@ -41,6 +50,7 @@ test('workspace initializer generates usable templates from another working dire
     assert.deepEqual(readdirSync(workspace).sort(), [...templates].sort());
     for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), readFileSync(join(project, 'workspace-template', file)));
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'agents.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
+    assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities.json'), 'utf8'))), []);
     assert.ok(readFileSync(join(workspace, 'AGENTS.md'), 'utf8').trim());
     assert.match(readFileSync(join(workspace, 'CLAUDE.md'), 'utf8'), /AGENTS\.md/);
   } finally { cleanup(); }
@@ -53,11 +63,14 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     mkdirSync(workspace);
     const custom = Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('用户工作习惯\r\n保留原样\r\n')]);
     writeFileSync(join(workspace, 'AGENTS.md'), custom);
+    const capabilities = Buffer.from('{\r\n  \"version\": 1, \"capabilities\": [], \"note\": \"用户维护\"\r\n}\r\n');
+    writeFileSync(join(workspace, 'capabilities.json'), capabilities);
     writeFileSync(join(workspace, 'private.txt'), 'existing unrelated context');
     requireSuccess(run(workspace, root));
     const before = new Map(readdirSync(workspace).map(file => [file, readFileSync(join(workspace, file))]));
     requireSuccess(run(workspace, root));
     assert.deepEqual(readFileSync(join(workspace, 'AGENTS.md')), custom);
+    assert.deepEqual(readFileSync(join(workspace, 'capabilities.json')), capabilities);
     for (const [file, bytes] of before) assert.deepEqual(readFileSync(join(workspace, file)), bytes);
   } finally { cleanup(); }
 });

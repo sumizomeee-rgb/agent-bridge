@@ -52,7 +52,7 @@ async function fixture() {
   void run.catch(() => undefined);
   await readiness;
   const supplement = { id: 'discord-2', input: [{ type: 'text' as const, text: '补充' }, { type: 'localImage' as const, path: 'image' }] };
-  return { transport, adapter, run, supplement, controller };
+  return { transport, adapter, run, supplement, controller, turn };
 }
 
 test('Codex steer 使用经核验的官方字段和有序输入，复用同一活动 transport', async () => {
@@ -107,4 +107,25 @@ test('在途 steer 未获确认时连接关闭返回 uncertain，不冒充明确
   await f.run;
   assert.equal((await supplement).status, 'uncertain');
   await f.adapter.close();
+});
+
+
+test('Codex reports native item lifecycle only, without deltas, commands or other thread events', async () => {
+  const f = await fixture(); const activities: unknown[] = [];
+  f.turn.onActivity = activity => activities.push(activity);
+  const emit = (method: string, item: JsonObject, threadId = 'thread-1') => f.transport.emit({ method, params: { threadId, turnId: 'turn-1', item } });
+  try {
+    emit('item/started', { id: 'foreign', type: 'commandExecution', command: 'secret' }, 'other-thread');
+    emit('item/started', { id: 'reasoning', type: 'reasoning', summary: ['PRIVATE THOUGHT'] });
+    emit('item/started', { id: 'tool', type: 'mcpToolCall', tool: 'browser', server: 'chrome', arguments: { password: 'SECRET' } });
+    emit('item/started', { id: 'tool', type: 'mcpToolCall', tool: 'browser' });
+    f.transport.emit({ method: 'item/commandExecution/outputDelta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'PRIVATE OUTPUT' } });
+    emit('item/completed', { id: 'tool', type: 'mcpToolCall', tool: 'browser', status: 'failed', result: 'PRIVATE OUTPUT' });
+    emit('item/completed', { id: 'tool', type: 'mcpToolCall', tool: 'browser', status: 'failed' });
+    f.transport.complete(); await f.run;
+    assert.deepEqual(activities.map(value => (value as { type: string }).type), ['reasoning', 'tool-started', 'tool-completed']);
+    assert.equal((activities[1] as { toolName: string }).toolName, 'browser');
+    assert.equal((activities[2] as { status: string }).status, 'failed');
+    assert.equal(JSON.stringify(activities).includes('PRIVATE'), false); assert.equal(JSON.stringify(activities).includes('SECRET'), false);
+  } finally { await f.adapter.close(); }
 });

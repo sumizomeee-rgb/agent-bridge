@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentName } from '../types.js';
+import type { AgentAdapter, AgentName, AgentExecutionProgress, AgentToolActivity } from '../types.js';
 import type { TaskCompletionEvent, TaskOrigin } from '../tasks.js';
 import type { ExecutionTargetBinding, RemoteHandoff, TargetSummary } from '../remote/types.js';
 
@@ -13,6 +13,10 @@ export interface ControllerWorker {
 export interface ControllerJob {
   id: string; workerId: string; origin: TaskOrigin; prompt: string; imagePaths: string[];
   status: ControllerJobStatus; taskId: string | null; result: string | null; cancelReason: string | null;
+  /** Optional metadata keeps old JSON rows compatible; no native payloads are stored. */
+  progress?: AgentExecutionProgress;
+  /** Stable per-tool notices survive remote reconnect and bridge restart. */
+  stallNotices?: string[];
   /** Route cancellation belongs to this dispatch, never all future turns of an idle worker. */
   wakeAllowed?: boolean;
   createdAt: string; updatedAt: string;
@@ -32,8 +36,13 @@ export interface ControllerTargetCatalog {
   adapterFor(binding: ExecutionTargetBinding): AgentAdapter;
   handoff(binding: ExecutionTargetBinding, nativeId: string, cwd: string, agent: AgentName): Promise<RemoteHandoff>;
 }
+export interface ControllerStallEvent {
+  id: string; observationKey: string; taskId: string | null; origin: TaskOrigin; workerId: string; jobId: string; targetId: string;
+  tool: AgentToolActivity; observedAt: string; waitingMs: number;
+}
 export interface ControllerRuntimeCallbacks {
   targetCatalog?: ControllerTargetCatalog;
+  onCheckCapabilities?: (workspace: string, args: { targetId?: string; agent?: AgentName; capabilityId?: string; refresh?: boolean }) => Promise<unknown>;
   onRequestRestart?: (origin: TaskOrigin) => Promise<unknown>;
   isDraining?: () => boolean;
   onCompletion?: (event: TaskCompletionEvent) => void | Promise<void>;
@@ -42,4 +51,7 @@ export interface ControllerRuntimeCallbacks {
   /** Test clock; production uses real UTC timestamps. */
   now?: () => number;
   pollIntervalMs?: number;
+  /** Observation only; the coordinating agent chooses what to do, never an automatic timeout. */
+  onStall?: (event: ControllerStallEvent) => void | Promise<void>;
+  stallAfterMs?: number;
 }

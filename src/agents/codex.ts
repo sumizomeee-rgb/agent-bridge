@@ -64,6 +64,22 @@ export class CodexAdapter implements AgentAdapter {
     const rpc = new JsonRpcClient(transport);
     const completed = deferred<AgentResult>();
     const replies = new Map<string, { text: string; phase: unknown }>();
+    const observedItems = new Set<string>();
+    const toolTypes = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'webSearch', 'imageView', 'collabAgentToolCall']);
+    const activity = (item: unknown, completed: boolean) => {
+      if (!isObject(item) || typeof item.type !== 'string' || typeof item.id !== 'string') return;
+      const key = `${completed ? 'completed' : 'started'}:${item.id}`; if (observedItems.has(key)) return;
+      observedItems.add(key);
+      const at = new Date().toISOString();
+      if (toolTypes.has(item.type)) {
+        const toolName = item.type === 'mcpToolCall' && typeof item.tool === 'string' ? item.tool
+          : item.type === 'dynamicToolCall' && typeof item.tool === 'string' ? item.tool : item.type;
+        turn.onActivity?.({ at, type: completed ? 'tool-completed' : 'tool-started', itemId: item.id, toolName,
+          ...(completed ? { status: item.status === 'failed' ? 'failed' : item.status === 'completed' ? 'completed' : 'unknown' } : {}) });
+      } else if (!completed && (item.type === 'reasoning' || item.type === 'agentMessage')) {
+        turn.onActivity?.({ at, type: item.type === 'reasoning' ? 'reasoning' : 'message', itemId: item.id });
+      }
+    };
     let nativeId = turn.conversation.nativeId;
     let turnId: string | null = null;
     let cancelled = false;
@@ -93,8 +109,10 @@ export class CodexAdapter implements AgentAdapter {
         turn.onProgress(params.delta);
       } else if (message.method === 'model/rerouted' && typeof params.toModel === 'string' && params.toModel) {
         turn.onModel?.(params.toModel);
+      } else if (message.method === 'item/started') {
+        activity(params.item, false);
       } else if (message.method === 'item/completed') {
-        collect(params.item);
+        activity(params.item, true); collect(params.item);
       } else if (message.method === 'error' && params.willRetry === false) {
         const error = isObject(params.error) ? params.error : params;
         completed.reject(new Error(`Codex 请求失败：${safeError(error.message, 'Agent 错误')}`));
@@ -107,7 +125,7 @@ export class CodexAdapter implements AgentAdapter {
           completed.reject(new Error(`Codex 执行失败：${safeError(error.message, '未正常完成')}`));
           return;
         }
-        if (Array.isArray(result.items)) result.items.forEach(collect);
+        if (Array.isArray(result.items)) result.items.forEach(item => { activity(item, true); collect(item); });
         const messages = [...replies.values()];
         const final = messages.filter((item) => item.phase === 'final_answer');
         const fallback = messages.filter((item) => item.phase !== 'commentary');

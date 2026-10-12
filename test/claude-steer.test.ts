@@ -43,7 +43,7 @@ async function fixture(version = '2.1.76') {
   const run = adapter.run(turn); void run.catch(() => {});
   await readiness;
   const supplement: AgentSupplement = { id: 'a1234567-1234-4567-8901-123456789012', input: [{ type: 'text', text: 'adjust current work' }] };
-  return { transport, adapter, controller, run, supplement, args };
+  return { transport, adapter, controller, run, supplement, args, turn };
 }
 
 test('Claude keeps stdin open and confirms current consumption by exact native UUID echo without interrupt/resume', async () => {
@@ -116,5 +116,25 @@ test('Claude completion with possibly consumed input stays uncertain and cannot 
   try {
     const receipt = f.adapter.steer('bridge-claude', f.supplement); f.transport.complete();
     assert.equal((await receipt).status, 'uncertain'); await f.run;
+  } finally { await f.adapter.close(); }
+});
+
+
+test('Claude observes actual tool_use/tool_result lifecycle, excluding partial arguments and nested subagent streams', async () => {
+  const f = await fixture(); const activities: unknown[] = []; f.turn.onActivity = activity => activities.push(activity);
+  try {
+    f.transport.emit({ type: 'stream_event', event: { type: 'message_start' } });
+    f.transport.emit({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: 'PRIVATE' } } });
+    f.transport.emit({ type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'tool', name: 'Bash' } } });
+    f.transport.emit({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: 'SECRET' } } });
+    const assistant = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool', name: 'Bash', input: { command: 'PRIVATE' } }] } };
+    f.transport.emit(assistant); f.transport.emit(assistant);
+    f.transport.emit({ ...assistant, parent_tool_use_id: 'nested', message: { content: [{ type: 'tool_use', id: 'nested-tool', name: 'Bash' }] } });
+    f.transport.emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool', content: 'PRIVATE OUTPUT', is_error: true }] } });
+    f.transport.emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool', content: 'PRIVATE OUTPUT' }] } });
+    f.transport.complete(); await f.run;
+    assert.deepEqual(activities.map(value => (value as { type: string }).type), ['reasoning', 'tool-started', 'tool-completed']);
+    assert.equal((activities[2] as { status: string }).status, 'failed');
+    assert.equal(JSON.stringify(activities).includes('PRIVATE'), false); assert.equal(JSON.stringify(activities).includes('SECRET'), false);
   } finally { await f.adapter.close(); }
 });

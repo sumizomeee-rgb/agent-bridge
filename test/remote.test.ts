@@ -291,3 +291,24 @@ test('daemon shutdown closes pending metadata adapters and propagates unconfirme
   await tick(); await assert.rejects(daemon.close(), /still running/); assert.equal(closed, 1);
   refuse = false; await daemon.close(); assert.match(String(await outcome), /stopped/); assert.ok(closed >= 2);
 });
+
+
+test('remote native progress is durable and repeated polling never fabricates a fresh activity', async () => {
+  const f = fixture();
+  try {
+    const turn = f.turn(); const activities: unknown[] = []; turn.onActivity = value => activities.push(value);
+    const run = f.adapter.run(turn); await tick(); await tick();
+    const native = f.natives[0]!;
+    native.turn!.onActivity?.({ at: '2026-10-12T10:00:00Z', type: 'tool-started', itemId: 'upload', toolName: 'upload' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(activities.length, 1); assert.equal(f.daemon.store.job(turn.dispatchId!)!.progress!.sequence, 1);
+    const before = f.daemon.store.job(turn.dispatchId!)!.progress!;
+    await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(activities.length, 1);
+    assert.deepEqual(f.daemon.store.job(turn.dispatchId!)!.progress, before);
+    native.turn!.onActivity?.({ at: '2026-10-12T10:02:00Z', type: 'tool-completed', itemId: 'upload', toolName: 'upload', status: 'completed' });
+    await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(activities.length, 2);
+    assert.equal((activities[1] as { snapshot: { activeTools: unknown[] } }).snapshot.activeTools.length, 0);
+    native.finish(); await run; assert.equal(f.daemon.store.job(turn.dispatchId!)!.progress!.sequence, 2);
+    assert.equal(f.calls.filter(value => value === 'dispatch').length, 1); assert.equal(native.interrupts, 0);
+  } finally { await f.adapter.close(); await f.daemon.close(); }
+});

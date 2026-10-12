@@ -4,13 +4,14 @@ import { isAbsolute, resolve } from 'node:path';
 import type { AgentAdapter, AgentName, AgentTurn, BridgeConfig, Conversation } from '../types.js';
 import type { TaskContextFile, TaskOrigin, TaskRegistry, TaskTerminalStatus } from '../tasks.js';
 import { ControllerStore } from './store.js';
+import { observeActivity } from '../agents/activity.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSupplement, ControllerWake, ControllerWorker } from './runtime-types.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
 const workspaceWorkerInstruction = '你是桥已登记并管理的工作区上下文调查子 Agent。只完成下面的只读调查，不执行新的工程或生活任务，不自行登记桥后台任务、发 Discord 消息或伪造完成回执。\n\n';
 const workspacePrompt = '这是当前父会话的一次性工作区初始化。以当前工作目录中的 AGENTS.md、README.md 为用户入口，遵循其中定义的初始化入口、只读范围和回传要求；仅在它们明确要求初始化读取时，沿导航读取指定的本机上下文文件。初始化读取范围和回传内容由用户文件维护，不预设业务栏目；没有额外定义时，仅返回这两个文件中与后续会话有关的必要指导。不要扫描未指定的目录或技能目录，不连接远程电脑、联网检查、修改文件或启动新工作。缺失文件、读取失败或不明确的范围如实报告，不猜测环境；区分文件声明与实际核实的事实。仅将结果作为本任务回执返回。';
-const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart']);
+const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities']);
 function pathKey(value: string): string { const result = resolve(value); return process.platform === 'win32' ? result.toLowerCase() : result; }
 function text(value: unknown, label: string, limit: number): string {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value, 'utf8') > limit || value.includes('\0')) throw new Error(`${label}为空或超过限制`);
@@ -191,6 +192,19 @@ export class ControllerRuntime {
       const previous = this.store.getCall(key, fingerprint);
       if (previous !== undefined) return previous;
     }
+    if (name === 'bridge_check_capabilities') {
+      const args = object(input, ['targetId', 'agent', 'capabilityId', 'refresh']);
+      if (args.agent !== undefined && args.agent !== 'codex' && args.agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
+      if (args.refresh !== undefined && typeof args.refresh !== 'boolean') throw new Error('refresh 必须是布尔值');
+      if (!this.callbacks.onCheckCapabilities) throw new Error('桥尚未配置能力体检服务');
+      // Read-only probes must reflect current readiness, never a historical call journal.
+      return this.callbacks.onCheckCapabilities(turn.conversation.cwd, {
+        ...(args.targetId === undefined ? {} : { targetId: text(args.targetId, 'targetId', 256) }),
+        ...(args.agent === undefined ? {} : { agent: args.agent }),
+        ...(args.capabilityId === undefined ? {} : { capabilityId: text(args.capabilityId, 'capabilityId', 256) }),
+        ...(args.refresh === undefined ? {} : { refresh: args.refresh }),
+      });
+    }
     if (name === 'bridge_list_targets') {
       const args = object(input, ['refresh']);
       if (args.refresh !== undefined && typeof args.refresh !== 'boolean') throw new Error('refresh 必须是布尔值');
@@ -338,6 +352,12 @@ export class ControllerRuntime {
         };
         result = { workers: workers.map(worker => {
           const jobs = this.store.jobs(worker.id); const latest = jobs.at(-1);
+          const currentJob = jobs.find(job => job.status === 'running') ?? latest;
+          const progress = currentJob?.progress;
+          const progressSummary = { observed: !!progress, stage: progress?.stage ?? 'unobserved', jobId: currentJob?.id ?? null,
+            lastActivityAt: progress?.lastActivity.at ?? null, activeToolCount: progress?.activeTools.length ?? null,
+            oldestToolStartedAt: progress?.activeTools.map(tool => tool.startedAt).sort()[0] ?? null,
+            stallNotices: currentJob?.stallNotices?.length ?? 0 };
           const supplements = jobs.flatMap(job => this.store.supplements(job.id));
           const supplementCounts: Record<string, number> = {};
           for (const value of supplements) supplementCounts[value.status] = (supplementCounts[value.status] ?? 0) + 1;
@@ -351,6 +371,7 @@ export class ControllerRuntime {
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
+            progress: details ? { ...progressSummary, lastActivity: progress?.lastActivity ?? null, lastTool: progress?.lastTool ?? null, activeTools: progress?.activeTools ?? [] } : progressSummary,
             hasResult: latest?.result != null, lastResultPreview,
             lastResultPreviewTruncated: latest?.result != null && lastResultPreview !== latest.result, supplementCounts,
             ...(details ? { lastResult: latest?.result == null ? null : listText(latest.result, 4096),
@@ -459,6 +480,12 @@ export class ControllerRuntime {
       const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction) + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
         onReady: () => { state.ready = true; this.pumpSupplements(workerId, state); },
+        onActivity: activity => {
+          if (!state.executing || state.abort.signal.aborted) return;
+          const current = this.store.getJob(job.id); if (!current || current.status !== 'running') return;
+          const progress = observeActivity(current.progress, activity);
+          if (progress && progress !== current.progress) this.store.saveJobProgress(job.id, progress);
+        },
         onNativeId: nativeId => this.nativeId(worker, nativeId),
         onModel: actualModel => { const current = this.store.getWorker(worker.id)!; current.actualModel = actualModel; this.store.saveWorker(current); },
         onReasoningEffort: effort => { const current = this.store.getWorker(worker.id)!; current.actualEffort = effort; this.store.saveWorker(current); } };
@@ -567,10 +594,32 @@ export class ControllerRuntime {
       if (this.unconfirmedStops.has(worker!.id)) { this.unconfirmedStops.delete(worker!.id); this.unconfirmedStops.add(worker!.id); }
     }
   }
+  private async observeStalls(): Promise<void> {
+    if (!this.callbacks.onStall) return;
+    const threshold = this.callbacks.stallAfterMs ?? 10 * 60_000;
+    for (const [workerId, state] of this.active) {
+      if (!state.executing || state.abort.signal.aborted || state.cancelReason || state.closing) continue;
+      const worker = this.store.getWorker(workerId); const job = this.store.getJob(state.job.id);
+      if (!worker || !job || job.status !== 'running' || job.cancelReason || (job.wakeAllowed ?? worker.wakeAllowed) === false
+        || worker.ownership === 'user' || worker.handoffPending) continue;
+      for (const tool of job.progress?.activeTools ?? []) {
+        const waitingMs = this.now() - Date.parse(tool.startedAt); const key = `${tool.itemId}:${tool.startedAt}`;
+        if (!Number.isFinite(waitingMs) || waitingMs < threshold || job.stallNotices?.includes(key)) continue;
+        try {
+          const observationKey = `worker-stall:${job.id}:${key}`;
+          await this.callbacks.onStall({ id: observationKey, observationKey, taskId: job.taskId, origin: job.origin, workerId, jobId: job.id,
+            targetId: worker.target?.id ?? 'local', tool, observedAt: this.timestamp(), waitingMs });
+          this.store.markToolStall(job.id, key);
+        }
+        catch (error) { this.error(error); }
+      }
+    }
+  }
   async poll(): Promise<void> {
     if (this.closed || this.stopping) return;
     await this.confirmUncertainStops();
     if (this.closed || this.stopping || this.isDraining()) return;
+    await this.observeStalls();
     for (const wake of this.store.wakes()) {
       if (wake.status === 'cancelled' || wake.status === 'fired' || Date.parse(wake.dueAt) > this.now()) continue;
       let taskId = wake.taskId;

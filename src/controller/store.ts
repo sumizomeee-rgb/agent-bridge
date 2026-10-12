@@ -102,6 +102,17 @@ export class ControllerStore {
     this.db.prepare('UPDATE controller_jobs SET status=?,task_id=?,result=?,cancel_reason=?,value_json=? WHERE id=?')
       .run(value.status, value.taskId, value.result, value.cancelReason, JSON.stringify(value), id);
   }
+  saveJobProgress(id: string, progress: ControllerJob['progress']): void {
+    const current = this.getJob(id); if (!current || current.status !== 'running') return;
+    this.db.prepare('UPDATE controller_jobs SET value_json=? WHERE id=?').run(JSON.stringify({ ...current, progress }), id);
+  }
+  markToolStall(id: string, toolKey: string): boolean {
+    const current = this.getJob(id);
+    if (!current || current.status !== 'running' || current.cancelReason || current.wakeAllowed === false || current.stallNotices?.includes(toolKey)) return false;
+    this.db.prepare('UPDATE controller_jobs SET value_json=? WHERE id=?')
+      .run(JSON.stringify({ ...current, stallNotices: [...(current.stallNotices ?? []), toolKey] }), id);
+    return true;
+  }
   saveSupplement(value: ControllerSupplement): void {
     this.db.prepare('INSERT INTO controller_supplements (id,worker_id,job_id,value_json) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET value_json=excluded.value_json')
       .run(value.id, value.workerId, value.jobId, JSON.stringify(value));

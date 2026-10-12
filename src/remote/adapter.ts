@@ -80,6 +80,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
     const execution = { dispatchId: turn.dispatchId, submitted: turn.recovering === true, cancelled: false };
     this.jobs.set(turn.conversation.id, execution); this.lastDispatch.set(turn.conversation.id, turn.dispatchId);
     let nativeId: string | null = null; let ready = false; let model: string | undefined; let effort: string | null | undefined;
+    let activitySequence = 0;
     try {
       try { await this.validate(); }
       catch (error) { if (!turn.recovering || this.knownRejection(error)) throw error; await this.inspectDispatch(turn.dispatchId); }
@@ -104,6 +105,10 @@ export class RemoteAgentAdapter implements AgentAdapter {
         if (job.actualModel && model !== job.actualModel) { model = job.actualModel; turn.onModel?.(model); }
         if (job.actualEffort !== undefined && effort !== job.actualEffort) { effort = job.actualEffort; turn.onReasoningEffort?.(effort); }
         if (job.ready && !ready) { ready = true; turn.onReady?.(); }
+        if (job.progress && job.progress.sequence > activitySequence) {
+          activitySequence = job.progress.sequence;
+          turn.onActivity?.({ ...job.progress.lastActivity, snapshot: job.progress });
+        }
         if (job.status === 'completed' && job.result) {
           if (job.stopped !== true) throw new RemoteDispatchUncertain('原生结果已产生，但目标 CLI 退出尚未确认。');
           try { return await this.download(job); }

@@ -30,11 +30,12 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-生成 `AGENTS.md`、`CLAUDE.md`、`README.md`、`agents.json` 和 `agents.example.json`。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
+生成 `AGENTS.md`、`CLAUDE.md`、`README.md`、`agents.json`、`capabilities.json` 和各自的 `.example.json`。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
 
 1. 在生成的 `README.md` 填写电脑用途、项目与 SSH 导航、需要初始化读取的本机入口；长工作指南只指向权威文档。
 2. `agents.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `agents.example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。
-3. 把 `.local/config.json` 的 `workspace` 设为该绝对路径。已运行桥需安全重启加载配置；当前用户也可用 `/cwd 完整绝对路径` 在新工作区开启会话。
+3. `capabilities.json` 初始为空；按 `capabilities.example.json` 填写真正使用的浏览器 profile 和能力入口。验收记录注明范围，当前状态由桥按需查询，示例不会启用；见[能力登记与就绪检查](capabilities.md)。
+4. 把 `.local/config.json` 的 `workspace` 设为该绝对路径。已运行桥需安全重启加载配置；当前用户也可用 `/cwd 完整绝对路径` 在新工作区开启会话。
 
 工作区文件属于用户资料，需要单独迁移；保留旧工作区就直接复制它，不必重新生成或覆盖。修改模板不会更新现有工作区。
 
@@ -56,6 +57,7 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 - `.local/data/attachments/`：会话图片，不应在会话仍使用时删除。
 - `.local/data/outgoing/`：之前回传的图片及普通文件，继续支持明确引用；不自动扫描、上传或为新消息创建目录。
 - `.local/logs/`：运行状态；日志不主动保存机器人 Token。
+- `.local/data/capability-health/`：能力轻检查缓存，与工作区静态登记及历史验收分开，不保存网站认证。
 
 迁移同平台时复制代码、构建和 `.local`，按新机器位置更新配置中的 CLI 和工作目录。只有目标用户本身已具有 CLI 认证才可使用，不迁移 CLI 登录 Token。
 

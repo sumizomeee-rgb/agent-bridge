@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { ControllerRuntime } from '../src/controller/runtime.js';
 import { ControllerStore } from '../src/controller/store.js';
+import type { ControllerStallEvent } from '../src/controller/runtime-types.js';
 import { TaskRegistry, type TaskCompletionEvent, type TaskContextFile } from '../src/tasks.js';
 import type { AgentAdapter, AgentResult, AgentTurn, AgentSupplement, SteerResult, BridgeConfig } from '../src/types.js';
 
@@ -48,12 +49,12 @@ function fixture() {
   const turn: AgentTurn = { conversation: { id: 'parent-A', userId: 'user-A', agent: 'codex', nativeId: 'native-parent', model: 'gpt-6.1-sol',
     actualEffort: 'medium', title: 'parent', cwd: dir, createdAt: '2026-01-01', updatedAt: '2026-01-01' }, text: 'parent', imagePaths: [],
     taskContextPath: created.contextPath, signal: new AbortController().signal, onProgress: () => {} };
-  const counts: number[] = []; const events: TaskCompletionEvent[] = []; const errors: unknown[] = [];
+  const counts: number[] = []; const events: TaskCompletionEvent[] = []; const errors: unknown[] = []; const stalls: ControllerStallEvent[] = [];
   let now = Date.parse('2026-10-09T10:00:00Z');
   const callbacks = { now: () => now, onCountChanged: (_id: string, count: number) => { counts.push(count); },
-    onCompletion: (event: TaskCompletionEvent) => { events.push(event); }, onError: (error: unknown) => { errors.push(error); }, pollIntervalMs: 60000 };
+    onCompletion: (event: TaskCompletionEvent) => { events.push(event); }, onStall: (event: ControllerStallEvent) => { stalls.push(event); }, onError: (error: unknown) => { errors.push(error); }, pollIntervalMs: 60000 };
   const runtime = new ControllerRuntime(config, { codex, claude }, registry, callbacks);
-  return { dir, registry, codex, claude, config, callbacks, turn, counts, events, errors, runtime, advance: (ms: number) => { now += ms; } };
+  return { dir, registry, codex, claude, config, callbacks, turn, counts, events, errors, stalls, runtime, advance: (ms: number) => { now += ms; } };
 }
 async function flush(): Promise<void> { await new Promise<void>(resolve => setImmediate(resolve)); }
 type Handle = { workerId: string; jobId: string; status: string };
@@ -703,4 +704,117 @@ for (const selection of [
     assert.equal(f.codex.turns[0]!.effort, selection.expected);
     f.codex.finish(handle.workerId); await flush();
   } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+
+test('worker observation warns once for a genuinely waiting tool, never for long reasoning or token output', async () => {
+  const f = fixture();
+  try {
+    const a = await launch(f.runtime, f.turn); await flush(); const child = f.codex.turns[0]!;
+    child.onActivity?.({ at: '2026-10-09T10:00:00Z', type: 'reasoning' });
+    child.onProgress('lots of token output'); f.advance(12 * 60000); await f.runtime.poll();
+    assert.equal(f.stalls.length, 0); assert.equal(f.registry.activeCount('parent-A'), 1);
+    child.onActivity?.({ at: '2026-10-09T10:12:00Z', type: 'tool-started', itemId: 'browser-1', toolName: 'browser' });
+    f.advance(599999); await f.runtime.poll(); assert.equal(f.stalls.length, 0);
+    f.advance(1); await f.runtime.poll(); await f.runtime.poll(); assert.equal(f.stalls.length, 1);
+    assert.equal(f.stalls[0]!.workerId, a.workerId); assert.equal(f.stalls[0]!.jobId, a.jobId);
+    assert.equal(f.stalls[0]!.taskId, a.jobId); assert.equal(f.stalls[0]!.origin.conversationId, 'parent-A');
+    assert.equal(f.stalls[0]!.origin.userId, 'user-A'); assert.equal(f.stalls[0]!.waitingMs, 600000);
+    assert.equal(f.stalls[0]!.observationKey, f.stalls[0]!.id);
+    assert.equal(f.codex.interrupts.length, 0); assert.equal(f.runtime.store.getJob(a.jobId)!.status, 'running');
+    assert.equal(f.registry.activeCount('parent-A'), 1); assert.equal(f.events.length, 0);
+    child.onActivity?.({ at: '2026-10-09T10:22:00Z', type: 'tool-completed', itemId: 'browser-1', toolName: 'browser', status: 'completed' });
+    f.advance(20 * 60000); await f.runtime.poll(); assert.equal(f.stalls.length, 1);
+    const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: a.workerId }) as { workers: { progress: { observed: boolean; stage: string; activeTools: unknown[]; lastTool: { status: string } } }[] };
+    assert.equal(details.workers[0]!.progress.observed, true); assert.equal(details.workers[0]!.progress.stage, 'between-tools');
+    assert.equal(details.workers[0]!.progress.activeTools.length, 0); assert.equal(details.workers[0]!.progress.lastTool.status, 'completed');
+    f.codex.finish(a.workerId); await flush(); await f.runtime.poll(); assert.equal(f.stalls.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('parallel tool waits are independently deduplicated, and a completed tool cannot cause a later stall', async () => {
+  const f = fixture();
+  try {
+    const a = await launch(f.runtime, f.turn); await flush(); const child = f.codex.turns[0]!;
+    for (const id of ['first', 'second']) child.onActivity?.({ at: '2026-10-09T10:00:00Z', type: 'tool-started', itemId: id, toolName: 'browser' });
+    child.onActivity?.({ at: '2026-10-09T10:01:00Z', type: 'tool-completed', itemId: 'first', toolName: 'browser', status: 'failed' });
+    f.advance(600000); await f.runtime.poll(); assert.equal(f.stalls.length, 1); assert.equal(f.stalls[0]!.tool.itemId, 'second');
+    child.onActivity?.({ at: '2026-10-09T10:10:00Z', type: 'message' });
+    await f.runtime.poll(); assert.equal(f.stalls.length, 1);
+    child.onActivity?.({ at: '2026-10-09T10:10:00Z', type: 'tool-started', itemId: 'third', toolName: 'upload' });
+    f.advance(600000); await f.runtime.poll(); assert.equal(f.stalls.length, 2); assert.equal(f.stalls[1]!.tool.itemId, 'third');
+    assert.equal(f.registry.activeCount('parent-A'), 1); f.codex.finish(a.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('stall receipt is marked only after the parent observation callback durably accepts it', async () => {
+  const f = fixture(); let attempts = 0;
+  f.callbacks.onStall = event => { attempts++; if (attempts === 1) throw new Error('observation storage unavailable'); f.stalls.push(event); };
+  try {
+    const a = await launch(f.runtime, f.turn); await flush();
+    f.codex.turns[0]!.onActivity?.({ at: '2026-10-09T10:00:00Z', type: 'tool-started', itemId: 'browser', toolName: 'browser' });
+    f.advance(600000); await f.runtime.poll(); assert.equal(f.runtime.store.getJob(a.jobId)!.stallNotices, undefined);
+    await f.runtime.poll(); await f.runtime.poll(); assert.equal(attempts, 2); assert.equal(f.stalls.length, 1);
+    assert.equal(f.runtime.store.getJob(a.jobId)!.stallNotices!.length, 1);
+    assert.equal(f.errors.length, 1); assert.equal(f.codex.interrupts.length, 0); f.codex.finish(a.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('new, stop and user ownership suppress old-parent stall notifications without changing execution semantics', async () => {
+  for (const mode of ['new', 'stop', 'user'] as const) {
+    const f = fixture();
+    try {
+      const a = await launch(f.runtime, f.turn); await flush();
+      f.codex.turns[0]!.onActivity?.({ at: '2026-10-09T10:00:00Z', type: 'tool-started', itemId: 'browser', toolName: 'browser' });
+      if (mode === 'new') f.runtime.detachConversation('parent-A');
+      else if (mode === 'stop') await f.runtime.cancelConversation('parent-A');
+      else { const worker = f.runtime.store.getWorker(a.workerId)!; worker.ownership = 'user'; f.runtime.store.saveWorker(worker); }
+      f.advance(2 * 600000); await f.runtime.poll(); assert.equal(f.stalls.length, 0);
+      if (mode !== 'stop') { assert.equal(f.codex.interrupts.length, 0); f.codex.finish(a.workerId); await flush(); }
+      else assert.equal(f.runtime.store.getJob(a.jobId)!.status, 'cancelled');
+    } finally { await f.runtime.close(); f.registry.close(); }
+  }
+});
+
+test('remote restart retains the original progress and stall receipt instead of sending a notification storm', async () => {
+  const f = fixture(); let second: ControllerRuntime | undefined;
+  try {
+    await f.runtime.close(); const store = new ControllerStore(f.dir);
+    const context = JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile;
+    const origin = f.registry.getContextOrigin(context); const jobId = randomUUID();
+    const taskId = f.registry.register(context, '远端等待', jobId).taskId;
+    const target = { id: 'station', label: '工位', transport: 'ssh' as const, agent: 'codex' as const, agentCommand: f.config.commands.codex, cwd: f.dir };
+    store.addWorker({ id: 'remote-worker', origin, agent: 'codex', model: null, actualModel: null, effort: null, cwd: f.dir, target,
+      title: 'remote', nativeId: 'native-remote-worker', imagePaths: [], wakeAllowed: true, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+    store.addJob({ id: jobId, workerId: 'remote-worker', origin, prompt: 'same original dispatch', imagePaths: [], status: 'running', taskId,
+      result: null, cancelReason: null, createdAt: '2026-10-09', updatedAt: '2026-10-09',
+      progress: { observed: true, sequence: 1, stage: 'tool', lastActivity: { at: '2026-10-09T10:00:00.000Z', type: 'tool-started', itemId: 'browser', toolName: 'browser' },
+        activeTools: [{ itemId: 'browser', toolName: 'browser', startedAt: '2026-10-09T10:00:00.000Z' }] },
+      stallNotices: ['browser:2026-10-09T10:00:00.000Z'] }); store.close(); f.advance(30 * 60000);
+    const adapter = new FakeAdapter();
+    second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, { ...f.callbacks, targetCatalog: {
+      listTargets: async () => [], resolveTarget: async () => target, adapterFor: () => adapter, handoff: async () => { throw new Error('unused'); } } });
+    await second.start(); await flush(); await second.poll(); await second.poll();
+    assert.equal(adapter.turns.length, 1); assert.equal(adapter.turns[0]!.recovering, true); assert.equal(adapter.turns[0]!.dispatchId, jobId);
+    assert.equal(f.stalls.length, 0); assert.equal(f.registry.activeCount('parent-A'), 1);
+    assert.equal(second.store.getJob(jobId)!.progress!.activeTools[0]!.startedAt, '2026-10-09T10:00:00.000Z');
+    adapter.finish('remote-worker'); await flush();
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+
+test('capability queries validate selectors and are freshly read, never cached as a dispatch or counted as a worker', async () => {
+  const f = fixture(); let runtime: ControllerRuntime | undefined; let calls = 0;
+  try {
+    await f.runtime.close();
+    runtime = new ControllerRuntime(f.config, { codex: f.codex, claude: f.claude }, f.registry, { ...f.callbacks,
+      onCheckCapabilities: async (workspace, args) => { assert.equal(workspace, f.turn.conversation.cwd); assert.equal(args.targetId, 'station'); calls++; return { generation: calls }; } });
+    const args = { targetId: 'station', agent: 'claude', capabilityId: 'upload', refresh: true };
+    assert.deepEqual(await runtime.invoke(f.turn, 'bridge_check_capabilities', args, 'same-query'), { generation: 1 });
+    assert.deepEqual(await runtime.invoke(f.turn, 'bridge_check_capabilities', args, 'same-query'), { generation: 2 });
+    for (const invalid of [{ agent: 'other' }, { refresh: 'yes' }, { targetId: '' }, { capabilityId: 1 }, { unknown: true }])
+      await assert.rejects(runtime.invoke(f.turn, 'bridge_check_capabilities', invalid));
+    assert.equal(calls, 2); assert.equal(f.codex.turns.length, 0); assert.equal(f.claude.turns.length, 0);
+    assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(runtime.store.jobs().length, 0);
+  } finally { await runtime?.close(); await f.runtime.close(); f.registry.close(); }
 });

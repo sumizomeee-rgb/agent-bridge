@@ -37,7 +37,7 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('AGENTS.md', 'CLAUDE.md', 'README.md', 'agents.json', 'agents.example.json')
+    $files = @('AGENTS.md', 'CLAUDE.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')
     # 先检查完整清单，避免目录占用了文件名时只生成一部分模板。
     foreach ($name in $files) {
         $source = Join-Path $templateRoot $name

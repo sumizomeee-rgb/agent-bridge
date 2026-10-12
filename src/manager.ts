@@ -764,13 +764,15 @@ export class SessionManager {
       return;
     }
     if (!registry.claimEvent(event.id)) return;
+    const observation = event.kind === 'worker-progress';
     const workspaceContext = event.purpose === 'workspace-context';
+    if (observation && (!this.config.controllerMode || !target.controllerMode || !registry.observationRelevant(event.id))) { registry.markDelivered(event.id); return; }
     if (workspaceContext && (!this.config.controllerMode || !target.controllerMode)) { registry.markDelivered(event.id); return; }
-    const status = { completed: '已完成', failed: '失败', cancelled: '已取消' }[event.status];
+    const status = { completed: '已完成', failed: '失败', cancelled: '已取消', running: '工具等待观察' }[event.status];
     const notice = `后台任务「${event.title}」${status}（${agentDisplayName(event.agent)} · 原会话 ${event.conversationId.slice(0, 8)} · 任务 ${event.taskId.slice(0, 8)}）。`;
     const active = this.store.getActive(event.userId);
     if (!event.wakeAllowed || active?.id !== event.conversationId) {
-      if (workspaceContext) { registry.markDelivered(event.id); return; }
+      if (workspaceContext || observation) { registry.markDelivered(event.id); return; }
       try {
         await this.sink.sendText(event.channelId, `${notice}\n原会话已停止或切换，未唤醒当前会话。\n${event.displayText == null ? '结果已保存，请在原会话核对。' : event.displayText.slice(0, 1500)}`);
         registry.markDelivered(event.id);
@@ -808,8 +810,8 @@ export class SessionManager {
       const result = await this.adapters[target.agent].run({
         conversation: target, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
-        event: { kind: workspaceContext ? 'workspace-context' : event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
-          toolName: workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText },
+        event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
+          toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText },
         onNativeId: workspaceContext ? nativeId => {
           if (!current() || !nativeId) return;
           if (boundNativeId && boundNativeId !== nativeId) throw new Error('工作区初始化返回了不同父会话');
@@ -830,7 +832,7 @@ export class SessionManager {
         registry.markDelivered(event.id);
         return;
       }
-      if (result.controlledOutput) { registry.markDelivered(event.id); return; }
+      if (result.controlledOutput || observation) { registry.markDelivered(event.id); return; }
       const outgoing = await collectOutgoingAttachments(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
         this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
@@ -845,7 +847,7 @@ export class SessionManager {
       registry.markDelivered(event.id);
     } catch (error) {
       registry.markUncertain(event.id, String(error));
-      if (workspaceContext) registry.markUncertainNotified(event.id);
+      if (workspaceContext || observation) registry.markUncertainNotified(event.id);
       else if (!this.closed) await this.sink.sendText(event.channelId,
         `${notice}\n自动汇总或投递${controller.signal.aborted ? '已停止' : '失败'}，未自动重做或重新派发任务。结果已保留。`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);

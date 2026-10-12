@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "capabilities": [
+    {
+      "id": "local-chrome-codex",
+      "label": "本机 Codex 接管常用 Chrome",
+      "targetId": "local",
+      "agent": "codex",
+      "kind": "browser",
+      "browser": {
+        "profilePath": "C:\\Users\\YOUR_USER\\AppData\\Local\\Google\\Chrome\\User Data\\Default",
+        "extensionId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "nativeHostManifests": [
+          "C:\\Users\\YOUR_USER\\AppData\\Local\\OpenAI\\extension\\com.openai.codexextension.json"
+        ]
+      }
+    },
+    {
+      "id": "local-feishu",
+      "label": "本机常用 Chrome 飞书网页版",
+      "targetId": "local",
+      "agent": "codex",
+      "kind": "web-app"
+    },
+    {
+      "id": "workstation-chrome-claude",
+      "label": "工位 Claude 接管已登录 Chrome（待验收）",
+      "targetId": "workstation",
+      "agent": "claude",
+      "kind": "browser"
+    }
+  ]
+}

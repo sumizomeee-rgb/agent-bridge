@@ -99,6 +99,25 @@ export class ClaudeAdapter implements AgentAdapter {
     let initialized = false;
     let liveSupported = false;
     let resultSeen = false;
+    const observedTools = new Map<string, string>();
+    const completedTools = new Set<string>();
+    const observedBlocks = new Set<string>();
+    const observeContent = (message: JsonObject) => {
+      if (message.parent_tool_use_id || !isObject(message.message) || !Array.isArray(message.message.content)) return;
+      for (const block of message.message.content) {
+        if (!isObject(block)) continue;
+        if (message.type === 'assistant' && block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string'
+          && !observedTools.has(block.id)) {
+          observedTools.set(block.id, block.name);
+          turn.onActivity?.({ at: new Date().toISOString(), type: 'tool-started', itemId: block.id, toolName: block.name });
+        } else if (message.type === 'user' && block.type === 'tool_result' && typeof block.tool_use_id === 'string'
+          && observedTools.has(block.tool_use_id) && !completedTools.has(block.tool_use_id)) {
+          completedTools.add(block.tool_use_id);
+          turn.onActivity?.({ at: new Date().toISOString(), type: 'tool-completed', itemId: block.tool_use_id,
+            toolName: observedTools.get(block.tool_use_id)!, status: block.is_error === true ? 'failed' : 'completed' });
+        }
+      }
+    };
     const pendingInputs = new Map<string, { done: ReturnType<typeof deferred<SteerResult>>; content: JsonObject[] }>();
     const cancellations = new Map<string, ReturnType<typeof deferred<JsonObject>>>();
     const withdrawing = new Map<string, Promise<SteerResult>>();
@@ -131,6 +150,7 @@ export class ClaudeAdapter implements AgentAdapter {
       for (const value of cancellations.values()) value.reject(error);
     });
     const removeMessage = transport.onMessage((message) => {
+      observeContent(message);
       if (message.type === 'system' && message.subtype === 'init') {
         // Persist the session before the first potentially long model/tool call.
         initialized = true;
@@ -158,6 +178,15 @@ export class ClaudeAdapter implements AgentAdapter {
         if (typeof message.message.model === 'string' && message.message.model) turn.onModel?.(message.message.model);
       } else if (message.type === 'stream_event' && !message.parent_tool_use_id && isObject(message.event)) {
         const event = message.event;
+        if (event.type === 'content_block_start' && isObject(event.content_block)
+          && (event.content_block.type === 'thinking' || event.content_block.type === 'text')) {
+          const key = `${event.index}:${event.content_block.type}`;
+          // Block indexes are local to an assistant message, reset by message_start.
+          if (!observedBlocks.has(key)) {
+            observedBlocks.add(key);
+            turn.onActivity?.({ at: new Date().toISOString(), type: event.content_block.type === 'thinking' ? 'reasoning' : 'message' });
+          }
+        } else if (event.type === 'message_start') observedBlocks.clear();
         if (event.type === 'content_block_delta' && isObject(event.delta) && event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
           turn.onProgress(event.delta.text);
         }

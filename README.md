@@ -17,7 +17,7 @@
 4. 运行 `.\start.ps1 -Check` 检查配置，再运行 `.\start.ps1`；代理可在配置设 `proxyPort: 7898` 或用 `.\start.ps1 -ProxyPort 7898`。
 5. 需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。
 
-生成脚本不需要 Node 或联网，只补缺失文件，已有文件原样保留。空 `agents.json` 可以直接使用；远端登记参考单独的 `agents.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
+生成脚本不需要 Node 或联网，只补缺失文件，已有文件原样保留。空 `agents.json`、`capabilities.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
 
 ## 目录导航
 
@@ -47,7 +47,9 @@ D:\Agent Workspace/
 ├─ CLAUDE.md                  引用 AGENTS.md
 ├─ README.md                  本机职责、上下文初始化入口与工作导航
 ├─ agents.json                实际跨电脑注册表，默认空表
-└─ agents.example.json        远端登记示例，不自动启用
+├─ agents.example.json        远端登记示例，不自动启用
+├─ capabilities.json          能力入口与验收范围，默认空表
+└─ capabilities.example.json  能力登记示例，不自动启用
 ```
 
 机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
@@ -56,6 +58,7 @@ D:\Agent Workspace/
 
 - [使用说明](docs/usage.md)：主控与子 Agent、私聊指令、图片和文件、模型及强度、任务计数与安全重启。
 - [部署与迁移](docs/deployment.md)：工作区生成、配置、代理、数据迁移与跨电脑登记。
+- [能力登记与就绪检查](docs/capabilities.md)：启动体检、按需查询、验收范围和任务进度。
 - [开发与验证](docs/development.md)：构建、测试和版本升级。
 
 新增或改变主控工具声明后，已有 Codex 原生会话需要 `/new` 才能加载新声明；普通重启仍续接旧会话。工作区模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化；普通模型、强度切换可以保留当前会话。

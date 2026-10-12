@@ -44,6 +44,22 @@ export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | n
 export type AgentInput = { type: 'text'; text: string } | { type: 'localImage'; path: string };
 export interface AgentSupplement { id: string; input: AgentInput[] }
 export type SteerResult = { status: 'accepted' } | { status: 'queued'; reason?: string; unsupported?: boolean } | { status: 'uncertain'; reason: string };
+export interface AgentActivityMetadata {
+  at: string;
+  type: 'reasoning' | 'message' | 'tool-started' | 'tool-completed';
+  itemId?: string;
+  toolName?: string;
+  status?: 'completed' | 'failed' | 'cancelled' | 'unknown';
+}
+export interface AgentToolActivity { itemId: string; toolName: string; startedAt: string }
+export interface AgentExecutionProgress {
+  observed: true; sequence: number; stage: 'reasoning' | 'message' | 'tool' | 'between-tools';
+  lastActivity: AgentActivityMetadata; activeTools: AgentToolActivity[]; lastTool?: AgentActivityMetadata;
+}
+export interface AgentActivity extends AgentActivityMetadata {
+  /** Owned remote snapshot; polling never creates a fresh native activity timestamp. */
+  snapshot?: AgentExecutionProgress;
+}
 export interface AgentTurn {
   conversation: Conversation;
   text: string;
@@ -62,11 +78,13 @@ export interface AgentTurn {
   acceptSupplements?: boolean;
   signal: AbortSignal;
   onProgress: (text: string) => void;
+  /** Native lifecycle metadata only, without arguments, command text or output. */
+  onActivity?: (activity: AgentActivity) => void;
   onNativeId?: (nativeId: string) => void;
   /** Only this explicit channel may publish coordinating-agent output. */
   onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string) => Promise<void>;
   /** Standalone background input, never a human authorization. */
-  event?: { kind: 'worker-result' | 'wake' | 'workspace-context'; toolName?: string; text: string };
+  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context'; toolName?: string; text: string };
   /** Optional explicit worker effort inherited from the coordinating turn. */
   effort?: string;
   onModel?: (model: string) => void;

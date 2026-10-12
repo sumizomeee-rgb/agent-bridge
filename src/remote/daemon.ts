@@ -14,6 +14,7 @@ import { isModelId } from '../config.js';
 import type { AgentAdapter, AgentName, AgentTurn, AgentInput, AgentSupplement, SteerResult } from '../types.js';
 import type { RemoteArtifact, RemoteDaemonConfig, RemoteDispatch, RemoteJob, RemoteRequest, RemoteResponse } from './types.js';
 import { RemoteStore, fingerprint, type ProcessRecord } from './store.js';
+import { observeActivity } from '../agents/activity.js';
 
 const CHUNK = 192 * 1024;
 const MAX_BYTES = 24 * 1024 * 1024;
@@ -253,6 +254,12 @@ export class RemoteDaemon {
       cwd: request.cwd, title: '远端直属任务', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
       text: request.text, imagePaths: request.imagePaths, ...(request.input ? { input: request.input } : {}), ...(request.effort ? { effort: request.effort } : {}),
       acceptSupplements: request.acceptSupplements, signal: abort.signal, onProgress: () => {},
+      onActivity: activity => {
+        const current = this.store.job(request.dispatchId);
+        if (!current || current.status !== 'running') return;
+        const progress = observeActivity(current.progress, activity);
+        if (progress && progress !== current.progress) this.store.update(request.dispatchId, { progress });
+      },
       onReady: () => this.store.update(request.dispatchId, { ready: true }),
       onNativeId: nativeId => { this.store.bindSession(nativeId, request.workerId, request.agent, request.cwd); this.store.update(request.dispatchId, { nativeId }); },
       onModel: actualModel => this.store.update(request.dispatchId, { actualModel }),
