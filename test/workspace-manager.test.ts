@@ -76,17 +76,33 @@ function fixture(t: TestContext, controllerMode = true) {
     dataDir: join(root, 'data'), attachmentsDir: join(root, 'images'), logsDir: join(root, 'logs'), maxImageBytes: 1024 };
   const registry = new TaskRegistry(join(root, 'tasks'));
   const children = new Children(); const controller = new Controller();
-  const replies: Array<{ text: string; options?: ReplyOptions }> = [];
+  const replies: Array<{ text: string; options?: ReplyOptions; channelId: string }> = [];
+  const delivery: { beforeSend?: (channel: string, text: string, options?: ReplyOptions) => Promise<void>; failNotice?: boolean; noticeAttempts: number } = { noticeAttempts: 0 };
+  let pauseCompletions = false;
   const counts: Array<{ id: string; count: number }> = [];
   const workCounts: WorkCounts[] = [];
   const initializations: AgentTurn[] = []; const errors: unknown[] = [];
   let manager!: SessionManager; let runtime!: ControllerRuntime;
-  const callbacks = { onCompletion: () => manager.completionAvailable(),
+  const callbacks = { onCompletion: () => { if (!pauseCompletions) manager.completionAvailable(); },
     onCountChanged: (id: string) => manager.refreshTaskCounts(id), onWorkCountsChanged: (counts: WorkCounts) => { workCounts.push({ ...counts }); },
     onError: (error: unknown) => errors.push(error), pollIntervalMs: 60000 };
   const makeRuntime = () => new ControllerRuntime(config, { codex: children, claude: children }, registry, callbacks);
   const makeManager = () => new SessionManager(config, { codex: controller, claude: controller }, {
-    async sendText(_channel, text, options) { replies.push({ text, options }); },
+    async sendText(channelId, text, options) {
+      const pending = delivery.beforeSend?.(channelId, text, options);
+      if (pending) {
+        let abort: (() => void) | undefined;
+        try { await (options?.signal ? Promise.race([pending, new Promise<never>((_resolve, reject) => {
+          abort = () => reject(new Error('send aborted')); options.signal!.addEventListener('abort', abort, { once: true });
+          if (options.signal!.aborted) abort();
+        })]) : pending); } finally { if (abort) options?.signal?.removeEventListener('abort', abort); }
+      }
+      if (options?.signal?.aborted) throw new Error('send aborted');
+      if (/^[✅⚠️]/u.test(text) && text.includes('（会话 ')) {
+        delivery.noticeAttempts++; if (delivery.failNotice) throw new Error('notification transport uncertain');
+      }
+      replies.push({ text, options, channelId });
+    },
     async setTaskCount(message, count) { counts.push({ id: message.id, count }); },
   }, { mergeDelayMs: 0, taskRegistry: registry,
     onInitializeWorkspace: turn => { initializations.push(turn); return runtime.initializeWorkspace(turn); },
@@ -95,7 +111,8 @@ function fixture(t: TestContext, controllerMode = true) {
   runtime = makeRuntime(); manager = makeManager();
   const inspect = new SessionStore(config.dataDir);
   const f = { root, config, registry, children, controller, replies, counts, workCounts, initializations, errors, inspect,
-    get manager() { return manager; }, get runtime() { return runtime; },
+    get manager() { return manager; }, get runtime() { return runtime; }, delivery,
+    pauseCompletions: () => { pauseCompletions = true; },
     send: (id: string, text: string, imagePaths: string[] = []) => manager.handle({ id, text, imagePaths, userId: 'user', channelId: 'dm' }),
     async restart() { await manager.close(); await runtime.close(); runtime = makeRuntime(); manager = makeManager(); await manager.recover(); await runtime.start(); },
   };
@@ -178,7 +195,7 @@ test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd �
   assert.deepEqual(f.errors, []);
 });
 
-test('/new 立即派背景任务；没有隐式用户话，初始化回传可静默建立原生父', async t => {
+test('/new 立即派背景任务；载入主控后只发送一次桥回执，不公开模型 fallback', async t => {
   const f = fixture(t);
   await f.send('new', '/new');
   await until(() => f.children.turns.length === 1);
@@ -197,9 +214,11 @@ test('/new 立即派背景任务；没有隐式用户话，初始化回传可静
   assert.equal(f.controller.turns[0]!.event?.kind, 'workspace-context');
   assert.equal(f.controller.turns[0]!.conversation.nativeId, null);
   assert.equal(f.controller.turns[0]!.taskContextPath, undefined, '未有真实 human 时不给初始化回执额外派工能力');
-  assert.equal(f.replies.length, 1, '没有显式发送，fallback保持静默');
+  await until(() => f.inspect.workspaceNotice(parent.id)?.state === 'delivered');
+  assert.equal(f.replies.length, 2, '原命令确认与一条桥回执，模型 fallback 保持静默');
+  assert.match(f.replies[1]!.text, /✅ 工作区上下文已载入/);
   assert(!f.replies.some(item => /UNSOLICITED|看看/.test(item.text)));
-  await f.send('hello', '你好'); await until(() => f.controller.turns.length === 2 && f.replies.length === 2);
+  await f.send('hello', '你好'); await until(() => f.controller.turns.length === 2 && f.replies.length === 3);
   assert.equal(f.controller.turns[1]!.conversation.nativeId, native);
   assert.equal(f.controller.turns[1]!.text, '你好');
   assert.equal(f.children.turns.length, 1);
@@ -280,13 +299,14 @@ test('/new 后相关 human 问题驱动 init 轮普通工作，其来源与回�
   assert.equal(ordinary.origin.originMessageId, 'human-question');
   assert.equal(ordinary.origin.nativeId, parent.nativeId);
   assert.equal(f.inspect.getMessage('new')!.conversationId, null);
-  assert.equal(f.replies.length, 2, 'init 结果不会自动公开');
+  await until(() => f.inspect.workspaceNotice(parent.id)?.state === 'delivered');
+  assert.equal(f.replies.length, 3, '只增加桥的载入回执，init 原始结果不自动公开');
   const followup = f.children.turns.findIndex(turn => turn.text.includes('RELATED_HUMAN_FOLLOWUP'));
   f.children.finish(followup, 'RELATED_FOLLOWUP_RESULT');
-  await until(() => f.controller.turns.length === 3 && f.registry.queuedEvents().length === 0 && f.replies.length === 3);
+  await until(() => f.controller.turns.length === 3 && f.registry.queuedEvents().length === 0 && f.replies.length === 4);
   assert.equal(f.controller.turns[2]!.event!.kind, 'worker-result');
   assert.equal(f.controller.turns[2]!.conversation.nativeId, parent.nativeId);
-  assert.match(f.replies[2]!.text, /普通任务结果/);
+  assert.match(f.replies[3]!.text, /普通任务结果/);
   assert.equal(f.runtime.store.jobs().filter(job => job.origin.purpose === undefined)[0]!.status, 'completed');
   assert.deepEqual(f.inspect.getMessage('human-question'), before);
   assert.equal(f.inspect.latestMessage(parent.id)!.id, 'human-question');
@@ -325,14 +345,16 @@ test('恢复无标记已有原生会话调查一次，完成标记跨重启保�
   assert.equal(f.inspect.getActive('user')!.nativeId, 'existing-production-native');
 });
 
-test('初始化子任务失败保存事实并交回原父，保持静默且不会自动反复重派', async t => {
+test('初始化子任务失败保存事实并交回原父，桥只提示一次失败且不反复重派', async t => {
   const f = fixture(t);
   await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
   f.children.fail(0); await until(() => f.controller.turns.length === 1 && f.registry.queuedEvents().length === 0);
   const result = f.controller.turns[0]!;
   assert.match(result.event!.text, /failed/); assert.match(result.event!.text, /workspace read denied/);
   assert.equal(f.runtime.store.jobs()[0]!.status, 'failed');
-  assert.equal(f.replies.length, 1); assert.equal(f.registry.activeCount(result.conversation.id), 0);
+  await until(() => f.inspect.workspaceNotice(result.conversation.id)?.state === 'delivered');
+  assert.equal(f.replies.length, 2); assert.match(f.replies[1]!.text, /读取失败/);
+  assert.equal(f.registry.activeCount(result.conversation.id), 0);
   await f.send('ask', '上下文查完了吗'); await until(() => f.controller.turns.length === 2);
   assert.equal(f.controller.turns[1]!.conversation.nativeId, f.inspect.getActive('user')!.nativeId);
   assert(f.controller.facts.get(f.inspect.getActive('user')!.nativeId!)!.includes('workspace read denied'));
@@ -354,7 +376,9 @@ test('新会话期间旧初始化结果只保存，不刷旧结果也不送入�
   assert.equal(f.controller.turns[0]!.conversation.id, fresh.id);
   assert.match(f.controller.turns[0]!.event!.text, /FRESH_CONTEXT_FACTS/);
   assert(!f.controller.turns[0]!.event!.text.includes('OLD_CONTEXT_FACTS'));
-  assert.equal(f.replies.length, 2);
+  await until(() => f.inspect.workspaceNotice(fresh.id)?.state === 'delivered');
+  assert.equal(f.replies.length, 3); assert(f.replies[2]!.text.includes(fresh.id.slice(0, 8)));
+  assert.equal(f.inspect.workspaceNotice(old.id)?.state, 'cancelled');
 });
 
 test('初始化完成不会抢占忙中的父，真实用户消息先于导航事实 turn', async t => {
@@ -450,4 +474,202 @@ test('回滚为直接模式后，旧初始化ordinary来源结果仍仅保存而
   assert.equal(f.replies.length, 2);
   assert(!f.replies.some(reply => reply.text.includes('LATE_OLD_WORKSPACE_CONTEXT')));
   assert.equal(f.inspect.getActive('user')!.id, current.id);
+});
+
+function deferred() {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => { release = resolve; });
+  return { promise, release };
+}
+
+function initializationReceipts(f: ReturnType<typeof fixture>) {
+  return f.replies.filter(reply => /^[✅⚠️]/u.test(reply.text) && reply.text.includes('（会话 '));
+}
+
+test('/new 子任务已结束但父上下文仍在载入时不提前宣布就绪', async t => {
+  const f = fixture(t); const gate = deferred();
+  f.controller.contextHook = () => gate.promise;
+  await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('user')!;
+  f.children.finish(0, 'PRIVATE_CONTEXT');
+  await until(() => f.controller.turns.length === 1 && f.inspect.getActive('user')!.nativeId !== null);
+  assert.equal(f.runtime.store.jobs()[0]!.status, 'completed');
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, null);
+  assert.equal(initializationReceipts(f).length, 0);
+  assert.equal(f.manager.isIdle(), false);
+  const nativeId = f.inspect.getActive('user')!.nativeId;
+  gate.release();
+  await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
+  assert.equal(initializationReceipts(f).length, 1);
+  assert.match(initializationReceipts(f)[0]!.text, /^✅ 工作区上下文已载入/);
+  assert(!initializationReceipts(f)[0]!.text.includes('PRIVATE_CONTEXT'));
+  assert.equal(f.inspect.getActive('user')!.nativeId, nativeId);
+});
+
+test('/new 的 ACK 发送未完成时即使极速初始化也先保存结果，再按 ACK→就绪顺序投递', async t => {
+  const f = fixture(t); const ack = deferred();
+  f.delivery.beforeSend = async (_channel, text) => { if (text.startsWith('已新建 ')) await ack.promise; };
+  f.children.onRun = turn => f.children.finish(f.children.turns.indexOf(turn));
+  const command = f.send('new-fast', '/new');
+  await until(() => {
+    const active = f.inspect.getActive('user');
+    return Boolean(active && f.inspect.workspaceNotice(active.id)?.outcome === 'ready');
+  });
+  const parent = f.inspect.getActive('user')!;
+  assert.equal(f.inspect.getMessage('new-fast')!.state, 'command');
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'waiting');
+  assert.equal(f.delivery.noticeAttempts, 0);
+  assert.equal(f.replies.length, 0);
+  ack.release(); await command;
+  await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered');
+  assert.equal(f.replies.length, 2);
+  assert.match(f.replies[0]!.text, /^已新建 /);
+  assert.match(f.replies[1]!.text, /^✅ 工作区上下文已载入/);
+  assert.equal(f.controller.turns.length, 1);
+});
+
+test('初始化通知投递结果未知只记 uncertain，任务保持已消化且重启不重跑模型或重发', async t => {
+  const f = fixture(t); f.delivery.failNotice = true;
+  await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('user')!;
+  f.children.finish(0); await until(() => f.manager.isIdle() && f.delivery.noticeAttempts === 1);
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'uncertain');
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, 'ready');
+  assert.equal(f.runtime.store.jobs()[0]!.status, 'completed');
+  assert.equal(f.registry.queuedEvents().length, 0);
+  assert.equal(f.controller.turns.length, 1); assert.equal(initializationReceipts(f).length, 0);
+  f.delivery.failNotice = false;
+  f.manager.completionAvailable(); await f.restart(); await delay(30);
+  assert.equal(f.delivery.noticeAttempts, 1); assert.equal(f.controller.turns.length, 1);
+  assert.equal(f.children.turns.length, 1); assert.equal(initializationReceipts(f).length, 0);
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'uncertain');
+});
+
+test('成功初始化回执持久去重，重复完成检查和恢复均不再发送', async t => {
+  const f = fixture(t);
+  await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('user')!;
+  f.children.finish(0); await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
+  const snapshot = f.inspect.workspaceNotice(parent.id)!;
+  assert.equal(snapshot.sourceMessageId, 'new'); assert.equal(snapshot.userId, 'user'); assert.equal(snapshot.channelId, 'dm');
+  f.manager.completionAvailable(); await f.manager.recover(); await f.restart(); await delay(30);
+  assert.equal(f.delivery.noticeAttempts, 1); assert.equal(initializationReceipts(f).length, 1);
+  assert.equal(f.controller.turns.length, 1); assert.equal(f.children.turns.length, 1);
+  assert.deepEqual(f.inspect.workspaceNotice(parent.id), snapshot);
+});
+
+test('两个获准用户的 /new 初始化各只通知原发送者的 DM，不广播或串会话', async t => {
+  const f = fixture(t); f.config.allowedUserIds.push('user-B');
+  await f.send('new-A', '/new');
+  await f.manager.handle({ id: 'new-B', text: '/new claude', imagePaths: [], userId: 'user-B', channelId: 'dm-B' });
+  await until(() => f.children.turns.length === 2);
+  const parentA = f.inspect.getActive('user')!; const parentB = f.inspect.getActive('user-B')!;
+  const indexA = f.children.turns.findIndex(turn => turn.conversation.userId === 'user');
+  const indexB = f.children.turns.findIndex(turn => turn.conversation.userId === 'user-B');
+  f.children.finish(indexB, 'PRIVATE_B');
+  await until(() => f.inspect.workspaceNotice(parentB.id)!.state === 'delivered');
+  assert.equal(f.inspect.workspaceNotice(parentA.id)!.outcome, null);
+  assert.deepEqual(initializationReceipts(f).map(reply => reply.channelId), ['dm-B']);
+  f.children.finish(indexA, 'PRIVATE_A');
+  await until(() => f.inspect.workspaceNotice(parentA.id)!.state === 'delivered');
+  assert.deepEqual(initializationReceipts(f).map(reply => reply.channelId), ['dm-B', 'dm']);
+  assert(initializationReceipts(f)[0]!.text.includes(parentB.id.slice(0, 8)));
+  assert(initializationReceipts(f)[1]!.text.includes(parentA.id.slice(0, 8)));
+  assert(!initializationReceipts(f).some(reply => /PRIVATE_[AB]/.test(reply.text)));
+  const before = f.replies.length;
+  await f.manager.handle({ id: 'outsider', text: '/new', imagePaths: [], userId: 'unauthorized', channelId: 'outsider-dm' });
+  assert.equal(f.replies.length, before); assert.equal(f.inspect.getActive('unauthorized'), null);
+});
+
+for (const mismatch of ['user', 'channel'] as const) {
+  test(`持久初始化通知的 ${mismatch} 与原 /new 来源不符时拒绝投递`, async t => {
+    const f = fixture(t); f.config.allowedUserIds.push('user-B');
+    f.runtime.initializeWorkspace = async () => undefined;
+    await f.send('source-new', '/new');
+    const target = f.inspect.createConversation('user', 'codex', f.root, { controllerMode: true });
+    f.inspect.setActive('user', target.id);
+    f.inspect.requestWorkspaceNotice(target.id, { id: 'source-new', text: '/new', imagePaths: [],
+      userId: mismatch === 'user' ? 'user-B' : 'user', channelId: mismatch === 'channel' ? 'wrong-dm' : 'dm' });
+    const registered = f.registry.createContext({ conversationId: target.id, userId: 'user', channelId: 'dm',
+      originMessageId: 'source-new', nativeId: null, agent: 'codex', cwd: f.root, purpose: 'workspace-context' });
+    const context = JSON.parse(readFileSync(registered.contextPath, 'utf8')) as TaskContextFile;
+    const task = f.registry.register(context, '工作区上下文'); f.registry.closeContext(registered.contextId);
+    f.registry.acceptObservedResult(task.taskId, 'completed', 'VALID_CONTEXT');
+    f.manager.completionAvailable();
+    await until(() => f.inspect.workspaceNotice(target.id)!.state === 'cancelled' && f.manager.isIdle());
+    assert.equal(f.controller.turns.length, 1); assert.equal(f.delivery.noticeAttempts, 0);
+    assert.equal(initializationReceipts(f).length, 0); assert.equal(f.replies.length, 1);
+    assert.equal(f.replies[0]!.channelId, 'dm');
+  });
+}
+
+for (const action of ['new', 'stop', 'close'] as const) {
+  test(`初始化回执排队发送时 ${action} 取消在途回执，旧回执不落入后续对话`, async t => {
+    const f = fixture(t); const gate = deferred(); let sendingSignal: AbortSignal | undefined;
+    f.delivery.beforeSend = async (_channel, text, options) => {
+      if (text.startsWith('✅ 工作区上下文已载入')) { sendingSignal = options?.signal; await gate.promise; }
+    };
+    await f.send('old-new', '/new'); await until(() => f.children.turns.length === 1);
+    const parent = f.inspect.getActive('user')!;
+    f.children.finish(0);
+    await until(() => sendingSignal !== undefined && f.inspect.workspaceNotice(parent.id)!.state === 'sending');
+    assert.equal(f.manager.isIdle(), false);
+    if (action === 'close') await f.manager.close();
+    else await f.send('cancel-command', action === 'new' ? '/new' : '/stop');
+    assert.equal(sendingSignal!.aborted, true);
+    gate.release();
+    await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'uncertain');
+    assert.equal(initializationReceipts(f).length, 0);
+    assert.equal(f.controller.turns.length, 1);
+    assert.equal(f.runtime.store.jobs()[0]!.status, 'completed');
+    assert.equal(f.registry.queuedEvents().length, 0);
+    assert.equal(f.errors.length, 0, '明确取消不记录通知错误');
+  });
+}
+
+test('初始派发请求抛错时一次性短报失败，不捏造上下文就绪', async t => {
+  const f = fixture(t);
+  f.runtime.initializeWorkspace = async () => { throw new Error('dispatch failed before registration'); };
+  await f.send('new', '/new');
+  const parent = f.inspect.getActive('user')!;
+  await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, 'request-failed');
+  assert.equal(initializationReceipts(f).length, 1);
+  assert.match(initializationReceipts(f)[0]!.text, /初始化请求未确认完成/);
+  assert.equal(f.children.turns.length, 0); assert.equal(f.controller.turns.length, 0);
+  assert.equal(f.initializations.length, 1); assert.equal(f.errors.length, 1);
+});
+
+test('子任务成功但父主控载入失败时只发载入失败回执，恢复不重复模型', async t => {
+  const f = fixture(t);
+  f.controller.contextHook = async () => { throw new Error('context turn incomplete'); };
+  await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('user')!;
+  f.children.finish(0); await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, 'load-failed');
+  assert.equal(initializationReceipts(f).length, 1);
+  assert.match(initializationReceipts(f)[0]!.text, /未能载入主控/);
+  assert(!initializationReceipts(f)[0]!.text.includes('已载入'));
+  assert.equal(f.runtime.store.jobs()[0]!.status, 'completed');
+  await f.restart(); await delay(30);
+  assert.equal(f.controller.turns.length, 1); assert.equal(f.children.turns.length, 1);
+  assert.equal(initializationReceipts(f).length, 1);
+});
+
+test('重启发现初始化事件处理中断时只报结果无法确认，不重放主控或子 Agent', async t => {
+  const f = fixture(t); f.pauseCompletions();
+  await f.send('new', '/new'); await until(() => f.children.turns.length === 1 && f.manager.isIdle());
+  const parent = f.inspect.getActive('user')!;
+  f.children.finish(0); await until(() => f.registry.queuedEvents().length === 1);
+  const event = f.registry.queuedEvents()[0]!;
+  assert.equal(f.registry.claimEvent(event.id), true);
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, null);
+  await f.restart(); await delay(30);
+  assert.equal(f.registry.eventState(event.id), 'uncertain');
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'delivered');
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, 'unknown');
+  assert.equal(f.controller.turns.length, 0); assert.equal(f.children.turns.length, 1);
+  assert.equal(initializationReceipts(f).length, 1);
+  assert.match(initializationReceipts(f)[0]!.text, /结果无法确认/);
+  assert(!initializationReceipts(f)[0]!.text.includes('已载入'));
 });

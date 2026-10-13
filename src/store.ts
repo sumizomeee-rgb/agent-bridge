@@ -16,6 +16,10 @@ export interface DeliveredReply {
   nativeId: string;
 }
 
+export type WorkspaceNoticeOutcome = 'ready' | 'read-failed' | 'read-cancelled' | 'load-failed' | 'request-failed' | 'unknown';
+export interface WorkspaceNotice { conversationId: string; userId: string; channelId: string; sourceMessageId: string;
+  outcome: WorkspaceNoticeOutcome | null; state: 'waiting' | 'sending' | 'delivered' | 'uncertain' | 'cancelled' }
+
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
 function conversation(row: Row): Conversation {
   return {
@@ -73,6 +77,11 @@ export class SessionStore {
         id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, native_id TEXT NOT NULL,
         channel_id TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS workspace_initialization_notices (
+        conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), user_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL, source_message_id TEXT NOT NULL, outcome TEXT,
+        state TEXT NOT NULL DEFAULT 'waiting', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS delivered_replies (
         user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
@@ -138,6 +147,41 @@ export class SessionStore {
   finishPublicMessage(id: string, state: 'delivered' | 'uncertain'): void {
     this.db.prepare('UPDATE controller_public_messages SET state=?,updated_at=? WHERE id=?')
       .run(state, new Date().toISOString(), id);
+  }
+
+  requestWorkspaceNotice(conversationId: string, message: BridgeMessage): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO workspace_initialization_notices
+      (conversation_id,user_id,channel_id,source_message_id,created_at,updated_at) VALUES(?,?,?,?,?,?)`)
+      .run(conversationId, message.userId, message.channelId, message.id, now, now);
+  }
+  workspaceNotice(conversationId: string): WorkspaceNotice | null {
+    const row = this.db.prepare('SELECT * FROM workspace_initialization_notices WHERE conversation_id=?').get(conversationId);
+    return row ? { conversationId: String(row.conversation_id), userId: String(row.user_id), channelId: String(row.channel_id),
+      sourceMessageId: String(row.source_message_id), outcome: row.outcome == null ? null : String(row.outcome) as WorkspaceNoticeOutcome,
+      state: String(row.state) as WorkspaceNotice['state'] } : null;
+  }
+  prepareWorkspaceNotice(conversationId: string, outcome: WorkspaceNoticeOutcome): void {
+    this.db.prepare("UPDATE workspace_initialization_notices SET outcome=?,updated_at=? WHERE conversation_id=? AND state='waiting' AND outcome IS NULL")
+      .run(outcome, new Date().toISOString(), conversationId);
+  }
+  claimWorkspaceNotice(notice: WorkspaceNotice): boolean {
+    return Number(this.db.prepare(`UPDATE workspace_initialization_notices SET state='sending',updated_at=?
+      WHERE conversation_id=? AND user_id=? AND channel_id=? AND source_message_id=? AND state='waiting' AND outcome=?`)
+      .run(new Date().toISOString(), notice.conversationId, notice.userId, notice.channelId, notice.sourceMessageId, notice.outcome).changes) === 1;
+  }
+  finishWorkspaceNotice(conversationId: string, state: 'delivered' | 'uncertain'): void {
+    this.db.prepare("UPDATE workspace_initialization_notices SET state=?,updated_at=? WHERE conversation_id=? AND state IN ('sending','uncertain')")
+      .run(state, new Date().toISOString(), conversationId);
+  }
+  cancelWorkspaceNotice(conversationId: string): void {
+    this.db.prepare(`UPDATE workspace_initialization_notices SET state=CASE WHEN state='sending' THEN 'uncertain' ELSE 'cancelled' END,
+      updated_at=? WHERE conversation_id=? AND state IN ('waiting','sending')`).run(new Date().toISOString(), conversationId);
+  }
+  recoverWorkspaceNotices(): string[] {
+    this.db.prepare("UPDATE workspace_initialization_notices SET state='uncertain',updated_at=? WHERE state='sending'").run(new Date().toISOString());
+    return this.db.prepare("SELECT conversation_id FROM workspace_initialization_notices WHERE state='waiting' AND outcome IS NOT NULL")
+      .all().map(row => String(row.conversation_id));
   }
 
   recentUserContext(conversationId: string): string {

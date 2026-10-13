@@ -2,7 +2,7 @@ import { modelEfforts, validateEffort } from './effort.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import { SessionStore } from './store.js';
+import { SessionStore, type WorkspaceNoticeOutcome } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
 import { formatComputerOverview, formatWorkerOverview, type ComputerOverview, type WorkerOverview } from './overview.js';
@@ -61,6 +61,7 @@ export class SessionManager {
   private readonly modelChanges = new Set<string>();
   private readonly initializationAttempts = new Set<string>();
   private readonly initializations = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private readonly noticeSends = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private closed = false;
   private closePromise?: Promise<void>;
   private draining = false;
@@ -83,7 +84,7 @@ export class SessionManager {
   beginDrain(): void { this.draining = true; }
   isIdle(): boolean {
     return this.workers.size === 0 && this.userWorkers.size === 0 && this.running.size === 0
-      && this.initializations.size === 0 && this.interruptPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
+      && this.initializations.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
   }
 
   discard(message: BridgeMessage): void {
@@ -110,6 +111,10 @@ export class SessionManager {
         if (this.closed) return;
         this.store.setState(message.id, 'completed');
         this.markReplyDelivered([message.id]);
+        if (parsed.name === 'new') {
+          const target = this.store.getActive(message.userId);
+          if (target && this.store.workspaceNotice(target.id)?.sourceMessageId === message.id) await this.sendWorkspaceNotice(target);
+        }
       } catch (error) {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
@@ -168,6 +173,8 @@ export class SessionManager {
       }
       for (const event of this.options.taskRegistry?.recoverProcessingEvents() ?? []) {
         if (event.purpose === 'workspace-context') {
+          const target = this.completionTarget(event);
+          if (target && event.wakeAllowed && this.store.getActive(event.userId)?.id === target.id) this.store.prepareWorkspaceNotice(target.id, 'unknown');
           this.options.taskRegistry?.markUncertainNotified(event.id);
           continue;
         }
@@ -183,6 +190,9 @@ export class SessionManager {
       }
     } finally { this.recovering = false; }
     if (this.closed) return;
+    for (const id of this.store.recoverWorkspaceNotices()) {
+      const target = this.store.getConversation(id); if (target) await this.sendWorkspaceNotice(target);
+    }
     for (const userId of this.config.allowedUserIds) {
       const active = this.store.getActive(userId);
       const source = active ? this.initializationSource(active) : null;
@@ -222,10 +232,11 @@ export class SessionManager {
         await this.options.onInitializeWorkspace!({ conversation: current, taskContextPath: context.contextPath,
           text: '', input: [], imagePaths: [], signal: controller.signal, onProgress: () => {} });
       } finally { this.options.taskRegistry!.closeContext(context.contextId); }
-    }).catch(error => {
-      // Runtime owns the durable failure state. Automatic context discovery never publishes an
-      // unsolicited failure or turns it into a new human request.
+    }).catch(async error => {
       try { this.options.onInitializationError?.(target, error); } catch { /* Logging is best effort. */ }
+      if (!controller.signal.aborted && !this.closed && this.store.getActive(target.userId)?.id === target.id) {
+        this.store.prepareWorkspaceNotice(target.id, 'request-failed'); await this.sendWorkspaceNotice(target);
+      }
     }).finally(() => {
       if (this.initializations.get(target.id)?.promise === promise) this.initializations.delete(target.id);
       this.refreshTaskCounts(target.id);
@@ -248,6 +259,8 @@ export class SessionManager {
   }
 
   private cancel(conversation: Conversation): number {
+    this.noticeSends.get(conversation.id)?.controller.abort();
+    this.store.cancelWorkspaceNotice(conversation.id);
     this.initializations.get(conversation.id)?.controller.abort();
     this.options.onDetach?.(conversation.id);
     this.options.taskRegistry?.cancelConversation(conversation.id);
@@ -423,8 +436,9 @@ export class SessionManager {
         if (current?.agent === agent && current.model) this.store.setModel(target.id, current.model);
         if (current?.agent === agent && current.effort) this.store.setEffort(target.id, current.effort);
         this.activate(message.userId, target);
+        if (this.config.controllerMode && name === 'new') this.store.requestWorkspaceNotice(target.id, message);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
-        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '旧会话待处理消息已取消；已启动子任务完成后仅通知结果。' : '旧会话待处理任务已取消。'}\n原生会话：尚未创建\n目录：${target.cwd}`);
+        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '旧会话待处理消息已取消；已启动后台上下文初始化，完成后会通知。' : '旧会话待处理任务已取消。'}\n原生会话：尚未创建\n目录：${target.cwd}`);
         return;
       }
       case 'cwd': {
@@ -757,6 +771,47 @@ export class SessionManager {
     this.latestMessages.set(message.userId, { id: message.id, channelId: message.channelId, conversationId });
   }
 
+  /** A program receipt for an explicit /new, routed independently from generated replies. */
+  private async sendWorkspaceNotice(target: Conversation): Promise<void> {
+    if (this.closed || !this.config.controllerMode || !target.controllerMode) return;
+    const previous = this.noticeSends.get(target.id); if (previous) return previous.promise;
+    const notice = this.store.workspaceNotice(target.id); if (!notice || notice.state !== 'waiting' || !notice.outcome) return;
+    const source = this.store.getMessage(notice.sourceMessageId);
+    if (!source || source.userId !== notice.userId || source.channelId !== notice.channelId || source.conversationId !== null
+      || command(source.text)?.name !== 'new' || notice.userId !== target.userId || !this.config.allowedUserIds.includes(notice.userId)
+      || this.store.getActive(notice.userId)?.id !== target.id) { this.store.cancelWorkspaceNotice(target.id); return; }
+    if (source.state === 'command') return; // The original /new acknowledgement must finish first.
+    if (source.state !== 'completed') { this.store.cancelWorkspaceNotice(target.id); return; }
+    const nativeId = this.store.getConversation(target.id)?.nativeId;
+    if (notice.outcome === 'ready' && !nativeId) return;
+    const bodies: Record<WorkspaceNoticeOutcome, string> = {
+      ready: '✅ 工作区上下文已载入。',
+      'read-failed': '⚠️ 工作区上下文读取失败，结果已交给主控。',
+      'read-cancelled': '⚠️ 工作区上下文读取已取消，结果已交给主控。',
+      'load-failed': '⚠️ 初始化结果未能载入主控，结果已保存。',
+      'request-failed': '⚠️ 工作区初始化请求未确认完成，请核对状态。',
+      unknown: '⚠️ 初次上下文载入结果无法确认；未自动重做。',
+    };
+    if (!this.store.claimWorkspaceNotice(notice)) return;
+    const controller = new AbortController();
+    const current = () => !this.closed && !controller.signal.aborted && this.store.getActive(notice.userId)?.id === target.id
+      && this.store.workspaceNotice(target.id)?.state === 'sending'
+      && (notice.outcome !== 'ready' || this.store.getConversation(target.id)?.nativeId === nativeId);
+    const promise = Promise.resolve().then(async () => {
+      if (!current()) throw new Error('初次上下文回执发送已取消');
+      await this.sink.sendText(notice.channelId, `${bodies[notice.outcome!]}（会话 ${target.id.slice(0, 8)}）`, { signal: controller.signal });
+      if (!current()) throw new Error('初次上下文回执发送期间会话已停止或改变');
+      this.store.finishWorkspaceNotice(target.id, 'delivered');
+    }).catch(error => {
+      this.store.finishWorkspaceNotice(target.id, 'uncertain');
+      if (!controller.signal.aborted && !this.closed) {
+        try { this.options.onInitializationError?.(target, error); } catch { /* Logging is best effort. */ }
+      }
+    }).finally(() => { if (this.noticeSends.get(target.id)?.promise === promise) this.noticeSends.delete(target.id); });
+    this.noticeSends.set(target.id, { controller, promise });
+    await promise;
+  }
+
   private completionTarget(event: TaskCompletionEvent): Conversation | null {
     const target = this.store.getConversation(event.conversationId);
     const origin = this.store.getMessage(event.originMessageId);
@@ -795,7 +850,10 @@ export class SessionManager {
     let boundNativeId = event.nativeId ?? (workspaceContext ? target.nativeId : null);
     if ((!workspaceContext && !boundNativeId) || target.nativeId !== boundNativeId) {
       registry.markUncertain(event.id, '原生父会话未绑定或已改变，未自动新建或切换会话');
-      if (workspaceContext) { registry.markUncertainNotified(event.id); return; }
+      if (workspaceContext) {
+        this.store.prepareWorkspaceNotice(target.id, 'unknown'); await this.sendWorkspaceNotice(target);
+        registry.markUncertainNotified(event.id); return;
+      }
       await this.sink.sendText(event.channelId, `${notice}\n父会话身份无法确认，未自动汇总。结果已保留，请先核对。`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
       return;
@@ -842,7 +900,9 @@ export class SessionManager {
       if (workspaceContext) {
         if (contextId) registry.updateNativeId(contextId, result.nativeId);
         this.store.saveNativeId(target.id, result.nativeId);
+        this.store.prepareWorkspaceNotice(target.id, event.status === 'completed' ? 'ready' : event.status === 'cancelled' ? 'read-cancelled' : 'read-failed');
         registry.markDelivered(event.id);
+        await this.sendWorkspaceNotice(target);
         return;
       }
       if (result.controlledOutput || observation) { registry.markDelivered(event.id); return; }
@@ -860,7 +920,10 @@ export class SessionManager {
       registry.markDelivered(event.id);
     } catch (error) {
       registry.markUncertain(event.id, String(error));
-      if (workspaceContext || observation) registry.markUncertainNotified(event.id);
+      if (workspaceContext) {
+        if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.sendWorkspaceNotice(target); }
+        registry.markUncertainNotified(event.id);
+      } else if (observation) registry.markUncertainNotified(event.id);
       else if (!this.closed) await this.sink.sendText(event.channelId,
         `${notice}\n自动汇总或投递${controller.signal.aborted ? '已停止' : '失败'}，未自动重做或重新派发任务。结果已保留。`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
@@ -885,12 +948,13 @@ export class SessionManager {
       this.store.setReplyState(turn.messageIds, 'cancelled');
     }
     for (const initialization of this.initializations.values()) initialization.controller.abort();
+    for (const notice of this.noticeSends.values()) notice.controller.abort();
     const adapterResults = await Promise.allSettled(Object.entries(this.adapters).map(async ([agent, adapter]) => {
       try { await adapter.close(); }
       catch (cause) { throw new Error(`${agent} close: ${cause instanceof Error ? cause.message : String(cause)}`, { cause }); }
     }));
     await Promise.allSettled([...this.initializations.values()].map(initialization => initialization.promise));
-    await Promise.allSettled([...this.workers.values(), ...this.interruptPromises]);
+    await Promise.allSettled([...this.workers.values(), ...this.interruptPromises, ...[...this.noticeSends.values()].map(notice => notice.promise)]);
     const failures = adapterResults.flatMap(result => result.status === 'rejected' ? [result.reason as Error] : []);
     try { this.store.close(); }
     catch (cause) { failures.push(new Error(`会话数据库关闭失败: ${String(cause)}`, { cause })); }
