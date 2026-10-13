@@ -8,7 +8,7 @@ import { OrderedInbox } from '../src/inbox.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from '../src/slash.js';
 import type { BridgeConfig, IncomingDM } from '../src/types.js';
 
-interface Request { path: string; method: string; headers: Headers; body: any }
+interface Request { path: string; method: string; headers: Headers; body: any; signal?: AbortSignal }
 const ok = () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
 const option = (name: string, value: string | boolean) => ({ name, type: typeof value === 'boolean' ? 5 : 3, value });
 const result = (name: string, options: ReturnType<typeof option>[] = []) => slashText({ name, type: 1, options });
@@ -51,7 +51,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
       const url = new URL(typeof input === 'string' ? input : 'url' in input ? input.url : input.href);
       assert.equal(url.origin, 'https://slash.test.invalid', 'Never contact a real Discord endpoint');
       const request = { path: url.pathname.replace(/^\/api/, ''), method: options?.method ?? 'GET',
-        headers: new Headers(options?.headers as HeadersInit), body: options?.body ? JSON.parse(String(options.body)) : null };
+        headers: new Headers(options?.headers as HeadersInit), body: options?.body ? JSON.parse(String(options.body)) : null, signal: options?.signal ?? undefined };
       requests.push(request);
       return handler(request);
     }) as typeof fetch,
@@ -188,10 +188,34 @@ test('failed ACK never executes the command and never logs a token-bearing netwo
   f.handler = () => new Response('{}', { status: 403 });
   f.dispatch(); await until(() => f.logs.some(line => line.includes('斜杠命令处理失败')));
   assert.equal(f.received.length, 0);
+  assert(f.logs.some(line => /stage=ack.*reason=http status=403/.test(line)));
   f.handler = () => { throw new Error('FAKE_INTERACTION_SECRET / FAKE_BOT_SECRET'); };
   f.dispatch(); await until(() => f.callbacks().length === 2);
   await delay(10);
   assert.equal(f.received.length, 0);
+  assert(f.logs.every(line => !line.includes('SECRET')));
+  assert(f.logs.some(line => /stage=ack.*reason=network/.test(line)));
+});
+
+test('expired initial ACK logs only numeric status/code and never response details or credentials', async t => {
+  const f = await fixture(t);
+  f.handler = () => new Response('{"code":10062,"message":"FAKE_INTERACTION_SECRET / FAKE_BOT_SECRET"}', { status: 404 });
+  const id = f.dispatch({ data: { name: 'workers', type: 1 } });
+  await until(() => f.logs.some(line => line.includes('code=10062')));
+  assert.equal(f.received.length, 0);
+  assert(f.logs.some(line => line.includes(`command=workers interaction=${id}`) && /elapsed_ms=\d+ reason=http status=404 code=10062/.test(line)));
+  assert(f.logs.every(line => !line.includes('SECRET') && !line.includes('/callback')));
+});
+
+test('initial ACK transport deadline is distinguished from immediate network failure without dispatch', async t => {
+  const f = await fixture(t);
+  f.handler = request => new Promise<Response>((_resolve, reject) => {
+    const abort = () => reject(new Error('FAKE_INTERACTION_SECRET')); request.signal!.addEventListener('abort', abort, { once: true });
+    if (request.signal!.aborted) abort();
+  });
+  f.dispatch({ data: { name: 'workers', type: 1 } });
+  await until(() => f.logs.some(line => line.includes('reason=timeout')));
+  assert.equal(f.received.length, 0); assert.equal(f.callbacks().length, 1);
   assert(f.logs.every(line => !line.includes('SECRET')));
 });
 

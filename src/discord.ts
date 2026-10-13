@@ -53,7 +53,11 @@ const outgoingBatchBytes = 24 * mib; // Leave room below Discord's 25 MiB reques
 interface PreparedAttachment { filename: string; blob: Blob; description?: string }
 
 class DiscordRestError extends Error {
-  constructor(public readonly status: number) { super(`Discord REST 请求失败（HTTP ${status}）。`); }
+  constructor(public readonly status: number, public readonly code?: number) { super(`Discord REST 请求失败（HTTP ${status}）。`); }
+}
+
+class DiscordInteractionNetworkError extends Error {
+  constructor(public readonly timedOut: boolean) { super('Discord 交互网络请求失败。'); }
 }
 
 export class ImagePreparationError extends Error {
@@ -716,7 +720,14 @@ export class DiscordTransport {
     } else if (value.t === 'MESSAGE_CREATE') {
       this.incoming(value.d);
     } else if (value.t === 'INTERACTION_CREATE') {
-      void this.incomingInteraction(value.d).catch(() => this.log('斜杠命令处理失败，未输出交互凭据。'));
+      const data = value.d; const startedAt = Date.now();
+      const name = record(data.data) && typeof data.data.name === 'string' && /^[a-z]{1,32}$/.test(data.data.name) ? data.data.name : 'unknown';
+      void this.incomingInteraction(data).catch(error => {
+        const detail = error instanceof DiscordRestError ? `reason=http status=${error.status}${error.code == null ? '' : ` code=${error.code}`}`
+          : error instanceof DiscordInteractionNetworkError ? `reason=${error.timedOut ? 'timeout' : 'network'}` : 'reason=unknown';
+        // Never log response messages, URLs, exceptions or interaction tokens.
+        this.log(`斜杠命令处理失败；stage=ack command=${name} interaction=${snowflake(data.id) ? data.id : 'unknown'} elapsed_ms=${Date.now() - startedAt} ${detail}`);
+      });
     }
   }
 
@@ -847,14 +858,15 @@ export class DiscordTransport {
     for (let attempt = 0; attempt < (initial ? 1 : 10); attempt++) {
       if (this.closed) throw new Error('Discord transport 已关闭。');
       let response;
+      const timeout = AbortSignal.timeout(initial ? 2000 : 30_000);
       try {
         response = await this.httpFetch(`${this.restBase}${path}`, {
           method, dispatcher: this.restDispatcher, redirect: 'error',
-          signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(initial ? 2000 : 30_000)]),
+          signal: AbortSignal.any([this.shutdown.signal, timeout]),
           headers: { 'content-type': 'application/json', 'user-agent': 'DiscordBot (https://github.com/discord/discord-api-docs, 0.1.0)' },
           body: JSON.stringify(body),
         });
-      } catch { throw new Error('Discord 交互网络请求失败。'); }
+      } catch { throw new DiscordInteractionNetworkError(timeout.aborted); }
       let data: unknown;
       try { data = await response.json(); } catch { data = null; }
       if (!response.ok) {
@@ -864,7 +876,8 @@ export class DiscordTransport {
           await delay(Math.max(50, seconds * 1000), undefined, { signal: this.shutdown.signal });
           continue;
         }
-        throw new DiscordRestError(response.status);
+        const code = record(data) && typeof data.code === 'number' && Number.isSafeInteger(data.code) && data.code > 0 ? data.code : undefined;
+        throw new DiscordRestError(response.status, code);
       }
       return;
     }
