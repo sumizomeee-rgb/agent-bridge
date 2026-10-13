@@ -70,7 +70,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
     return data.id;
   };
   const callbacks = () => requests.filter(request => request.path.endsWith('/callback'));
-  return { transport, requests, received, logs, dispatch, callbacks,
+  return { transport, requests, received, logs, sockets, dispatch, callbacks,
     get heartbeats() { return heartbeats; },
     set handler(value: typeof handler) { handler = value; },
     set onMessage(value: typeof onMessage) { onMessage = value; },
@@ -159,6 +159,16 @@ test('registration failure does not close transport or break ordinary DMs', asyn
   await until(() => f.received.length === 1);
   assert.equal(f.received[0]!.text, 'ordinary text still works');
   assert.equal(f.received[0]!.interaction, undefined);
+});
+
+test('authorized slash input clears the restart receipt; unauthorized interaction does not', async t => {
+  const f = await fixture(t); const states: string[] = [];
+  f.sockets.at(-1)!.on('message', raw => {
+    const packet = JSON.parse(raw.toString()); if (packet.op === 3) states.push(packet.d.activities[0].state);
+  });
+  f.transport.setPresence('idle'); await until(() => states.at(-1) === '已重启');
+  f.dispatch({ user: { id: '444' } }); await until(() => f.callbacks().length === 1); assert.equal(states.at(-1), '已重启');
+  f.dispatch({ data: { name: 'workers', type: 1 } }); await until(() => f.received.length === 1 && states.at(-1) === '空闲');
 });
 
 test('a valid model interaction ACKs type5 anonymously then forwards text and memory-only metadata', async t => {

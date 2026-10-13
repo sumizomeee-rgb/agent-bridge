@@ -232,6 +232,7 @@ export class DiscordTransport {
   private desiredPresence: BridgePresence = 'recovering';
   private lastPresence: string | undefined;
   private workCounts: WorkCounts = { running: 0, queued: 0 };
+  private restartNotice = true;
   private workPresenceTimer: NodeJS.Timeout | undefined;
   private gatewayReady = false;
   private readonly presenceTimes: number[] = [];
@@ -304,9 +305,9 @@ export class DiscordTransport {
 
   private flushPresence(): void {
     const state = this.desiredPresence === 'idle'
-      ? this.workCounts.running || this.workCounts.queued
-        ? `在线 · 全桥运行 ${this.workCounts.running} 个 · 等待 ${this.workCounts.queued} 轮` : '空闲 · 随时可以聊天'
-      : { draining: '准备重启 · 正在收尾', recovering: '会话恢复中', failed: '重启失败 · 等待检查' }[this.desiredPresence];
+      ? [this.restartNotice ? '已重启' : '', this.workCounts.running ? `运行 ${this.workCounts.running}` : '',
+        this.workCounts.queued ? `排队 ${this.workCounts.queued}` : ''].filter(Boolean).join(' · ') || '空闲'
+      : { draining: '准备重启', recovering: '恢复中', failed: '重启失败' }[this.desiredPresence];
     const payload = { since: null, activities: [{ name: 'Bridge', type: 4, state }],
       status: this.desiredPresence === 'idle' ? 'online' : this.desiredPresence === 'failed' ? 'dnd' : 'idle', afk: false };
     const signature = JSON.stringify(payload);
@@ -753,11 +754,18 @@ export class DiscordTransport {
     });
   }
 
+  /** Only live, authorized human input clears the startup receipt; background results and reconnects do not. */
+  private consumeRestartNotice(): void {
+    if (!this.restartNotice) return;
+    this.restartNotice = false; this.flushPresence();
+  }
+
   private incoming(data: RecordValue): void {
     const message = this.parseIncoming(data);
     if (!message || this.seenMessages.has(message.id)) return;
     this.options.onReceive?.(message);
     this.seenMessages.add(message.id);
+    this.consumeRestartNotice();
     this.knownDMChannels.add(message.channelId);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
     const receiptKey = `${data.channel_id}:${data.id}`;
@@ -816,6 +824,7 @@ export class DiscordTransport {
     }
     const parsed = slashText(data.data);
     if ('error' in parsed) { await reject(parsed.error); return; }
+    this.consumeRestartNotice();
     const interaction: SlashInteraction = { id: data.id, token: data.token, applicationId: data.application_id };
     const message: IncomingDM & { interaction: SlashInteraction } = {
       id: data.id, userId: user.id, channelId, text: parsed.text, attachments: [], interaction,
