@@ -48,7 +48,11 @@ function compact(value: unknown, limit = 240): string {
 }
 function fingerprint(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 function plain(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function windowsPath(path: string): string { return process.platform === 'win32' && path.startsWith('\\\\?\\') ? path.slice(4) : path; }
+export function windowsPath(path: string): string {
+  if (process.platform !== 'win32') return path;
+  if (/^\\\\\?\\UNC\\/i.test(path)) return '\\\\' + path.slice(8);
+  return /^\\\\\?\\[A-Za-z]:\\/.test(path) ? path.slice(4) : path;
+}
 
 /** One target-native journal: leases and reverse handoffs survive bridge reconnects. */
 export class NativeSessionLeaseStore {
@@ -173,8 +177,9 @@ export class NativeSessionService {
     } finally { db.close(); }
   }
   private checkedPath(path: string, agent: AgentName): string {
-    const home = realpathSync(this.homes[agent]); const actual = realpathSync(path); const rel = relative(home, actual);
-    if (!isAbsolute(path) || rel.startsWith('..') || isAbsolute(rel) || lstatSync(path).isSymbolicLink() || !statSync(actual).isFile()) throw new Error('原生会话记录不在可信用户 profile 内。');
+    const normalized = windowsPath(path);
+    const home = realpathSync(windowsPath(this.homes[agent])); const actual = realpathSync(normalized); const rel = relative(home, actual);
+    if (!isAbsolute(normalized) || rel.startsWith('..') || isAbsolute(rel) || lstatSync(normalized).isSymbolicLink() || !statSync(actual).isFile()) throw new Error('原生会话记录不在可信用户 profile 内。');
     return actual;
   }
   private slices(path: string, tailLimit = 1024 * 1024): { head: Record<string, any>[]; tail: Record<string, any>[]; bytes: number; mtime: number; partial: boolean } {

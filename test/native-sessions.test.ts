@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, realpathSync, rmSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { join, sep, win32 } from 'node:path';
 import { hostname } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import { NativeAdoptionRejectedError, NativeSessionService, probeNativeFileHolders, type NativeSessionRef } from '../src/native-sessions.js';
+import { NativeAdoptionRejectedError, NativeSessionService, probeNativeFileHolders, windowsPath, type NativeSessionRef } from '../src/native-sessions.js';
 import { RemoteStore } from '../src/remote/store.js';
 import { RemoteDaemon } from '../src/remote/daemon.js';
 import { RemoteAgentAdapter } from '../src/remote/adapter.js';
@@ -49,6 +49,27 @@ test('native discovery is metadata only and read preserves the real ID, model an
   assert.equal(read.nativeId, nativeId); assert.equal(read.model, 'gpt-6-astra'); assert.equal(read.effort, 'medium');
   assert.equal(read.cwd, f.cwd); assert.equal(read.health, 'healthy');
   assert.deepEqual(read.messages.map(item => item.text), ['existing user instruction', 'existing native result']);
+});
+
+test('Windows extended rollout paths discover, read and adopt the original ID without changing the index', { skip: process.platform !== 'win32' }, async t => {
+  const f = fixture(t), service = f.make(), extendedPath = '\\\\?\\' + f.path;
+  const db = new DatabaseSync(join(f.home, '.codex', 'state_5.sqlite'));
+  db.prepare('UPDATE threads SET rollout_path=? WHERE id=?').run(extendedPath, nativeId); db.close();
+  const page = await service.list({ agent: 'codex', userId: 'owner' });
+  assert.equal(page.sessions.length, 1); assert.equal(page.sessions[0]!.nativeId, nativeId);
+  const read = await service.read('owner', ref); assert.equal(read.health, 'healthy');
+  const adopted = await service.adopt('owner', { ref, workerId: 'extended-path-worker', adoptionId: 'extended-path-adoption', expectedRevision: read.revision });
+  assert.equal(adopted.nativeId, nativeId);
+  const index = new DatabaseSync(join(f.home, '.codex', 'state_5.sqlite'), { readOnly: true });
+  try { assert.equal(index.prepare('SELECT rollout_path FROM threads WHERE id=?').get(nativeId)!.rollout_path, extendedPath); } finally { index.close(); }
+});
+
+test('Windows extended UNC normalization retains an absolute network path and leaves device paths unchanged', { skip: process.platform !== 'win32' }, () => {
+  const unc = '\\\\server\\share\\workspace', extendedUnc = '\\\\?\\UNC\\server\\share\\workspace';
+  assert.equal(windowsPath(extendedUnc), unc); assert.equal(win32.isAbsolute(windowsPath(extendedUnc)), true);
+  assert.equal(windowsPath('\\\\?\\unc\\server\\share\\workspace'), unc);
+  assert.equal(windowsPath('\\\\?\\C:\\workspace'), 'C:\\workspace');
+  assert.equal(windowsPath('\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1'), '\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1');
 });
 
 test('adoption only claims an idle worker and is durable and idempotent while its exact lease is current', async t => {
