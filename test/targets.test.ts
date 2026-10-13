@@ -23,8 +23,17 @@ test('target catalog supplies local builtin without agents.json and makes no rem
   const catalog = new TargetCatalogService(f.config, { codex: f.local, claude: f.local }, { clientFactory: () => { connections++; throw new Error('not allowed to probe'); } });
   assert.deepEqual((await catalog.listTargets(f.workspace)).map(value => value.id), ['local']);
   assert.equal((await catalog.resolveTarget(f.workspace, 'local', 'codex')).cwd, f.workspace); assert.equal(connections, 0);
-  assert.equal(catalog.adapterFor(await catalog.resolveTarget(f.workspace, 'local', 'claude')), f.local);
+  const binding = await catalog.resolveTarget(f.workspace, 'local', 'claude');
+  const wrapped = catalog.adapterFor(binding); assert.notEqual(wrapped, f.local); assert.equal(wrapped, catalog.adapterFor(binding));
+  let calls = 0;
+  f.local.run = async turn => { calls++; assert.equal(turn.text, 'authorized test input'); turn.onNativeId?.('native-fresh'); return { nativeId: 'native-fresh', text: 'original adapter result' }; };
+  const conversation = { id: 'local-worker', userId: 'owner', agent: 'claude' as const, nativeId: null as string | null, model: null, title: 'local lease test', cwd: f.workspace, createdAt: '', updatedAt: '' };
+  const turn = { conversation, text: 'authorized test input', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
+  assert.equal((await wrapped.run(turn)).text, 'original adapter result'); assert.equal(calls, 1);
+  conversation.nativeId = 'native-fresh'; await catalog.handoff(binding, 'native-fresh', f.workspace, 'claude');
+  await assert.rejects(wrapped.run(turn), /交给用户/); assert.equal(calls, 1);
   await assert.rejects(catalog.resolveTarget(f.workspace, 'missing', 'codex'), /未在/);
+  await catalog.close(); await f.catalog.close();
 });
 test('remote catalog snapshots only registered fields and never stats a target cwd on the bridge computer', async () => {
   const f = fixture(); writeFileSync(join(f.workspace, 'agents.json'), JSON.stringify({ version: 1, targets: [f.entry] }));

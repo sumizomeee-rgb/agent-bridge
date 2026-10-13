@@ -67,6 +67,11 @@ export class ControllerStore {
     this.db.prepare('INSERT INTO controller_workers (id,parent_id,value_json) VALUES (?,?,?)')
       .run(value.id, value.origin.conversationId, JSON.stringify(value));
   }
+  removeUnclaimedWorker(id: string): void {
+    const value = this.getWorker(id);
+    if (!value || value.adoption?.status !== 'pending' || this.jobs(id).length) throw new Error('不能移除已有任务或已接管的会话登记');
+    this.db.prepare('DELETE FROM controller_workers WHERE id=?').run(id);
+  }
   saveWorker(value: ControllerWorker): void {
     this.db.prepare('UPDATE controller_workers SET value_json=? WHERE id=?').run(JSON.stringify(value), value.id);
   }
@@ -94,10 +99,11 @@ export class ControllerStore {
     const row = this.db.prepare("SELECT * FROM controller_jobs WHERE worker_id=? AND status='queued' ORDER BY created_at,rowid LIMIT 1").get(workerId);
     return row ? job(row) : null;
   }
-  setJob(id: string, status: ControllerJobStatus, update: { taskId?: string; result?: string; cancelReason?: string; wakeAllowed?: boolean } = {}): void {
+  setJob(id: string, status: ControllerJobStatus, update: { taskId?: string; result?: string; cancelReason?: string; wakeAllowed?: boolean; startedAt?: string } = {}): void {
     const current = this.getJob(id); if (!current) throw new Error('子任务不存在');
     const value = { ...current, status, taskId: update.taskId ?? current.taskId, result: update.result ?? current.result,
       cancelReason: update.cancelReason ?? current.cancelReason, wakeAllowed: update.wakeAllowed ?? current.wakeAllowed,
+      ...(status === 'running' && current.status === 'queued' && !current.startedAt ? { startedAt: update.startedAt ?? new Date().toISOString() } : {}),
       updatedAt: new Date().toISOString() };
     this.db.prepare('UPDATE controller_jobs SET status=?,task_id=?,result=?,cancel_reason=?,value_json=? WHERE id=?')
       .run(value.status, value.taskId, value.result, value.cancelReason, JSON.stringify(value), id);

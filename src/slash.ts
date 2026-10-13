@@ -35,6 +35,14 @@ export const SLASH_COMMANDS: SlashDefinition[] = [
   ] },
   { type: 1, name: 'models', description: '列出当前 Agent 的模型选项', contexts: [1] },
   { type: 1, name: 'status', description: '查看当前模型、会话和排队情况', contexts: [1] },
+  { type: 1, name: 'computers', description: '查看已登记电脑、连接状态和 Agent CLI 入口', contexts: [1], options: [
+    { type: 5, name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
+  ] },
+  { type: 1, name: 'workers', description: '查看运行中直属 Agent 的电脑、会话和本轮耗时', contexts: [1], options: [
+    { type: 3, name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [
+      { name: '当前对话', value: 'current' }, { name: '我的全部对话', value: 'all' },
+    ] },
+  ] },
   { type: 1, name: 'stop', description: '停止当前任务并清空其队列，保留上下文', contexts: [1] },
   { type: 1, name: 'help', description: '查看可用命令和用法', contexts: [1] },
 ];
@@ -72,6 +80,8 @@ export function slashText(data: unknown): { text: string } | { error: string } {
     case 'agent': return { text: `/${definition.name}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };
     case 'cwd': return { text: `/cwd ${values.get('path')}` };
+    case 'computers': return { text: `/computers${values.has('refresh') ? values.get('refresh') ? ' refresh' : ' cached' : ''}` };
+    case 'workers': return { text: `/workers${values.has('scope') ? ` ${values.get('scope')}` : ''}` };
     case 'model': {
       const name = values.get('name');
       if (values.get('custom') === true && !name) return { error: '使用自定义模型时请填写模型 ID。' };

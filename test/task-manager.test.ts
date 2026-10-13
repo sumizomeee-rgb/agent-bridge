@@ -148,20 +148,17 @@ test('重复回执和重复唤醒仅汇总并投递一次', async t => {
   assert.equal(f.sink.replies.filter(item => item.text.includes('one parent summary')).length, 1);
 });
 
-test('登记数量移到最新普通消息，完成回执逐个减到零', async t => {
+test('登记和完成数量刷新不再向普通消息发送数字表情，也不启动模型轮次', async t => {
   const f = fixture(t);
   await f.manager.handle(message('first', 'delegate'));
   await waitFor(() => f.codex.calls.length === 1);
   const a = f.register(0, 'a'); const b = f.register(0, 'b');
   f.manager.refreshTaskCounts();
-  await waitFor(() => f.sink.counts.some(item => item.id === 'first' && item.count === 2));
   await f.manager.handle(message('latest', 'more context'));
-  await waitFor(() => f.sink.counts.some(item => item.id === 'latest' && item.count === 2));
-  assert.equal(f.sink.counts.filter(item => item.id === 'first').at(-1)!.count, 0);
   f.registry.acceptObservedResult(a.taskId, 'completed', 'a done'); f.manager.completionAvailable();
-  await waitFor(() => f.sink.counts.filter(item => item.id === 'latest').at(-1)?.count === 1);
   f.registry.acceptObservedResult(b.taskId, 'completed', 'b done'); f.manager.completionAvailable();
-  await waitFor(() => f.sink.counts.filter(item => item.id === 'latest').at(-1)?.count === 0);
+  await setTimeout(20);
+  assert.deepEqual(f.sink.counts, []);
   assert.equal(f.codex.calls.length, 1, '数量刷新不会新建模型 turn');
 });
 
@@ -339,7 +336,7 @@ for (const failure of ['generation', 'delivery'] as const) {
   });
 }
 
-test('重启补收 queued 回执，恢复最新用户消息计数并原父 Session 续接', async t => {
+test('重启补收 queued 回执并原父 Session 续接，未结束数量保留但不发送数字', async t => {
   const f = fixture(t);
   await f.manager.handle(message('latest', 'delegate'));
   await waitFor(() => f.codex.calls.length === 1);
@@ -350,7 +347,8 @@ test('重启补收 queued 回执，恢复最新用户消息计数并原父 Sessi
   await f.manager.close(); f.restart(); await f.manager.recover();
   await waitFor(() => f.codex.calls.length === 2);
   assert.equal(f.codex.calls[1]!.conversation.nativeId, event.nativeId);
-  await waitFor(() => f.sink.counts.filter(item => item.id === 'latest').at(-1)?.count === 1);
+  assert.equal(f.registry.activeCount(event.conversationId), 1);
+  assert.deepEqual(f.sink.counts, []);
   f.codex.finish(1);
   await waitFor(() => f.registry.eventState(event.id) === 'delivered');
 });

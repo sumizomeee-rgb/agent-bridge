@@ -7,6 +7,7 @@ import test, { type TestContext } from 'node:test';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
+import type { WorkCounts } from '../src/overview.js';
 import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, ReplyOptions } from '../src/types.js';
 
@@ -77,10 +78,12 @@ function fixture(t: TestContext, controllerMode = true) {
   const children = new Children(); const controller = new Controller();
   const replies: Array<{ text: string; options?: ReplyOptions }> = [];
   const counts: Array<{ id: string; count: number }> = [];
+  const workCounts: WorkCounts[] = [];
   const initializations: AgentTurn[] = []; const errors: unknown[] = [];
   let manager!: SessionManager; let runtime!: ControllerRuntime;
   const callbacks = { onCompletion: () => manager.completionAvailable(),
-    onCountChanged: (id: string) => manager.refreshTaskCounts(id), onError: (error: unknown) => errors.push(error), pollIntervalMs: 60000 };
+    onCountChanged: (id: string) => manager.refreshTaskCounts(id), onWorkCountsChanged: (counts: WorkCounts) => { workCounts.push({ ...counts }); },
+    onError: (error: unknown) => errors.push(error), pollIntervalMs: 60000 };
   const makeRuntime = () => new ControllerRuntime(config, { codex: children, claude: children }, registry, callbacks);
   const makeManager = () => new SessionManager(config, { codex: controller, claude: controller }, {
     async sendText(_channel, text, options) { replies.push({ text, options }); },
@@ -91,7 +94,7 @@ function fixture(t: TestContext, controllerMode = true) {
     onDetach: id => runtime.detachConversation(id), onStop: id => runtime.cancelConversation(id) });
   runtime = makeRuntime(); manager = makeManager();
   const inspect = new SessionStore(config.dataDir);
-  const f = { root, config, registry, children, controller, replies, counts, initializations, errors, inspect,
+  const f = { root, config, registry, children, controller, replies, counts, workCounts, initializations, errors, inspect,
     get manager() { return manager; }, get runtime() { return runtime; },
     send: (id: string, text: string, imagePaths: string[] = []) => manager.handle({ id, text, imagePaths, userId: 'user', channelId: 'dm' }),
     async restart() { await manager.close(); await runtime.close(); runtime = makeRuntime(); manager = makeManager(); await manager.recover(); await runtime.start(); },
@@ -117,7 +120,9 @@ test('首条普通消息并行派只读初始化，真实任务计数且不改�
   assert.deepEqual(f.children.turns[0]!.imagePaths, []);
   const parent = f.inspect.getActive('user')!;
   assert.equal(f.registry.activeCount(parent.id), 1);
-  await until(() => f.counts.some(item => item.id === 'first' && item.count === 1));
+  await until(() => f.workCounts.at(-1)?.running === 1);
+  assert.deepEqual(f.runtime.getGlobalWorkCounts(), { running: 1, queued: 0 });
+  assert.deepEqual(f.counts, [], '初始化数量由全桥状态回报，不向原消息发送数字表情');
   await f.send('second', '我继续聊天');
   await until(() => f.replies.length === 2);
   assert.equal(f.children.turns.length, 1, '同一会话不重复调查');
@@ -129,7 +134,10 @@ test('首条普通消息并行派只读初始化，真实任务计数且不改�
   assert.equal(delivered.event?.toolName, 'bridge_workspace_context');
   assert.equal(delivered.conversation.nativeId, parent.nativeId);
   assert.equal(f.replies.length, 2, '自动调研完成不公开刷消息');
-  await until(() => f.counts.filter(item => item.id === 'second').at(-1)?.count === 0);
+  await until(() => f.workCounts.at(-1)?.running === 0 && f.workCounts.at(-1)?.queued === 0);
+  assert.deepEqual(f.runtime.getGlobalWorkCounts(), { running: 0, queued: 0 });
+  assert.equal(f.registry.activeCount(parent.id), 0, '初始化完成后登记数量真实归零');
+  assert.deepEqual(f.counts, [], '归零也不修改原消息数字表情');
   assert.deepEqual(f.errors, []);
 });
 
@@ -177,7 +185,11 @@ test('/new 立即派背景任务；没有隐式用户话，初始化回传可静
   assert.equal(f.controller.turns.length, 0);
   assert.equal(f.inspect.getMessage('new')?.conversationId, null);
   assert.equal(f.initializations[0]!.conversation.nativeId, null);
-  await until(() => f.counts.some(item => item.id === 'new' && item.count === 1));
+  const parent = f.inspect.getActive('user')!;
+  await until(() => f.workCounts.at(-1)?.running === 1);
+  assert.equal(f.registry.activeCount(parent.id), 1, '/new 的初始化真实登记为运行子任务');
+  assert.deepEqual(f.runtime.getGlobalWorkCounts(), { running: 1, queued: 0 });
+  assert.deepEqual(f.counts, [], '/new 不发送数字表情计数');
   f.controller.uncontrolledContext = true;
   f.children.finish(0);
   await until(() => f.controller.turns.length === 1 && f.inspect.getActive('user')!.nativeId !== null);
@@ -191,6 +203,10 @@ test('/new 立即派背景任务；没有隐式用户话，初始化回传可静
   assert.equal(f.controller.turns[1]!.conversation.nativeId, native);
   assert.equal(f.controller.turns[1]!.text, '你好');
   assert.equal(f.children.turns.length, 1);
+  await until(() => f.workCounts.at(-1)?.running === 0 && f.workCounts.at(-1)?.queued === 0);
+  assert.deepEqual(f.runtime.getGlobalWorkCounts(), { running: 0, queued: 0 });
+  assert.equal(f.registry.activeCount(parent.id), 0, '/new 初始化回传后登记数量真实归零');
+  assert.deepEqual(f.counts, []);
 });
 
 test('相关真实问题先获临时答复，初始化回执仅通过显式发送补答一次且仍属同原生父', async t => {

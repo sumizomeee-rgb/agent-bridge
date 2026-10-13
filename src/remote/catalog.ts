@@ -1,10 +1,13 @@
 import { readFile, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { isAbsolute, join, win32, posix } from 'node:path';
 import { isObject } from '../agents/process.js';
 import type { AgentAdapter, AgentCommand, AgentName, BridgeConfig } from '../types.js';
 import type { ExecutionTargetBinding, RemoteHandoff, RemoteTargetRegistration, TargetSummary } from './types.js';
 import { RemoteAgentAdapter, type RemoteAdapterOptions } from './adapter.js';
 import { fingerprint } from './store.js';
+import { NativeSessionService, type NativeSessionAdoptArgs, type NativeSessionAdoption, type NativeSessionPage, type NativeSessionQuery, type NativeSessionRead, type NativeSessionReadOptions, type NativeSessionRef } from '../native-sessions.js';
+import type { ComputerOverview } from '../overview.js';
 
 const targetId = (value: unknown): string => {
   if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(value) || value === 'local') throw new Error('远端登记 id 无效或与本机保留名称冲突。'); return value;
@@ -37,13 +40,24 @@ export function parseTargetRegistry(raw: unknown): RemoteTargetRegistration[] {
     }
     // Credentials and extra policy fields are not copied into a persisted worker binding.
     return { id, label: string(value.label, '目标名称'), expectedHostname, sshConfig, alias,
-      remoteRoot: remoteAbsolute(value.remoteRoot, '远端运行目录'), nodePath: remoteAbsolute(value.nodePath, '远端 Node 命令'), engines };
+      remoteRoot: remoteAbsolute(value.remoteRoot, '远端运行目录'), nodePath: remoteAbsolute(value.nodePath, '远端 Node 命令'), engines,
+      ...(value.allowedUserIds === undefined ? {} : { allowedUserIds: (() => {
+        if (!Array.isArray(value.allowedUserIds) || value.allowedUserIds.length > 100 || value.allowedUserIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9_.:-]{1,199}$/.test(id))) throw new Error('目标电脑 allowedUserIds 无效。');
+        return [...new Set(value.allowedUserIds as string[])];
+      })() }) };
   });
 }
 export class TargetCatalogService {
   private readonly cache = new Map<string, RemoteTargetRegistration[]>();
   private readonly remote = new Map<string, RemoteAgentAdapter>();
-  constructor(private readonly config: BridgeConfig, private readonly localAdapters: Record<AgentName, AgentAdapter>, private readonly options: RemoteAdapterOptions = {}) {}
+  private readonly local = new Map<AgentName, AgentAdapter>();
+  private readonly overviewCache = new Map<string, ComputerOverview[]>();
+  private readonly nativeSessions: NativeSessionService;
+  constructor(private readonly config: BridgeConfig, private readonly localAdapters: Record<AgentName, AgentAdapter>, private readonly options: RemoteAdapterOptions & { nativeSessions?: NativeSessionService } = {}) {
+    this.nativeSessions = options.nativeSessions ?? new NativeSessionService(config.dataDir, {
+      codex: { agentCommand: config.commands.codex, defaultCwd: config.workspace }, claude: { agentCommand: config.commands.claude, defaultCwd: config.workspace },
+    });
+  }
   private async registrations(workspace: string, refresh = false): Promise<RemoteTargetRegistration[]> {
     const cached = this.cache.get(workspace); if (!refresh && cached) return cached;
     let entries: RemoteTargetRegistration[];
@@ -72,13 +86,68 @@ export class TargetCatalogService {
       agent, agentCommand: engine.agentCommand, cwd: remoteCwd };
   }
   adapterFor(binding: ExecutionTargetBinding): AgentAdapter {
-    if (binding.transport === 'local') return this.localAdapters[binding.agent];
+    if (binding.transport === 'local') {
+      let wrapper = this.local.get(binding.agent); if (wrapper) return wrapper;
+      const adapter = this.localAdapters[binding.agent], service = this.nativeSessions, agent = binding.agent;
+      wrapper = {
+        run: async turn => {
+          if (turn.conversation.nativeId) await service.assertRunOwnership({ agent, profile: 'default', nativeId: turn.conversation.nativeId }, turn.conversation.userId, turn.conversation.id);
+          return adapter.run({ ...turn, onNativeId: nativeId => {
+            service.bindRunOwnership({ agent, profile: 'default', nativeId }, turn.conversation.userId, turn.conversation.id); turn.onNativeId?.(nativeId);
+          } });
+        },
+        interrupt: id => adapter.interrupt(id), close: () => adapter.close(),
+        ...(adapter.steer ? { steer: (id, message) => adapter.steer!(id, message) } : {}),
+        ...(adapter.confirmStopped ? { confirmStopped: id => adapter.confirmStopped!(id) } : {}),
+        ...(adapter.getModelInfo ? { getModelInfo: cwd => adapter.getModelInfo!(cwd) } : {}),
+      };
+      this.local.set(agent, wrapper); return wrapper;
+    }
     const key = fingerprint(binding); let adapter = this.remote.get(key);
     if (!adapter) { adapter = new RemoteAgentAdapter(binding, this.config, this.options); this.remote.set(key, adapter); } return adapter;
+  }
+  async authorizeNativeAccess(workspace: string, userId: string, id: string): Promise<void> {
+    if (!this.config.allowedUserIds.includes(userId)) throw new Error('用户不在机器人白名单中。');
+    const owner = this.config.allowedUserIds[0];
+    const registration = id === 'local' ? null : (await this.registrations(workspace)).find(item => item.id === id);
+    if (id !== 'local' && !registration) throw new Error('目标电脑未登记。');
+    const allowed = registration?.allowedUserIds ?? (owner ? [owner] : []);
+    if (!allowed.includes(userId)) throw new Error('用户未获此电脑原生会话历史的访问权限。');
+  }
+  async listNativeSessions(binding: ExecutionTargetBinding, userId: string, query: Omit<NativeSessionQuery, 'agent' | 'userId'>): Promise<NativeSessionPage> {
+    return binding.transport === 'ssh' ? (this.adapterFor(binding) as RemoteAgentAdapter).listNativeSessions(userId, query)
+      : this.nativeSessions.list({ ...query, userId, agent: binding.agent });
+  }
+  async readNativeSession(binding: ExecutionTargetBinding, userId: string, ref: NativeSessionRef, options?: NativeSessionReadOptions): Promise<NativeSessionRead> {
+    if (ref.agent !== binding.agent) throw new Error('原生会话引擎与目标登记不一致。');
+    return binding.transport === 'ssh' ? (this.adapterFor(binding) as RemoteAgentAdapter).readNativeSession(userId, ref, options) : this.nativeSessions.read(userId, ref, options);
+  }
+  async adoptNativeSession(binding: ExecutionTargetBinding, userId: string, args: NativeSessionAdoptArgs): Promise<NativeSessionAdoption> {
+    if (args.ref.agent !== binding.agent) throw new Error('原生会话引擎与目标登记不一致。');
+    return binding.transport === 'ssh' ? (this.adapterFor(binding) as RemoteAgentAdapter).adoptNativeSession(userId, args) : this.nativeSessions.adopt(userId, args);
+  }
+  async computerOverview(workspace: string, refresh = false): Promise<ComputerOverview[]> {
+    const cached = this.overviewCache.get(workspace); if (!refresh && cached) return cached;
+    const targets = await this.listTargets(workspace, refresh); const results: ComputerOverview[] = [];
+    for (const target of targets) {
+      const item: ComputerOverview = { targetId: target.id, label: target.label, transport: target.transport, connection: 'unknown', checkedAt: new Date().toISOString(), agents: target.engines.map(agent => ({ agent, cli: 'unknown' })) };
+      if (target.transport === 'local') {
+        item.connection = 'connected'; item.agents = target.engines.map(agent => ({ agent, cli: existsSync(this.config.commands[agent].command) && this.config.commands[agent].args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable' }));
+      } else {
+        try {
+          const binding = await this.resolveTarget(workspace, target.id, target.engines[0]!);
+          const hello = await (this.adapterFor(binding) as RemoteAgentAdapter).probeEntries(); item.connection = 'connected';
+          item.agents = target.engines.map(agent => ({ agent, cli: hello.cliEntries?.[agent] ?? 'unknown' }));
+        } catch { item.connection = 'unreachable'; item.reason = '目标执行器或 SSH 连接未就绪；未启动模型任务。'; }
+      }
+      results.push(item);
+    }
+    this.overviewCache.set(workspace, results); return results;
   }
   async handoff(binding: ExecutionTargetBinding, nativeId: string, cwd: string, agent: AgentName): Promise<RemoteHandoff> {
     if (binding.agent !== agent || binding.cwd !== cwd || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(nativeId)) throw new Error('交接的会话或目标与登记不一致。');
     if (binding.transport === 'ssh') await (this.adapterFor(binding) as RemoteAgentAdapter).handoff(nativeId, cwd);
+    else this.nativeSessions.leases.release({ agent, profile: 'default', nativeId });
     // Runtime invokes local handoff only after its native adapter has completed/closed.
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
     const args = agent === 'codex' ? ['resume', nativeId] : ['--resume', nativeId];
@@ -86,5 +155,5 @@ export class TargetCatalogService {
     return { targetId: binding.id, nativeId, cwd, agent, resumeCommand, stopped: true };
   }
   /** Only local SSH clients close; target-native daemons and their tasks remain independent. */
-  async close(): Promise<void> { const adapters = [...this.remote.values()]; this.remote.clear(); await Promise.all(adapters.map(adapter => adapter.close())); }
+  async close(): Promise<void> { const adapters = [...this.remote.values()]; this.remote.clear(); await Promise.all(adapters.map(adapter => adapter.close())); this.nativeSessions.close(); }
 }

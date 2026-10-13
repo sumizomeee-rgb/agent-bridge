@@ -4,6 +4,10 @@ import { isAbsolute, resolve } from 'node:path';
 import type { AgentAdapter, AgentName, AgentTurn, BridgeConfig, Conversation } from '../types.js';
 import type { TaskContextFile, TaskOrigin, TaskRegistry, TaskTerminalStatus } from '../tasks.js';
 import { ControllerStore } from './store.js';
+import { isModelId } from '../config.js';
+import { effortValues } from '../effort.js';
+import type { NativeSessionRef } from '../native-sessions.js';
+import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSupplement, ControllerWake, ControllerWorker } from './runtime-types.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
@@ -11,7 +15,7 @@ import type { ExecutionTargetBinding } from '../remote/types.js';
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
 const workspaceWorkerInstruction = '你是桥已登记并管理的工作区上下文调查子 Agent。只完成下面的只读调查，不执行新的工程或生活任务，不自行登记桥后台任务、发 Discord 消息或伪造完成回执。\n\n';
 const workspacePrompt = '这是当前父会话的一次性工作区初始化。以当前工作目录中的 AGENTS.md、README.md 为用户入口，遵循其中定义的初始化入口、只读范围和回传要求；仅在它们明确要求初始化读取时，沿导航读取指定的本机上下文文件。初始化读取范围和回传内容由用户文件维护，不预设业务栏目；没有额外定义时，仅返回这两个文件中与后续会话有关的必要指导。不要扫描未指定的目录或技能目录，不连接远程电脑、联网检查、修改文件或启动新工作。缺失文件、读取失败或不明确的范围如实报告，不猜测环境；区分文件声明与实际核实的事实。仅将结果作为本任务回执返回。';
-const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities']);
+const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_adopt_native_session']);
 function pathKey(value: string): string { const result = resolve(value); return process.platform === 'win32' ? result.toLowerCase() : result; }
 function text(value: unknown, label: string, limit: number): string {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value, 'utf8') > limit || value.includes('\0')) throw new Error(`${label}为空或超过限制`);
@@ -50,27 +54,126 @@ export class ControllerRuntime {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private polling: Promise<void> | undefined;
   private started = false;
+  private starting: Promise<void> | undefined;
   private closed = false;
   private stopping = false;
   private draining = false;
+  private lastWorkCounts: string | undefined;
   private isDraining(): boolean { return this.draining || this.callbacks.isDraining?.() === true; }
   beginDrain(): void { this.draining = true; }
-  isIdle(): boolean { return this.active.size === 0 && this.dispatches.size === 0 && this.unconfirmedStops.size === 0 && !this.polling; }
+  isIdle(): boolean { return this.active.size === 0 && this.dispatches.size === 0 && this.unconfirmedStops.size === 0 && !this.polling && !this.starting; }
 
   constructor(private readonly config: BridgeConfig, private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
     this.store = new ControllerStore(config.dataDir);
   }
   private adapter(worker: ControllerWorker): AgentAdapter {
-    if (worker.target?.transport === 'ssh') {
-      if (!this.callbacks.targetCatalog) throw new Error('远端执行目标服务未配置，拒绝改为本机执行');
-      return this.callbacks.targetCatalog.adapterFor(worker.target);
-    }
+    if (worker.target && this.callbacks.targetCatalog) return this.callbacks.targetCatalog.adapterFor(worker.target);
+    if (worker.target?.transport === 'ssh') throw new Error('远端执行目标服务未配置，拒绝改为本机执行');
     return this.adapters[worker.agent];
   }
   private assertBridgeOwnership(worker: ControllerWorker): void {
+    if (worker.supersededBy) throw new Error('此原生会话已转交其他直属 Agent，旧登记仅保留历史');
+    if (worker.adoption?.status === 'pending') throw new Error('此原生会话接管状态尚未确认');
     if (worker.ownership === 'user') throw new Error('此子 Agent 已交接给用户，桥不能再续接、派发或取消');
     if (worker.handoffPending) throw new Error('此子 Agent 的交接状态尚未确认，拒绝自动续接或再次交接');
+  }
+  private nativeAgent(value: unknown): AgentName {
+    if (value !== 'codex' && value !== 'claude') throw new Error('agent 必须是 codex 或 claude'); return value;
+  }
+  private nativeRef(args: Record<string, unknown>): NativeSessionRef {
+    if (args.profile !== undefined && args.profile !== 'default') throw new Error('未登记的原生 profile');
+    return { agent: this.nativeAgent(args.agent), profile: 'default', nativeId: text(args.nativeId, 'nativeId', 256) };
+  }
+  private async authorizeNativeAccess(origin: TaskOrigin, targetId: string): Promise<void> {
+    if (this.callbacks.targetCatalog?.authorizeNativeAccess) await this.callbacks.targetCatalog.authorizeNativeAccess(origin.cwd, origin.userId, targetId);
+    else if (origin.userId !== this.config.allowedUserIds[0]) throw new Error('当前用户未获此电脑原生历史访问权限');
+  }
+  private selectedWorkerModel(value: unknown, inherited: string | null): string | null {
+    if (value === undefined) return inherited;
+    if (value === 'default') return null;
+    const model = text(value, '模型', 200); if (!isModelId(model)) throw new Error('模型标识无效'); return model;
+  }
+  private selectedWorkerEffort(value: unknown, agent: AgentName, inherited: string | null): string | null {
+    if (value === undefined) return inherited;
+    if (value === 'default') return null;
+    const effort = text(value, '思考强度', 32);
+    if (!effortValues[agent].includes(effort)) throw new Error(`${agent} 不支持强度 ${effort}。`); return effort;
+  }
+  private adoptionResult(worker: ControllerWorker): Record<string, unknown> {
+    return { workerId: worker.id, status: 'idle', ownership: 'bridge', adopted: true, nativeId: worker.nativeId,
+      target: worker.target ?? null, agent: worker.agent, cwd: worker.cwd, model: worker.model, effort: worker.effort, title: worker.title };
+  }
+  private async completeAdoption(workerId: string): Promise<unknown> {
+    const worker = this.store.getWorker(workerId); if (!worker?.adoption || !worker.target) throw new Error('会话接管登记不存在');
+    if (worker.adoption.status === 'adopted') this.assertBridgeOwnership(worker);
+    const catalog = this.callbacks.targetCatalog;
+    if (!catalog?.adoptNativeSession) throw new Error('原生会话接管服务未配置');
+    await this.authorizeNativeAccess(worker.origin, worker.target.id);
+    const currentBinding = await this.resolveTarget(worker.origin.cwd, worker.target.id, worker.agent);
+    const route = (binding: ExecutionTargetBinding) => canonical({ ...binding, cwd: undefined });
+    if (route(currentBinding) !== route(worker.target)) throw new Error('接管期间电脑登记已改变，不能使用旧连接自动恢复；需先核对原接管结果');
+    let receipt;
+    try {
+      receipt = await catalog.adoptNativeSession(worker.target, worker.origin.userId, {
+        ref: worker.adoption.ref, workerId, adoptionId: worker.adoption.id, expectedRevision: worker.adoption.expectedRevision,
+      });
+    } catch (error) {
+      if (error instanceof Error && (error as Error & { adoptionRejected?: boolean }).adoptionRejected === true) {
+        this.store.transaction(() => {
+          const current = this.store.getWorker(workerId); if (!current || current.adoption?.status !== 'pending') return;
+          for (const id of current.adoption.previousWorkers) {
+            const prior = this.store.getWorker(id); if (!prior || prior.supersededBy) continue;
+            prior.handoffPending = false; prior.updatedAt = this.timestamp(); this.store.saveWorker(prior);
+          }
+          this.store.removeUnclaimedWorker(workerId);
+          if (current.adoption.callKey) this.store.updateCall(current.adoption.callKey, { workerId, status: 'rejected', adopted: false, reason: error.message });
+        });
+      }
+      throw error;
+    }
+    if (receipt.status !== 'adopted' || receipt.workerId !== workerId || receipt.userId !== worker.origin.userId
+      || receipt.adoptionId !== worker.adoption.id || receipt.nativeId !== worker.nativeId || receipt.ref.agent !== worker.agent
+      || receipt.ref.profile !== worker.adoption.ref.profile || pathKey(receipt.cwd) !== pathKey(worker.cwd)) throw new Error('原生接管回执与已登记身份不一致');
+    return this.store.transaction(() => {
+      const current = this.store.getWorker(workerId)!; if (!current.adoption) throw new Error('接管登记发生变化');
+      if (current.adoption.status === 'adopted') return this.adoptionResult(current);
+      for (const id of current.adoption.previousWorkers) {
+        const prior = this.store.getWorker(id); if (!prior) continue;
+        if (this.active.has(id) || this.store.jobs(id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))) throw new Error('原持有者静止状态变化，接管结果需要核对');
+        prior.supersededBy = current.id; prior.ownership = 'user'; prior.handoffPending = false; prior.wakeAllowed = false;
+        prior.updatedAt = this.timestamp(); this.store.saveWorker(prior);
+      }
+      current.blocked = false; current.adoption.status = 'adopted'; current.updatedAt = this.timestamp(); this.store.saveWorker(current);
+      const result = this.adoptionResult(current); if (current.adoption.callKey) this.store.updateCall(current.adoption.callKey, result);
+      return result;
+    });
+  }
+  getGlobalWorkCounts(): WorkCounts {
+    const jobs = this.store.jobs();
+    return { running: new Set(jobs.filter(job => job.status === 'running').map(job => job.workerId)).size,
+      queued: jobs.filter(job => job.status === 'queued').length };
+  }
+  queryWorkerOverview(conversation: Conversation, scope: 'current' | 'all' = 'current'): WorkerOverview[] {
+    return this.store.workers().filter(worker => worker.origin.userId === conversation.userId
+      && worker.origin.channelId && (scope === 'all' || worker.origin.conversationId === conversation.id)).map(worker => {
+      const jobs = this.store.jobs(worker.id); const active = jobs.find(job => job.status === 'running'); const latest = jobs.at(-1);
+      const queued = jobs.filter(job => job.status === 'queued').length;
+      const status = worker.handoffPending || worker.adoption?.status === 'pending' ? 'handoff-pending'
+        : worker.ownership === 'user' || worker.supersededBy ? 'handed-off' : worker.blocked ? 'uncertain'
+        : active ? 'running' : queued ? 'queued' : latest?.status ?? 'idle';
+      return { workerId: worker.id, conversationId: worker.origin.conversationId,
+        ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
+        targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
+        model: worker.model ?? worker.actualModel, effort: worker.actualEffort ?? worker.effort, nativeId: worker.nativeId,
+        status, running: !!active, queued, startedAt: active?.startedAt ?? null };
+    });
+  }
+  private async workCountsChanged(): Promise<void> {
+    const counts = this.getGlobalWorkCounts(); const signature = JSON.stringify(counts);
+    if (signature === this.lastWorkCounts) return;
+    this.lastWorkCounts = signature;
+    try { await this.callbacks.onWorkCountsChanged?.(counts); } catch (error) { this.lastWorkCounts = undefined; this.error(error); }
   }
   private async resolveTarget(workspace: string, targetId: string, agent: AgentName, cwd?: string): Promise<ExecutionTargetBinding> {
     if (this.callbacks.targetCatalog) return this.callbacks.targetCatalog.resolveTarget(workspace, targetId, agent, cwd);
@@ -114,8 +217,17 @@ export class ControllerRuntime {
   }
   async start(): Promise<void> {
     if (this.closed || this.stopping) throw new Error('主控执行服务已关闭');
+    if (this.starting) return this.starting;
     if (this.started) return;
-    this.started = true;
+    const recovery = this.recoverStartup(); this.starting = recovery;
+    try { await recovery; } finally { this.starting = undefined; }
+  }
+  private async recoverStartup(): Promise<void> {
+    for (const worker of this.store.workers().filter(value => value.adoption?.status === 'pending')) {
+      try { await this.completeAdoption(worker.id); } catch (error) { this.error(error); }
+    }
+    if (this.stopping || this.closed) return;
+    await this.workCountsChanged();
     for (const supplement of this.store.supplements()) {
       if (supplement.status === 'pending' || supplement.status === 'steering') this.setSupplement(supplement,
         supplement.status === 'steering' ? 'uncertain' : 'not_delivered', '桥在补充期间重启；未自动重发。');
@@ -139,6 +251,8 @@ export class ControllerRuntime {
         worker.blocked = true; this.store.saveWorker(worker);
       }
     }
+    if (this.stopping || this.closed) return;
+    this.started = true;
     await this.poll();
     for (const worker of this.store.workers()) this.kick(worker.id);
     this.schedule();
@@ -176,8 +290,10 @@ export class ControllerRuntime {
   private async dispatch(turn: AgentTurn, name: string, input: unknown, callId?: string, workspaceInitialization = false): Promise<unknown> {
     if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
     if (!tools.has(name)) throw new Error('未知桥调度工具');
-    if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_wake'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
+    if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_wake', 'bridge_adopt_native_session'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
     const contextOrigin = this.origin(turn);
+    await this.start();
+    if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
     const origin: TaskOrigin = workspaceInitialization ? { ...contextOrigin, purpose: 'workspace-context' } : contextOrigin;
     const key = workspaceInitialization || callId === undefined ? null : `${origin.conversationId}:${text(callId, '工具调用编号', 512)}`;
     const fingerprint = createHash('sha256').update(canonical({ name, input })).digest('hex');
@@ -190,7 +306,81 @@ export class ControllerRuntime {
       }
     } else if (key) {
       const previous = this.store.getCall(key, fingerprint);
-      if (previous !== undefined) return previous;
+      if (previous !== undefined) {
+        if (name === 'bridge_adopt_native_session' && previous && typeof previous === 'object'
+          && 'status' in previous && (previous.status === 'adopting' || previous.status === 'idle') && 'workerId' in previous && typeof previous.workerId === 'string') {
+          const worker = this.store.getWorker(previous.workerId);
+          if (!worker?.adoption) throw new Error('此前接管登记已失效，需重新查询会话');
+          if (worker.origin.userId !== origin.userId || worker.origin.conversationId !== origin.conversationId || worker.origin.channelId !== origin.channelId) throw new Error('此前接管不属于当前父会话');
+          return this.completeAdoption(previous.workerId);
+        }
+        return previous;
+      }
+    }
+    if (name === 'bridge_list_native_sessions' || name === 'bridge_read_native_session') {
+      const args = object(input, name === 'bridge_list_native_sessions'
+        ? ['targetId', 'agent', 'cwd', 'cursor', 'limit', 'query'] : ['targetId', 'agent', 'nativeId', 'profile', 'limit']);
+      const agent = this.nativeAgent(args.agent); const targetId = args.targetId === undefined ? 'local' : text(args.targetId, 'targetId', 256);
+      const catalog = this.callbacks.targetCatalog;
+      if (!catalog?.listNativeSessions || !catalog.readNativeSession) throw new Error('桥尚未配置原生会话管理服务');
+      await this.authorizeNativeAccess(origin, targetId);
+      const binding = await this.resolveTarget(origin.cwd, targetId, agent);
+      const limit = args.limit === undefined ? name === 'bridge_list_native_sessions' ? 12 : 4 : args.limit;
+      if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 20) throw new Error('limit 必须是 1–20 的整数');
+      if (name === 'bridge_list_native_sessions') return { targetId, ...(await catalog.listNativeSessions(binding, origin.userId, {
+        limit: Number(limit), ...(args.cwd === undefined ? {} : { cwd: text(args.cwd, 'cwd', 8192) }),
+        ...(args.cursor === undefined ? {} : { cursor: text(args.cursor, 'cursor', 2048) }),
+        ...(args.query === undefined ? {} : { query: text(args.query, 'query', 256) }),
+      })) };
+      return { targetId, ...(await catalog.readNativeSession(binding, origin.userId, this.nativeRef(args), { limit: Number(limit) })) };
+    }
+    if (name === 'bridge_adopt_native_session') {
+      const args = object(input, ['targetId', 'agent', 'nativeId', 'profile', 'expectedRevision', 'title']);
+      const ref = this.nativeRef(args); const targetId = args.targetId === undefined ? 'local' : text(args.targetId, 'targetId', 256);
+      const expectedRevision = text(args.expectedRevision, 'expectedRevision', 256);
+      const catalog = this.callbacks.targetCatalog;
+      if (!catalog?.readNativeSession || !catalog.adoptNativeSession) throw new Error('桥尚未配置原生会话管理服务');
+      await this.authorizeNativeAccess(origin, targetId);
+      const binding = await this.resolveTarget(origin.cwd, targetId, ref.agent);
+      if (targetId === 'local' && ref.agent === origin.agent && ref.nativeId === origin.nativeId) throw new Error('主控不能把自己登记为执行子 Agent');
+      const pending = this.store.workers().find(worker => worker.agent === ref.agent && (worker.target?.id ?? 'local') === targetId
+        && worker.nativeId === ref.nativeId && worker.origin.userId === origin.userId && worker.adoption?.status === 'pending');
+      if (pending) {
+        if (pending.origin.conversationId !== origin.conversationId || pending.origin.channelId !== origin.channelId) throw new Error('此会话正在其他父会话中接管，请先核对该次接管结果');
+        if (pending.adoption!.expectedRevision !== expectedRevision) throw new Error('待确认接管的版本与请求不一致，请先查询原接管结果');
+        const result = await this.completeAdoption(pending.id); if (key) this.store.saveCall(key, fingerprint, result); return result;
+      }
+      const candidate = await catalog.readNativeSession(binding, origin.userId, ref, { limit: 1 });
+      if (candidate.nativeId !== ref.nativeId || candidate.ref.agent !== ref.agent || candidate.ref.profile !== ref.profile) throw new Error('原生会话身份与请求不一致');
+      if (candidate.revision !== expectedRevision) throw new Error('会话在检查后发生变化，请重新核实状态');
+      if (candidate.health !== 'healthy') throw new Error(`原生会话尚不能接管：${candidate.reason ?? candidate.health}`);
+      const previous = this.store.workers().filter(worker => worker.agent === ref.agent && (worker.target?.id ?? 'local') === targetId
+        && worker.nativeId === ref.nativeId && !worker.supersededBy);
+      for (const worker of previous) {
+        if (worker.origin.userId !== origin.userId) throw new Error('此会话由其他用户持有，不能接管');
+        if (worker.blocked || worker.handoffPending || worker.adoption?.status === 'pending' || this.active.has(worker.id)
+          || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))) throw new Error('原会话仍忙碌或停止状态未确认，不能接管');
+      }
+      const existing = previous.find(worker => worker.origin.conversationId === origin.conversationId && worker.origin.channelId === origin.channelId && worker.ownership !== 'user');
+      if (existing) {
+        const result = this.adoptionResult(existing); if (key) this.store.saveCall(key, fingerprint, result); return result;
+      }
+      const worker: ControllerWorker = { id: randomUUID(), origin, agent: ref.agent, nativeId: ref.nativeId,
+        cwd: candidate.cwd, title: args.title === undefined ? candidate.title : text(args.title, 'title', 1024),
+        model: candidate.model, actualModel: candidate.actualModel ?? candidate.model, effort: candidate.effort, actualEffort: candidate.effort,
+        target: { ...binding, cwd: candidate.cwd }, ownership: 'bridge', imagePaths: [], wakeAllowed: true, blocked: true,
+        createdAt: this.timestamp(), updatedAt: this.timestamp(), adoption: { id: randomUUID(), ref, expectedRevision,
+          status: 'pending', previousWorkers: previous.map(value => value.id), ...(key ? { callKey: key } : {}) } };
+      this.store.transaction(() => {
+        for (const prior of previous) {
+          const current = this.store.getWorker(prior.id)!;
+          if (current.handoffPending || current.blocked || this.active.has(prior.id) || this.store.jobs(prior.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))) throw new Error('原持有者在交接准备期间开始了工作');
+          current.handoffPending = true; this.store.saveWorker(current);
+        }
+        this.store.addWorker(worker);
+        if (key) this.store.saveCall(key, fingerprint, { workerId: worker.id, status: 'adopting', nativeId: ref.nativeId, targetId });
+      });
+      return this.completeAdoption(worker.id);
     }
     if (name === 'bridge_check_capabilities') {
       const args = object(input, ['targetId', 'agent', 'capabilityId', 'refresh']);
@@ -268,13 +458,14 @@ export class ControllerRuntime {
       const initial = { workerId: worker.id, status: 'cancelling', stopped: false, scope, target: worker.target ?? null, nativeId: worker.nativeId };
       this.store.transaction(() => { this.requestCancellation(worker.id, reason); if (key) this.store.saveCall(key, fingerprint, initial); });
       const stopped = await this.stopWorker(worker.id, reason);
+      await this.workCountsChanged();
       const result = { workerId: worker.id, status: stopped ? 'cancelled' : 'uncertain', stopped, scope, target: worker.target ?? null, nativeId: worker.nativeId,
         remoteEffects: '远端自行启动的后台进程或已发生的改动需要另行核对' };
       if (key) this.store.updateCall(key, result);
       return result;
     }
     if (name === 'bridge_continue_worker') {
-      const args = object(input, ['workerId', 'prompt', 'imagePaths', 'delivery']);
+      const args = object(input, ['workerId', 'prompt', 'imagePaths', 'delivery', 'model', 'effort']);
       if (args.delivery !== undefined && args.delivery !== 'current' && args.delivery !== 'next') throw new Error('delivery 必须是 current 或 next');
       const worker = this.ownedWorker(origin, args.workerId);
       this.assertBridgeOwnership(worker);
@@ -282,6 +473,11 @@ export class ControllerRuntime {
       const images = this.images(turn, args.imagePaths, worker);
       const prompt = text(args.prompt, '任务内容', 128 * 1024);
       const active = this.active.get(worker.id);
+      // A subsequent queued round inherits the latest queued selection; a current-round supplement uses the active selection.
+      const inherited = args.delivery === 'next' || !active ? this.store.jobs(worker.id).filter(job => job.status === 'queued').at(-1)?.execution : undefined;
+      const execution = { model: this.selectedWorkerModel(args.model, inherited?.model === undefined ? worker.model : inherited.model),
+        effort: this.selectedWorkerEffort(args.effort, worker.agent, inherited?.effort === undefined ? worker.effort : inherited.effort) };
+      if (active && args.delivery !== 'next' && (execution.model !== worker.model || execution.effort !== worker.effort)) throw new Error('运行中的 Agent 不能在当前轮切换模型或强度；请用 delivery=next 为下一轮设置参数。');
       if (active && args.delivery !== 'next') {
         const supplement: ControllerSupplement = { id: randomUUID(), workerId: worker.id, jobId: active.job.id, origin, prompt, imagePaths: images,
           status: !this.adapter(worker).steer ? 'unsupported' : active.abort.signal.aborted ? 'cancelled' : !active.executing ? 'not_delivered' : 'pending',
@@ -294,20 +490,21 @@ export class ControllerRuntime {
         if (supplement.status === 'pending') this.pumpSupplements(worker.id, active);
         return result;
       }
-      const job = this.makeJob(worker, origin, prompt, images);
+      const job = this.makeJob(worker, origin, prompt, images, execution);
       const result = { workerId: worker.id, jobId: job.id, status: 'queued', delivery: 'next', nativeId: worker.nativeId,
-        agent: worker.agent, model: worker.model, effort: worker.effort, target: worker.target ?? null, ownership: worker.ownership ?? 'bridge' };
+        agent: worker.agent, model: execution.model, effort: execution.effort, target: worker.target ?? null, ownership: worker.ownership ?? 'bridge' };
       this.store.transaction(() => {
         worker.imagePaths = [...new Set([...worker.imagePaths, ...images])]; worker.updatedAt = this.timestamp();
         this.store.saveWorker(worker); this.store.addJob(job); if (key) this.store.saveCall(key, fingerprint, result);
       });
       if (!this.started) await this.start();
       this.kick(worker.id);
+      await this.workCountsChanged();
       return result;
     }
     let target: ExecutionTargetBinding | undefined;
     if (name === 'bridge_start_worker') {
-      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'imagePaths', 'targetId']);
+      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId']);
       const agent = args.agent === undefined ? turn.conversation.agent : args.agent;
       if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
       target = await this.resolveTarget(turn.conversation.cwd, args.targetId === undefined ? 'local' : text(args.targetId, '执行目标', 256), agent,
@@ -320,15 +517,15 @@ export class ControllerRuntime {
     const result = this.store.transaction(() => {
       let result: unknown;
       if (name === 'bridge_start_worker') {
-        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'imagePaths', 'targetId']);
+        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId']);
         const agent = args.agent === undefined ? turn.conversation.agent : args.agent;
         if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
         const cwd = target!.cwd;
-        const model = args.model === undefined ? agent === turn.conversation.agent ? turn.conversation.model ?? null : null
-          : text(args.model, '模型', 256);
+        const model = this.selectedWorkerModel(args.model, agent === turn.conversation.agent ? turn.conversation.model ?? null : null);
+        const effort = this.selectedWorkerEffort(args.effort, agent, agent === turn.conversation.agent ? turn.effort ?? turn.conversation.effort ?? turn.conversation.actualEffort ?? null : null);
         const images = this.images(turn, args.imagePaths);
         const worker: ControllerWorker = { id: randomUUID(), origin, agent, model, actualModel: null, target: target!, ownership: 'bridge',
-          effort: agent === turn.conversation.agent ? turn.effort ?? turn.conversation.effort ?? turn.conversation.actualEffort ?? null : null, cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
+          effort, cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
           imagePaths: images, wakeAllowed: true, blocked: false, createdAt: this.timestamp(), updatedAt: this.timestamp() };
         const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), images);
         this.store.addWorker(worker); this.store.addJob(job); workerToStart = worker.id;
@@ -371,6 +568,7 @@ export class ControllerRuntime {
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
+            startedAt: currentJob?.startedAt ?? null,
             progress: details ? { ...progressSummary, lastActivity: progress?.lastActivity ?? null, lastTool: progress?.lastTool ?? null, activeTools: progress?.activeTools ?? [] } : progressSummary,
             hasResult: latest?.result != null, lastResultPreview,
             lastResultPreviewTruncated: latest?.result != null && lastResultPreview !== latest.result, supplementCounts,
@@ -428,9 +626,9 @@ export class ControllerRuntime {
     for (const value of this.store.supplements(state.job.id)) if (value.status === 'pending') this.setSupplement(value,
       state.abort.signal.aborted ? 'cancelled' : 'not_delivered', '当前轮结束或停止前未发送；未自动排队。');
   }
-  private makeJob(worker: ControllerWorker, origin: TaskOrigin, prompt: string, imagePaths: string[]): ControllerJob {
+  private makeJob(worker: ControllerWorker, origin: TaskOrigin, prompt: string, imagePaths: string[], execution = { model: worker.model, effort: worker.effort }): ControllerJob {
     return { id: randomUUID(), workerId: worker.id, origin, prompt, imagePaths, status: 'queued', taskId: null, result: null,
-      cancelReason: null, wakeAllowed: true, createdAt: this.timestamp(), updatedAt: this.timestamp() };
+      cancelReason: null, wakeAllowed: true, execution, createdAt: this.timestamp(), updatedAt: this.timestamp() };
   }
   private kick(workerId: string): void {
     if (!this.started || this.stopping || this.closed || this.isDraining() || this.active.has(workerId) || this.store.getWorker(workerId)?.blocked || !this.store.nextJob(workerId)) return;
@@ -461,7 +659,7 @@ export class ControllerRuntime {
     if (/[\r\n\0]/.test(value) || value !== value.trim()) throw new Error('子会话编号格式无效');
     const stored = this.store.getWorker(worker.id)!;
     if (stored.nativeId && stored.nativeId !== value) throw new Error('子 Agent 续接返回了不同会话，拒绝静默换新会话');
-    if (this.store.workers().some(other => other.id !== worker.id && other.agent === worker.agent && (other.target?.id ?? 'local') === (worker.target?.id ?? 'local') && other.nativeId === value)) throw new Error('不同子 Agent 返回了相同原生会话编号');
+    if (this.store.workers().some(other => other.id !== worker.id && other.agent === worker.agent && (other.target?.id ?? 'local') === (worker.target?.id ?? 'local') && other.nativeId === value && (!(worker.adoption?.status === 'adopted') || (other.ownership !== 'user' && !other.supersededBy)))) throw new Error('不同子 Agent 返回了相同原生会话编号');
     stored.nativeId = value; stored.updatedAt = this.timestamp(); this.store.saveWorker(stored);
     worker.nativeId = value;
   }
@@ -469,7 +667,15 @@ export class ControllerRuntime {
     const worker = this.store.getWorker(workerId)!;
     let job = this.store.getJob(state.job.id)!;
     if (job.status !== (state.recovering ? 'running' : 'queued') || this.stopping) { await this.settleSupplements(state); return; }
-    if (!state.recovering) this.store.setJob(job.id, 'running');
+    if (!state.recovering) {
+      this.store.setJob(job.id, 'running', { startedAt: this.timestamp() });
+      if (job.execution) {
+        if (worker.model !== job.execution.model) worker.actualModel = null;
+        if (worker.effort !== job.execution.effort || worker.model !== job.execution.model) worker.actualEffort = null;
+        worker.model = job.execution.model; worker.effort = job.execution.effort; this.store.saveWorker(worker);
+      }
+    }
+    await this.workCountsChanged();
     try {
       this.assertBridgeOwnership(worker);
       if (!job.taskId) this.register(worker, job);
@@ -514,6 +720,7 @@ export class ControllerRuntime {
   }
   private async count(conversationId: string): Promise<void> {
     try { await this.callbacks.onCountChanged?.(conversationId, this.registry.activeCount(conversationId)); } catch (error) { this.error(error); }
+    await this.workCountsChanged();
   }
   private async notify(taskId: string): Promise<void> {
     const event = this.registry.queuedEvents().find(event => event.taskId === taskId);
@@ -640,6 +847,7 @@ export class ControllerRuntime {
   async close(): Promise<void> {
     if (this.closed) return;
     this.stopping = true; clearTimeout(this.timer);
+    await this.starting;
     const active = [...this.active.entries()];
     for (const [, state] of active) { state.closing = true; state.abort.abort('桥正在关闭'); }
     const errors: unknown[] = [];

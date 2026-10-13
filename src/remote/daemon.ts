@@ -15,6 +15,7 @@ import type { AgentAdapter, AgentName, AgentTurn, AgentInput, AgentSupplement, S
 import type { RemoteArtifact, RemoteDaemonConfig, RemoteDispatch, RemoteJob, RemoteRequest, RemoteResponse } from './types.js';
 import { RemoteStore, fingerprint, type ProcessRecord } from './store.js';
 import { observeActivity } from '../agents/activity.js';
+import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
 
 const CHUNK = 192 * 1024;
 const MAX_BYTES = 24 * 1024 * 1024;
@@ -77,12 +78,14 @@ async function stopPersisted(record: ProcessRecord): Promise<boolean> {
 }
 
 export interface RemoteDaemonOptions {
+  nativeSessionOptions?: Pick<NativeSessionServiceOptions, 'busyProbe' | 'userHome'>;
   /** Test seam only; production always uses target-native adapters and current target environment. */
   adapterFactory?: (agent: AgentName, dispatch: RemoteDispatch, track: (process: JsonLineProcess) => void) => AgentAdapter;
 }
 export class RemoteDaemon {
   readonly store: RemoteStore;
   readonly dataDirectory: string;
+  readonly nativeSessions: NativeSessionService;
   private readonly active = new Map<string, { adapter: AgentAdapter; abort: AbortController; done: Promise<void> }>();
   private readonly operations = new Map<string, Promise<SteerResult>>();
   private readonly dispatches = new Map<string, { fingerprint: string; promise: Promise<RemoteJob> }>();
@@ -91,10 +94,13 @@ export class RemoteDaemon {
   private server: Server | null = null;
   private httpServer: HttpServer | null = null;
   private closing = false;
+  private nativeClosing = false;
+  private readonly nativeOperations = new Set<Promise<unknown>>();
   private token: string;
   constructor(readonly root: string, readonly config: RemoteDaemonConfig, private readonly options: RemoteDaemonOptions = {}) {
     if (hostname().toLowerCase() !== config.expectedHostname.toLowerCase()) throw new Error('远端电脑名称与登记不一致，拒绝启动。');
     this.dataDirectory = remoteDataDirectory(root); this.store = new RemoteStore(this.dataDirectory);
+    this.nativeSessions = new NativeSessionService(this.dataDirectory, config.engines, { ...options.nativeSessionOptions, env: this.environment(), leaseStore: this.store.nativeLeases, legacyOwnership: ref => this.store.nativeOwnership(ref), rebind: (ref, userId, workerId, cwd) => this.store.adoptSession(ref, userId, workerId, cwd) });
     const tokenFile = join(this.dataDirectory, 'ipc-token');
     if (!existsSync(tokenFile)) writeFileSync(tokenFile, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
     this.token = readFileSync(tokenFile, 'utf8').trim();
@@ -159,7 +165,11 @@ export class RemoteDaemon {
   private respond(socket: Socket, response: RemoteResponse): void { if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`); }
   async handle(method: string, raw: unknown): Promise<unknown> {
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
-    if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1 };
+    if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
+    if (method.startsWith('sessions/') && this.nativeClosing) throw new Error('远端会话服务正在关闭。');
+    if (method === 'sessions/list') return this.nativeOperation(this.nativeSessions.list({ ...(isObject(raw.query) ? raw.query : {}), agent: this.agent(raw.agent), userId: identifier(raw.userId, '用户编号') }));
+    if (method === 'sessions/read') return this.nativeOperation(this.nativeSessions.read(identifier(raw.userId, '用户编号'), raw.ref as NativeSessionRef, isObject(raw.options) ? raw.options : {}));
+    if (method === 'sessions/adopt') return this.nativeOperation(this.nativeSessions.adopt(identifier(raw.userId, '用户编号'), raw.adoption as unknown as NativeSessionAdoptArgs));
     if (method === 'query') {
       const id = identifier(raw.dispatchId, '派发编号');
       const pending = this.dispatches.get(id); if (pending) await pending.promise;
@@ -184,6 +194,9 @@ export class RemoteDaemon {
       finally { await adapter.close(); this.metadataAdapters.delete(adapter); }
     }
     throw new Error('未知远端协议操作。');
+  }
+  private nativeOperation<T>(promise: Promise<T>): Promise<T> {
+    this.nativeOperations.add(promise); void promise.finally(() => this.nativeOperations.delete(promise)).catch(() => {}); return promise;
   }
   private agent(value: unknown): AgentName { if (value !== 'codex' && value !== 'claude' || !this.config.engines[value]) throw new Error('目标电脑未登记此引擎。'); return value; }
   private async directory(value: unknown): Promise<string> { const cwd = text(value, '工作目录', 4000); if (!isAbsolute(cwd) || !statSync(cwd).isDirectory()) throw new Error('远端工作目录不存在或不是绝对目录。'); return cwd; }
@@ -216,18 +229,20 @@ export class RemoteDaemon {
     const cwd = await this.directory(raw.cwd); const workerId = identifier(raw.workerId, '子任务编号');
     if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain'))) throw new Error('同一子会话尚在执行或结果未知，拒绝并发续接。');
     const nativeId = raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号');
-    if (nativeId) this.store.bindSession(nativeId, workerId, agent, cwd);
+    const userId = identifier(raw.userId, '用户编号');
+    if (nativeId) { await this.nativeSessions.assertRunOwnership({ agent, profile: 'default', nativeId }, userId, workerId); this.store.bindSession(nativeId, workerId, agent, cwd, userId); }
     if (raw.model != null && (typeof raw.model !== 'string' || !isModelId(raw.model))) throw new Error('模型选择无效。');
     if (raw.effort != null && (typeof raw.effort !== 'string' || raw.effort.length > 50)) throw new Error('推理强度无效。');
     if (!Array.isArray(raw.imagePaths) || raw.imagePaths.length > 32 || typeof raw.acceptSupplements !== 'boolean') throw new Error('图片或补充选项无效。');
     const imagePaths = await Promise.all(raw.imagePaths.map(path => this.uploadedPath(path)));
-    const request: RemoteDispatch = { dispatchId: id, workerId, userId: identifier(raw.userId, '用户编号'), agent, agentCommand: engine.agentCommand, cwd,
+    const request: RemoteDispatch = { dispatchId: id, workerId, userId, agent, agentCommand: engine.agentCommand, cwd,
       nativeId, text: text(raw.text, '任务文字'), imagePaths, model: raw.model as string | null,
       ...(raw.effort != null ? { effort: raw.effort as string } : {}), acceptSupplements: raw.acceptSupplements,
       ...(raw.input !== undefined ? { input: await this.input(raw.input) } : {}) };
     // Check again after filesystem awaits. The SQLite insert/active check is synchronous.
     const raced = this.store.job(id); if (raced) return this.store.create(request).job;
     if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain'))) throw new Error('同一子会话已开始执行，拒绝并发续接。');
+    if (nativeId) this.store.bindSession(nativeId, workerId, agent, cwd, userId);
     const created = this.store.create(request); if (created.created) this.start(request);
     return created.job;
   }
@@ -261,7 +276,7 @@ export class RemoteDaemon {
         if (progress && progress !== current.progress) this.store.update(request.dispatchId, { progress });
       },
       onReady: () => this.store.update(request.dispatchId, { ready: true }),
-      onNativeId: nativeId => { this.store.bindSession(nativeId, request.workerId, request.agent, request.cwd); this.store.update(request.dispatchId, { nativeId }); },
+      onNativeId: nativeId => { this.store.bindSession(nativeId, request.workerId, request.agent, request.cwd, request.userId); this.store.update(request.dispatchId, { nativeId }); },
       onModel: actualModel => this.store.update(request.dispatchId, { actualModel }),
       onReasoningEffort: actualEffort => this.store.update(request.dispatchId, { actualEffort }) };
     // Deferring keeps the handle durable before native execution starts.
@@ -269,7 +284,7 @@ export class RemoteDaemon {
       let terminal: Partial<RemoteJob>;
       try {
         const result = await adapter.run(turn);
-        this.store.bindSession(result.nativeId, request.workerId, request.agent, request.cwd);
+        this.store.bindSession(result.nativeId, request.workerId, request.agent, request.cwd, request.userId);
         const captured = await collectOutgoingAttachments(result.text, request.cwd, 10 * 1024 * 1024, MAX_BYTES);
         const artifacts: RemoteArtifact[] = [];
         for (const attachment of [...captured.images.map(item => ({ ...item, image: true })), ...captured.files.map(item => ({ ...item, image: false }))]) {
@@ -376,6 +391,8 @@ export class RemoteDaemon {
   }
   async close(): Promise<void> {
     if (this.closing) return;
+    this.nativeClosing = true;
+    await Promise.allSettled([...this.nativeOperations]);
     for (const id of [...this.active.keys()]) await this.interrupt(id);
     // Metadata queries own native CLI transports too. Keep any failed close tracked for retry.
     for (const adapter of [...this.metadataAdapters]) { await adapter.close(); this.metadataAdapters.delete(adapter); }

@@ -75,6 +75,7 @@ const runtime = config.controllerMode ? new ControllerRuntime(config, executionA
   },
   onCompletion: () => manager.completionAvailable(),
   onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
+  onWorkCountsChanged: counts => discord.setWorkCounts(counts),
   onError: error => log('CONTROLLER_WORKER ' + safeError(error)),
   isDraining: () => restart?.isDraining() ?? false,
   onRequestRestart: origin => restart.request(origin),
@@ -177,7 +178,10 @@ manager = new SessionManager(config, adapters, {
         ...(file.description ? { description: redactText(file.description, [config.token]) } : {}),
       })) } : {}),
     } : undefined),
-}, { taskRegistry: tasks, ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
+}, { taskRegistry: tasks,
+  onListComputers: (conversation, refresh) => targetCatalog.computerOverview(conversation.cwd, refresh),
+  onListWorkers: (conversation, scope) => Promise.resolve(runtime?.queryWorkerOverview(conversation, scope) ?? []),
+  ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
   ...(runtime ? { onStop: id => runtime.cancelConversation(id), onDetach: id => runtime.detachConversation(id),
     onInitializeWorkspace: turn => runtime.initializeWorkspace(turn),
     onInitializationError: (_conversation, error) => log('workspace initialization: ' + safeError(error)),
@@ -239,6 +243,7 @@ try {
   await manager.recover();
   if (!closing) await runtime?.start();
   if (!closing) taskService.start();
+  if (!closing && runtime) discord.setWorkCounts(runtime.getGlobalWorkCounts());
   releaseStartup();
   if (!closing) { ingress.start(); restart.ready(); }
 } catch (error) {

@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { FormData, Headers, ProxyAgent, Request, Response, type Dispatcher } from 'undici';
 import { DiscordTransport } from '../src/discord.js';
+import { discordReplyHeader, replyHeader } from '../src/reply.js';
 import type { BridgeConfig, OutgoingFile, OutgoingImage } from '../src/types.js';
 
 const mib = 1024 * 1024;
@@ -92,7 +93,7 @@ test('a short final reply and screenshot share one valid multipart message', asy
   })] });
   assert.equal(f.sent.length, 1);
   const sent = f.sent[0]!;
-  assert.equal(sent.payload.content, content);
+  assert.equal(sent.payload.content, `${discordReplyHeader(header)}\n\n截图如下。`);
   assert.deepEqual(sent.payload.attachments, [{ id: 0, filename: '工位截图.png', description: '用于检查窗口内容' }]);
   assert.deepEqual(sent.payload.allowed_mentions, { parse: [] });
   assert.equal(sent.payload.enforce_nonce, true);
@@ -109,6 +110,43 @@ test('a short final reply and screenshot share one valid multipart message', asy
   assert.deepEqual(new Uint8Array(await file.arrayBuffer()), png());
   assert(!JSON.stringify(sent.payload).includes(f.config.token));
   assert.deepEqual(f.logs, []);
+});
+
+test('dynamic identity is green once, resets before closing its fence, and leaves Markdown outside', async t => {
+  const f = fixture(t);
+  const header = replyHeader({ conversationId: 'bridge-id', agent: 'codex', nativeId: 'native-4cc9' }, null, 'gpt-6.1-sol', 'xhigh');
+  const body = '**检查完成**\n\n```ts\nconst value = 1;\n```\n[报告](https://example.com)';
+  await f.transport.sendText('222', `${header}\n\n${body}`, { repeatHeader: header });
+  assert.equal(f.sent.length, 1);
+  const content = f.sent[0]!.payload.content as string;
+  assert.equal(content, '```ansi\n\u001b[32m[Codex · 6.1-sol · 极高 · 4cc9]\u001b[0m\n```\n\n' + body);
+  assert.equal(content.split('```ansi').length - 1, 1);
+  assert.equal(content.slice(content.indexOf('\n\n') + 2), body);
+  assert(!content.includes('\\u001b'));
+  assert.equal(f.sent[0]!.form, undefined);
+});
+
+test('malformed metadata cannot inject ANSI controls or close the header fence', async t => {
+  const f = fixture(t);
+  const header = replyHeader({ conversationId: 'bridge-id', agent: 'claude', nativeId: 'native-cdef' }, null, 'model```\n\u001b[31m@everyone', 'high');
+  const body = '正文保持原样。';
+  await f.transport.sendText('222', `${header}\n\n${body}`, { repeatHeader: header });
+  const content = f.sent[0]!.payload.content as string;
+  const lines = content.slice(0, content.indexOf('\n\n')).split('\n');
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0], '```ansi');
+  assert.equal(lines[2], '```');
+  assert(!lines[1]!.includes('`'));
+  assert(!content.includes('\u001b[31m') && !content.includes('@everyone'));
+  assert.equal(content.match(/\u001b/g)?.length, 2);
+  assert(content.endsWith(`\n\n${body}`));
+});
+
+test('oversized or mismatched raw headers reject before any physical send', async t => {
+  const f = fixture(t);
+  await assert.rejects(f.transport.sendText('222', '', { repeatHeader: 'h'.repeat(1975), images: [image()] }), /回复头/);
+  await assert.rejects(f.transport.sendText('222', '[other]\n\n正文', { repeatHeader: '[Codex]' }), /回复头/);
+  assert.equal(f.sent.length, 0);
 });
 
 test('JPG, PNG, WebP and GIF output supports declared types and bounded byte views', async t => {
@@ -134,7 +172,7 @@ test('image-only output works with and without a confirmed reply header', async 
   await f.transport.sendText('222', '', { repeatHeader: header, images: [image()] });
   assert.equal(f.sent.length, 2);
   assert.equal(f.sent[0]!.payload.content, '图片 1/1');
-  assert.equal(f.sent[1]!.payload.content, `${header}\n\n图片 1/1`);
+  assert.equal(f.sent[1]!.payload.content, `${discordReplyHeader(header)}\n\n图片 1/1`);
   assert(f.sent.every(message => message.files.length === 1));
 });
 
@@ -152,23 +190,24 @@ test('long text repeats the header, preserves emoji and uploads each picture onc
   const f = fixture(t);
   const header = '[Codex · model · high · …abcdef ✅]';
   const prefix = `${header}\n\n`;
-  const body = 'a'.repeat(1999 - prefix.length) + '😀' + 'b'.repeat(2100);
+  const displayPrefix = `${discordReplyHeader(header)}\n\n`;
+  const body = 'a'.repeat(1999 - displayPrefix.length) + '😀' + 'b'.repeat(2100);
   await Promise.all([
     f.transport.sendText('222', `${prefix}${body}`, { repeatHeader: header, images: [image()] }),
     f.transport.sendText('222', 'after'),
   ]);
   const reply = f.sent.slice(0, -1);
   assert(reply.length > 1);
-  assert.equal(reply.map(message => (message.payload.content as string).slice(prefix.length)).join(''), body);
+  assert.equal(reply.map(message => (message.payload.content as string).slice(displayPrefix.length)).join(''), body);
   assert.equal(reply.reduce((sum, message) => sum + message.files.length, 0), 1);
   assert.equal(reply[0]!.files.length, 1);
   assert.equal(f.sent.at(-1)!.payload.content, 'after');
   for (const message of reply) {
     const content = message.payload.content as string;
-    assert(content.startsWith(prefix));
+    assert(content.startsWith(displayPrefix));
     assert(content.length <= 2000);
     assert(!/[\ud800-\udbff]$/.test(content));
-    assert(!/^[\udc00-\udfff]/.test(content.slice(prefix.length)));
+    assert(!/^[\udc00-\udfff]/.test(content.slice(displayPrefix.length)));
   }
 });
 
@@ -196,8 +235,8 @@ test('picture batches after a short body keep the same header and get a compact 
   const images = [1, 2, 3].map(n => image({ filename: `screen${n}.png`, data: large }));
   await f.transport.sendText('222', `${header}\n\n完成。`, { repeatHeader: header, images });
   assert.equal(f.sent.length, 2);
-  assert.equal(f.sent[0]!.payload.content, `${header}\n\n完成。`);
-  assert.equal(f.sent[1]!.payload.content, `${header}\n\n图片 2/2`);
+  assert.equal(f.sent[0]!.payload.content, `${discordReplyHeader(header)}\n\n完成。`);
+  assert.equal(f.sent[1]!.payload.content, `${discordReplyHeader(header)}\n\n图片 2/2`);
   assert.deepEqual(f.sent.map(message => message.files.length), [2, 1]);
 });
 
@@ -297,12 +336,12 @@ test('multipart uploads use the explicit REST proxy and closing rejects subseque
   assert.equal(f.sent.length, 1);
 });
 
-test('image-only batch captions respect the text limit even with a long explicit header', async t => {
+test('image-only batch captions reserve ANSI header overhead at the text limit', async t => {
   const f = fixture(t);
-  const header = 'h'.repeat(1995);
+  const header = 'h'.repeat(1974);
   await f.transport.sendText('222', '', { repeatHeader: header, images: [image()] });
   const content = f.sent[0]!.payload.content as string;
-  assert(content.startsWith(`${header}\n\n`));
+  assert(content.startsWith(`${discordReplyHeader(header)}\n\n`));
   assert(content.length <= 2000);
 });
 
@@ -409,7 +448,7 @@ test('ordinary files accept empty bytes and do not require an image or document 
     file({ data: new Uint8Array([1, 2, 3]) }),
   ] });
   assert.equal(f.sent.length, 1);
-  assert.equal(f.sent[0]!.payload.content, `${header}\n\n附件 1/1`);
+  assert.equal(f.sent[0]!.payload.content, `${discordReplyHeader(header)}\n\n附件 1/1`);
   assert.deepEqual(f.sent[0]!.files.map(attachment => attachment.size), [0, 3, 3]);
   assert.deepEqual(f.sent[0]!.files.map(attachment => attachment.contentType),
     ['text/plain', 'application/octet-stream', 'application/pdf']);
@@ -425,8 +464,8 @@ test('mixed pictures and files share 24 MiB batches and later captions keep the 
   assert.equal(f.sent.length, 2);
   assert.deepEqual(f.sent.map(message => message.files.map(attachment => attachment.filename)),
     [['screenshot.png', 'report.pdf'], ['more.zip']]);
-  assert.equal(f.sent[0]!.payload.content, `${header}\n\n完成。`);
-  assert.equal(f.sent[1]!.payload.content, `${header}\n\n附件 2/2`);
+  assert.equal(f.sent[0]!.payload.content, `${discordReplyHeader(header)}\n\n完成。`);
+  assert.equal(f.sent[1]!.payload.content, `${discordReplyHeader(header)}\n\n附件 2/2`);
   assert.deepEqual(f.sent[1]!.payload.attachments, [{ id: 0, filename: 'more.zip' }]);
   for (const message of f.sent) assert(message.files.reduce((total, attachment) => total + attachment.size, 0) <= 24 * mib);
 });

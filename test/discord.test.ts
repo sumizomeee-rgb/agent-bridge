@@ -10,6 +10,7 @@ import { fetch, ProxyAgent, Response } from 'undici';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import WebSocket, { WebSocketServer } from 'ws';
 import { DiscordTransport, ImagePreparationError, ingressFailureText, type DiscordTransportOptions } from '../src/discord.js';
+import { discordReplyHeader } from '../src/reply.js';
 import type { BridgeConfig, IncomingDM } from '../src/types.js';
 
 interface Packet { op: number; d?: Record<string, unknown> | number | null; t?: string; s?: number }
@@ -161,6 +162,71 @@ test('Presence仅op3自定义state，去重并重连恢复当前状态，READY/R
   await eventually(() => f.packets.some(packet => packet.op === 6) && f.packets.filter(packet => packet.op === 3).length === 3);
   const restored = f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
   assert.equal(restored.status, 'idle'); assert.deepEqual(restored.activities, [{ name: 'Bridge', type: 4, state: '准备重启 · 正在收尾' }]);
+  assert.equal(f.posts.length, 0);
+});
+
+test('全桥数量合并、完整文字去重，重启阶段覆盖数字，恢复正常后采用最新数量', async t => {
+  const f = await fixture(t, async () => {}, { presenceCoalesceMs: 15 });
+  f.transport.setPresence('idle'); await f.transport.start();
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
+  f.transport.setWorkCounts({ running: 1, queued: 0 });
+  f.transport.setWorkCounts({ running: 2, queued: 3 });
+  f.transport.setWorkCounts({ running: 2, queued: 3 });
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
+  const state = () => ((f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>).activities as Array<{ state: string }>)[0]!.state;
+  assert.equal(state(), '在线 · 全桥运行 2 个 · 等待 3 轮');
+  f.transport.setWorkCounts({ running: 2, queued: 3 }); await delay(25);
+  assert.equal(f.packets.filter(packet => packet.op === 3).length, 2);
+  f.transport.setPresence('draining');
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 3);
+  f.transport.setWorkCounts({ running: 9, queued: 8 }); await delay(25);
+  assert.equal(state(), '准备重启 · 正在收尾');
+  assert.equal(f.packets.filter(packet => packet.op === 3).length, 3);
+  f.transport.setPresence('idle');
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 4);
+  assert.equal(state(), '在线 · 全桥运行 9 个 · 等待 8 轮');
+  assert.equal(f.posts.length, 0);
+});
+
+test('全桥数量同阶段限流只保留最新值，重连强制发布，错误数量不影响状态', async t => {
+  const f = await fixture(t, async () => {}, { presenceWindowMs: 100, presenceCoalesceMs: 0 });
+  f.transport.setPresence('idle'); await f.transport.start();
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
+  for (let count = 1; count <= 4; count++) {
+    f.transport.setWorkCounts({ running: count, queued: 0 });
+    await eventually(() => f.packets.filter(packet => packet.op === 3).length === count + 1);
+  }
+  f.transport.setWorkCounts({ running: 5, queued: 2 });
+  f.transport.setWorkCounts({ running: 6, queued: 3 });
+  await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 5);
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 6);
+  const latest = () => f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
+  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '在线 · 全桥运行 6 个 · 等待 3 轮' }]);
+  for (const count of [-1, 0.5, NaN, Infinity]) f.transport.setWorkCounts({ running: count, queued: 0 });
+  await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 6);
+  f.sockets.at(-1)!.terminate();
+  await eventually(() => f.packets.some(packet => packet.op === 6) && f.packets.filter(packet => packet.op === 3).length === 7);
+  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '在线 · 全桥运行 6 个 · 等待 3 轮' }]);
+  assert.equal(f.posts.length, 0);
+});
+
+test('恢复和失败状态优先于全桥计数，关闭后不会继续发布', async t => {
+  const f = await fixture(t, async () => {}, { presenceCoalesceMs: 15 });
+  f.transport.setWorkCounts({ running: 3, queued: 2 });
+  await f.transport.start();
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
+  assert.deepEqual((f.packets.find(packet => packet.op === 3)!.d as Record<string, unknown>).activities,
+    [{ name: 'Bridge', type: 4, state: '会话恢复中' }]);
+  f.transport.setPresence('failed');
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
+  const failed = f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
+  assert.equal(failed.status, 'dnd');
+  assert.deepEqual(failed.activities, [{ name: 'Bridge', type: 4, state: '重启失败 · 等待检查' }]);
+  f.transport.setPresence('idle');
+  await eventually(() => f.packets.filter(packet => packet.op === 3).length === 3);
+  f.transport.setWorkCounts({ running: 4, queued: 0 });
+  await f.transport.close(); await delay(25);
+  assert.equal(f.packets.filter(packet => packet.op === 3).length, 3);
   assert.equal(f.posts.length, 0);
 });
 
@@ -578,20 +644,21 @@ test('every physical reply chunk repeats the explicit header while preserving em
   const f = await fixture(t);
   const header = '[Codex · confirmed-model · high · …abcdef ✅]';
   const prefix = `${header}\n\n`;
-  const body = 'a'.repeat(1999 - prefix.length) + '😀' + 'b'.repeat(2100);
+  const displayPrefix = `${discordReplyHeader(header)}\n\n`;
+  const body = 'a'.repeat(1999 - displayPrefix.length) + '😀' + 'b'.repeat(2100) + '\n**完成**\n```ts\nconst value = 1;\n```';
   await Promise.all([
     f.transport.sendText('222', `${prefix}${body}`, { repeatHeader: header }),
     f.transport.sendText('222', 'command menu'),
   ]);
   const contents = f.posts.slice(0, -1).map(post => post.content as string);
   assert(contents.length > 1);
-  assert.equal(contents.map(content => content.slice(prefix.length)).join(''), body);
+  assert.equal(contents.map(content => content.slice(displayPrefix.length)).join(''), body);
   assert.equal(f.posts.at(-1)!.content, 'command menu');
   for (const content of contents) {
-    assert(content.startsWith(prefix));
+    assert(content.startsWith(displayPrefix));
     assert(content.length <= 2000);
     assert(!/[\ud800-\udbff]$/.test(content));
-    assert(!/^[\udc00-\udfff]/.test(content.slice(prefix.length)));
+    assert(!/^[\udc00-\udfff]/.test(content.slice(displayPrefix.length)));
   }
 });
 
@@ -605,7 +672,7 @@ test('partial long-reply delivery reports failure without replaying successful c
   const header = '[Claude Code · model · 强度未知 · …abcdef]';
   await assert.rejects(f.transport.sendText('222', `${header}\n\n${'x'.repeat(5000)}`, { repeatHeader: header }), /HTTP 403/);
   assert.equal(f.posts.length, 2);
-  assert(f.posts.every(post => (post.content as string).startsWith(`${header}\n\n`)));
+  assert(f.posts.every(post => (post.content as string).startsWith(`${discordReplyHeader(header)}\n\n`)));
 });
 
 test('downloads Discord images to random safe filenames and never forwards Bot authorization', async t => {

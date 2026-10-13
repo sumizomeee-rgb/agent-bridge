@@ -5,6 +5,7 @@ import type { AgentAdapter, AgentInput, AgentModelInfo, AgentResult, AgentSupple
 import type { ExecutionTargetBinding, RemoteClient, RemoteDispatch, RemoteJob } from './types.js';
 import { RemoteDispatchUncertain, RemoteArtifactTransferError } from './types.js';
 import { SshRemoteClient } from './client.js';
+import type { NativeSessionAdoption, NativeSessionAdoptArgs, NativeSessionPage, NativeSessionQuery, NativeSessionRead, NativeSessionReadOptions, NativeSessionRef } from '../native-sessions.js';
 
 export interface RemoteAdapterOptions { clientFactory?: (binding: ExecutionTargetBinding) => RemoteClient; pollMs?: number; reconnectDeadlineMs?: number; reconnectDelayMs?: number }
 export class RemoteAgentAdapter implements AgentAdapter {
@@ -22,6 +23,20 @@ export class RemoteAgentAdapter implements AgentAdapter {
     const hello = await this.connection().request<{ hostname: string; version: number; engines: string[] }>('hello', {});
     if (hello.version !== 1 || typeof hello.hostname !== 'string' || hello.hostname.toLowerCase() !== this.binding.expectedHostname!.toLowerCase()
       || !Array.isArray(hello.engines) || !hello.engines.includes(this.binding.agent)) throw Object.assign(new Error('目标电脑名称、协议版本或引擎与登记不一致。'), { code: 'REMOTE_REJECTED' });
+  }
+  async probeEntries(): Promise<{ cliEntries?: Record<string, 'ready' | 'unavailable'> }> {
+    await this.validate(); return this.connection().request('hello', {});
+  }
+  async listNativeSessions(userId: string, query: Omit<NativeSessionQuery, 'userId' | 'agent'>): Promise<NativeSessionPage> {
+    await this.validate(); return this.connection().request('sessions/list', { userId, agent: this.binding.agent, query });
+  }
+  async readNativeSession(userId: string, ref: NativeSessionRef, options?: NativeSessionReadOptions): Promise<NativeSessionRead> {
+    if (ref.agent !== this.binding.agent) throw new Error('原生会话引擎与目标登记不一致。');
+    await this.validate(); return this.connection().request('sessions/read', { userId, ref, options });
+  }
+  async adoptNativeSession(userId: string, adoption: NativeSessionAdoptArgs): Promise<NativeSessionAdoption> {
+    if (adoption.ref.agent !== this.binding.agent) throw new Error('原生会话引擎与目标登记不一致。');
+    await this.validate(); return this.connection().request('sessions/adopt', { userId, adoption });
   }
   private knownRejection(error: unknown): boolean {
     const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';

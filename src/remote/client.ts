@@ -28,7 +28,7 @@ export function requestRemoteHttp<T>(port: number, token: string, method: string
         try {
           const value: unknown = JSON.parse(data);
           if (!isObject(value)) throw new Error('远端返回无效协议。');
-          if (isObject(value.error)) throw Object.assign(new Error(typeof value.error.message === 'string' ? value.error.message : '远端请求失败。'), { code: value.error.code });
+          if (isObject(value.error)) throw Object.assign(new Error(typeof value.error.message === 'string' ? value.error.message : '远端请求失败。'), { code: value.error.code, ...(value.error.code === 'NATIVE_ADOPTION_REJECTED' ? { name: 'NativeAdoptionRejectedError', definitive: true, adoptionRejected: true } : {}) });
           if (response.statusCode !== 200 || !('result' in value)) throw new Error('远端返回无效状态。');
           resolveValue(value.result as T);
         } catch (error) { reject(error); }

@@ -81,8 +81,8 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
   };
 }
 
-test('native registry contains exactly the ten supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'stop', 'help']);
+test('native registry contains twelve supported DM-only commands, never resume/startup', () => {
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'computers', 'workers', 'stop', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);
@@ -99,6 +99,28 @@ test('native options map to existing text commands including custom models and W
   assert.deepEqual(result('model', [option('name', 'sonnet'), option('custom', false)]), { text: '/model sonnet' });
 });
 
+test('computer and worker options map to direct text queries and reject foreign scope parameters', () => {
+  assert.deepEqual(result('computers'), { text: '/computers' });
+  assert.deepEqual(result('computers', [option('refresh', true)]), { text: '/computers refresh' });
+  assert.deepEqual(result('computers', [option('refresh', false)]), { text: '/computers cached' });
+  assert.deepEqual(result('workers'), { text: '/workers' });
+  assert.deepEqual(result('workers', [option('scope', 'all')]), { text: '/workers all' });
+  assert.deepEqual(result('workers', [option('scope', 'current')]), { text: '/workers current' });
+  assert('error' in result('workers', [option('scope', 'another-user')]));
+  assert('error' in result('workers', [option('userId', '444')]));
+  assert('error' in result('computers', [option('refresh', 'true')]));
+});
+
+test('real DM slash computer and worker interactions use type5 ACK and carry query parameters', async t => {
+  const f = await fixture(t);
+  f.dispatch({ data: { name: 'computers', type: 1, options: [option('refresh', false)] } });
+  f.dispatch({ data: { name: 'workers', type: 1, options: [option('scope', 'all')] } });
+  await until(() => f.received.length === 2);
+  assert.deepEqual(f.received.map(message => message.text), ['/computers cached', '/workers all']);
+  assert(f.callbacks().every(request => request.body.type === 5));
+  assert(f.received.every(message => message.userId === '111' && message.interaction != null));
+});
+
 test('unsupported names, incomplete options, types, duplicates and unsafe line breaks are rejected', () => {
   const invalid = [result('resume'), result('startup'), result('cwd'), result('agent', [option('agent', 'other')]),
     result('model', [option('custom', true)]), result('model', [option('name', 'a'.repeat(201))]),
@@ -109,7 +131,7 @@ test('unsupported names, incomplete options, types, duplicates and unsafe line b
   assert(invalid.every(value => 'error' in value));
 });
 
-test('registration uses READY application ID and PUTs ten global BOT_DM definitions', async t => {
+test('registration uses READY application ID and PUTs twelve global BOT_DM definitions', async t => {
   const f = await fixture(t);
   await f.transport.syncSlashCommands();
   assert.equal(f.requests.length, 1);

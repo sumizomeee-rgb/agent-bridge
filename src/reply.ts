@@ -8,6 +8,12 @@ function headerValue(value: string): string {
   return value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/@/g, '＠').trim().slice(0, 120);
 }
 
+/** Discord display only; the raw reply header and persisted identity remain unchanged. */
+export function discordReplyHeader(header: string): string {
+  const singleLine = header.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ');
+  return ['```ansi', `\u001b[32m${singleLine}\u001b[0m`, '```'].join('\n');
+}
+
 /** Reply headers show actual metadata; delivery identities are persisted separately. */
 export function replyHeader(identity: DeliveredReply, _previous: DeliveredReply | null,
   model: string | null, effort: string | null): string {

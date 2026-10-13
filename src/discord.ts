@@ -7,6 +7,8 @@ import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
 import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
+import type { WorkCounts } from './overview.js';
+import { discordReplyHeader } from './reply.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
@@ -23,6 +25,7 @@ export interface DiscordTransportOptions {
   invalidSessionDelayMs?: number;
   maxImages?: number;
   presenceWindowMs?: number;
+  presenceCoalesceMs?: number;
   maxTotalImageBytes?: number;
   logger?: (message: string) => void;
   /** Synchronous ordinary-DM journal hook, before receipts or queued preparation. */
@@ -223,7 +226,9 @@ export class DiscordTransport {
   private readyTimer: NodeJS.Timeout | undefined;
   private presenceTimer: NodeJS.Timeout | undefined;
   private desiredPresence: BridgePresence = 'recovering';
-  private lastPresence: BridgePresence | undefined;
+  private lastPresence: string | undefined;
+  private workCounts: WorkCounts = { running: 0, queued: 0 };
+  private workPresenceTimer: NodeJS.Timeout | undefined;
   private gatewayReady = false;
   private readonly presenceTimes: number[] = [];
   private heartbeatAcknowledged = true;
@@ -277,12 +282,32 @@ export class DiscordTransport {
   /** Presence is the only restart notification: no channel messages or broadcasts. */
   setPresence(phase: BridgePresence): void {
     this.desiredPresence = phase;
+    clearTimeout(this.workPresenceTimer); this.workPresenceTimer = undefined;
     this.flushPresence();
   }
 
+  /** 全桥数量只发布汇总，永不包含用户、电脑或任务名称。 */
+  setWorkCounts(counts: WorkCounts): void {
+    if (this.closed || !Number.isSafeInteger(counts.running) || counts.running < 0
+      || !Number.isSafeInteger(counts.queued) || counts.queued < 0) return;
+    if (counts.running === this.workCounts.running && counts.queued === this.workCounts.queued) return;
+    this.workCounts = { running: counts.running, queued: counts.queued };
+    if (this.desiredPresence !== 'idle' || this.workPresenceTimer) return;
+    this.workPresenceTimer = setTimeout(() => {
+      this.workPresenceTimer = undefined; this.flushPresence();
+    }, this.options.presenceCoalesceMs ?? 250);
+  }
+
   private flushPresence(): void {
+    const state = this.desiredPresence === 'idle'
+      ? this.workCounts.running || this.workCounts.queued
+        ? `在线 · 全桥运行 ${this.workCounts.running} 个 · 等待 ${this.workCounts.queued} 轮` : '空闲 · 随时可以聊天'
+      : { draining: '准备重启 · 正在收尾', recovering: '会话恢复中', failed: '重启失败 · 等待检查' }[this.desiredPresence];
+    const payload = { since: null, activities: [{ name: 'Bridge', type: 4, state }],
+      status: this.desiredPresence === 'idle' ? 'online' : this.desiredPresence === 'failed' ? 'dnd' : 'idle', afk: false };
+    const signature = JSON.stringify(payload);
     if (this.closed || !this.gatewayReady || !this.ws || this.ws.readyState !== WebSocket.OPEN
-      || this.lastPresence === this.desiredPresence) return;
+      || this.lastPresence === signature) return;
     const now = Date.now(); const window = this.options.presenceWindowMs ?? 20_000;
     while (this.presenceTimes.length && this.presenceTimes[0]! <= now - window) this.presenceTimes.shift();
     if (this.presenceTimes.length >= 5) {
@@ -292,11 +317,8 @@ export class DiscordTransport {
       return;
     }
     clearTimeout(this.presenceTimer); this.presenceTimer = undefined;
-    const state = { idle: '空闲 · 随时可以聊天', draining: '准备重启 · 正在收尾',
-      recovering: '会话恢复中', failed: '重启失败 · 等待检查' }[this.desiredPresence];
-    this.sendPacket(this.ws, 3, { since: null, activities: [{ name: 'Bridge', type: 4, state }],
-      status: this.desiredPresence === 'idle' ? 'online' : this.desiredPresence === 'failed' ? 'dnd' : 'idle', afk: false });
-    this.presenceTimes.push(now); this.lastPresence = this.desiredPresence;
+    this.sendPacket(this.ws, 3, payload);
+    this.presenceTimes.push(now); this.lastPresence = signature;
   }
 
   async sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> {
@@ -308,9 +330,10 @@ export class DiscordTransport {
       this.config.maxImageBytes, this.config.maxFileBytes ?? 20 * mib);
     const caption = options?.files?.length ? '附件' : '图片';
     if (!text.length && !attachmentBatches.length) return;
-    const prefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
-    if (prefix && (prefix.length >= 1998 || (text.length > 0 && !text.startsWith(prefix)))) throw new Error('回复头过长或与正文不一致。');
-    const parts = prefix ? chunks(text.slice(prefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : chunks(text);
+    const rawPrefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
+    const prefix = options?.repeatHeader ? `${discordReplyHeader(options.repeatHeader)}\n\n` : '';
+    if (prefix && (prefix.length >= 1998 || (text.length > 0 && !text.startsWith(rawPrefix)))) throw new Error('回复头过长或与正文不一致。');
+    const parts = prefix ? chunks(text.slice(rawPrefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : chunks(text);
     const previous = this.sendQueues.get(channelId) ?? Promise.resolve();
     const job = previous.catch(() => undefined).then(async () => {
       signal?.throwIfAborted();
@@ -508,6 +531,7 @@ export class DiscordTransport {
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.readyTimer);
     clearTimeout(this.presenceTimer); this.presenceTimer = undefined;
+    clearTimeout(this.workPresenceTimer); this.workPresenceTimer = undefined;
     this.rejectReady?.(new Error('Discord transport 已关闭。'));
     this.rejectReady = undefined;
     this.resolveReady = undefined;
@@ -612,6 +636,7 @@ export class DiscordTransport {
     this.identifyTimer = undefined;
     this.gatewayReady = false; this.lastPresence = undefined;
     clearTimeout(this.presenceTimer); this.presenceTimer = undefined;
+    clearTimeout(this.workPresenceTimer); this.workPresenceTimer = undefined;
   }
 
   private sendPacket(socket: WebSocket, op: number, data: unknown): void {

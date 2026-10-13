@@ -17,6 +17,7 @@ export interface ExecutionTargetBinding {
 export interface TargetEngine { agentCommand: AgentCommand; defaultCwd: string }
 export interface RemoteTargetRegistration {
   id: string; label: string; expectedHostname: string; sshConfig: string; alias: string;
+  allowedUserIds?: string[];
   remoteRoot: string; nodePath: string; engines: Partial<Record<AgentName, TargetEngine>>;
 }
 export interface TargetSummary {

@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { SessionStore } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
+import { formatComputerOverview, formatWorkerOverview, type ComputerOverview, type WorkerOverview } from './overview.js';
 import { collectOutgoingAttachments } from './artifacts.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
@@ -29,6 +30,8 @@ const HELP = `直接发送文字或图片即可继续当前会话。
 /model default：恢复 CLI 当前默认；/model custom 模型名：指定网关自定义模型
 /effort [level|default]：查询或设置当前会话推理强度
 /status：查看当前会话和排队情况
+/computers [refresh|cached]：查看已登记电脑及 Agent 的连接和 CLI 入口
+/workers [all]：查看当前对话或本用户全部对话的运行中直属 Agent
 /stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务
 /help：查看帮助`;
 
@@ -39,12 +42,20 @@ function command(text: string): { name: string; argument: string } | null {
   return match ? { name: match[1]!.toLowerCase(), argument: (match[2] ?? '').trim() } : null;
 }
 
+export interface SessionManagerOptions {
+  mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry;
+  onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void;
+  controllerSeed?: (previous: Conversation) => string; onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>;
+  onInitializationError?: (conversation: Conversation, error: unknown) => void;
+  onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
+  onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
+}
+
 export class SessionManager {
   private readonly store: SessionStore;
   private readonly workers = new Map<string, Promise<void>>();
   private readonly userWorkers = new Map<string, Promise<void>>();
   private readonly latestMessages = new Map<string, { id: string; channelId: string; conversationId: string }>();
-  private readonly taskCounts = new Map<string, number>();
   private readonly running = new Map<string, RunningTurn>();
   private readonly interruptPromises = new Set<Promise<void>>();
   private readonly modelChanges = new Set<string>();
@@ -63,7 +74,7 @@ export class SessionManager {
     private readonly config: BridgeConfig,
     private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly sink: ReplySink,
-    private readonly options: { mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry; onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void; controllerSeed?: (previous: Conversation) => string; onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>; onInitializationError?: (conversation: Conversation, error: unknown) => void } = {},
+    private readonly options: SessionManagerOptions = {},
   ) { this.store = new SessionStore(config.dataDir); }
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
@@ -242,7 +253,6 @@ export class SessionManager {
     this.options.taskRegistry?.cancelConversation(conversation.id);
     const latest = this.latestMessages.get(conversation.userId);
     if (latest?.conversationId === conversation.id) {
-      this.setTaskCount(latest, 0);
       this.latestMessages.delete(conversation.userId);
     }
     this.revisions.set(conversation.userId, this.revision(conversation.userId) + 1);
@@ -439,9 +449,32 @@ export class SessionManager {
       case 'resume': {
         await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 自动续接当前目录的会话；/new 新建，/chats 只读查看历史。'); return;
       }
+      case 'computers': {
+        if (argument && argument !== 'refresh' && argument !== 'cached') {
+          await reply('用法：/computers [refresh|cached]；默认重新检查，cached 查看已有检查。'); return;
+        }
+        if (!this.options.onListComputers) { await reply('桥尚未配置电脑清单查询。'); return; }
+        const target = current ?? this.ensureActive(message.userId);
+        let items: ComputerOverview[];
+        try { items = await this.options.onListComputers(target, argument !== 'cached'); }
+        catch { throw new Error('电脑清单检查失败，请稍后重试。'); }
+        await reply(formatComputerOverview(items)); return;
+      }
+      case 'workers': {
+        if (argument && argument !== 'current' && argument !== 'all') {
+          await reply('用法：/workers [all]；默认查看当前对话，all 查看你的全部对话。'); return;
+        }
+        if (!this.options.onListWorkers) { await reply('桥尚未配置直属 Agent 查询。'); return; }
+        const target = current ?? this.ensureActive(message.userId);
+        const scope = argument === 'all' ? 'all' : 'current';
+        let items: WorkerOverview[];
+        try { items = await this.options.onListWorkers(target, scope); }
+        catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
+        await reply(formatWorkerOverview(items, scope)); return;
+      }
       case 'status':
         await reply(current
-          ? `${agentDisplayName(current.agent)} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}${this.options.taskRegistry ? `\n已登记执行中的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}`
+          ? `${agentDisplayName(current.agent)} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}${this.options.taskRegistry ? `\n已登记未结束的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}`
           : '还没有会话，发送文字或图片即可开始。');
         return;
       case 'stop': {
@@ -717,31 +750,11 @@ export class SessionManager {
     }
   }
 
-  refreshTaskCounts(conversationId?: string): void {
-    if (this.closed || !this.options.taskRegistry || !this.sink.setTaskCount) return;
-    for (const [userId, message] of this.latestMessages) {
-      if (conversationId && message.conversationId !== conversationId) continue;
-      const active = this.store.getActive(userId);
-      this.setTaskCount(message, active?.id === message.conversationId
-        ? this.options.taskRegistry.activeCount(message.conversationId) : 0);
-    }
-  }
+  /** 旧调用兼容：数量由全桥状态和 /workers 展示，不再修改原消息的数字表情。 */
+  refreshTaskCounts(_conversationId?: string): void {}
 
   private setLatestMessage(message: BridgeMessage, conversationId: string): void {
-    const previous = this.latestMessages.get(message.userId);
-    if (previous && previous.id !== message.id) this.setTaskCount(previous, 0);
     this.latestMessages.set(message.userId, { id: message.id, channelId: message.channelId, conversationId });
-  }
-
-  private setTaskCount(message: Pick<BridgeMessage, 'id' | 'channelId'>, count: number): void {
-    if (!this.sink.setTaskCount) return;
-    const key = `${message.channelId}:${message.id}`;
-    if (this.taskCounts.get(key) === count) return;
-    this.taskCounts.set(key, count);
-    // Transport serializes updates for each original message; reactions never block work.
-    void Promise.resolve().then(() => this.sink.setTaskCount?.(message, count)).catch(() => {
-      if (this.taskCounts.get(key) === count) this.taskCounts.delete(key);
-    });
   }
 
   private completionTarget(event: TaskCompletionEvent): Conversation | null {
