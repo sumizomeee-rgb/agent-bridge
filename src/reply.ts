@@ -10,7 +10,8 @@ function headerValue(value: string): string {
 
 /** Discord display only; the raw reply header and persisted identity remain unchanged. */
 export function discordReplyHeader(header: string): string {
-  const singleLine = header.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ');
+  const displayHeader = header.startsWith('[') && header.endsWith(']') ? header.slice(1, -1) : header;
+  const singleLine = displayHeader.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ');
   return ['```ansi', `\u001b[32m${singleLine}\u001b[0m`, '```'].join('\n');
 }
 

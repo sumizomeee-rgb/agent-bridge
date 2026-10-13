@@ -119,7 +119,7 @@ test('dynamic identity is green once, resets before closing its fence, and leave
   await f.transport.sendText('222', `${header}\n\n${body}`, { repeatHeader: header });
   assert.equal(f.sent.length, 1);
   const content = f.sent[0]!.payload.content as string;
-  assert.equal(content, '```ansi\n\u001b[32m[Codex · 6.1-sol · 极高 · 4cc9]\u001b[0m\n```\n\n' + body);
+  assert.equal(content, '```ansi\n\u001b[32mCodex · 6.1-sol · 极高 · 4cc9\u001b[0m\n```\n\n' + body);
   assert.equal(content.split('```ansi').length - 1, 1);
   assert.equal(content.slice(content.indexOf('\n\n') + 2), body);
   assert(!content.includes('\\u001b'));
