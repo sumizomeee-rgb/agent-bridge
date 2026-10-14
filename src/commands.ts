@@ -23,13 +23,15 @@ export const COMMANDS: CommandDefinition[] = [
   ] },
   { name: 'models', help: "/models：列出当前 Agent 的模型选项", description: '列出当前 Agent 的模型选项' },
   { name: 'status', help: "/status：查看桥、模型、会话、运行与排队状态", description: '查看当前模型、会话和排队情况' },
-  { name: 'computers', help: "/computers [refresh|cached]：查看登记电脑、连接与 CLI 入口", description: '查看已登记电脑、连接状态和 Agent CLI 入口', options: [
+  { name: 'computers', help: "/computers [refresh|cached] [details]：查看登记电脑、连接与 CLI 入口", description: '查看已登记电脑、连接状态和 Agent CLI 入口', options: [
     { type: 'boolean', name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
+    { type: 'boolean', name: 'details', description: '展开完整检查信息；默认简要展示' },
   ] },
-  { name: 'workers', help: "/workers [all]：查看当前对话或自己的全部对话的直属助手", description: '查看已登记直属助手的电脑、会话、状态和本轮耗时', options: [
+  { name: 'workers', help: "/workers [all] [details]：查看当前对话或自己的全部对话的直属助手", description: '查看已登记直属助手的电脑、会话、状态和本轮耗时', options: [
     { type: 'string', name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [
       { name: '当前对话', value: 'current' }, { name: '我的全部对话', value: 'all' },
     ] },
+    { type: 'boolean', name: 'details', description: '展开完整 ID 与回执；默认简要展示' },
   ] },
   { name: 'stop', help: "/stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务", description: '停止当前任务并清空其队列，保留上下文' },
   { name: 'help', help: "/help：查看共用命令与用法", description: '查看可用命令和用法' },

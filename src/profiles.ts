@@ -4,6 +4,7 @@ import type { BridgePlatform } from './types.js';
 
 export interface BotProfile {
   platform: BridgePlatform; name: string; applicationId?: string; token?: string; appSecret?: string;
+  network?: { proxyPort: number | null };
   allowedUserIds: string[]; features?: { reactions?: boolean; nativeCommands?: boolean; presence?: boolean };
 }
 export function readJson(path: string): Record<string, unknown> {
@@ -21,6 +22,10 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
   const applicationId = String(raw.applicationId ?? '').trim();
   if (!(platform === 'discord' ? /^\d{15,22}$/ : /^cli_[a-zA-Z0-9]+$/).test(applicationId)) throw new Error('Profile 缺少有效 applicationId。');
   if (!Array.isArray(raw.allowedUserIds) || !raw.allowedUserIds.length) throw new Error('Profile 必须配置 allowedUserIds。');
+  const network = raw.network as Record<string, unknown> | undefined;
+  if (network != null && (typeof network !== 'object' || Array.isArray(network) || Object.keys(network).some(key => key !== 'proxyPort'))) throw new Error('network 仅支持 proxyPort。');
+  const proxyPort = network?.proxyPort ?? null;
+  if (proxyPort !== null && (typeof proxyPort !== 'number' || !Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535)) throw new Error('Profile 代理端口需要是 1–65535 的整数或 null。');
   const features = raw.features;
   if (features != null && (typeof features !== 'object' || Array.isArray(features))) throw new Error('features 必须是对象。');
   for (const [key, enabled] of Object.entries(features ?? {})) {
@@ -28,7 +33,7 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
     if (platform === 'feishu' && enabled && key !== 'reactions') throw new Error(`飞书暂不支持可选功能 ${key}。`);
   }
   return { platform, name, applicationId, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
-    allowedUserIds: raw.allowedUserIds.map(String), features: features as BotProfile['features'] };
+    allowedUserIds: raw.allowedUserIds.map(String), network: { proxyPort: proxyPort as number | null }, features: features as BotProfile['features'] };
 }
 /** A credential rotation or profile alias change retains the bot's actual identity. */
 export function profileScope(profile: BotProfile): string {

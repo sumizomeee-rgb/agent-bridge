@@ -5,6 +5,7 @@
   "allowedUserIds": [
     "FILL_IN_USER_OPEN_ID"
   ],
+  "network": { "proxyPort": null },
   "features": {
     "reactions": false,
     "nativeCommands": false,

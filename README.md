@@ -14,7 +14,7 @@
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-4. 运行 `.\start.ps1 -Check` 检查配置，再运行 `.\start.ps1`；代理可在配置设 `proxyPort: 7898` 或用 `.\start.ps1 -ProxyPort 7898`。
+4. 运行 `.\start.ps1 -Check` 检查配置，再运行 `.\start.ps1`；代理按启动 Profile 的 `network.proxyPort` 配置（Discord 示例 7898、飞书直连），也可临时用 `.\start.ps1 -ProxyPort 7898`。
 5. 需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。
 
 生成脚本不需要 Node 或联网，只补缺失文件，已有文件原样保留。空 `agents.json`、`capabilities.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。

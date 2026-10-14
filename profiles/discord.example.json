@@ -5,6 +5,7 @@
   "allowedUserIds": [
     "FILL_IN_DISCORD_USER_ID"
   ],
+  "network": { "proxyPort": 7898 },
   "features": {
     "reactions": true,
     "nativeCommands": true,

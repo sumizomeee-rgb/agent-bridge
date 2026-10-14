@@ -5,8 +5,11 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { SessionManager, type SessionManagerOptions } from '../src/manager.js';
-import { elapsedText, formatComputerOverview, formatWorkerOverview, splitOverviewMessage, type ComputerOverview, type WorkerOverview } from '../src/overview.js';
+import { elapsedText, formatComputerOverview as renderComputerDetails, formatWorkerOverview as renderWorkerDetails, splitOverviewMessage, type ComputerOverview, type WorkerOverview } from '../src/overview.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, BridgeMessage, Conversation } from '../src/types.js';
+
+const formatComputerOverview = (items: readonly ComputerOverview[]) => renderComputerDetails(items, true);
+const formatWorkerOverview = (items: readonly WorkerOverview[], scope: 'current' | 'all', now: number) => renderWorkerDetails(items, scope, now, true);
 
 const now = Date.parse('2026-10-13T08:00:00Z');
 const computers: ComputerOverview[] = [

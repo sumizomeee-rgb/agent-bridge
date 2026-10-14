@@ -16,7 +16,7 @@ export interface DeliveredReply {
   nativeId: string;
 }
 
-export type WorkspaceNoticeOutcome = 'ready' | 'read-failed' | 'read-cancelled' | 'load-failed' | 'request-failed' | 'unknown';
+export type WorkspaceNoticeOutcome = 'ready' | 'read-failed' | 'read-cancelled' | 'load-failed' | 'request-failed' | 'introduction-failed' | 'unknown';
 export interface WorkspaceNotice { conversationId: string; userId: string; channelId: string; sourceMessageId: string;
   outcome: WorkspaceNoticeOutcome | null; state: 'waiting' | 'sending' | 'delivered' | 'uncertain' | 'cancelled' }
 

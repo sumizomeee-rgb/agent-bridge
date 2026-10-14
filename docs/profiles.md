@@ -2,6 +2,10 @@
 
 桥项目名称为 `agent-bridge`。Discord 和飞书共用会话、主控、执行器、远端调度、任务回执和恢复逻辑；平台适配器负责各自的鉴权、接收、历史、媒体和回复。
 
+## 网络预设
+
+网络配置属于所选 Profile 的 `network.proxyPort`。Discord 示例设置 `7898`，飞书示例设置 `null`（桥直连，不注入专用代理）；缺省也是直连。公共配置不接受旧 `proxyPort` 字段，不会偷偷继承另一个平台的端口。`-ProxyPort` 仅作为本次启动的显式覆盖。Agent 未被 Profile 指定代理时沿用本机自己的默认环境与 CLI 配置。网络改变不影响 bot 身份、会话和任务归属。
+
 ## 启动前选择
 
 `Profile` 是“平台 / 本地 bot 预设名”，例如 `discord/default`、`feishu/bot2`。预设名方便人选择，数据归属使用真实的应用身份：`discord:<applicationId>|` 或 `feishu:<applicationId>|`。改预设名或轮换凭据不会丢失该 bot 的会话；不同 bot 的同名用户、频道和消息不会共用绑定。

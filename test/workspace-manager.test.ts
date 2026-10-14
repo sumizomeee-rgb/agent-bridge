@@ -56,6 +56,7 @@ class Controller implements AgentAdapter {
     if (turn.event?.kind === 'workspace-context') {
       this.facts.set(nativeId, turn.event.text);
       await this.contextHook?.(turn);
+      if (turn.event.introductionRequested && !this.uncontrolledContext) await turn.onPublicMessage?.(`你好，我是这个工作区的主控。我已了解入口文档，会依据已确认的能力协助你；实际模型与远端状态仍以运行结果为准。（会话 ${turn.conversation.id.slice(0, 8)}）`, [], `introduction-${turn.conversation.id}`);
       return { nativeId, text: this.uncontrolledContext ? this.contextResultText : 'DONE', controlledOutput: !this.uncontrolledContext };
     }
     await this.gates.get(turn.text)?.promise;
@@ -101,7 +102,7 @@ function fixture(t: TestContext, controllerMode = true) {
         })]) : pending); } finally { if (abort) options?.signal?.removeEventListener('abort', abort); }
       }
       if (options?.signal?.aborted) throw new Error('send aborted');
-      if (/^[✅⚠️]/u.test(text) && text.includes('（会话 ')) {
+      if ((/^[✅⚠️]/u.test(text) || text.includes('你好，我是这个工作区的主控')) && text.includes('（会话 ')) {
         delivery.noticeAttempts++; if (delivery.failNotice) throw new Error('notification transport uncertain');
       }
       replies.push({ text, options, channelId });
@@ -219,7 +220,7 @@ test('/new 立即派背景任务；载入主控后只发送一次桥回执，不
   assert.equal(f.controller.turns[0]!.taskContextPath, undefined, '未有真实 human 时不给初始化回执额外派工能力');
   await until(() => f.inspect.workspaceNotice(parent.id)?.state === 'delivered');
   assert.equal(f.replies.length, 2, '原命令确认与一条桥回执，模型 fallback 保持静默');
-  assert.match(f.replies[1]!.text, /✅ 工作区上下文已载入/);
+  assert.match(f.replies[1]!.text, /主控没有完成介绍/);
   assert(!f.replies.some(item => /UNSOLICITED|看看/.test(item.text)));
   await f.send('hello', '你好'); await until(() => f.controller.turns.length === 2 && f.replies.length === 3);
   assert.equal(f.controller.turns[1]!.conversation.nativeId, native);
@@ -486,7 +487,7 @@ function deferred() {
 }
 
 function initializationReceipts(f: ReturnType<typeof fixture>) {
-  return f.replies.filter(reply => /^[✅⚠️]/u.test(reply.text) && reply.text.includes('（会话 '));
+  return f.replies.filter(reply => (/^[✅⚠️]/u.test(reply.text) || reply.text.includes('你好，我是这个工作区的主控')) && reply.text.includes('（会话 '));
 }
 
 test('/new 子任务已结束但父上下文仍在载入时不提前宣布就绪', async t => {
@@ -504,7 +505,9 @@ test('/new 子任务已结束但父上下文仍在载入时不提前宣布就绪
   gate.release();
   await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
   assert.equal(initializationReceipts(f).length, 1);
-  assert.match(initializationReceipts(f)[0]!.text, /^✅ 工作区上下文已载入/);
+  assert.match(initializationReceipts(f)[0]!.text, /你好，我是这个工作区的主控/);
+  assert.equal(f.controller.turns[0]!.event?.introductionRequested, true);
+  assert(initializationReceipts(f)[0]!.options?.repeatHeader, '介绍通过主控正常公开回复链路带实际元数据');
   assert(!initializationReceipts(f)[0]!.text.includes('PRIVATE_CONTEXT'));
   assert.equal(f.inspect.getActive('user')!.nativeId, nativeId);
 });
@@ -527,7 +530,7 @@ test('/new 的 ACK 发送未完成时即使极速初始化也先保存结果，�
   await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered');
   assert.equal(f.replies.length, 2);
   assert.match(f.replies[0]!.text, /^已新建 /);
-  assert.match(f.replies[1]!.text, /^✅ 工作区上下文已载入/);
+  assert.match(f.replies[1]!.text, /你好，我是这个工作区的主控/);
   assert.equal(f.controller.turns.length, 1);
 });
 
@@ -610,7 +613,7 @@ for (const action of ['new', 'stop', 'close'] as const) {
   test(`初始化回执排队发送时 ${action} 取消在途回执，旧回执不落入后续对话`, async t => {
     const f = fixture(t); const gate = deferred(); let sendingSignal: AbortSignal | undefined;
     f.delivery.beforeSend = async (_channel, text, options) => {
-      if (text.startsWith('✅ 工作区上下文已载入')) { sendingSignal = options?.signal; await gate.promise; }
+      if (text.includes('你好，我是这个工作区的主控')) { sendingSignal = options?.signal; await gate.promise; }
     };
     await f.send('old-new', '/new'); await until(() => f.children.turns.length === 1);
     const parent = f.inspect.getActive('user')!;

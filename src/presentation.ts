@@ -38,7 +38,6 @@ export function discordPresentationPages(view: BridgePresentation, limit = 2000)
 export function discordPresentationText(view: BridgePresentation): string {
   return discordPresentationPages(view, Number.MAX_SAFE_INTEGER)[0]!;
 }
-const escapeEntry = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/([\\`*_\[\]#])/g, '\\$1');
 const safeMarkdown = (text: string): string => text.replace(/<(\/?(?:at|person|font|text_tag|number_tag)\b[^>]*>)/gi, '&lt;$1');
 /** 正文分片时关闭并续开代码围栏，保留可复制的代码展示。 */
 export function markdownParts(text: string, maxBytes = 8000): string[] {
@@ -71,8 +70,8 @@ export function feishuPresentationCards(view: BridgePresentation): Record<string
     header: { template, title: { tag: 'plain_text', content: titleText(view.title) + (index ? ` · ${index}` : '') } }, body: { elements } });
   const cards: Record<string, unknown>[] = []; let elements: unknown[] = [];
   const blocks = [...view.blocks, ...(view.footer ? [{ kind: 'text' as const, text: view.footer }] : [])];
-  for (const block of blocks) for (const content of markdownParts(block.kind === 'entry' ? escapeEntry(block.text) : safeMarkdown(block.text))) {
-    const element = { tag: 'markdown', content };
+  for (const block of blocks) for (const content of markdownParts(block.kind === 'entry' ? block.text : safeMarkdown(block.text))) {
+    const element = block.kind === 'entry' ? { tag: 'div', text: { tag: 'plain_text', content } } : { tag: 'markdown', content };
     const next = [...elements, ...(elements.length ? [{ tag: 'hr' }] : []), element];
     if (elements.length && (Buffer.byteLength(JSON.stringify(make(next))) > 24 * 1024 || next.length > 40)) {
       cards.push(make(elements)); elements = [element];

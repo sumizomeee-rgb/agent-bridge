@@ -123,9 +123,9 @@ export async function migrateProject(configPath: string, options: MigrationOptio
     const botPath = join(local, 'bots', 'discord', 'default.json');
     if (existsSync(botPath)) throw new Error('discord/default 已存在，未覆盖配置。');
     const common = migrateValue(raw, prefix, oldRoot, newRoot) as Record<string, unknown>;
-    for (const key of ['token', 'applicationId', 'allowedUserIds', 'appSecret', 'appId']) delete common[key];
+    for (const key of ['token', 'applicationId', 'allowedUserIds', 'appSecret', 'appId', 'proxyPort']) delete common[key];
     Object.assign(common, { version: 2, startupProfile: 'discord/default', platformProfiles: { discord: 'discord/default', feishu: 'feishu/default' } });
-    stageFile(botPath, JSON.stringify({ platform: 'discord', applicationId, token: raw.token, allowedUserIds: raw.allowedUserIds,
+    stageFile(botPath, JSON.stringify({ platform: 'discord', applicationId, token: raw.token, allowedUserIds: raw.allowedUserIds, network: { proxyPort: raw.proxyPort ?? null },
       features: { reactions: true, nativeCommands: true, presence: true } }, null, 2) + '\n');
     const eol = bytes.toString('utf8').includes('\r\n') ? '\r\n' : '\n', bom = bytes.subarray(0, 3).equals(Buffer.from([239,187,191])) ? '\uFEFF' : '';
     stageFile(configPath, bom + (JSON.stringify(common, null, 2) + '\n').replace(/\n/g, eol));

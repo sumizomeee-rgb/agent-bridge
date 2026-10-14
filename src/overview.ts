@@ -43,7 +43,7 @@ export function splitOverviewMessage(text: string, limit = 2000): string[] | nul
   return parts;
 }
 
-export function computerOverview(items: readonly ComputerOverview[]): BridgePresentation {
+function computerDetails(items: readonly ComputerOverview[]): BridgePresentation {
   const title = `当前工作区的电脑 · 已登记${items.length}台`;
   if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: '当前工作区没有登记的电脑。' }] };
   return { title, tone: 'info', purpose: 'overview', blocks: items.map((item, index) => {
@@ -68,8 +68,53 @@ export function computerOverview(items: readonly ComputerOverview[]): BridgePres
 }
 
 /** Discord 展示入口；核心使用上面的结构化总览。 */
-export const formatComputerOverview = (items: readonly ComputerOverview[]): string => discordPresentationText(computerOverview(items));
-export const formatWorkerOverview = (items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): string => discordPresentationText(workerOverview(items, scope, now));
+export const formatComputerOverview = (items: readonly ComputerOverview[], details = false): string => discordPresentationText(computerOverview(items, details));
+export const formatWorkerOverview = (items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false): string => discordPresentationText(workerOverview(items, scope, now, details));
+
+
+/** 默认总览先呈现派发准备；原始检查证据只在 details 展开。 */
+export function computerOverview(items: readonly ComputerOverview[], details = false): BridgePresentation {
+  if (details) return computerDetails(items);
+  const ready = (item: ComputerOverview) => item.connection === 'connected' && item.agents.some(agent => agent.cli === 'ready');
+  const rank = (item: ComputerOverview) => ready(item) ? 0 : item.connection === 'unreachable' || item.agents.every(agent => agent.cli === 'unavailable') ? 2 : 1;
+  const sorted = [...items].sort((a, b) => rank(a) - rank(b));
+  const count = sorted.filter(ready).length;
+  return { title: `当前工作区的电脑 · 已登记${items.length}台`, tone: 'info', purpose: 'overview',
+    blocks: sorted.length ? [{ kind: 'entry', text: `✅ 就绪 ${count} 台 · ⚠️ 待确认 ${sorted.filter(item => rank(item) === 1).length} 台 · ❌ 不可用 ${sorted.filter(item => rank(item) === 2).length} 台` }, ...sorted.map((item, index) => {
+      const lines = [`${ready(item) ? '✅' : rank(item) === 2 ? '❌' : '⚠️'} ${index + 1}. ${clean(item.label, 60)}`];
+      for (const agent of ['codex', 'claude'] as const) {
+        const cli = item.agents.find(value => value.agent === agent);
+        const status = !cli ? '⚪ 未登记' : item.connection === 'unreachable' || cli.cli === 'unavailable' ? '❌ 不可用'
+          : item.connection === 'connected' && cli.cli === 'ready' ? '✅ 可派发' : '⚠️ 待确认';
+        lines.push(`${agentLabel(agent)}：${status}`);
+      }
+      if (item.connection === 'unreachable') lines.push(`连接：${clean(item.reason ?? '连接不可用', 70)}`);
+      return { kind: 'entry' as const, text: lines.join('\n') };
+    })] : [{ kind: 'text', text: '当前工作区没有登记的电脑。' }],
+    footer: '✅ 表示连接与 CLI 入口就绪，模型需实际调用确认。/computers details 查看检查时间和详情。' };
+}
+export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false): BridgePresentation {
+  if (details) return workerDetails(items, scope, now);
+  const label = scope === 'all' ? '你的全部对话' : '当前对话';
+  const running = items.filter(item => item.running).length, queued = items.reduce((sum, item) => sum + item.queued, 0);
+  const uncertain = items.filter(item => item.status === 'uncertain').length;
+  const rank = (item: WorkerOverview) => item.running ? 0 : ['uncertain', 'handoff-pending', 'failed'].includes(item.status) ? 1 : item.queued ? 2 : 3;
+  const sorted = [...items].sort((a, b) => rank(a) - rank(b));
+  const states = { queued: '⏳ 等待执行', running: '🔄 运行中', completed: '✅ 已完成', failed: '❌ 失败', cancelled: '⏹ 已停止', uncertain: '⚠️ 待核对', idle: '💤 空闲', 'handed-off': '👤 已交给你', 'handoff-pending': '⚠️ 交接待确认' };
+  const effortNames: Record<string, string> = { none: '无', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高' };
+  return { title: `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`, tone: 'info', purpose: 'overview',
+    blocks: sorted.length ? sorted.map((item, index) => {
+      const model = item.model ? clean(item.model, 60).replace(/^gpt-/i, '') : '模型未知';
+      const effort = item.effort ? (Object.hasOwn(effortNames, item.effort.toLowerCase()) ? effortNames[item.effort.toLowerCase()]! : clean(item.effort, 30)) : '强度未知';
+      const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
+      const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? '尚未开始' : '耗时未回报';
+      const lines = [`${index + 1}. ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
+        `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
+      if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
+      if (item.blocked || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`需核对：${clean(item.statusReason ?? '任务已阻塞', 80)}`);
+      return { kind: 'entry', text: lines.join('\n') };
+    }) : [{ kind: 'text', text: `${label}没有已登记的直属助手。` }], footer: '/workers details 查看完整 ID、回执和详情。' };
+}
 
 export function elapsedText(startedAt: string | null, now = Date.now()): string {
   const started = startedAt ? Date.parse(startedAt) : NaN;
@@ -85,7 +130,7 @@ function shortWorkerId(item: WorkerOverview, items: readonly WorkerOverview[]): 
   return clean(item.workerId.slice(0, length), 256);
 }
 
-export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): BridgePresentation {
+function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): BridgePresentation {
   const prefix = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length;
   const queued = items.reduce((total, item) => total + item.queued, 0);

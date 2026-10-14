@@ -296,7 +296,7 @@ test('workspace initialization uses one durable child with the parent backend/mo
     assert.match(child.text, /AGENTS\.md、README\.md/); assert.match(child.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
     assert.match(child.text, /不要扫描未指定的目录或技能目录/); assert.match(child.text, /不连接远程电脑/);
     assert(!child.text.includes('用户职责和偏好、当前电脑用途'));
-    assert.match(child.text, /不自行登记桥后台任务、发 Discord 消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
+    assert.match(child.text, /不自行登记桥后台任务、向聊天平台发消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
     assert.equal(child.taskContextPath, undefined); assert.equal(child.onPublicMessage, undefined); assert.equal(f.registry.activeCount('parent-A'), 1);
     f.codex.finish(first!.workerId, '主机和导航已阅读；Chrome 登录状态仅依据 README 声明。'); await flush();
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.events.length, 1); assert.equal(f.events[0]!.purpose, 'workspace-context');

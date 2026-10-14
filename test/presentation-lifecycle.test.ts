@@ -33,8 +33,10 @@ test('结构化总览无平台颜色代码，渲染器保持 Discord 样式并�
   assert(discordPresentationPages(view)[0]!.startsWith('```ansi\n\u001b[33m'));
   const cards = feishuPresentationCards(view); const encoded = JSON.stringify(cards);
   assert.equal((cards[0]!.header as any).template, 'orange');
-  assert(!encoded.includes('ansi')); assert(!encoded.includes('<at '));
-  assert.match(encoded, /原生会话 ID/); assert.equal(cards[0]!.schema, '2.0');
+  assert(!encoded.includes('ansi'));
+  assert((cards[0]!.body as any).elements.some((element: any) => element.tag === 'div' && element.text.tag === 'plain_text'));
+  assert(!encoded.includes('原生会话 ID'));
+  assert.match(JSON.stringify(feishuPresentationCards(workerOverview([], 'current'))), /没有已登记/); assert.equal(cards[0]!.schema, '2.0');
   assert.equal(feishuPresentationCards(computerOverview([])).length, 1);
 });
 test('长中文和代码回复按实际 JSON 大小分页，标题每页重复且代码围栏闭合', () => {

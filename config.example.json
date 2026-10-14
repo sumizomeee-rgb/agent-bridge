@@ -8,7 +8,6 @@
   "defaultAgent": "codex",
   "controllerMode": true,
   "workspace": "C:\\SuchProject\\AgentWorkspace",
-  "proxyPort": 7898,
   "maxFileBytes": 20971520,
   "commands": {
     "codex": {

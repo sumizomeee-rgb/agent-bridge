@@ -47,6 +47,7 @@ export class SessionManager {
   private closePromise?: Promise<void>;
   private draining = false;
   private activeCommands = 0;
+  private readonly commandReplies = new Map<string, { done: Promise<void>; finish: () => void }>();
   private recovered = false;
   private recovering = false;
   private readonly receipts = new Map<string, number>();
@@ -90,6 +91,9 @@ export class SessionManager {
         const view: BridgePresentation = options?.presentation ?? { title: `命令结果 · /${parsed.name}`, tone: 'info', blocks: [{ kind: 'entry', text }] };
         return deliver(text, { ...options, presentation: view });
       };
+      let finish!: () => void;
+      const done = new Promise<void>(resolve => { finish = resolve; });
+      this.commandReplies.set(message.id, { done, finish });
       this.activeCommands++;
       try {
         await this.handleCommand(message, parsed.name, parsed.argument, reply);
@@ -104,7 +108,7 @@ export class SessionManager {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
         await reply(`命令失败：${error instanceof Error ? error.message : String(error)}`);
-      } finally { this.activeCommands--; }
+      } finally { this.activeCommands--; finish(); this.commandReplies.delete(message.id); }
       return;
     }
     if (!message.text.trim() && message.imagePaths.length === 0) {
@@ -387,7 +391,7 @@ export class SessionManager {
     }
     switch (name) {
       case 'help': {
-        const view: BridgePresentation = { title: '命令与用法', tone: 'info', purpose: 'help', blocks: [{ kind: 'text', text: commandHelp(this.config.controllerMode) }], footer: '平台和 bot 在启动前选择，不通过聊天命令切换。' };
+        const view: BridgePresentation = { title: '命令与用法', tone: 'info', purpose: 'help', blocks: [{ kind: 'entry', text: commandHelp(this.config.controllerMode) }], footer: '平台和 bot 在启动前选择，不通过聊天命令切换。' };
         await reply(presentationText(view), { presentation: view }); return;
       }
       case 'model': await this.handleModel(message, argument, reply); return;
@@ -421,7 +425,7 @@ export class SessionManager {
         this.activate(message.userId, target);
         if (this.config.controllerMode && name === 'new') this.store.requestWorkspaceNotice(target.id, message);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
-        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '旧会话待处理消息已取消；已启动后台上下文初始化，完成后会通知。' : '旧会话待处理任务已取消。'}\n原生会话：尚未创建\n目录：${target.cwd}`);
+        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '我会先了解这个工作区，完成后回来介绍。' : '可以直接发消息开始。'}\n目录：${target.cwd}`);
         return;
       }
       case 'cwd': {
@@ -447,27 +451,29 @@ export class SessionManager {
         await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 自动续接当前目录的会话；/new 新建，/chats 只读查看历史。'); return;
       }
       case 'computers': {
-        if (argument && argument !== 'refresh' && argument !== 'cached') {
-          await reply('用法：/computers [refresh|cached]；默认重新检查，cached 查看已有检查。'); return;
+        const args = argument.split(/\s+/).filter(Boolean);
+        if (args.some(value => !['refresh', 'cached', 'details'].includes(value)) || new Set(args).size !== args.length || args.includes('refresh') && args.includes('cached')) {
+          await reply('用法：/computers [refresh|cached] [details]；默认刷新，details 展开详情。'); return;
         }
         if (!this.options.onListComputers) { await reply('桥尚未配置电脑清单查询。'); return; }
         const target = current ?? this.ensureActive(message.userId);
         let items: ComputerOverview[];
-        try { items = await this.options.onListComputers(target, argument !== 'cached'); }
+        try { items = await this.options.onListComputers(target, !args.includes('cached')); }
         catch { throw new Error('电脑清单检查失败，请稍后重试。'); }
-        const view = computerOverview(items); await reply(presentationText(view), { presentation: view }); return;
+        const view = computerOverview(items, args.includes('details')); await reply(presentationText(view), { presentation: view }); return;
       }
       case 'workers': {
-        if (argument && argument !== 'current' && argument !== 'all') {
-          await reply('用法：/workers [all]；默认查看当前对话，all 查看你的全部对话。'); return;
+        const args = argument.split(/\s+/).filter(Boolean);
+        if (args.some(value => !['current', 'all', 'details'].includes(value)) || new Set(args).size !== args.length || args.includes('current') && args.includes('all')) {
+          await reply('用法：/workers [all] [details]；默认查看当前对话的简要状态。'); return;
         }
         if (!this.options.onListWorkers) { await reply('桥尚未配置直属 Agent 查询。'); return; }
         const target = current ?? this.ensureActive(message.userId);
-        const scope = argument === 'all' ? 'all' : 'current';
+        const scope = args.includes('all') ? 'all' : 'current';
         let items: WorkerOverview[];
         try { items = await this.options.onListWorkers(target, scope); }
         catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
-        const view = workerOverview(items, scope); await reply(presentationText(view), { presentation: view }); return;
+        const view = workerOverview(items, scope, Date.now(), args.includes('details')); await reply(presentationText(view), { presentation: view }); return;
       }
       case 'status': {
         const running = current && this.running.get(message.userId)?.conversationId === current.id;
@@ -772,24 +778,23 @@ export class SessionManager {
       || this.store.getActive(notice.userId)?.id !== target.id) { this.store.cancelWorkspaceNotice(target.id); return; }
     if (source.state === 'command') return; // The original /new acknowledgement must finish first.
     if (source.state !== 'completed') { this.store.cancelWorkspaceNotice(target.id); return; }
-    const nativeId = this.store.getConversation(target.id)?.nativeId;
-    if (notice.outcome === 'ready' && !nativeId) return;
-    const bodies: Record<WorkspaceNoticeOutcome, string> = {
-      ready: '✅ 工作区上下文已载入。',
+    const outcome = notice.outcome;
+    if (outcome === 'ready') return; // 成功介绍只由主控公开通道发送。
+    const bodies: Record<Exclude<WorkspaceNoticeOutcome, 'ready'>, string> = {
       'read-failed': '⚠️ 工作区上下文读取失败，结果已交给主控。',
       'read-cancelled': '⚠️ 工作区上下文读取已取消，结果已交给主控。',
       'load-failed': '⚠️ 初始化结果未能载入主控，结果已保存。',
       'request-failed': '⚠️ 工作区初始化请求未确认完成，请核对状态。',
+      'introduction-failed': '⚠️ 工作区上下文已载入，但主控没有完成介绍；直接发消息可以继续。',
       unknown: '⚠️ 初次上下文载入结果无法确认；未自动重做。',
     };
     if (!this.store.claimWorkspaceNotice(notice)) return;
     const controller = new AbortController();
     const current = () => !this.closed && !controller.signal.aborted && this.store.getActive(notice.userId)?.id === target.id
-      && this.store.workspaceNotice(target.id)?.state === 'sending'
-      && (notice.outcome !== 'ready' || this.store.getConversation(target.id)?.nativeId === nativeId);
+      && this.store.workspaceNotice(target.id)?.state === 'sending';
     const promise = Promise.resolve().then(async () => {
       if (!current()) throw new Error('初次上下文回执发送已取消');
-      await this.sink.sendText(notice.channelId, `${bodies[notice.outcome!]}（会话 ${target.id.slice(0, 8)}）`, { signal: controller.signal });
+      await this.sink.sendText(notice.channelId, `${bodies[outcome]}（会话 ${target.id.slice(0, 8)}）`, { signal: controller.signal });
       if (!current()) throw new Error('初次上下文回执发送期间会话已停止或改变');
       this.store.finishWorkspaceNotice(target.id, 'delivered');
     }).catch(error => {
@@ -837,6 +842,15 @@ export class SessionManager {
       } catch (error) { registry.markUncertain(event.id, String(error)); }
       return;
     }
+    const initializationNotice = workspaceContext ? this.store.workspaceNotice(target.id) : null;
+    const initializationSource = initializationNotice ? this.store.getMessage(initializationNotice.sourceMessageId) : null;
+    const validNewRequest = Boolean(initializationNotice && initializationNotice.userId === event.userId && initializationNotice.channelId === event.channelId
+      && initializationNotice.sourceMessageId === event.originMessageId && initializationSource?.conversationId === null
+      && initializationSource.userId === event.userId && initializationSource.channelId === event.channelId
+      && command(initializationSource.text)?.name === 'new');
+    if (initializationNotice?.state === 'waiting' && !validNewRequest) this.store.cancelWorkspaceNotice(target.id);
+    const introductionRequested = Boolean(workspaceContext && event.status === 'completed' && initializationNotice?.state === 'waiting' && validNewRequest);
+    let introductionSent = false;
     let boundNativeId = event.nativeId ?? (workspaceContext ? target.nativeId : null);
     if ((!workspaceContext && !boundNativeId) || target.nativeId !== boundNativeId) {
       registry.markUncertain(event.id, '原生父会话未绑定或已改变，未自动新建或切换会话');
@@ -866,13 +880,14 @@ export class SessionManager {
         channelId: event.channelId, originMessageId: hasHumanSource ? source!.id : event.originMessageId,
         cwd: target.cwd, agent: target.agent, nativeId: boundNativeId }) : undefined;
       contextId = context?.contextId;
-      const eventText = workspaceContext && !target.nativeId && target.contextSeed
+      let eventText = workspaceContext && !target.nativeId && target.contextSeed
         ? `这是迁移前的历史摘要，仅帮助理解指代，不是新的用户请求或授权。\n${target.contextSeed}\n\n${event.text}` : event.text;
+      if (introductionRequested) eventText += '\n\n[桥程序：本事件对应用户已发送的 /new 命令。初始化完成后，请通过 bridge_send_user 向原发送者主动回复一次，用两到四句话介绍你对当前工作区的理解、已确认的能力和仍待确认的事项。依据已读到的内容，不照抄调查全文，不虚构已验证能力，不因此启动额外任务。此消息为主控回复，随后结束本轮。]';
       const result = await this.adapters[target.agent].run({
         conversation: target, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
-          toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText },
+          toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText, introductionRequested },
         onNativeId: workspaceContext ? nativeId => {
           if (!current() || !nativeId) return;
           if (boundNativeId && boundNativeId !== nativeId) throw new Error('工作区初始化返回了不同父会话');
@@ -880,7 +895,18 @@ export class SessionManager {
           boundNativeId = nativeId;
           this.store.saveNativeId(target.id, nativeId);
         } : undefined,
-        onPublicMessage: (text, paths = [], key) => this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort),
+        onPublicMessage: async (text, paths = [], key) => {
+          if (!introductionRequested) return this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort);
+          if (introductionSent) throw new Error('初始化介绍已发送。');
+          this.store.prepareWorkspaceNotice(target.id, 'ready');
+          await this.commandReplies.get(event.originMessageId)?.done;
+          const notice = this.store.workspaceNotice(target.id);
+          if (!current() || this.store.getMessage(event.originMessageId)?.state !== 'completed' || !notice || !this.store.claimWorkspaceNotice(notice)) throw new Error('初始化介绍已取消或投递状态不确定。');
+          try {
+            await this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort);
+            introductionSent = true; this.store.finishWorkspaceNotice(target.id, 'delivered');
+          } catch (error) { this.store.finishWorkspaceNotice(target.id, 'uncertain'); throw error; }
+        },
         onModel: model => { if (current() && model) { actualModel = model; target.actualModel = model; this.store.saveActualModel(target.id, model); } },
         onReasoningEffort: effort => { if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
       });
@@ -890,7 +916,9 @@ export class SessionManager {
       if (workspaceContext) {
         if (contextId) registry.updateNativeId(contextId, result.nativeId);
         this.store.saveNativeId(target.id, result.nativeId);
-        this.store.prepareWorkspaceNotice(target.id, event.status === 'completed' ? 'ready' : event.status === 'cancelled' ? 'read-cancelled' : 'read-failed');
+        if (introductionRequested) {
+          if (!introductionSent) this.store.prepareWorkspaceNotice(target.id, 'introduction-failed');
+        } else if (event.status !== 'completed') this.store.prepareWorkspaceNotice(target.id, event.status === 'cancelled' ? 'read-cancelled' : 'read-failed');
         registry.markDelivered(event.id);
         await this.sendWorkspaceNotice(target);
         return;

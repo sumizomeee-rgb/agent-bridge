@@ -28,6 +28,7 @@ export function loadConfig(argv = process.argv.slice(2), createDirectories = tru
     if (typeof candidate !== 'string') throw new Error('未配置该平台的默认 Profile。');
     profileOverride = candidate;
   }
+  if ('proxyPort' in raw) throw new Error('proxyPort 已移至启动 Profile 的 network.proxyPort；公共配置不接受此字段。');
   const profile = selectProfile(raw, configPath, profileOverride);
   if (platformOverride && profile.platform !== platformOverride) throw new Error('Profile 与选择的平台不一致。');
   const token = profile.token ?? '';
@@ -49,7 +50,7 @@ export function loadConfig(argv = process.argv.slice(2), createDirectories = tru
     if (!existsSync(executable)) throw new Error(`${name} 运行时不存在：${executable}`);
     return { command: executable, args: value.args.map(a => a.replaceAll('{project}', projectRoot)) };
   };
-  const proxyPort = portOverride ?? (raw.proxyPort == null ? null : parsePort(String(raw.proxyPort)));
+  const proxyPort = portOverride ?? profile.network?.proxyPort ?? null;
   const proxyUrl = proxyPort == null ? null : `http://127.0.0.1:${proxyPort}`;
   const defaultAgent = raw.defaultAgent ?? 'codex';
   if (defaultAgent !== 'codex' && defaultAgent !== 'claude') throw new Error('defaultAgent 只能是 codex 或 claude');

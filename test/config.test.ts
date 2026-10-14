@@ -20,7 +20,7 @@ test('port override and invalid ports are validated without printing token', () 
     const path = join(root, 'config.json');
     mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
     writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
-    writeFileSync(path, JSON.stringify({ version: 2, startupProfile: 'discord/default', workspace: join(root, 'workspace'), dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, proxyPort: 7898 }));
+    writeFileSync(path, JSON.stringify({ version: 2, startupProfile: 'discord/default', workspace: join(root, 'workspace'), dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } }));
     assert.equal(loadConfig(['--config', path, '--proxy-port', '7899']).proxyUrl, 'http://127.0.0.1:7899');
     assert.throws(() => loadConfig(['--config', path, '--proxy-port', '0']), /1–65535/);
     assert.throws(() => loadConfig(['--config', path, '--proxy-port', 'bad']), /1–65535/);
