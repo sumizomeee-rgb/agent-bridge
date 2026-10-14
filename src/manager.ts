@@ -1,4 +1,4 @@
-import { modelEfforts, validateEffort } from './effort.js';
+import { effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -31,7 +31,7 @@ const HELP = `直接发送文字或图片即可继续当前会话。
 /effort [level|default]：查询或设置当前会话推理强度
 /status：查看当前会话和排队情况
 /computers [refresh|cached]：查看已登记电脑及 Agent 的连接和 CLI 入口
-/workers [all]：查看当前对话或本用户全部对话的运行中直属 Agent
+/workers [all]：查看当前对话或本用户全部对话的已登记直属助手
 /stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务
 /help：查看帮助`;
 
@@ -311,7 +311,7 @@ export class SessionManager {
     for (const id of this.config.modelOptions?.[target.agent] ?? []) {
       if (!models.has(id)) models.set(id, { id, displayName: '配置的自定义模型' });
     }
-    return { models: [...models.values()], defaultModel: info.defaultModel ?? this.config.defaultModels?.[target.agent] ?? null };
+    return { ...info, models: [...models.values()], defaultModel: info.defaultModel };
   }
 
   private async handleModel(message: BridgeMessage, argument: string,
@@ -339,14 +339,11 @@ export class SessionManager {
     if (!isModelId(requested)) { await reply('模型 ID 需要是至多 200 字符的单个名称；/model list 查看选项。'); return; }
     this.modelChanges.add(target.id);
     try {
-      let selected = requested;
+      let selected: string | null = requested;
       let unverified = custom || target.agent === 'claude';
       if (requested === 'default' && !custom) {
-        selected = (await this.modelInfo(target)).defaultModel ?? '';
-        if (!selected || !isModelId(selected)) {
-          await reply('无法确认 CLI 当前默认模型，未修改会话。请从 /model list 选择明确模型。'); return;
-        }
-        unverified = target.agent === 'claude';
+        selected = null;
+        unverified = false;
       } else if (target.agent === 'codex' && !custom && !(this.config.modelOptions?.codex ?? []).includes(requested)) {
         const info = await this.modelInfo(target);
         if (!info.models.some(model => model.id === requested)) {
@@ -367,7 +364,7 @@ export class SessionManager {
       }
       this.store.setModel(target.id, selected);
       this.store.saveActualEffort(target.id, null);
-      await reply(`当前 ${target.agent} 会话下轮使用 ${selected}，上下文保留。${unverified ? '\n已设置模型 ID，提供方可用性尚未验证。' : ''}`);
+      await reply(`当前 ${target.agent} 会话下轮使用 ${selected ?? 'CLI 默认（已清除显式覆盖）'}，上下文保留。${unverified ? '\n已设置模型 ID，提供方可用性尚未验证。' : ''}`);
     } finally {
       this.modelChanges.delete(target.id);
       if (!this.closed && (this.store.pendingCount(target.id) > 0 || this.options.taskRegistry?.getNextEvent(target.id))) this.wake(target.id);
@@ -378,7 +375,7 @@ export class SessionManager {
     const target = this.ensureActive(message.userId);
     if (!argument || argument === 'list') {
       const info = await this.modelInfo(target);
-      await reply(`${target.agent}\n${this.modelStatus(target)}\n当前模型支持强度：${modelEfforts(info, target)?.join('、') || 'CLI 尚未提供'}\n/effort level 设置；/effort default 使用 CLI 默认。`);
+      await reply(`${target.agent}\n${this.modelStatus(target)}\n当前模型支持强度：${effortCapabilityText(modelEffortCapability(info, target))}\n/effort level 设置；/effort default 使用 CLI 默认。`);
       return;
     }
     const busy = () => this.running.get(message.userId)?.conversationId === target.id || this.workers.has(target.id) || this.store.pendingCount(target.id) > 0;
@@ -433,7 +430,7 @@ export class SessionManager {
           }
         }
         const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true });
-        if (current?.agent === agent && current.model) this.store.setModel(target.id, current.model);
+        if (current?.agent === agent && (current.model || current.modelPolicy === 'cli-default')) this.store.setModel(target.id, current.model ?? null);
         if (current?.agent === agent && current.effort) this.store.setEffort(target.id, current.effort);
         this.activate(message.userId, target);
         if (this.config.controllerMode && name === 'new') this.store.requestWorkspaceNotice(target.id, message);
@@ -447,7 +444,7 @@ export class SessionManager {
         const cwd = isAbsolute(value) ? value : resolve(current?.cwd ?? this.config.workspace, value);
         if (!statSync(cwd).isDirectory()) { await reply('指定路径不是目录。'); return; }
         const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd, { controllerMode: this.config.controllerMode === true });
-        if (current?.model) this.store.setModel(target.id, current.model);
+        if (current?.model || current?.modelPolicy === 'cli-default') this.store.setModel(target.id, current.model ?? null);
         if (current?.effort) this.store.setEffort(target.id, current.effort);
         this.activate(message.userId, target);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
@@ -488,7 +485,7 @@ export class SessionManager {
       }
       case 'status':
         await reply(current
-          ? `${agentDisplayName(current.agent)} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}${this.options.taskRegistry ? `\n已登记未结束的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}`
+          ? `${agentDisplayName(current.agent)} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? this.config.controllerMode ? '主控处理1' : '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}${this.options.taskRegistry ? `\n已登记未结束的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}`
           : '还没有会话，发送文字或图片即可开始。');
         return;
       case 'stop': {

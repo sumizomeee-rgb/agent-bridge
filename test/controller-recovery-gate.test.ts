@@ -13,6 +13,17 @@ import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig } from '../src/
 import type { ExecutionTargetBinding } from '../src/remote/types.js';
 
 class Adapter implements AgentAdapter {
+  async getModelInfo() { return { defaultModel: 'gpt-6.1-sol', models: [
+    { id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'gpt-6-astra', displayName: 'Astra', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'haiku', displayName: 'Custom fixture', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'user-alias', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'model-A', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'unsupported', displayName: 'No effort', supportedEfforts: [] },
+    { id: 'unknown', displayName: 'Unknown' },
+  ] }; }
+
   readonly turns: AgentTurn[] = [];
   private readonly pending = new Map<string, { resolve: (result: AgentResult) => void; nativeId: string }>();
   run(turn: AgentTurn): Promise<AgentResult> {

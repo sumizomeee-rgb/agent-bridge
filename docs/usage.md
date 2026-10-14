@@ -63,7 +63,7 @@ steer 超时（10 秒）、连接断开、内部错误、响应损坏或返回�
 | `/agent` | 查看当前 Agent 和两种切换指令 |
 | `/status` | 查看当前会话和排队情况 |
 | `/computers` | 直接检查登记电脑的连接与 Agent CLI 入口；`cached` 使用缓存 |
-| `/workers` | 直接查看当前对话的直属 Agent：电脑、模型、强度、会话名和本轮耗时；`all` 查看本人所有对话 |
+| `/workers` | 查看当前对话的已登记直属助手：电脑、实际模型/强度、会话名、状态和本轮耗时；`all` 查看本人所有对话 |
 | `/model` | 查看 CLI 回报模型、会话选择和新会话默认 |
 | `/model list` 或 `/models` | 列出当前 Agent 的模型 |
 | `/model gpt-6.1-sol` | 在当前 Codex 会话切换模型，保留上下文 |
@@ -75,6 +75,14 @@ steer 超时（10 秒）、连接断开、内部错误、响应损坏或返回�
 | `/stop` | 停止当前任务和待处理消息，保留上下文 |
 | `/cwd 路径` | 在指定目录新建会话 |
 | `/help` | 查看帮助 |
+
+`/workers` 与 `/computers` 使用黄色 ANSI 总览代码框，各助手或电脑独立编号、单独代码框；客户端即使不显示颜色，文字结构仍可读。长列表按完整条目分页，每段不超过 Discord 的 2000 字符限制。会话名适度截断，完整名称与回执可由主控按完整 `workerId` 查询；短 ID 沿用 workerId 前缀，至少 8 位，列表内碰撞时延长，条目保留完整 workerId 与原生 ID 供复制定位。
+
+助手运行数只计已登记且有运行中 job 的助手；等待数是排队的助手 job 轮次，不含空闲历史会话、主控或预约唤醒。presence 显示“运行助手N”和“等待N轮”；现有主控 `/status` 的执行状态显示“主控处理1”，输入队列仍单独显示排队条数，presence 不新增主控计数。助手耗时取本轮 job 的开始时间，已完成轮次取其记录的结束更新时间；缺失或无法确认时明确说明，模型和强度只显示最近 CLI 实际回报，不用请求值替代。
+
+电脑列表区分 SSH/本机连接、执行器 hello、CLI 静态入口、各后端直属派发准备和模型实测；入口就绪仅说明已有检查通过，未知字段保持未确认。本次显示层不增加健康探测或改变缓存。已运行的桥需要部署方安排受控重启才会加载这些修改。
+
+Discord 官方说明：[多行代码框](https://support.discord.com/hc/en-us/articles/210298617-Markdown-Text-101-Chat-Formatting-Bold-Italic-Underline)、[消息内容长度](https://docs.discord.com/developers/resources/message#create-message)。黄色使用 `ansi` 代码框中的 ANSI 33 色及复位，不保证所有客户端显示颜色。
 
 原生菜单的 `/effort` 使用 `level` 选项，例如 `level: xhigh`；留空查询，`level: default` 清除会话选择。
 
@@ -120,13 +128,15 @@ $job = & $ctx.nodePath $ctx.helperPath register --title '工位检查' `
 
 ## 会话推理强度
 
-强度选择写入桥会话数据库的 `effort` 列，不修改用户的 Codex/Claude 配置。旧数据库启动时增加可空列，历史原生会话和绑定保持不变。`/status`、`/model`、`/effort` 区分会话选择与最近 CLI 回报；选择后先清空旧强度回报，不能把“下轮提交”当作已生效。
+`/effort` 只设置当前会话（主控模式中即当前主控）；直属子 Agent 的参数由主控通过派发工具管理，不增加用户逐个管理的菜单。强度选择写入桥会话数据库的 `effort` 列，不修改用户的 Codex/Claude 配置。旧数据库启动时增加可空列，历史原生会话和绑定保持不变。`/status`、`/model`、`/effort` 区分会话选择与最近 CLI 回报；选择后先清空旧强度回报，不能把“下轮提交”当作已生效。
 
-Codex 从实际 CLI `model/list.supportedReasoningEfforts` 校验支持值；例如 GPT-6.1 Sol 支持 `xhigh`。Claude 从初始化元数据的 `supportsEffort`、`supportedEffortLevels` 校验，本机 CLI 2.1.76 接受 low/medium/high/max，不接受 xhigh。缺少模型强度元数据（含未知网关 ID）时拒绝显式强度；可 `/effort default` 沿用 CLI。模型切换若与已有强度选择不兼容会拒绝，需先设置兼容强度或恢复默认。恢复历史后端会话保留它自己的选择，首次切另一后端不复制强度；每次显式强度执行前重新读取模型能力，配置重载也重新校验。执行/排队/切换设置期间拒绝强度修改。
+Codex 从实际 CLI `model/list.supportedReasoningEfforts` 校验支持值；例如 GPT-6.1 Sol 支持 `xhigh`。Claude 从初始化元数据的 `supportsEffort`、`supportedEffortLevels` 校验，本机 CLI 2.1.76 接受 low/medium/high/max，不接受 xhigh。能力统一分为已支持的非空集合、明确不支持的空集合、缺证据的未知状态，并保留 CLI 来源与模型标识。只使用 CLI 明确返回的别名解析，不按名称猜网关能力；能力元数据也不证明网关实际执行。缺少有效模型强度元数据（含未知网关 ID）时拒绝显式强度；明确不支持时也拒绝，不擅自降档，可 `/effort default` 清除显式覆盖、沿用 CLI。模型切换若与已有强度选择不兼容会拒绝，需先设置兼容强度或恢复默认。恢复历史后端会话保留它自己的选择，首次切另一后端不复制强度；每次显式强度执行前重新读取模型能力，配置重载也重新校验。执行/排队/切换设置期间拒绝强度修改。
 
 Codex 使用原生 thread/start 或 thread/resume 的配置覆盖和 turn/start.effort；控制器选择变化重建其 CLI 进程、续接同一原生 ID，不要求 /new。每轮提交后读取 thread/read 的 reasoningEffort：这是 CLI 当前会话配置回报，不是服务端逐轮执行遥测。Claude 用 --effort 与 --resume，控制器使用同一会话；当前 Claude 协议不回报实际强度，状态保持未确认，回复头显示强度未知。不同后端不能共用未验证的强度参数。
 
-同后端的新桥子任务按派发轮次显式 effort、父对话保存的 effort、父对话最近 CLI 实际回报的顺序继承；都未知时沿用目标 CLI 默认。跨后端新任务不复制父强度，使用目标 CLI 原生默认，不修改父会话或用户全局配置。显式强度执行前针对目标后端/模型重新校验；不兼容则明确失败，不强行提交参数。现有子任务和续接保留保存的指定强度，CLI 实际回报单独记录。旧版本把两者混存到 worker.effort，导致 CLI 回报可改变后续续接值；升级后以旧已保存值作为指定值，实际值先保持未知，首次新回报再记录。不能把近期某个 child 显示 xhigh 解释成所有旧任务已跟随父强度改变。同后端 /new、/cwd 沿用显式选择。
+`/model default` 同样清除显式覆盖，保存 `cli-default` 策略，不把查询到的模型 ID 固化；续接时只临时解析目标 CLI 当前默认，无法确认则明确失败。新可空 `model_policy` 列只标记新设置，旧原生会话未设置策略的记录保持原续接行为。Claude 主控读取外部 settings 时，仅透传本机已核对合法的持久 `effortLevel` low/medium/high；无效 xhigh 等字段不进入 `--settings`，源文件不改，max 仍只能在支持它的模型上作为会话参数使用。
+
+同后端的新桥子任务按派发轮次显式 effort、父对话保存的 effort、父对话最近 CLI 实际回报的顺序继承；都未知时沿用目标 CLI 默认。跨后端新任务不复制父强度，使用目标 CLI 原生默认，不修改父会话或用户全局配置。`bridge_start_worker` 和 `bridge_continue_worker` 的新轮在入队与持久化前校验最终后端/模型/强度，不兼容不留新 worker/job，也不污染已有选择；执行前再次校验动态能力。忙时 current 补充不能改变模型或强度，只有显式 next 新轮使用独立参数快照；default 清除对应覆盖，后续省略继承最后排队快照。执行结果未知及未确认接管不自动重放。显式强度不兼容则明确失败，不强行提交参数。现有子任务和续接保留保存的指定强度，CLI 实际回报单独记录。旧版本把两者混存到 worker.effort，导致 CLI 回报可改变后续续接值；升级后以旧已保存值作为指定值，实际值先保持未知，首次新回报再记录。不能把近期某个 child 显示 xhigh 解释成所有旧任务已跟随父强度改变。同后端 /new、/cwd 沿用显式选择。
 
 升级只编译不会改变已运行桥。待桥任务、排队消息和本轮控制器工作完成后，备份运行数据库，安排正常停启一次；启动会同步 12 个 slash 命令。重启期间执行中任务会被取消或记为结果未知，因此不要在长任务运行中重启。上线后在机器人私聊用 /effort 查询，再设置 level 并发送普通消息，核对实际回报和原生会话尾号；Claude 未确认状态不能充作成功遥测。
 

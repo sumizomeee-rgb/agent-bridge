@@ -11,6 +11,17 @@ import type { ControllerJob, ControllerTargetCatalog, ControllerWorker, Controll
 import { RemoteDispatchUncertain, type ExecutionTargetBinding, type RemoteHandoff } from '../src/remote/types.js';
 
 class ExecutionAdapter implements AgentAdapter {
+  async getModelInfo() { return { defaultModel: 'gpt-6.1-sol', models: [
+    { id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'gpt-6-astra', displayName: 'Astra', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'haiku', displayName: 'Custom fixture', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'user-alias', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'model-A', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'unsupported', displayName: 'No effort', supportedEfforts: [] },
+    { id: 'unknown', displayName: 'Unknown' },
+  ] }; }
+
   turns: AgentTurn[] = [];
   interrupts: string[] = [];
   supplements: AgentSupplement[] = [];

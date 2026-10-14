@@ -1,4 +1,4 @@
-import { selectedEffort, validateEffort } from '../effort.js';
+import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, safeError, type JsonObject } from './process.js';
@@ -45,10 +45,15 @@ export class ClaudeAdapter implements AgentAdapter {
         if (typeof id !== 'string' || !id || id === 'default') continue;
         models.push({ id, displayName: typeof item.displayName === 'string' ? item.displayName : id,
           description: typeof item.description === 'string' ? item.description : '',
-          ...(item.supportsEffort === false ? { supportedEfforts: [] } : Array.isArray(item.supportedEffortLevels) ? { supportedEfforts: item.supportedEffortLevels.filter((value): value is string => typeof value === 'string') } : {}) });
+          ...(typeof item.resolvedModel === 'string' ? { resolvedModel: item.resolvedModel } : {}),
+          effortCapability: normalizeEffortCapability('claude', item.supportedEffortLevels,
+            { source: 'claude-initialize', modelId: id,
+              ...(typeof item.resolvedModel === 'string' ? { resolvedModel: item.resolvedModel } : {}),
+              ...(typeof payload.cliVersion === 'string' ? { cliVersion: payload.cliVersion } : {}) }, item.supportsEffort === false),
+          ...(Array.isArray(item.supportedEffortLevels) ? { supportedEfforts: item.supportedEffortLevels.filter((value): value is string => typeof value === 'string') } : item.supportsEffort === false ? { supportedEfforts: [] } : {}) });
       }
       const defaultModel = typeof payload.model === 'string' ? payload.model : typeof payload.defaultModel === 'string' ? payload.defaultModel : this.env.ANTHROPIC_MODEL ?? null;
-      completed.resolve({ models, defaultModel: defaultModel === 'default' ? null : defaultModel });
+      completed.resolve({ models, defaultModel: defaultModel === 'default' ? null : defaultModel, source: 'claude-initialize', ...(typeof payload.cliVersion === 'string' ? { cliVersion: payload.cliVersion } : {}) });
     });
     let success = false;
     try {
@@ -62,6 +67,7 @@ export class ClaudeAdapter implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('Claude 适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
+    turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
     if (effort) await validateEffort(this, turn.conversation, effort);
     turn.onReasoningEffort?.(null);

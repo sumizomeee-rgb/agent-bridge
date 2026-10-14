@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { claudeModelSettings, modelEffortCapability, normalizeEffortCapability, resolveDefaultModel, validateEffort } from '../src/effort.js';
 import { CodexAdapter } from '../src/agents/codex.js';
 import { ClaudeAdapter } from '../src/agents/claude.js';
 import type { AgentTurn } from '../src/types.js';
@@ -57,5 +58,58 @@ test('Claude 原生默认不提交 effort，也不依赖模型强度元数据查
     const records = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line)); const args = records[0].args;
     assert.equal(args.includes('--effort'), false); assert.equal(args[args.indexOf('--model') + 1], 'haiku');
     assert.equal(args[args.indexOf('--resume') + 1], 'same'); assert.equal(records.some(item => item.type === 'user'), true);
+  } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('capabilities distinguish supported/unsupported/unknown and trust only explicit alias metadata', async () => {
+  const target: AgentTurn['conversation'] = { id: 'c', userId: 'u', agent: 'claude', nativeId: null,
+    model: 'haiku', cwd: '.', title: '', createdAt: '', updatedAt: '', actualModel: 'known' };
+  const info = { source: 'fixture', cliVersion: '2.1.76', defaultModel: 'known', models: [
+    { id: 'known', displayName: 'Known', supportedEfforts: ['high'] },
+  ] };
+  assert.equal(modelEffortCapability(info, target).status, 'unknown');
+  assert.equal(modelEffortCapability(info, { ...target, model: null }).status, 'supported');
+  assert.equal(modelEffortCapability({ ...info, defaultModel: null }, { ...target, model: null }).status, 'unknown');
+  const evidence = { source: 'fixture', modelId: 'haiku' };
+  assert.equal(normalizeEffortCapability('claude', [], evidence).status, 'unsupported');
+  assert.equal(normalizeEffortCapability('claude', ['xhigh'], evidence).status, 'unknown');
+  assert.equal(normalizeEffortCapability('claude', ['high', null], evidence).status, 'unknown');
+  assert.equal(normalizeEffortCapability('claude', undefined, evidence).status, 'unknown');
+  const resolved = { ...info, models: [{ id: 'haiku', resolvedModel: 'provider-model', displayName: 'Alias', supportedEfforts: ['high'] }] };
+  assert.equal(modelEffortCapability(resolved, { ...target, model: 'provider-model' }).status, 'supported');
+  assert.equal(modelEffortCapability(resolved, { ...target, model: 'HAIKU' }).status, 'unknown');
+  const adapter = { run: async () => { throw new Error('no generation'); }, interrupt: async () => {}, close: async () => {},
+    getModelInfo: async () => ({ defaultModel: 'haiku', models: [{ id: 'haiku', displayName: 'Haiku', supportedEfforts: [] }] }) };
+  await assert.rejects(validateEffort(adapter, target, 'high'), /不支持可调/);
+  await assert.rejects(validateEffort(adapter, target, 'xhigh'), /claude 不支持/);
+  adapter.getModelInfo = async () => ({ defaultModel: 'haiku', models: [] });
+  await assert.rejects(validateEffort(adapter, target, 'high'), /不能确认兼容性/);
+});
+
+test('Claude filters invalid external persisted effort without mutating source settings', () => {
+  const settings = { model: 'haiku', effortLevel: 'xhigh', alwaysThinkingEnabled: false };
+  assert.deepEqual(claudeModelSettings(settings), { model: 'haiku', alwaysThinkingEnabled: false });
+  assert.equal(settings.effortLevel, 'xhigh');
+  for (const effortLevel of ['low', 'medium', 'high']) assert.equal(claudeModelSettings({ effortLevel }).effortLevel, effortLevel);
+  assert.deepEqual(claudeModelSettings({ effortLevel: 'max' }), {});
+});
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} explicit model default resolves each native resume without persisting a concrete ID`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-default-policy-'));
+  const script = join(dir, 'cli.cjs'), trace = join(dir, 'trace.jsonl'); writeFileSync(script, cli);
+  const adapter = agent === 'codex' ? new CodexAdapter({ command: process.execPath, args: [script] }, { ...process.env, TRACE: trace })
+    : new ClaudeAdapter({ command: process.execPath, args: [script] }, { ...process.env, TRACE: trace });
+  let defaultModel = 'known';
+  adapter.getModelInfo = async () => ({ defaultModel, models: [] });
+  const turn: AgentTurn = { conversation: { id: 'bridge', userId: 'u', agent, nativeId: 'same', model: null, modelPolicy: 'cli-default',
+    cwd: dir, title: '', createdAt: '', updatedAt: '' }, text: 'fixture', imagePaths: [], signal: new AbortController().signal, onProgress: () => {} };
+  try {
+    await adapter.run(turn); defaultModel = 'other'; await adapter.run(turn);
+    const records = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    if (agent === 'codex') assert.deepEqual(records.filter(item => item.method === 'thread/resume').map(item => item.params.model), ['known', 'other']);
+    else assert.deepEqual(records.filter(item => item.args).map(item => item.args[item.args.indexOf('--model') + 1]), ['known', 'other']);
+    assert.equal(turn.conversation.model, null); assert.equal(turn.conversation.nativeId, 'same');
+    defaultModel = ''; await assert.rejects(resolveDefaultModel(adapter, turn), /无法确认/);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
 });

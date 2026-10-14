@@ -11,49 +11,106 @@ export interface WorkerOverview {
   targetId: string; targetLabel: string; agent: AgentName; title: string;
   model: string | null; effort: string | null; nativeId: string | null;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
-  running: boolean; queued: number; startedAt: string | null;
+  running: boolean; queued: number; startedAt: string | null; endedAt?: string | null;
+  blocked?: boolean; ownership?: 'bridge' | 'user'; statusReason?: string;
+  lastResultPreview?: string | null; unresolvedSupplements?: number;
 }
 
-const clean = (value: string, limit = 100): string => value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+const clean = (value: string, limit = 120): string => {
+  const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();
+  return text.length <= limit ? text : text.slice(0, limit - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
+};
 const agentLabel = (agent: AgentName): string => agent === 'codex' ? 'Codex' : 'Claude Code';
+const box = (lines: string[]): string => ['```', ...lines, '```'].join('\n');
+const yellowHeading = (text: string): string => ['```ansi', `\u001b[33m${clean(text, 500)}\u001b[0m`, '```'].join('\n');
 const checkedTime = (value: string | null): string => {
   const parsed = value ? Date.parse(value) : NaN;
   return Number.isFinite(parsed) ? new Date(parsed).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '尚未检查';
 };
 
+/** 仅识别本模块生成的总览，在完整条目之间分页，不改变普通回复。 */
+export function splitOverviewMessage(text: string, limit = 2000): string[] | null {
+  if (!/^```ansi\n\u001b\[33m(?:当前工作区的电脑 · 已登记\d+台|(?:当前对话|你的全部对话)的直属助手 · 运行\d+个 · 等待\d+轮(?: · 待核对\d+个)?)\u001b\[0m\n```(?:\n\n|$)/.test(text)) return null;
+  const [heading, ...blocks] = text.split('\n\n');
+  if (!heading || !heading.endsWith('\n```') || heading.length > limit) throw new Error('总览标题超过消息限制。');
+  const parts: string[] = [];
+  let part = heading;
+  for (const block of blocks) {
+    if (heading.length + 2 + block.length > limit) throw new Error('总览条目超过消息限制。');
+    if (part.length + 2 + block.length > limit) { parts.push(part); part = heading; }
+    part += '\n\n' + block;
+  }
+  parts.push(part);
+  return parts;
+}
+
 export function formatComputerOverview(items: readonly ComputerOverview[]): string {
-  if (!items.length) return '当前工作区没有登记的电脑。';
-  return ['当前工作区的电脑与 Agent', ...items.map(item => {
+  const heading = yellowHeading(`当前工作区的电脑 · 已登记${items.length}台`);
+  if (!items.length) return heading + '\n\n当前工作区没有登记的电脑。';
+  return [heading, ...items.map((item, index) => {
     const connection = { connected: '已连接', unreachable: '连接不可用', unknown: '连接尚未确认' }[item.connection];
-    const agents = item.agents.length ? item.agents.map(engine => {
-      const status = { ready: 'CLI 入口可用', unavailable: 'CLI 入口不可用', unknown: 'CLI 入口尚未确认' }[engine.cli];
-      return `${agentLabel(engine.agent)}：${status}${engine.reason ? `（${clean(engine.reason, 140)}）` : ''}`;
-    }).join('\n  ') : '未登记 Agent';
-    return `${clean(item.label)}（${clean(item.targetId, 64)} · ${item.transport === 'local' ? '桥电脑' : '跨电脑'}）\n  ${connection}${item.reason ? `：${clean(item.reason, 140)}` : ''}；检查：${checkedTime(item.checkedAt)}\n  ${agents}`;
-  }), '登记仅表示已配置；CLI 入口可用不代表模型服务或现有会话一定健康。'].join('\n\n');
+    const hello = item.transport === 'local' ? '本机执行器（无需 SSH hello）'
+      : item.connection === 'connected' ? '已回报' : '未确认';
+    const lines = [`${index + 1}. ${clean(item.label)} · ${clean(item.targetId, 64)}`,
+      `${item.transport === 'local' ? '本机连接' : 'SSH 连接'}：${connection}`, `执行器 hello：${hello}`,
+      `检查时间：${checkedTime(item.checkedAt)}`];
+    if (item.reason || item.connection === 'unreachable') lines.push(`失败原因：${item.reason ? clean(item.reason, 140) : '连接检查失败，具体原因未回报'}`);
+    for (const agent of ['codex', 'claude'] as const) {
+      const engine = item.agents.find(value => value.agent === agent);
+      const cli = engine ? { ready: '可用', unavailable: '不可用', unknown: '未确认' }[engine.cli] : '未登记';
+      const preparation = !engine ? '未登记' : item.connection === 'unreachable' || engine.cli === 'unavailable' ? '未就绪'
+        : item.connection === 'connected' && engine.cli === 'ready' ? '入口已就绪（模型未实测）' : '未确认';
+      lines.push(`${agentLabel(agent)} CLI 静态入口：${cli}`, `${agentLabel(agent)} 直属派发准备：${preparation}`);
+      if (engine?.reason || engine?.cli === 'unavailable') lines.push(`${agentLabel(agent)} 失败原因：${engine.reason ? clean(engine.reason, 140) : 'CLI 静态入口检查未通过，具体原因未回报'}`);
+    }
+    lines.push('模型实测：未提供实测结果');
+    return box(lines);
+  }), '登记仅表示已配置；连接和 CLI 静态入口检查不代表模型服务或现有会话一定健康。'].join('\n\n');
 }
 
 export function elapsedText(startedAt: string | null, now = Date.now()): string {
   const started = startedAt ? Date.parse(startedAt) : NaN;
-  if (!Number.isFinite(started) || started > now) return '开始时间未记录';
+  if (!Number.isFinite(started) || !Number.isFinite(now) || started > now) return '开始时间未记录';
   const seconds = Math.floor((now - started) / 1000);
   const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds % 3600 / 60);
   return hours ? `${hours}小时${minutes}分` : minutes ? `${minutes}分${seconds % 60}秒` : `${seconds}秒`;
 }
 
+function shortWorkerId(item: WorkerOverview, items: readonly WorkerOverview[]): string {
+  let length = Math.min(8, item.workerId.length);
+  while (length < item.workerId.length && items.some(other => other.workerId !== item.workerId && other.workerId.startsWith(item.workerId.slice(0, length)))) length++;
+  return clean(item.workerId.slice(0, length), 256);
+}
+
 export function formatWorkerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): string {
-  const active = items.filter(item => item.running || item.queued > 0 || item.status === 'uncertain' || item.status === 'handoff-pending');
   const prefix = scope === 'all' ? '你的全部对话' : '当前对话';
-  if (!active.length) return `${prefix}没有运行、排队或待核对的直属 Agent。`;
-  const running = active.filter(item => item.running).length;
-  const queued = active.reduce((total, item) => total + item.queued, 0);
-  const uncertain = active.filter(item => item.status === 'uncertain').length;
-  const heading = `${prefix}的直属 Agent · 运行 ${running} 个 · 等待 ${queued} 轮${uncertain ? ` · 待核对 ${uncertain} 个` : ''}`;
+  const running = items.filter(item => item.running).length;
+  const queued = items.reduce((total, item) => total + item.queued, 0);
+  const uncertain = items.filter(item => item.status === 'uncertain').length;
+  const heading = yellowHeading(`${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`);
+  if (!items.length) return heading + `\n\n${prefix}没有已登记的直属助手。`;
   const statuses = { queued: '等待执行', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已停止', uncertain: '状态待核对', idle: '空闲', 'handed-off': '已交给用户', 'handoff-pending': '交接待确认' };
-  return [heading, ...active.map(item => {
-    const status = item.status === 'uncertain' || item.status === 'handoff-pending' ? statuses[item.status] : item.running ? '运行中' : item.queued > 0 ? '等待执行' : statuses[item.status];
-    const elapsed = item.running ? elapsedText(item.startedAt, now) : item.status === 'uncertain' ? '无法确认' : '尚未开始';
-    const source = scope === 'all' ? `\n  主控对话：${clean(item.conversationTitle ?? item.conversationId)}` : '';
-    return `${clean(item.title)} · ${clean(item.workerId, 8)}\n  ${clean(item.targetLabel)}（${clean(item.targetId, 64)}） · ${agentLabel(item.agent)}\n  模型：${item.model ? clean(item.model) : '未确认'}；强度：${item.effort ? clean(item.effort) : '未确认'}\n  ${status}；本轮耗时：${elapsed}；等待 ${item.queued} 轮${source}`;
-  })].join('\n\n');
+  const effortLabels: Record<string, string> = { minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', none: '无' };
+  return [heading, ...items.map((item, index) => {
+    const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? statuses[item.status]
+      : item.running ? '运行中' : item.queued > 0 ? '等待执行' : statuses[item.status];
+    const elapsed = item.status === 'uncertain' ? '未知（状态待核对）' : item.running ? elapsedText(item.startedAt, now)
+      : item.status === 'queued' || item.queued > 0 ? '尚未开始'
+      : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : '未回报';
+    const model = item.model ? clean(item.model).replace(/^gpt-/i, '') || '模型未知' : '模型未知';
+    const actualEffort = item.effort ? clean(item.effort) || '强度未知' : '强度未知';
+    const effort = Object.hasOwn(effortLabels, actualEffort.toLowerCase()) ? effortLabels[actualEffort.toLowerCase()]! : actualEffort;
+    const computer = item.targetId === 'local' ? '桥电脑' : clean(item.targetLabel);
+    const lines = [`${index + 1}. ${computer} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
+      `会话名：${clean(item.title, 80)}`, `电脑：${clean(item.targetLabel)} · target ID：${clean(item.targetId, 64)}`,
+      `workerId：${clean(item.workerId, 256)}`, `原生会话 ID：${item.nativeId ? clean(item.nativeId, 256) : '未回报'}`];
+    if (scope === 'all') lines.push(`主控对话：${clean(item.conversationTitle ?? item.conversationId, 80)}`);
+    if (item.blocked) lines.push('阻塞：已阻塞，需先核对结果与进程');
+    if (item.ownership) lines.push(`拥有权：${item.ownership === 'user' ? '用户' : '桥'}`);
+    if (item.statusReason) lines.push(`状态说明：${clean(item.statusReason, 140)}`);
+    if (item.lastResultPreview != null) lines.push(`最近回执：${clean(item.lastResultPreview, 180)}`);
+    if (item.unresolvedSupplements) lines.push(`未确认补充回执：${item.unresolvedSupplements}条`);
+    lines.push(`${status} · 本轮耗时：${elapsed} · 等待${item.queued}轮`);
+    return box(lines);
+  }), '模型和强度为最近 CLI 回报；未回报则未知。完整会话名、回执及续接/取消/交接操作可由主控按完整 workerId 查询，原有权限检查仍适用。'].join('\n\n');
 }

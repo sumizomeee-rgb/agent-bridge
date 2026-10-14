@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AgentTurn } from '../src/types.js';
@@ -559,6 +559,39 @@ test('controller effort changes resume original native thread and read CLI setti
     assert.equal(start.effort, undefined);
     turn.conversation.effort = 'ultra'; await assert.rejects(s.adapter.run(turn), /不支持/);
   } finally { await s.cleanup(); }
+});
+
+test('Claude controller filters invalid external effort in settings and preserves valid source bytes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-claude-settings-effort-'));
+  const sourceDir = join(dir, '.claude'); mkdirSync(sourceDir);
+  const source = join(sourceDir, 'settings.json');
+  const launches: string[][] = [];
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, {
+    agent: 'claude', dataDir: join(dir, 'data'), userHome: dir, invokeTool: async () => ({}),
+    createTransport: (_command, args) => {
+      launches.push(args); const transport = new FakeTransport();
+      transport.write = message => { if (message.type === 'user') {
+        transport.emit({ type: 'system', subtype: 'init', session_id: 'same-claude', model: 'sonnet', tools: [] });
+        transport.emit({ type: 'result', subtype: 'success', session_id: 'same-claude', result: 'DONE' });
+      } }; return transport;
+    },
+  });
+  const turn: AgentTurn = { conversation: { id: 'c', userId: 'u', agent: 'claude', nativeId: 'same-claude',
+    title: '', cwd: dir, createdAt: '', updatedAt: '' }, text: '', imagePaths: [],
+    event: { kind: 'wake', text: 'fixture' }, signal: new AbortController().signal, onProgress: () => {} };
+  try {
+    for (const effortLevel of ['xhigh', 'high']) {
+      const bytes = Buffer.from(JSON.stringify({ model: 'sonnet', effortLevel, alwaysThinkingEnabled: true }) + '\r\n');
+      writeFileSync(source, bytes); await adapter.run(turn);
+      const args = launches.at(-1)!;
+      const settings = JSON.parse(args[args.indexOf('--settings') + 1]!);
+      assert.equal(settings.effortLevel, effortLevel === 'high' ? 'high' : undefined);
+      assert.equal(settings.model, 'sonnet'); assert.equal(settings.alwaysThinkingEnabled, true);
+      assert.equal(args.includes('--effort'), false);
+      assert.deepEqual(readFileSync(source), bytes);
+    }
+    assert.equal(launches.length, 2);
+  } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('Claude controller passes its own effort with same native resume and leaves actual effort unknown', async () => {

@@ -6,6 +6,8 @@ export interface Conversation {
   nativeId: string | null;
   /** Explicit per-conversation selection; null leaves the CLI default unchanged. */
   model?: string | null;
+  /** Explicit default follows current CLI settings even when resuming; absent preserves legacy native behavior. */
+  modelPolicy?: 'cli-default';
   /** Most recently reported effective model, separate from aliases/selections. */
   actualModel?: string | null;
   /** Most recently reported reasoning effort; null means the CLI did not confirm it. */
@@ -39,8 +41,21 @@ export interface BridgeConfig {
   defaultModels?: Partial<Record<AgentName, string>>;
   modelOptions?: Partial<Record<AgentName, string[]>>;
 }
-export interface AgentModel { id: string; displayName: string; description?: string; isDefault?: boolean; supportedEfforts?: string[] }
-export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | null }
+export type EffortCapability = {
+  status: 'supported'; levels: [string, ...string[]];
+  source: string; modelId: string | null; resolvedModel?: string; cliVersion?: string;
+} | {
+  status: 'unsupported' | 'unknown'; levels: [];
+  source: string; modelId: string | null; resolvedModel?: string; cliVersion?: string;
+};
+export interface AgentModel {
+  id: string; displayName: string; description?: string; isDefault?: boolean;
+  /** Only an explicit CLI resolution may associate an alias with another ID. */
+  resolvedModel?: string; effortCapability?: EffortCapability;
+  /** Compatibility with older metadata adapters; normalized before use. */
+  supportedEfforts?: string[];
+}
+export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | null; source?: string; cliVersion?: string }
 export type AgentInput = { type: 'text'; text: string } | { type: 'localImage'; path: string };
 export interface AgentSupplement { id: string; input: AgentInput[] }
 export type SteerResult = { status: 'accepted' } | { status: 'queued'; reason?: string; unsupported?: boolean } | { status: 'uncertain'; reason: string };

@@ -38,7 +38,7 @@ export const SLASH_COMMANDS: SlashDefinition[] = [
   { type: 1, name: 'computers', description: '查看已登记电脑、连接状态和 Agent CLI 入口', contexts: [1], options: [
     { type: 5, name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
   ] },
-  { type: 1, name: 'workers', description: '查看运行中直属 Agent 的电脑、会话和本轮耗时', contexts: [1], options: [
+  { type: 1, name: 'workers', description: '查看已登记直属助手的电脑、会话、状态和本轮耗时', contexts: [1], options: [
     { type: 3, name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [
       { name: '当前对话', value: 'current' }, { name: '我的全部对话', value: 'all' },
     ] },

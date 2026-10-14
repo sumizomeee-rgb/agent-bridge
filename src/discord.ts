@@ -7,7 +7,7 @@ import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
 import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
-import type { WorkCounts } from './overview.js';
+import { splitOverviewMessage, type WorkCounts } from './overview.js';
 import { discordReplyHeader } from './reply.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
@@ -305,8 +305,8 @@ export class DiscordTransport {
 
   private flushPresence(): void {
     const state = this.desiredPresence === 'idle'
-      ? [this.restartNotice ? '已重启' : '', this.workCounts.running ? `运行 ${this.workCounts.running}` : '',
-        this.workCounts.queued ? `排队 ${this.workCounts.queued}` : ''].filter(Boolean).join(' · ') || '空闲'
+      ? [this.restartNotice ? '已重启' : '', this.workCounts.running ? `运行助手${this.workCounts.running}` : '',
+        this.workCounts.queued ? `等待${this.workCounts.queued}轮` : ''].filter(Boolean).join(' · ') || '空闲'
       : { draining: '准备重启', recovering: '恢复中', failed: '重启失败' }[this.desiredPresence];
     const payload = { since: null, activities: [{ name: 'Bridge', type: 4, state }],
       status: this.desiredPresence === 'idle' ? 'online' : this.desiredPresence === 'failed' ? 'dnd' : 'idle', afk: false };
@@ -338,7 +338,7 @@ export class DiscordTransport {
     const rawPrefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
     const prefix = options?.repeatHeader ? `${discordReplyHeader(options.repeatHeader)}\n\n` : '';
     if (prefix && (prefix.length >= 1998 || (text.length > 0 && !text.startsWith(rawPrefix)))) throw new Error('回复头过长或与正文不一致。');
-    const parts = prefix ? chunks(text.slice(rawPrefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : chunks(text);
+    const parts = prefix ? chunks(text.slice(rawPrefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : splitOverviewMessage(text) ?? chunks(text);
     const previous = this.sendQueues.get(channelId) ?? Promise.resolve();
     const job = previous.catch(() => undefined).then(async () => {
       signal?.throwIfAborted();
@@ -411,7 +411,7 @@ export class DiscordTransport {
     if (!snowflake(interaction.id) || !snowflake(interaction.applicationId) || !interaction.token || interaction.token.length > 4096) {
       throw new Error('无效的 Discord 交互回复信息。');
     }
-    const parts = chunks(text || '命令已完成。');
+    const parts = splitOverviewMessage(text) ?? chunks(text || '命令已完成。');
     const endpoint = `/webhooks/${interaction.applicationId}/${encodeURIComponent(interaction.token)}`;
     for (let index = 0; index < parts.length; index++) {
       await this.interactionRest(index === 0 ? `${endpoint}/messages/@original` : endpoint,

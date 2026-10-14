@@ -1,4 +1,4 @@
-import { selectedEffort, validateEffort } from '../effort.js';
+import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, safeError, type JsonObject, type RpcTransport } from './process.js';
 
@@ -35,6 +35,7 @@ export class CodexAdapter implements AgentAdapter {
           if (!models.some(model => model.id === value.model)) models.push({
             id: value.model, displayName: typeof value.displayName === 'string' ? value.displayName : value.model,
             description: typeof value.description === 'string' ? value.description : '', isDefault: value.isDefault === true,
+            effortCapability: normalizeEffortCapability('codex', Array.isArray(value.supportedReasoningEfforts) ? value.supportedReasoningEfforts.map(item => isObject(item) ? item.reasoningEffort : null) : undefined, { source: 'codex-model-list', modelId: value.model }),
             ...(Array.isArray(value.supportedReasoningEfforts) ? { supportedEfforts: value.supportedReasoningEfforts.filter(isObject).map(item => item.reasoningEffort).filter((item): item is string => typeof item === 'string') } : {}),
           });
         }
@@ -43,7 +44,7 @@ export class CodexAdapter implements AgentAdapter {
         if (cursor) cursors.add(cursor);
       } while (cursor);
       success = true;
-      return { models, defaultModel: typeof config.model === 'string' && config.model ? config.model : models.find(model => model.isDefault)?.id ?? null };
+      return { models, source: 'codex-model-list', defaultModel: typeof config.model === 'string' && config.model ? config.model : models.find(model => model.isDefault)?.id ?? null };
     } finally {
       await transport.stop(success); rpc.close(); this.metadataProcesses.delete(transport);
     }
@@ -52,6 +53,7 @@ export class CodexAdapter implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
+    turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
     if (effort) await validateEffort(this, turn.conversation, effort);
     if (turn.signal.aborted) throw abortError();

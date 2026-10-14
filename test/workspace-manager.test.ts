@@ -12,6 +12,9 @@ import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, ReplyOptions } from '../src/types.js';
 
 class Children implements AgentAdapter {
+  async getModelInfo() { return { source: 'offline-fixture', defaultModel: 'gpt-6.1-sol', models: [
+    { id: 'gpt-6.1-sol', displayName: 'Fixture', supportedEfforts: ['medium'] },
+  ] }; }
   readonly turns: AgentTurn[] = [];
   onRun?: (turn: AgentTurn) => void;
   readonly pending = new Map<string, { resolve: (value: AgentResult) => void; reject: (error: Error) => void }>();

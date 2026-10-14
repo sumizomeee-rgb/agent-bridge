@@ -10,6 +10,7 @@ import type { NativeSessionAdoption, NativeSessionAdoptArgs, NativeSessionPage, 
 export interface RemoteAdapterOptions { clientFactory?: (binding: ExecutionTargetBinding) => RemoteClient; pollMs?: number; reconnectDeadlineMs?: number; reconnectDelayMs?: number }
 export class RemoteAgentAdapter implements AgentAdapter {
   private client: RemoteClient | null = null;
+  private reconnecting: Promise<void> | null = null;
   private readonly jobs = new Map<string, { dispatchId: string; submitted: boolean; cancelled: boolean }>();
   private readonly lastDispatch = new Map<string, string>();
   private readonly imageMappings = new Map<string, string>();
@@ -19,8 +20,17 @@ export class RemoteAgentAdapter implements AgentAdapter {
     if (this.closed) throw new Error('远端适配器已关闭。');
     return this.client ??= this.options.clientFactory?.(this.binding) ?? new SshRemoteClient(this.binding, this.config.workspace);
   }
-  private async validate(): Promise<void> {
-    const hello = await this.connection().request<{ hostname: string; version: number; engines: string[] }>('hello', {});
+  private async validate(allowPreparingRecovery = false, retry = true): Promise<void> {
+    if (retry && this.reconnecting) await this.reconnecting;
+    const client = this.connection();
+    let hello: { hostname: string; version: number; engines: string[] };
+    try { hello = await client.request('hello', {}); }
+    catch (error) {
+      const idle = this.jobs.size === 0 || (allowPreparingRecovery && this.jobs.size === 1 && [...this.jobs.values()].every(job => !job.submitted));
+      // Only a failed handshake may be retried before dispatch; probes cannot detach busy work.
+      if (!retry || !idle || this.knownRejection(error)) throw error;
+      await this.reconnect(client); return;
+    }
     if (hello.version !== 1 || typeof hello.hostname !== 'string' || hello.hostname.toLowerCase() !== this.binding.expectedHostname!.toLowerCase()
       || !Array.isArray(hello.engines) || !hello.engines.includes(this.binding.agent)) throw Object.assign(new Error('目标电脑名称、协议版本或引擎与登记不一致。'), { code: 'REMOTE_REJECTED' });
   }
@@ -42,10 +52,16 @@ export class RemoteAgentAdapter implements AgentAdapter {
     const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
     return ['REMOTE_REJECTED', 'DISPATCH_NOT_FOUND', 'REMOTE_JOB_FAILED'].includes(code);
   }
-  private async reconnect(): Promise<void> {
-    const previous = this.client; this.client = null;
-    try { await previous?.close(); } catch {}
-    await this.validate();
+  private async reconnect(failedClient = this.client): Promise<void> {
+    if (this.reconnecting) return this.reconnecting;
+    if (this.client !== failedClient) return this.validate(false, false);
+    const work = (async () => {
+      const previous = this.client; this.client = null;
+      try { await previous?.close(); } catch {}
+      await this.validate(false, false);
+    })();
+    this.reconnecting = work;
+    try { await work; } finally { if (this.reconnecting === work) this.reconnecting = null; }
   }
   /** Reattachment never resubmits dispatch, even when its initial acknowledgement was lost. */
   async inspectDispatch(dispatchId: string): Promise<RemoteJob> {
@@ -97,7 +113,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
     let nativeId: string | null = null; let ready = false; let model: string | undefined; let effort: string | null | undefined;
     let activitySequence = 0;
     try {
-      try { await this.validate(); }
+      try { await this.validate(true); }
       catch (error) { if (!turn.recovering || this.knownRejection(error)) throw error; await this.inspectDispatch(turn.dispatchId); }
       if (!turn.recovering) {
         if (turn.signal.aborted || execution.cancelled) throw Object.assign(new Error('远端任务尚未派发，已取消。'), { name: 'AbortError' });

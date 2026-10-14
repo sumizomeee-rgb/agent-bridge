@@ -12,6 +12,17 @@ import type { NativeSessionAdoptArgs, NativeSessionAdoption, NativeSessionRead }
 import type { WorkCounts } from '../src/overview.js';
 
 class Child implements AgentAdapter {
+  async getModelInfo() { return { defaultModel: 'gpt-6.1-sol', models: [
+    { id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'gpt-6-astra', displayName: 'Astra', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'haiku', displayName: 'Custom fixture', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'user-alias', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'model-A', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'unsupported', displayName: 'No effort', supportedEfforts: [] },
+    { id: 'unknown', displayName: 'Unknown' },
+  ] }; }
+
   turns: AgentTurn[] = [];
   pending = new Map<string, { resolve: (value: AgentResult) => void; reject: (error: Error) => void; nativeId: string }>();
   async run(turn: AgentTurn): Promise<AgentResult> {
@@ -261,6 +272,66 @@ test('worker overview excludes other users and shows actual running-round start,
     f.runtime.store.addJob({ ...job, id: 'legacy', workerId: 'other-parent', startedAt: undefined });
     f.runtime.store.setJob('legacy', 'running', { startedAt: '2026-10-13T11:00:00Z' });
     assert.equal(f.runtime.store.getJob('legacy')!.startedAt, undefined);
+    f.codex.finish(h.workerId); await flush();
+  } finally { await f.cleanup(); }
+});
+
+
+test('model/effort incompatibility rejects before start/next persistence and never changes active work', async () => {
+  const f = setup();
+  try {
+    for (const model of ['unsupported', 'unknown']) {
+      await assert.rejects(launch(f, { model, effort: 'high' }), /不支持|不能确认/);
+      assert.equal(f.runtime.store.workers().length, 0); assert.equal(f.runtime.store.jobs().length, 0);
+    }
+    const h = await launch(f); await flush();
+    const before = structuredClone(f.runtime.store.getWorker(h.workerId)!);
+    for (const model of ['unsupported', 'unknown']) {
+      await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'invalid next', delivery: 'next', model }), /不支持|不能确认/);
+      assert.deepEqual(f.runtime.store.getWorker(h.workerId), before); assert.equal(f.runtime.store.jobs().length, 1);
+    }
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'current change', model: 'gpt-6-astra' }), /delivery=next/);
+    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'default next', delivery: 'next', model: 'default', effort: 'default' }) as Handle;
+    assert.deepEqual(f.runtime.store.getJob(next.jobId!)!.execution, { model: null, effort: null, modelPolicy: 'cli-default' });
+    assert.deepEqual(f.runtime.store.getWorker(h.workerId), { ...before, updatedAt: f.runtime.store.getWorker(h.workerId)!.updatedAt });
+    f.codex.finish(h.workerId); await flush(); await flush();
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.model, null);
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.modelPolicy, 'cli-default');
+    assert.equal(f.codex.turns[1]!.conversation.nativeId, before.nativeId);
+    f.codex.finish(h.workerId); await flush();
+  } finally { await f.cleanup(); }
+});
+
+test('queued capability changes fail before applying the snapshot or launching another turn', async () => {
+  const f = setup();
+  try {
+    const h = await launch(f); await flush();
+    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', {
+      workerId: h.workerId, prompt: 'next with changed model', delivery: 'next', model: 'gpt-6-astra', effort: 'high',
+    }) as Handle;
+    const before = structuredClone(f.runtime.store.getWorker(h.workerId)!);
+    f.codex.getModelInfo = async () => ({ defaultModel: 'gpt-6.1-sol', models: [
+      { id: 'gpt-6-astra', displayName: 'Changed capability', supportedEfforts: [] },
+    ] });
+    f.codex.finish(h.workerId); await flush(); await flush();
+    assert.equal(f.runtime.store.getJob(next.jobId!)!.status, 'failed');
+    assert.match(f.runtime.store.getJob(next.jobId!)!.result!, /不支持可调/);
+    assert.deepEqual(f.runtime.store.getWorker(h.workerId), before);
+    assert.equal(f.codex.turns.length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test('capability lookup racing worker handoff does not enqueue or overwrite ownership', async () => {
+  const f = setup();
+  try {
+    const h = await launch(f); await flush();
+    let release!: () => void; const query = new Promise<void>(resolve => { release = resolve; });
+    const metadata = f.codex.getModelInfo.bind(f.codex);
+    f.codex.getModelInfo = async () => { await query; return metadata(); };
+    const next = f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'next', delivery: 'next' });
+    await flush(); const worker = f.runtime.store.getWorker(h.workerId)!; worker.ownership = 'user'; f.runtime.store.saveWorker(worker);
+    release(); await assert.rejects(next, /交接给用户/); assert.equal(f.runtime.store.jobs().length, 1);
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.ownership, 'user');
     f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }
 });

@@ -93,16 +93,31 @@ test('切model保留nativeID及上下文，实际model与选择持久化到重�
   assert.equal(inspect(store => store.getActive('owner')!.nativeId), prior.nativeId);
 });
 
-test('/model default解析配置默认5.6，保留原生会话，避免误用目录推荐6.1', async t => {
+test('/model default清除覆盖，保留原生会话并跟随CLI默认', async t => {
   const { f, send, inspect } = fixture(t);
   await send('first'); await waitFor(() => f.replies.some(reply => reply.text.endsWith('\n\nreply:first')));
   const id = inspect(store => store.getActive('owner')!.nativeId);
   await send('/model gpt-6.1-sol');
   await send('/model default');
   const selected = inspect(store => store.getActive('owner')!);
-  assert.equal(selected.model, 'gpt-5.6-sol'); assert.equal(selected.nativeId, id);
+  assert.equal(selected.model, null); assert.equal(selected.modelPolicy, 'cli-default'); assert.equal(selected.nativeId, id);
   await send('default turn'); await waitFor(() => f.codex.calls.length === 2);
-  assert.equal(f.codex.calls[1]!.conversation.model, 'gpt-5.6-sol');
+  assert.equal(f.codex.calls[1]!.conversation.model, null);
+});
+
+test('explicit model default survives reopen and same-backend new/cwd without rewriting legacy records', async t => {
+  const { f, send, inspect } = fixture(t);
+  await send('/model default');
+  const oldId = inspect(store => store.getActive('owner')!.id);
+  await f.manager.close();
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink);
+  assert.equal(inspect(store => store.getActive('owner')!.modelPolicy), 'cli-default');
+  await send('/new'); await send(`/cwd ${f.root}`);
+  const selected = inspect(store => store.getActive('owner')!);
+  assert.equal(selected.model, null); assert.equal(selected.modelPolicy, 'cli-default');
+  assert.equal(inspect(store => store.getConversation(oldId)!.modelPolicy), 'cli-default');
+  await send('/new claude');
+  assert.equal(inspect(store => store.getActive('owner')!.modelPolicy), undefined);
 });
 
 test('同Agent的/new和/cwd保留显式model，清除原生上下文和实际model；换Agent用CLI默认', async t => {
@@ -192,7 +207,7 @@ test('Claude支持网关跨协议型号，不强制官方白名单，并支持/m
   assert.equal(f.claude.calls[0]!.conversation.model, 'gpt-6-sol');
 });
 
-test('元数据失败和无法解析default均不改变旧选择', async t => {
+test('元数据失败保留显式选择，default无需解析即可清除覆盖', async t => {
   const { f, send, inspect } = fixture(t);
   await send('/model gateway/model-v1');
   f.codex.metadata = async () => { throw new Error('metadata offline'); };
@@ -200,8 +215,8 @@ test('元数据失败和无法解析default均不改变旧选择', async t => {
   assert.equal(inspect(store => store.getActive('owner')!.model), 'gateway/model-v1');
   f.codex.metadata = async () => ({ models: [], defaultModel: null });
   await send('/model default');
-  assert.equal(inspect(store => store.getActive('owner')!.model), 'gateway/model-v1');
-  assert.match(f.replies.at(-1)!.text, /无法确认 CLI 当前默认/);
+  assert.equal(inspect(store => store.getActive('owner')!.model), null);
+  assert.match(f.replies.at(-1)!.text, /已清除显式覆盖/);
 });
 
 test('旧SQLite迁移保留active、nativeId和历史，新model列可重启恢复', t => {

@@ -173,10 +173,10 @@ test('重启提示保留至获准用户输入，后台发送和未授权消息�
     return packet ? ((packet.d as Record<string, unknown>).activities as Array<{ state: string }>)[0]!.state : undefined;
   };
   f.transport.setPresence('idle'); await f.transport.start(); await eventually(() => state() === '已重启');
-  f.transport.setWorkCounts({ running: 1, queued: 0 }); await eventually(() => state() === '已重启 · 运行 1');
-  await f.transport.sendText('222', '后台结果。'); assert.equal(state(), '已重启 · 运行 1');
-  f.dispatch({ author: { id: '444', bot: false } }); await delay(20); assert.equal(state(), '已重启 · 运行 1');
-  f.dispatch(); await eventually(() => received.length === 1 && state() === '运行 1');
+  f.transport.setWorkCounts({ running: 1, queued: 0 }); await eventually(() => state() === '已重启 · 运行助手1');
+  await f.transport.sendText('222', '后台结果。'); assert.equal(state(), '已重启 · 运行助手1');
+  f.dispatch({ author: { id: '444', bot: false } }); await delay(20); assert.equal(state(), '已重启 · 运行助手1');
+  f.dispatch(); await eventually(() => received.length === 1 && state() === '运行助手1');
   f.transport.setWorkCounts({ running: 0, queued: 0 }); await eventually(() => state() === '空闲');
   f.sockets.at(-1)!.terminate(); await eventually(() => f.packets.some(packet => packet.op === 6));
   await eventually(() => f.packets.filter(packet => packet.op === 3).length >= 5); assert.equal(state(), '空闲');
@@ -191,7 +191,7 @@ test('全桥数量合并、完整文字去重，重启阶段覆盖数字，恢�
   f.transport.setWorkCounts({ running: 2, queued: 3 });
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
   const state = () => ((f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>).activities as Array<{ state: string }>)[0]!.state;
-  assert.equal(state(), '已重启 · 运行 2 · 排队 3');
+  assert.equal(state(), '已重启 · 运行助手2 · 等待3轮');
   f.transport.setWorkCounts({ running: 2, queued: 3 }); await delay(25);
   assert.equal(f.packets.filter(packet => packet.op === 3).length, 2);
   f.transport.setPresence('draining');
@@ -201,7 +201,7 @@ test('全桥数量合并、完整文字去重，重启阶段覆盖数字，恢�
   assert.equal(f.packets.filter(packet => packet.op === 3).length, 3);
   f.transport.setPresence('idle');
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 4);
-  assert.equal(state(), '已重启 · 运行 9 · 排队 8');
+  assert.equal(state(), '已重启 · 运行助手9 · 等待8轮');
   assert.equal(f.posts.length, 0);
 });
 
@@ -218,12 +218,12 @@ test('全桥数量同阶段限流只保留最新值，重连强制发布，错�
   await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 5);
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 6);
   const latest = () => f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
-  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行 6 · 排队 3' }]);
+  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行助手6 · 等待3轮' }]);
   for (const count of [-1, 0.5, NaN, Infinity]) f.transport.setWorkCounts({ running: count, queued: 0 });
   await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 6);
   f.sockets.at(-1)!.terminate();
   await eventually(() => f.packets.some(packet => packet.op === 6) && f.packets.filter(packet => packet.op === 3).length === 7);
-  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行 6 · 排队 3' }]);
+  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行助手6 · 等待3轮' }]);
   assert.equal(f.posts.length, 0);
 });
 

@@ -5,7 +5,7 @@ import type { AgentAdapter, AgentName, AgentTurn, BridgeConfig, Conversation } f
 import type { TaskContextFile, TaskOrigin, TaskRegistry, TaskTerminalStatus } from '../tasks.js';
 import { ControllerStore } from './store.js';
 import { isModelId } from '../config.js';
-import { effortValues } from '../effort.js';
+import { effortValues, resolveDefaultModel, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
@@ -71,6 +71,13 @@ export class ControllerRuntime {
     if (worker.target && this.callbacks.targetCatalog) return this.callbacks.targetCatalog.adapterFor(worker.target);
     if (worker.target?.transport === 'ssh') throw new Error('远端执行目标服务未配置，拒绝改为本机执行');
     return this.adapters[worker.agent];
+  }
+  private async validateWorkerSelection(worker: ControllerWorker, execution: NonNullable<ControllerJob['execution']> = { model: worker.model, effort: worker.effort, ...(worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {}) }): Promise<void> {
+    if (!execution.effort) return;
+    const target: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent,
+      nativeId: worker.nativeId, model: execution.model, effort: execution.effort, cwd: worker.cwd,
+      title: worker.title, createdAt: worker.createdAt, updatedAt: worker.updatedAt };
+    await validateEffort(this.adapter(worker), target, execution.effort);
   }
   private assertBridgeOwnership(worker: ControllerWorker): void {
     if (worker.supersededBy) throw new Error('此原生会话已转交其他直属 Agent，旧登记仅保留历史');
@@ -158,6 +165,7 @@ export class ControllerRuntime {
     return this.store.workers().filter(worker => worker.origin.userId === conversation.userId
       && worker.origin.channelId && (scope === 'all' || worker.origin.conversationId === conversation.id)).map(worker => {
       const jobs = this.store.jobs(worker.id); const active = jobs.find(job => job.status === 'running'); const latest = jobs.at(-1);
+      const currentJob = active ?? latest;
       const queued = jobs.filter(job => job.status === 'queued').length;
       const status = worker.handoffPending || worker.adoption?.status === 'pending' ? 'handoff-pending'
         : worker.ownership === 'user' || worker.supersededBy ? 'handed-off' : worker.blocked ? 'uncertain'
@@ -165,8 +173,15 @@ export class ControllerRuntime {
       return { workerId: worker.id, conversationId: worker.origin.conversationId,
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
         targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
-        model: worker.model ?? worker.actualModel, effort: worker.actualEffort ?? worker.effort, nativeId: worker.nativeId,
-        status, running: !!active, queued, startedAt: active?.startedAt ?? null };
+        model: worker.actualModel, effort: worker.actualEffort ?? null, nativeId: worker.nativeId,
+        blocked: worker.blocked === true, ownership: worker.ownership ?? 'bridge',
+        ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
+          : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
+          : latest?.cancelReason ? { statusReason: latest.cancelReason } : {}),
+        lastResultPreview: latest?.result == null ? null : listText(latest.result, 180),
+        unresolvedSupplements: this.store.supplements().filter(value => value.workerId === worker.id && ['pending', 'steering', 'uncertain'].includes(value.status)).length,
+        status, running: !!active, queued, startedAt: currentJob?.startedAt ?? null,
+        endedAt: currentJob && ['completed', 'failed', 'cancelled'].includes(currentJob.status) ? currentJob.updatedAt : null };
     });
   }
   private async workCountsChanged(): Promise<void> {
@@ -476,8 +491,9 @@ export class ControllerRuntime {
       // A subsequent queued round inherits the latest queued selection; a current-round supplement uses the active selection.
       const inherited = args.delivery === 'next' || !active ? this.store.jobs(worker.id).filter(job => job.status === 'queued').at(-1)?.execution : undefined;
       const execution = { model: this.selectedWorkerModel(args.model, inherited?.model === undefined ? worker.model : inherited.model),
-        effort: this.selectedWorkerEffort(args.effort, worker.agent, inherited?.effort === undefined ? worker.effort : inherited.effort) };
-      if (active && args.delivery !== 'next' && (execution.model !== worker.model || execution.effort !== worker.effort)) throw new Error('运行中的 Agent 不能在当前轮切换模型或强度；请用 delivery=next 为下一轮设置参数。');
+        effort: this.selectedWorkerEffort(args.effort, worker.agent, inherited?.effort === undefined ? worker.effort : inherited.effort),
+        ...((args.model === 'default' || (args.model === undefined && (inherited ? inherited.modelPolicy : worker.modelPolicy) === 'cli-default')) ? { modelPolicy: 'cli-default' as const } : {}) };
+      if (active && args.delivery !== 'next' && (execution.model !== worker.model || execution.effort !== worker.effort || execution.modelPolicy !== worker.modelPolicy)) throw new Error('运行中的 Agent 不能在当前轮切换模型或强度；请用 delivery=next 为下一轮设置参数。');
       if (active && args.delivery !== 'next') {
         const supplement: ControllerSupplement = { id: randomUUID(), workerId: worker.id, jobId: active.job.id, origin, prompt, imagePaths: images,
           status: !this.adapter(worker).steer ? 'unsupported' : active.abort.signal.aborted ? 'cancelled' : !active.executing ? 'not_delivered' : 'pending',
@@ -490,12 +506,21 @@ export class ControllerRuntime {
         if (supplement.status === 'pending') this.pumpSupplements(worker.id, active);
         return result;
       }
-      const job = this.makeJob(worker, origin, prompt, images, execution);
+      const queueBefore = this.store.jobs(worker.id).filter(job => job.status === 'queued').map(job => [job.id, job.execution]);
+      await this.validateWorkerSelection(worker, execution);
+      const latest = this.ownedWorker(origin, worker.id);
+      this.assertBridgeOwnership(latest);
+      if (this.closed || this.stopping || this.isDraining() || latest.blocked || this.active.get(worker.id) !== active
+        || latest.model !== worker.model || latest.effort !== worker.effort || latest.modelPolicy !== worker.modelPolicy
+        || canonical(this.store.jobs(worker.id).filter(job => job.status === 'queued').map(job => [job.id, job.execution])) !== canonical(queueBefore)) {
+        throw new Error('校验期间子会话或队列状态已改变，未排队；请按当前状态重试。');
+      }
+      const job = this.makeJob(latest, origin, prompt, images, execution);
       const result = { workerId: worker.id, jobId: job.id, status: 'queued', delivery: 'next', nativeId: worker.nativeId,
         agent: worker.agent, model: execution.model, effort: execution.effort, target: worker.target ?? null, ownership: worker.ownership ?? 'bridge' };
       this.store.transaction(() => {
-        worker.imagePaths = [...new Set([...worker.imagePaths, ...images])]; worker.updatedAt = this.timestamp();
-        this.store.saveWorker(worker); this.store.addJob(job); if (key) this.store.saveCall(key, fingerprint, result);
+        latest.imagePaths = [...new Set([...latest.imagePaths, ...images])]; latest.updatedAt = this.timestamp();
+        this.store.saveWorker(latest); this.store.addJob(job); if (key) this.store.saveCall(key, fingerprint, result);
       });
       if (!this.started) await this.start();
       this.kick(worker.id);
@@ -503,6 +528,7 @@ export class ControllerRuntime {
       return result;
     }
     let target: ExecutionTargetBinding | undefined;
+    let preparedWorker: ControllerWorker | undefined;
     if (name === 'bridge_start_worker') {
       const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId']);
       const agent = args.agent === undefined ? turn.conversation.agent : args.agent;
@@ -511,23 +537,24 @@ export class ControllerRuntime {
         args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
       if (target.agent !== agent || target.id !== (args.targetId ?? 'local')) throw new Error('执行目标服务返回的电脑或引擎与请求不一致');
       if (target.transport === 'local' && (!isAbsolute(target.cwd) || /[\r\n]/.test(target.cwd) || !statSync(target.cwd).isDirectory())) throw new Error('工作目录必须是本机已有目录的绝对路径');
-      if (this.isDraining()) throw new Error('桥正在安全重启，已暂停新派发');
+      const model = this.selectedWorkerModel(args.model, agent === turn.conversation.agent ? turn.conversation.model ?? null : null);
+      const effort = this.selectedWorkerEffort(args.effort, agent, agent === turn.conversation.agent
+        ? turn.effort ?? turn.conversation.effort ?? turn.conversation.actualEffort ?? null : null);
+      preparedWorker = { id: randomUUID(), origin, agent, model, actualModel: null, target, ownership: 'bridge',
+        effort, ...((args.model === 'default' || (args.model === undefined && agent === turn.conversation.agent && turn.conversation.modelPolicy === 'cli-default')) ? { modelPolicy: 'cli-default' as const } : {}), cwd: target.cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
+        imagePaths: this.images(turn, args.imagePaths), wakeAllowed: true, blocked: false,
+        createdAt: this.timestamp(), updatedAt: this.timestamp() };
+      text(args.prompt, '任务内容', 128 * 1024);
+      await this.validateWorkerSelection(preparedWorker);
+      if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或安全重启，已暂停派发');
     }
     let workerToStart: string | undefined;
     const result = this.store.transaction(() => {
       let result: unknown;
       if (name === 'bridge_start_worker') {
         const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId']);
-        const agent = args.agent === undefined ? turn.conversation.agent : args.agent;
-        if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
-        const cwd = target!.cwd;
-        const model = this.selectedWorkerModel(args.model, agent === turn.conversation.agent ? turn.conversation.model ?? null : null);
-        const effort = this.selectedWorkerEffort(args.effort, agent, agent === turn.conversation.agent ? turn.effort ?? turn.conversation.effort ?? turn.conversation.actualEffort ?? null : null);
-        const images = this.images(turn, args.imagePaths);
-        const worker: ControllerWorker = { id: randomUUID(), origin, agent, model, actualModel: null, target: target!, ownership: 'bridge',
-          effort, cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
-          imagePaths: images, wakeAllowed: true, blocked: false, createdAt: this.timestamp(), updatedAt: this.timestamp() };
-        const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), images);
+        const worker = preparedWorker!;
+        const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), worker.imagePaths);
         this.store.addWorker(worker); this.store.addJob(job); workerToStart = worker.id;
         result = { workerId: worker.id, jobId: job.id, status: 'queued', agent: worker.agent, model: worker.model, effort: worker.effort, nativeId: worker.nativeId, target: worker.target, ownership: worker.ownership };
       } else if (name === 'bridge_schedule_wake') {
@@ -626,7 +653,7 @@ export class ControllerRuntime {
     for (const value of this.store.supplements(state.job.id)) if (value.status === 'pending') this.setSupplement(value,
       state.abort.signal.aborted ? 'cancelled' : 'not_delivered', '当前轮结束或停止前未发送；未自动排队。');
   }
-  private makeJob(worker: ControllerWorker, origin: TaskOrigin, prompt: string, imagePaths: string[], execution = { model: worker.model, effort: worker.effort }): ControllerJob {
+  private makeJob(worker: ControllerWorker, origin: TaskOrigin, prompt: string, imagePaths: string[], execution: ControllerJob['execution'] = { model: worker.model, effort: worker.effort, ...worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {} }): ControllerJob {
     return { id: randomUUID(), workerId: worker.id, origin, prompt, imagePaths, status: 'queued', taskId: null, result: null,
       cancelReason: null, wakeAllowed: true, execution, createdAt: this.timestamp(), updatedAt: this.timestamp() };
   }
@@ -664,24 +691,31 @@ export class ControllerRuntime {
     worker.nativeId = value;
   }
   private async execute(workerId: string, state: ActiveWorker): Promise<void> {
-    const worker = this.store.getWorker(workerId)!;
+    let worker = this.store.getWorker(workerId)!;
     let job = this.store.getJob(state.job.id)!;
     if (job.status !== (state.recovering ? 'running' : 'queued') || this.stopping) { await this.settleSupplements(state); return; }
-    if (!state.recovering) {
-      this.store.setJob(job.id, 'running', { startedAt: this.timestamp() });
-      if (job.execution) {
-        if (worker.model !== job.execution.model) worker.actualModel = null;
-        if (worker.effort !== job.execution.effort || worker.model !== job.execution.model) worker.actualEffort = null;
-        worker.model = job.execution.model; worker.effort = job.execution.effort; this.store.saveWorker(worker);
-      }
-    }
+    if (!state.recovering) this.store.setJob(job.id, 'running', { startedAt: this.timestamp() });
     await this.workCountsChanged();
     try {
       this.assertBridgeOwnership(worker);
+      if (!state.recovering) {
+        // Recheck dynamic metadata before applying the queued selection to the worker.
+        await this.validateWorkerSelection(worker, job.execution);
+        worker = this.store.getWorker(workerId)!;
+        this.assertBridgeOwnership(worker);
+        if (worker.blocked || state.abort.signal.aborted) throw new Error('子 Agent 已暂停或正在停止，本轮未提交。');
+        if (job.execution) {
+          if (worker.model !== job.execution.model) worker.actualModel = null;
+          if (worker.effort !== job.execution.effort || worker.model !== job.execution.model) worker.actualEffort = null;
+          worker.model = job.execution.model; worker.effort = job.execution.effort;
+          if (job.execution.modelPolicy) worker.modelPolicy = job.execution.modelPolicy; else delete worker.modelPolicy;
+          this.store.saveWorker(worker);
+        }
+      }
       if (!job.taskId) this.register(worker, job);
       job = this.store.getJob(job.id)!; state.job = job;
       const conversation: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent, nativeId: worker.nativeId,
-        model: worker.model, actualModel: worker.actualModel, effort: worker.effort, actualEffort: worker.actualEffort ?? null, title: worker.title, cwd: worker.cwd,
+        model: worker.model, ...worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {}, actualModel: worker.actualModel, effort: worker.effort, actualEffort: worker.actualEffort ?? null, title: worker.title, cwd: worker.cwd,
         createdAt: worker.createdAt, updatedAt: this.timestamp() };
       const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction) + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
@@ -696,7 +730,9 @@ export class ControllerRuntime {
         onModel: actualModel => { const current = this.store.getWorker(worker.id)!; current.actualModel = actualModel; this.store.saveWorker(current); },
         onReasoningEffort: effort => { const current = this.store.getWorker(worker.id)!; current.actualEffort = effort; this.store.saveWorker(current); } };
       // No taskContextPath: the worker is already registered by this service.
-      const running = this.adapter(worker).run(turn);
+      const adapter = this.adapter(worker);
+      const prepared = await resolveDefaultModel(adapter, turn);
+      const running = adapter.run(prepared);
       void this.count(job.origin.conversationId);
       const result = await running;
       await this.settleSupplements(state);

@@ -6,6 +6,7 @@ import { createServer } from 'node:net';
 import { request as httpRequest } from 'node:http';
 import { JsonLineProcess, isObject } from '../agents/process.js';
 import type { ExecutionTargetBinding, RemoteClient } from './types.js';
+import type { AgentCommand } from '../types.js';
 
 interface Endpoint { version: 1; hostname: string; port: number; token: string }
 /** Private metadata is transferred by SFTP; it never appears in a command argument or registry. */
@@ -44,6 +45,11 @@ async function freeLoopbackPort(): Promise<number> {
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('无法分配本地隧道端口。');
   const port = address.port; await new Promise<void>(resolveValue => server.close(() => resolveValue())); return port;
 }
+export interface SshRemoteClientOptions {
+  /** Offline transport fixtures; production uses SSH/SFTP and authenticated loopback HTTP. */
+  createProcess?: (command: AgentCommand, cwd: string) => JsonLineProcess;
+  requestHttp?: typeof requestRemoteHttp;
+}
 export class SshRemoteClient implements RemoteClient {
   private transport: JsonLineProcess | null = null;
   private metadataCopy: JsonLineProcess | null = null;
@@ -51,13 +57,23 @@ export class SshRemoteClient implements RemoteClient {
   private port = 0;
   private startup: Promise<void> | null = null;
   private closed = false;
-  constructor(private readonly binding: ExecutionTargetBinding, private readonly cwd: string, private readonly timeoutMs = 20_000) {}
+  constructor(private readonly binding: ExecutionTargetBinding, private readonly cwd: string, private readonly timeoutMs = 20_000, private readonly options: SshRemoteClientOptions = {}) {}
+  private process(command: AgentCommand): JsonLineProcess {
+    return this.options.createProcess?.(command, this.cwd) ?? new JsonLineProcess(command, [], this.cwd, {});
+  }
+  private async clearConnection(): Promise<void> {
+    const copy = this.metadataCopy, transport = this.transport;
+    await Promise.all([copy?.stop(false), transport?.stop(false)]);
+    if (this.metadataCopy === copy) this.metadataCopy = null;
+    if (this.transport === transport) this.transport = null;
+    this.endpoint = null; this.port = 0;
+  }
   private async initialize(): Promise<void> {
     if (this.closed) throw new Error('远端隧道客户端已关闭。');
     const directory = await mkdtemp(join(tmpdir(), 'rin-remote-endpoint-')); const path = join(directory, `${randomUUID()}.json`);
     try {
       await new Promise<void>((resolveValue, reject) => {
-        const copy = new JsonLineProcess({ command: 'scp', args: ['-q', '-F', this.binding.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', remoteMetadataSpec(this.binding), path] }, [], this.cwd, {});
+        const copy = this.process({ command: 'scp', args: ['-q', '-F', this.binding.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', remoteMetadataSpec(this.binding), path] });
         this.metadataCopy = copy;
         const timer = setTimeout(() => { void copy.stop(false).catch(() => {}); reject(new Error('获取远端连接元数据超时。')); }, this.timeoutMs);
         copy.child.on('error', () => { clearTimeout(timer); reject(new Error('无法启动远端连接元数据传输。')); });
@@ -71,15 +87,15 @@ export class SshRemoteClient implements RemoteClient {
     if (this.closed) throw new Error('远端隧道客户端已关闭。');
     this.port = await freeLoopbackPort();
     if (this.closed) throw new Error('远端隧道客户端已关闭。');
-    this.transport = new JsonLineProcess({ command: 'ssh', args: ['-F', this.binding.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+    this.transport = this.process({ command: 'ssh', args: ['-F', this.binding.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
       '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2', '-N', '-n', '-T',
-      '-L', `127.0.0.1:${this.port}:127.0.0.1:${this.endpoint!.port}`, this.binding.alias!] }, [], this.cwd, {});
+      '-L', `127.0.0.1:${this.port}:127.0.0.1:${this.endpoint!.port}`, this.binding.alias!] });
     let failed: Error | null = null; this.transport.onFailure(error => { failed = error; });
     const deadline = Date.now() + this.timeoutMs;
     while (!this.closed && Date.now() < deadline) {
       if (failed) throw failed;
       try {
-        const hello = await requestRemoteHttp<{ hostname: string; version: number }>(this.port, this.endpoint!.token, 'hello', {}, 750);
+        const hello = await (this.options.requestHttp ?? requestRemoteHttp)<{ hostname: string; version: number }>(this.port, this.endpoint!.token, 'hello', {}, 750);
         if (hello.version !== 1 || hello.hostname.toLowerCase() !== this.binding.expectedHostname!.toLowerCase()) throw Object.assign(new Error('隧道目标电脑名称不符。'), { code: 'REMOTE_REJECTED' });
         return;
       } catch (error) { if (error && typeof error === 'object' && 'code' in error && error.code === 'REMOTE_REJECTED') throw error; }
@@ -89,8 +105,15 @@ export class SshRemoteClient implements RemoteClient {
   }
   async request<T = unknown>(method: string, args: unknown): Promise<T> {
     if (this.closed) throw new Error('远端隧道客户端已关闭。');
-    this.startup ??= this.initialize(); await this.startup;
-    return requestRemoteHttp<T>(this.port, this.endpoint!.token, method, args, this.timeoutMs);
+    this.startup ??= this.initialize().catch(async error => {
+      // Keep concurrent callers on one failure; a later call must reread the endpoint.
+      await this.clearConnection(); this.startup = null;
+      throw error;
+    });
+    await this.startup;
+    if (this.closed) throw new Error('远端隧道客户端已关闭。');
+    // Never replay a request here: dispatch or supplement delivery may already have happened.
+    return (this.options.requestHttp ?? requestRemoteHttp)<T>(this.port, this.endpoint!.token, method, args, this.timeoutMs);
   }
-  async close(): Promise<void> { this.closed = true; await this.metadataCopy?.stop(false); await this.transport?.stop(false); this.transport = null; this.endpoint = null; }
+  async close(): Promise<void> { this.closed = true; await this.clearConnection(); }
 }

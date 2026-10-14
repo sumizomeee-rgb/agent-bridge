@@ -11,6 +11,17 @@ import { TaskRegistry, type TaskCompletionEvent, type TaskContextFile } from '..
 import type { AgentAdapter, AgentResult, AgentTurn, AgentSupplement, SteerResult, BridgeConfig } from '../src/types.js';
 
 class FakeAdapter implements AgentAdapter {
+  async getModelInfo() { return { defaultModel: 'gpt-6.1-sol', models: [
+    { id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'gpt-6-astra', displayName: 'Astra', supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+    { id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'haiku', displayName: 'Custom fixture', supportedEfforts: ['low', 'medium', 'high'] },
+    { id: 'user-alias', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'model-A', displayName: 'Fixture', supportedEfforts: ['medium'] },
+    { id: 'unsupported', displayName: 'No effort', supportedEfforts: [] },
+    { id: 'unknown', displayName: 'Unknown' },
+  ] }; }
+
   turns: AgentTurn[] = [];
   interrupts: string[] = [];
   pending = new Map<string, { resolve: (value: AgentResult) => void; reject: (error: Error) => void }>();

@@ -8,6 +8,7 @@ export type ControllerJobStatus = 'queued' | 'running' | 'completed' | 'failed' 
 export interface ControllerWorker {
   id: string; origin: TaskOrigin; agent: AgentName; model: string | null; actualModel: string | null;
   actualEffort?: string | null;
+  modelPolicy?: 'cli-default';
   effort: string | null; cwd: string; title: string; nativeId: string | null; imagePaths: string[];
   target?: ExecutionTargetBinding; ownership?: 'bridge' | 'user'; handoffPending?: boolean;
   wakeAllowed: boolean; blocked?: boolean; createdAt: string; updatedAt: string;
@@ -24,7 +25,7 @@ export interface ControllerJob {
   /** Route cancellation belongs to this dispatch, never all future turns of an idle worker. */
   wakeAllowed?: boolean;
   startedAt?: string;
-  execution?: { model: string | null; effort: string | null };
+  execution?: { model: string | null; effort: string | null; modelPolicy?: 'cli-default' };
   createdAt: string; updatedAt: string;
 }
 export interface ControllerSupplement {
