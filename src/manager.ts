@@ -425,7 +425,9 @@ export class SessionManager {
         this.activate(message.userId, target);
         if (this.config.controllerMode && name === 'new') this.store.requestWorkspaceNotice(target.id, message);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
-        await reply(`已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '我会先了解这个工作区，完成后回来介绍。' : '可以直接发消息开始。'}\n目录：${target.cwd}`);
+        const text = `已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '正在初始化工作区；完成后由主控发送介绍。' : '可以直接发消息开始。'}\n目录：${target.cwd}`;
+        await reply(text, { presentation: { title: `新会话已创建 · ${agentDisplayName(agent)}`, tone: 'info', purpose: 'status',
+          blocks: [{ kind: 'entry', text }] } });
         return;
       }
       case 'cwd': {

@@ -508,6 +508,9 @@ test('/new 子任务已结束但父上下文仍在载入时不提前宣布就绪
   assert.match(initializationReceipts(f)[0]!.text, /你好，我是这个工作区的主控/);
   assert.equal(f.controller.turns[0]!.event?.introductionRequested, true);
   assert(initializationReceipts(f)[0]!.options?.repeatHeader, '介绍通过主控正常公开回复链路带实际元数据');
+  assert.match(initializationReceipts(f)[0]!.options!.repeatHeader!, /Codex · 6.1-sol · 中 ·/);
+  assert.equal(f.replies[0]!.options?.presentation?.purpose, 'status', '新建回执使用系统卡片，不能伪造尚未回报的模型标题');
+  assert.match(f.replies[0]!.options!.presentation!.title, /新会话已创建/);
   assert(!initializationReceipts(f)[0]!.text.includes('PRIVATE_CONTEXT'));
   assert.equal(f.inspect.getActive('user')!.nativeId, nativeId);
 });

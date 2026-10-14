@@ -65,7 +65,7 @@ export function markdownParts(text: string, maxBytes = 8000): string[] {
   return parts;
 }
 export function feishuPresentationCards(view: BridgePresentation): Record<string, unknown>[] {
-  const template = view.purpose === 'overview' && view.tone === 'info' ? 'orange' : { info: 'blue', success: 'green', warning: 'orange', error: 'red' }[view.tone];
+  const template = view.purpose === 'reply' ? 'green' : 'orange';
   const make = (elements: unknown[], index?: number): Record<string, unknown> => ({ schema: '2.0', config: { wide_screen_mode: true },
     header: { template, title: { tag: 'plain_text', content: titleText(view.title) + (index ? ` · ${index}` : '') } }, body: { elements } });
   const cards: Record<string, unknown>[] = []; let elements: unknown[] = [];

@@ -99,6 +99,7 @@ test('飞书实际发送路径使用卡片展示命令和模型回复，生命�
   await bridge.onBridgeLifecycle({ phase: 'ready', reason: 'restart', recipient: { userId: prefix + 'ou_owner', channelId: prefix + 'oc_chat' } });
   assert.equal(messages.length, 2); assert.equal(messages[1].receive_id, 'oc_chat');
   assert.match(JSON.parse(messages[1].content).header.title.content, /重启成功/);
+  assert.equal(JSON.parse(messages[1].content).header.template, 'orange', '系统成功通知也使用黄框，模型回复保留绿框');
 });
 test('Feishu recovery spans equal timestamps across pages without losing lower opaque IDs or replaying duplicates', async t => {
   const { root, config, cleanup } = setup(t), handled: string[] = [];
