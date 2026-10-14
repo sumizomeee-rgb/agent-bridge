@@ -1,4 +1,4 @@
-import type { AgentName } from './types.js';
+import type { AgentName, EffortConfiguration } from './types.js';
 import { discordPresentationText, type BridgePresentation } from './presentation.js';
 
 export interface WorkCounts { running: number; queued: number }
@@ -11,6 +11,7 @@ export interface WorkerOverview {
   workerId: string; conversationId: string; conversationTitle?: string;
   targetId: string; targetLabel: string; agent: AgentName; title: string;
   model: string | null; effort: string | null; nativeId: string | null;
+  requestedEffort?: string | null; effortConfiguration?: EffortConfiguration | null;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
   running: boolean; queued: number; startedAt: string | null; endedAt?: string | null;
   blocked?: boolean; ownership?: 'bridge' | 'user'; statusReason?: string;
@@ -26,6 +27,13 @@ const clean = (value: string, limit = 120): string => {
   const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();
   return text.length <= limit ? text : text.slice(0, limit - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
 };
+const effortNames: Record<string, string> = { none: '无', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', auto: '自动' };
+function workerEffort(item: WorkerOverview): string {
+  const label = (value: string) => Object.hasOwn(effortNames, value.toLowerCase()) ? effortNames[value.toLowerCase()]! : clean(value, 30);
+  if (item.effort) return label(item.effort);
+  if (item.effortConfiguration) return `${label(item.effortConfiguration.value)}〔${item.effortConfiguration.source === 'argument' ? '启动参数' : item.effortConfiguration.source === 'environment' ? '环境配置' : 'CLI 配置'}〕`;
+  return item.requestedEffort ? `${label(item.requestedEffort)}〔指定〕` : 'CLI 默认 · 未回报';
+}
 const agentLabel = (agent: AgentName): string => agent === 'codex' ? 'Codex' : 'Claude Code';
 const checkedTime = (value: string | null): string => {
   const parsed = value ? Date.parse(value) : NaN;
@@ -106,11 +114,10 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
   const rank = (item: WorkerOverview) => item.running ? 0 : ['uncertain', 'handoff-pending', 'failed'].includes(item.status) ? 1 : item.queued ? 2 : 3;
   const sorted = [...items].sort((a, b) => rank(a) - rank(b));
   const states = { queued: '⏳ 等待执行', running: '🔄 运行中', completed: '✅ 已完成', failed: '❌ 失败', cancelled: '⏹ 已停止', uncertain: '⚠️ 待核对', idle: '💤 空闲', 'handed-off': '👤 已交给你', 'handoff-pending': '⚠️ 交接待确认' };
-  const effortNames: Record<string, string> = { none: '无', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高' };
   return { title: view === 'history' ? `${label}的历史助手 · 共${items.length}个` : `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`, tone: 'info', purpose: 'overview',
     blocks: sorted.length ? sorted.map((item, index) => {
       const model = item.model ? clean(item.model, 60).replace(/^gpt-/i, '') : '模型未知';
-      const effort = item.effort ? (Object.hasOwn(effortNames, item.effort.toLowerCase()) ? effortNames[item.effort.toLowerCase()]! : clean(item.effort, 30)) : '强度未知';
+      const effort = workerEffort(item);
       const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
       const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? '尚未开始' : '耗时未回报';
       const lines = [`${index + 1}. ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
@@ -143,7 +150,6 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
   const title = view === 'history' ? `${prefix}的历史助手 · 共${items.length}个` : `${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`;
   if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: view === 'history' ? `${prefix}没有历史助手。` : `${prefix}没有正在执行、排队或待核对的助手。` }] };
   const statuses = { queued: '等待执行', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已停止', uncertain: '状态待核对', idle: '空闲', 'handed-off': '已交给用户', 'handoff-pending': '交接待确认' };
-  const effortLabels: Record<string, string> = { minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', none: '无' };
   return { title, tone: 'info', purpose: 'overview', blocks: items.map((item, index) => {
     const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? statuses[item.status]
       : item.running ? '运行中' : item.queued > 0 ? '等待执行' : statuses[item.status];
@@ -151,12 +157,13 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
       : item.status === 'queued' || item.queued > 0 ? '尚未开始'
       : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : '未回报';
     const model = item.model ? clean(item.model).replace(/^gpt-/i, '') || '模型未知' : '模型未知';
-    const actualEffort = item.effort ? clean(item.effort) || '强度未知' : '强度未知';
-    const effort = Object.hasOwn(effortLabels, actualEffort.toLowerCase()) ? effortLabels[actualEffort.toLowerCase()]! : actualEffort;
+    const effort = workerEffort(item);
     const computer = item.targetId === 'local' ? '桥电脑' : clean(item.targetLabel);
     const lines = [`${index + 1}. ${computer} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
       `会话名：${clean(item.title, 80)}`, `电脑：${clean(item.targetLabel)} · target ID：${clean(item.targetId, 64)}`,
       `workerId：${clean(item.workerId, 256)}`, `原生会话 ID：${item.nativeId ? clean(item.nativeId, 256) : '未回报'}`];
+    lines.push(`强度指定：${item.requestedEffort ? clean(item.requestedEffort, 30) : 'CLI 默认'} · CLI 回报：${item.effort ? clean(item.effort, 30) : '未回报'}`);
+    if (item.effortConfiguration) lines.push(`启动配置：${clean(item.effortConfiguration.value, 30)} · 来源：${item.effortConfiguration.source}`);
     if (scope === 'all') lines.push(`主控对话：${clean(item.conversationTitle ?? item.conversationId, 80)}`);
     if (item.blocked) lines.push('阻塞：已阻塞，需先核对结果与进程');
     if (item.ownership) lines.push(`拥有权：${item.ownership === 'user' ? '用户' : '桥'}`);
@@ -165,5 +172,5 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
     if (item.unresolvedSupplements) lines.push(`未确认补充回执：${item.unresolvedSupplements}条`);
     lines.push(`${status} · 本轮耗时：${elapsed} · 等待${item.queued}轮`);
     return { kind: 'entry', text: lines.join('\n') };
-  }), footer: '模型和强度为最近 CLI 回报；未回报则未知。完整会话名、回执及续接/取消/交接操作可由主控按完整 workerId 查询，原有权限检查仍适用。' };
+  }), footer: '模型来自 CLI 回报；强度优先显示回报，〔配置〕和〔指定〕仅表示启动设置，未证明模型实际执行。完整会话名、回执及续接/取消/交接操作可由主控按完整 workerId 查询，原有权限检查仍适用。' };
 }

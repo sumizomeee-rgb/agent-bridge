@@ -1,5 +1,6 @@
 import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
+import { claudeEffortConfiguration } from './claude-effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, safeError, type JsonObject } from './process.js';
 
@@ -71,6 +72,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const effort = selectedEffort(turn);
     if (effort) await validateEffort(this, turn.conversation, effort);
     turn.onReasoningEffort?.(null);
+    turn.onEffortConfiguration?.(await claudeEffortConfiguration(this.command, this.env, turn.conversation.cwd, effort));
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');
     const content: JsonObject[] = [];

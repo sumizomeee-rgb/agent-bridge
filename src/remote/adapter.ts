@@ -111,7 +111,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
     const execution = { dispatchId: turn.dispatchId, submitted: turn.recovering === true, cancelled: false };
     this.jobs.set(turn.conversation.id, execution); this.lastDispatch.set(turn.conversation.id, turn.dispatchId);
     let nativeId: string | null = null; let ready = false; let model: string | undefined; let effort: string | null | undefined;
-    let activitySequence = 0;
+    let activitySequence = 0; let configurationKey: string | undefined;
     try {
       try { await this.validate(true); }
       catch (error) { if (!turn.recovering || this.knownRejection(error)) throw error; await this.inspectDispatch(turn.dispatchId); }
@@ -135,6 +135,9 @@ export class RemoteAgentAdapter implements AgentAdapter {
         if (job.nativeId && nativeId !== job.nativeId) { nativeId = job.nativeId; turn.onNativeId?.(job.nativeId); }
         if (job.actualModel && model !== job.actualModel) { model = job.actualModel; turn.onModel?.(model); }
         if (job.actualEffort !== undefined && effort !== job.actualEffort) { effort = job.actualEffort; turn.onReasoningEffort?.(effort); }
+        if (job.effortConfiguration !== undefined && configurationKey !== JSON.stringify(job.effortConfiguration)) {
+          configurationKey = JSON.stringify(job.effortConfiguration); turn.onEffortConfiguration?.(job.effortConfiguration);
+        }
         if (job.ready && !ready) { ready = true; turn.onReady?.(); }
         if (job.progress && job.progress.sequence > activitySequence) {
           activitySequence = job.progress.sequence;

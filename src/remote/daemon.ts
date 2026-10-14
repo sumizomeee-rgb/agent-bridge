@@ -281,7 +281,8 @@ export class RemoteDaemon {
       onReady: () => this.store.update(request.dispatchId, { ready: true }),
       onNativeId: nativeId => { this.store.bindSession(nativeId, request.workerId, request.agent, request.cwd, request.userId); this.store.update(request.dispatchId, { nativeId }); },
       onModel: actualModel => this.store.update(request.dispatchId, { actualModel }),
-      onReasoningEffort: actualEffort => this.store.update(request.dispatchId, { actualEffort }) };
+      onReasoningEffort: actualEffort => this.store.update(request.dispatchId, { actualEffort }),
+      onEffortConfiguration: effortConfiguration => this.store.update(request.dispatchId, { effortConfiguration }) };
     // Deferring keeps the handle durable before native execution starts.
     const done = Promise.resolve().then(async () => {
       let terminal: Partial<RemoteJob>;

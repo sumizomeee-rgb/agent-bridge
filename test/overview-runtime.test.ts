@@ -46,6 +46,9 @@ test('只读总览使用实际 metadata 与本轮 job 时间，计数排除空�
     const active = overview.find(value => value.workerId === 'running')!;
     assert.equal(active.startedAt, '2026-10-13T08:00:00Z');
     assert.equal(active.model, null); assert.equal(active.effort, null);
+    assert.equal(active.requestedEffort, 'xhigh'); assert.equal(active.effortConfiguration, null);
+    const configured = runtime.store.getWorker('running')!; configured.effortConfiguration = { value: 'high', source: 'environment' }; runtime.store.saveWorker(configured);
+    assert.deepEqual(runtime.queryWorkerOverview(conversation).find(value => value.workerId === 'running')!.effortConfiguration, { value: 'high', source: 'environment' });
     const actual = runtime.store.getWorker('running')!; actual.actualModel = 'gpt-6.1-sol'; actual.actualEffort = 'medium'; runtime.store.saveWorker(actual);
     const observed = runtime.queryWorkerOverview(conversation).find(value => value.workerId === 'running')!;
     assert.equal(observed.model, 'gpt-6.1-sol'); assert.equal(observed.effort, 'medium');

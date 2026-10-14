@@ -23,7 +23,8 @@ class FakeNative implements AgentAdapter {
   nativeId: string = randomUUID();
   async run(turn: AgentTurn): Promise<AgentResult> {
     this.turn = turn; this.nativeId = turn.conversation.nativeId ?? this.nativeId;
-    turn.onNativeId?.(this.nativeId); turn.onModel?.('actual-model'); turn.onReasoningEffort?.('medium'); turn.onReady?.();
+    turn.onNativeId?.(this.nativeId); turn.onModel?.('actual-model'); turn.onReasoningEffort?.('medium');
+    turn.onEffortConfiguration?.({ value: 'high', source: 'user-settings' }); turn.onReady?.();
     return new Promise((resolve, reject) => { this.resolve = resolve; this.reject = reject; });
   }
   async steer(_id: string, input: AgentSupplement): Promise<SteerResult> { this.supplements.push(input); return { status: 'accepted' }; }
@@ -311,4 +312,21 @@ test('remote native progress is durable and repeated polling never fabricates a 
     native.finish(); await run; assert.equal(f.daemon.store.job(turn.dispatchId!)!.progress!.sequence, 2);
     assert.equal(f.calls.filter(value => value === 'dispatch').length, 1); assert.equal(native.interrupts, 0);
   } finally { await f.adapter.close(); await f.daemon.close(); }
+});
+
+test('remote launch configuration survives storage and polling separately from native confirmation', async () => {
+  const f = fixture();
+  try {
+    const turn = f.turn(); const configurations: unknown[] = [], actual: unknown[] = [];
+    turn.onEffortConfiguration = value => configurations.push(value);
+    turn.onReasoningEffort = value => actual.push(value);
+    const running = f.adapter.run(turn);
+    while (!f.natives.length || !configurations.length) await tick();
+    const stored = f.daemon.store.job(turn.dispatchId!)!;
+    assert.deepEqual(stored.effortConfiguration, { value: 'high', source: 'user-settings' });
+    assert.equal(stored.actualEffort, 'medium');
+    f.natives[0]!.finish(); await running;
+    assert.deepEqual(configurations, [{ value: 'high', source: 'user-settings' }]);
+    assert.deepEqual(actual, ['medium']);
+  } finally { await f.daemon.close(); }
 });

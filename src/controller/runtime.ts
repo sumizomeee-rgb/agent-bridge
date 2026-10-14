@@ -173,7 +173,8 @@ export class ControllerRuntime {
       return { workerId: worker.id, conversationId: worker.origin.conversationId,
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
         targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
-        model: worker.actualModel, effort: worker.actualEffort ?? null, nativeId: worker.nativeId,
+        model: worker.actualModel, effort: worker.actualEffort ?? null, requestedEffort: worker.effort,
+        effortConfiguration: worker.effortConfiguration ?? null, nativeId: worker.nativeId,
         blocked: worker.blocked === true, ownership: worker.ownership ?? 'bridge',
         ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
@@ -596,7 +597,7 @@ export class ControllerRuntime {
           const lastResultPreview = latest?.result == null ? null : preview(latest.result);
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
             target: worker.target ?? null, ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
-            effort: worker.effort, actualEffort: worker.actualEffort ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
+            effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
             startedAt: currentJob?.startedAt ?? null,
@@ -717,6 +718,7 @@ export class ControllerRuntime {
           this.store.saveWorker(worker);
         }
       }
+      if (!state.recovering) { worker.actualEffort = null; worker.effortConfiguration = null; this.store.saveWorker(worker); }
       if (!job.taskId) this.register(worker, job);
       job = this.store.getJob(job.id)!; state.job = job;
       const conversation: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent, nativeId: worker.nativeId,
@@ -733,7 +735,8 @@ export class ControllerRuntime {
         },
         onNativeId: nativeId => this.nativeId(worker, nativeId),
         onModel: actualModel => { const current = this.store.getWorker(worker.id)!; current.actualModel = actualModel; this.store.saveWorker(current); },
-        onReasoningEffort: effort => { const current = this.store.getWorker(worker.id)!; current.actualEffort = effort; this.store.saveWorker(current); } };
+        onReasoningEffort: effort => { const current = this.store.getWorker(worker.id)!; current.actualEffort = effort; this.store.saveWorker(current); },
+        onEffortConfiguration: configuration => { const current = this.store.getWorker(worker.id)!; current.effortConfiguration = configuration; this.store.saveWorker(current); } };
       // No taskContextPath: the worker is already registered by this service.
       const adapter = this.adapter(worker);
       const prepared = await resolveDefaultModel(adapter, turn);

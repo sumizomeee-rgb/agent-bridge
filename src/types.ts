@@ -83,6 +83,10 @@ export interface AgentActivity extends AgentActivityMetadata {
   /** Owned remote snapshot; polling never creates a fresh native activity timestamp. */
   snapshot?: AgentExecutionProgress;
 }
+export interface EffortConfiguration {
+  value: string;
+  source: 'argument' | 'environment' | 'user-settings' | 'project-settings' | 'local-settings' | 'session-settings';
+}
 export interface AgentTurn {
   conversation: Conversation;
   text: string;
@@ -112,6 +116,8 @@ export interface AgentTurn {
   effort?: string;
   onModel?: (model: string) => void;
   onReasoningEffort?: (effort: string | null) => void;
+  /** Captured on the execution machine at launch; separate from native confirmation. */
+  onEffortConfiguration?: (configuration: EffortConfiguration | null) => void;
 }
 export interface AgentResult { nativeId: string; text: string; controlledOutput?: boolean }
 export interface AgentAdapter {

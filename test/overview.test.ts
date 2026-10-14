@@ -73,7 +73,7 @@ test('空列表、未知回报、完成、空闲及阻塞状态均可读，历�
     worker({ workerId: 'failed', status: 'failed', running: false, queued: 0, lastResultPreview: '真实执行失败', endedAt: '2026-10-13T07:59:00Z' }),
   ], 'current', now);
   assert.match(text, /运行1个 · 等待2轮 · 待核对1个/);
-  assert.match(text, /模型未知 · 强度未知/);
+  assert.match(text, /模型未知 · CLI 默认 · 未回报/);
   assert.match(text, /本轮耗时：开始时间未记录/);
   assert.match(text, /阻塞：已阻塞/); assert.match(text, /状态说明：进程退出未确认/);
   assert.match(text, /未确认补充回执：2条/);
@@ -96,7 +96,7 @@ test('会话名安全截断、短 ID 碰撞扩展且完整复制信息保留', (
     worker({ workerId: '12345678-b', title: '正常会话', model: 'gpt-6.1-sol', effort: null }),
     worker({ workerId: 'worker-c', title: '```\u001b[31m\n@everyone', targetLabel: '```\u001b[31m', model: 'gpt-```\n\u001b[31m', effort: '```\n\u001b[31m' })];
   const text = formatWorkerOverview(workers, 'current', now);
-  assert.match(text, /极高 · 12345678-a/); assert.match(text, /强度未知 · 12345678-b/);
+  assert.match(text, /极高 · 12345678-a/); assert.match(text, /CLI 默认 · 未回报 · 12345678-b/);
   assert.match(text, /workerId：12345678-a/); assert.match(text, /原生会话 ID：native-long-123456789/);
   const title = text.split('\n').find(line => line.startsWith('会话名：'))!.slice(4);
   assert(title.length <= 80); assert(title.endsWith('…'));
