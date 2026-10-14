@@ -1,5 +1,5 @@
 {
-  "name": "discord-agent-bridge",
+  "name": "agent-bridge",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,6 +12,7 @@
     "start": "node dist/src/main.js"
   },
   "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.75.0",
     "https-proxy-agent": "7.0.6",
     "smol-toml": "1.9.1",
     "undici": "7.30.0",

@@ -1,13 +1,13 @@
-# Discord Agent Bridge
+# Agent Bridge
 
-在 Windows 笔记本运行，使用已有 Discord 机器人私聊 Codex / Claude Code。支持双向图片，也可以要求 Agent 把生成或整理的普通文件作为附件发回。文字、图片、会话绑定和原生会话 ID 都会保留；程序重启后继续当前会话。
+在 Windows 笔记本运行，启动前选择 Discord 或飞书 bot，通过机器人私聊 Codex / Claude Code。支持双向图片，也可以要求 Agent 把生成或整理的普通文件作为附件发回。文字、图片、会话绑定和原生会话 ID 都会保留；程序重启后继续当前会话。
 
 ## 部署与生成工作区
 
 已验证平台为 Windows x64。目标用户需要已配置 Codex CLI 和 Claude Code；供应商、认证和模型别名沿用自己的 CLI / CC Switch 设置。
 
 1. 获取代码及编译后的 `dist/`，复制同平台 `node_modules/` 和 `.local/runtime/`。
-2. 将 `config.example.json` 复制为 `.local/config.json`，填写机器人 Token、用户白名单及 CLI 路径。
+2. 将 `config.example.json` 复制为 `.local/config.json`，填写 CLI 路径、工作区和默认启动 Profile；再把 profiles/ 下的 bot 模板复制到 .local/bots/<平台>/<名称>.json，填写该 bot 的凭据和白名单。
 3. 生成工作区，在其 `README.md` 填写自己的导航，再把桥配置中的 `workspace` 设为同一路径：
 
 ```powershell
@@ -22,12 +22,13 @@
 ## 目录导航
 
 ```text
-discord-agent-bridge/
+agent-bridge/
 ├─ README.md                  项目入口
 ├─ init-workspace.ps1          生成独立 Agent 工作区
 ├─ start.ps1 / stop.ps1        启动 / 手动停用
 ├─ install-startup.ps1         登录后后台启动
-├─ config.example.json        桥配置示例
+├─ config.example.json        公共配置示例
+├─ profiles/                  Discord / 飞书 bot 配置模板
 ├─ runtime-manifest.json      已验证运行时信息
 ├─ package.json / package-lock.json
 ├─ docs/                      使用、部署和开发说明
@@ -56,10 +57,12 @@ D:\Agent Workspace/
 
 ## 使用与维护
 
+- [Profile、bot 与语义迁移](docs/profiles.md)：启动前选平台及 bot、本地私有配置、Git 边界和完整的一次性迁移。
+
 - [使用说明](docs/usage.md)：主控与子 Agent、私聊指令、图片和文件、模型及强度、任务计数与安全重启。
 - [部署与迁移](docs/deployment.md)：工作区生成、配置、代理、数据迁移与跨电脑登记。
 - [能力登记与就绪检查](docs/capabilities.md)：启动体检、按需查询、验收范围和任务进度。
 - [开发与验证](docs/development.md)：构建、测试和版本升级。
-- [飞书通信适配可行性](docs/feishu-bridge-feasibility.md)：共享核心、单平台互斥启动、能力边界与后续验收；目前为调研方案。
+- [飞书通信适配可行性](docs/feishu-bridge-feasibility.md)：共享核心、单平台互斥启动、能力边界与后续验收；保留最初调研证据。
 
 新增或改变主控工具声明后，已有 Codex 原生会话需要 `/new` 才能加载新声明；普通重启仍续接旧会话。工作区模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化；普通模型、强度切换可以保留当前会话。

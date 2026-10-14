@@ -206,6 +206,7 @@ test('全桥数量合并、完整文字去重，重启阶段覆盖数字，恢�
 });
 
 test('全桥数量同阶段限流只保留最新值，重连强制发布，错误数量不影响状态', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000 });
   const f = await fixture(t, async () => {}, { presenceWindowMs: 100, presenceCoalesceMs: 0 });
   f.transport.setPresence('idle'); await f.transport.start();
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
@@ -216,6 +217,7 @@ test('全桥数量同阶段限流只保留最新值，重连强制发布，错�
   f.transport.setWorkCounts({ running: 5, queued: 2 });
   f.transport.setWorkCounts({ running: 6, queued: 3 });
   await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 5);
+  t.mock.timers.tick(101);
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 6);
   const latest = () => f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
   assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行助手6 · 等待3轮' }]);

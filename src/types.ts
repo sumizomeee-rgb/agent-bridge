@@ -1,4 +1,5 @@
 export type AgentName = 'codex' | 'claude';
+export type BridgePlatform = 'discord' | 'feishu';
 export interface Conversation {
   id: string;
   userId: string;
@@ -23,6 +24,13 @@ export interface Conversation {
 }
 export interface AgentCommand { command: string; args: string[] }
 export interface BridgeConfig {
+  platform?: BridgePlatform;
+  profile?: string;
+  applicationId?: string;
+  appSecret?: string;
+  scopePrefix?: string;
+  externalAllowedUserIds?: string[];
+  features?: { reactions?: boolean; nativeCommands?: boolean; presence?: boolean };
   token: string;
   allowedUserIds: string[];
   defaultAgent: AgentName;
@@ -150,6 +158,9 @@ export interface DiscordAttachment {
   url: string;
   size: number;
   content_type?: string;
+  /** Feishu IM resource reference; never a cloud-drive token. */
+  resourceKey?: string;
+  messageId?: string;
 }
 export interface IncomingDM {
   id: string;

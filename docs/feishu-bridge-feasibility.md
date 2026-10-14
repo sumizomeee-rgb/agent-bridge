@@ -1,5 +1,7 @@
 # 飞书通信适配可行性与开发边界
 
+后续开发决定：采用共享核心、启动 Profile、真实 bot 命名空间和离线一次性语义迁移。当前格式与能力边界以 [Profile、bot 与语义迁移](profiles.md) 为准；以下内容保留最初调查时的现场证据，不代表当前实现进度。harucode 网关仅供参考，不接入本桥。
+
 [返回项目首页](../README.md)
 
 查证日期：2026-10-14。项目现状基于当时工作树（HEAD `ca38928`）的源码与现有文档；本文件记录调研和设计决定，不表示适配器已经实现。
@@ -46,10 +48,10 @@
 
 ### 当前Discord实例：实际加载链与Git状态
 
-2026-10-14本机只读审计：hostname `DESKTOP-6FVMGQD`、账号 `desktop-6fvmgqd\sumizome`，repo根 `C:\SuchProject\Other\discord-agent-bridge`。其他worker正在修改源码/测试；本节只描述当次配置及加载代码，未覆盖他们的修改，未启动或重启部署。
+2026-10-14本机只读审计：hostname `DESKTOP-6FVMGQD`、账号 `desktop-6fvmgqd\sumizome`，repo根 `C:\SuchProject\Other\agent-bridge`。其他worker正在修改源码/测试；本节只描述当次配置及加载代码，未覆盖他们的修改，未启动或重启部署。
 
-- 生效入口为根 `start.ps1` 或登录任务`SumizomeDiscordAgentBridge`→`scripts\supervise.ps1`，均启动 `.local\runtime\win-x64\node.exe`→`dist\src\main.js`。当次计划任务为Running；PID记录对应项目内Node进程且无`--config`覆盖参数。这是运行路径核验，未读取完整进程命令或环境到文档。
-- `src/config.ts`和当前构建`dist/src/config.js`默认读取 **`C:\SuchProject\Other\discord-agent-bridge\.local\config.json`**；可以由`--config`指定其他文件，当前运行未指定。Discord token来自该JSON的`token`，没有Discord凭据环境变量或`.env`回退加载。当前`.env`不存在。
+- 生效入口为根 `start.ps1` 或登录任务`SumizomeAgentBridge`→`scripts\supervise.ps1`，均启动 `.local\runtime\win-x64\node.exe`→`dist\src\main.js`。当次计划任务为Running；PID记录对应项目内Node进程且无`--config`覆盖参数。这是运行路径核验，未读取完整进程命令或环境到文档。
+- `src/config.ts`和当前构建`dist/src/config.js`默认读取 **`C:\SuchProject\Other\agent-bridge\.local\config.json`**；可以由`--config`指定其他文件，当前运行未指定。Discord token来自该JSON的`token`，没有Discord凭据环境变量或`.env`回退加载。当前`.env`不存在。
 - 该真实JSON有`token`、`applicationId`、`allowedUserIds`、`controllerMode`、CLI命令路径、workspace、代理及模型选项；只核对键名/存在性，未输出真实值。token有值，白名单1人，controllerMode开启。`applicationId`虽然已落盘，当前源码和构建加载器均未消费此字段；实际application ID由Discord `READY`事件或`GET /applications/@me`获得，bot用户ID/名称由READY获得。它们可在运行内存/连接日志出现，不能把额外JSON字段当当前必需启动参数。
 - 授权用户ID来自`allowedUserIds`；私聊channel/message ID来自平台事件并持久化于收件/会话/任务来源。当前仅接受bot私聊，guild输入被拒绝，没有本实例必需的guild白名单或写死的私聊channel启动字段。
 - 代理环境由`agentEnvironment`在启动CLI时派生；CLI供应商认证沿用用户已有配置，和Discord token是不同凭据。控制器隔离home的创建逻辑还会复制CLI认证，不能因`.local`被忽略就把整目录当无秘密可公开迁移包。
@@ -58,17 +60,17 @@
 
 | 实际笔记本位置 | 内容/用途 | 当前存在与Git结果 |
 | --- | --- | --- |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\config.json` | 真实Discord token、实例字段/白名单/CLI参数 | 存在；未tracked，根`.gitignore`的`.local/`规则命中 |
-| `C:\SuchProject\Other\discord-agent-bridge\config.example.json` | 部署模板 | tracked；token/白名单为占位值，未把真实凭据或授权ID写入模板 |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\bridge.sqlite` | 消息、会话绑定、原生session ID、回复投递状态 | 存在；未tracked且ignored |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\ingress.sqlite` | 原始收件、私聊来源和补取游标 | 存在；未tracked且ignored |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\controller.sqlite` | 直属worker、job、wake、补充和归属记录 | 存在；未tracked且ignored |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\tasks.sqlite`、同目录`contexts\`和`tickets\` | 后台登记、结果/回执及桥内部认证票据 | 均存在；未tracked且ignored。票据本身含认证材料，不读取/输出/提交 |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\restart.sqlite`、`bridge.pid.json` | 安全重启状态、当前实例元信息 | 存在；未tracked且ignored。命名管道锁在OS内存中，不是Git文件 |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\attachments` | 用户图片与回传处理的本地附件 | 存在；未tracked且ignored；本轮未打开内容 |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\data\controller-homes` | CLI隔离配置/home，创建逻辑可包含认证副本 | 目录存在；未tracked且ignored；仅核对路径，不读取里面凭据 |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\logs` | bridge日志与监督启动错误日志 | 存在；未tracked且ignored；不读取聊天/日志正文 |
-| `C:\SuchProject\Other\discord-agent-bridge\.local\runtime\win-x64\node.exe` | 当前项目Node运行时 | 存在；未tracked且ignored |
+| `C:\SuchProject\Other\agent-bridge\.local\config.json` | 真实Discord token、实例字段/白名单/CLI参数 | 存在；未tracked，根`.gitignore`的`.local/`规则命中 |
+| `C:\SuchProject\Other\agent-bridge\config.example.json` | 部署模板 | tracked；token/白名单为占位值，未把真实凭据或授权ID写入模板 |
+| `C:\SuchProject\Other\agent-bridge\.local\data\bridge.sqlite` | 消息、会话绑定、原生session ID、回复投递状态 | 存在；未tracked且ignored |
+| `C:\SuchProject\Other\agent-bridge\.local\data\ingress.sqlite` | 原始收件、私聊来源和补取游标 | 存在；未tracked且ignored |
+| `C:\SuchProject\Other\agent-bridge\.local\data\controller.sqlite` | 直属worker、job、wake、补充和归属记录 | 存在；未tracked且ignored |
+| `C:\SuchProject\Other\agent-bridge\.local\data\tasks.sqlite`、同目录`contexts\`和`tickets\` | 后台登记、结果/回执及桥内部认证票据 | 均存在；未tracked且ignored。票据本身含认证材料，不读取/输出/提交 |
+| `C:\SuchProject\Other\agent-bridge\.local\data\restart.sqlite`、`bridge.pid.json` | 安全重启状态、当前实例元信息 | 存在；未tracked且ignored。命名管道锁在OS内存中，不是Git文件 |
+| `C:\SuchProject\Other\agent-bridge\.local\data\attachments` | 用户图片与回传处理的本地附件 | 存在；未tracked且ignored；本轮未打开内容 |
+| `C:\SuchProject\Other\agent-bridge\.local\data\controller-homes` | CLI隔离配置/home，创建逻辑可包含认证副本 | 目录存在；未tracked且ignored；仅核对路径，不读取里面凭据 |
+| `C:\SuchProject\Other\agent-bridge\.local\logs` | bridge日志与监督启动错误日志 | 存在；未tracked且ignored；不读取聊天/日志正文 |
+| `C:\SuchProject\Other\agent-bridge\.local\runtime\win-x64\node.exe` | 当前项目Node运行时 | 存在；未tracked且ignored |
 
 `git ls-files -- .local .env .env.*`当次返回0项；`git check-ignore -v --no-index`对上述`.local`路径均命中根`.gitignore:1`，`.env`命中第4行。在必要的`.local`、data、runtime、logs目录未发现额外嵌套`.gitignore`。源码、启动脚本、`.gitignore`、`runtime-manifest.json`和模板已tracked，真实配置/运行数据是项目目录下的Git忽略本地文件，不是Git版本内容。本结论检查当前索引/工作树，不证明全Git历史从未泄露；本轮未扫描历史，也未发现或处置历史凭据。
 

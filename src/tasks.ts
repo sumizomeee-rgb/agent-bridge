@@ -159,7 +159,10 @@ export class TaskRegistry {
   }
   closeContext(contextId: string): void { this.db.prepare('UPDATE task_contexts SET open=0 WHERE id=?').run(contextId); }
   closeOpenContexts(): void { this.db.exec('UPDATE task_contexts SET open=0 WHERE open=1'); }
-  recoverContexts(): void { this.closeOpenContexts(); }
+  recoverContexts(users?: string[]): void {
+    if (!users) { this.closeOpenContexts(); return; }
+    for (const row of this.db.prepare('SELECT id,origin_json FROM task_contexts WHERE open=1').all()) if (users.includes((JSON.parse(String(row.origin_json)) as TaskOrigin).userId)) this.closeContext(String(row.id));
+  }
   private authorize(context: TaskContextFile, allowClosed = false): Row {
     if (context.version !== 1 || resolve(context.registryDir) !== this.dataDir) throw new Error('任务上下文目录不匹配');
     const row = this.db.prepare('SELECT * FROM task_contexts WHERE id=?').get(context.contextId);
@@ -338,15 +341,21 @@ export class TaskRegistry {
   markUncertain(id: string, reason = '任务汇报过程中断，结果未知；不自动重做'): void {
     for (const table of ['task_events', 'task_observations']) this.db.prepare(`UPDATE ${table} SET state='uncertain',reason=?,updated_at=? WHERE id=? AND state IN ('queued','processing')`).run(reason, timestamp(), id);
   }
-  recoverProcessing(): number {
-    this.db.prepare("UPDATE task_observations SET state='uncertain',notice_sent=1,reason='进度观察处理中断，未重放',updated_at=? WHERE state='processing'").run(timestamp());
-    return Number(this.db.prepare("UPDATE task_events SET state='uncertain',reason='桥在任务汇报中断后重启；不自动重复生成或发送',updated_at=? WHERE state='processing'")
-      .run(timestamp()).changes);
+  recoverProcessing(users?: string[]): number {
+    let count = 0;
+    for (const table of ['task_events', 'task_observations']) {
+      for (const row of this.db.prepare(`SELECT id,origin_json FROM ${table} WHERE state='processing'`).all()) {
+        if (users && !users.includes((JSON.parse(String(row.origin_json)) as TaskOrigin).userId)) continue;
+        this.markUncertain(String(row.id), '桥在任务汇报中断后重启；不自动重复生成或发送');
+        if (table === 'task_observations') this.markUncertainNotified(String(row.id)); else count++;
+      }
+    }
+    return count;
   }
-  recoverProcessingEvents(): TaskCompletionEvent[] {
-    this.recoverProcessing();
+  recoverProcessingEvents(users?: string[]): TaskCompletionEvent[] {
+    this.recoverProcessing(users);
     return this.db.prepare(`SELECT e.*,t.title,t.wake_allowed FROM task_events e JOIN tasks t ON t.id=e.task_id
-      WHERE e.state='uncertain' AND e.notice_sent=0 ORDER BY e.created_at,e.rowid`).all().map(row => this.event(row));
+      WHERE e.state='uncertain' AND e.notice_sent=0 ORDER BY e.created_at,e.rowid`).all().map(row => this.event(row)).filter(event => !users || users.includes(event.userId));
   }
   markUncertainNotified(id: string): void {
     for (const table of ['task_events', 'task_observations']) this.db.prepare(`UPDATE ${table} SET notice_sent=1,updated_at=? WHERE id=? AND state='uncertain'`).run(timestamp(), id);

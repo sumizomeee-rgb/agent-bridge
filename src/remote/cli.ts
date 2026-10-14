@@ -5,12 +5,14 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { RemoteDaemon, loadRemoteConfig, remoteDataDirectory, remoteEndpoint } from './daemon.js';
 import { isObject, safeError } from '../agents/process.js';
+import { ensureRemoteSemanticData } from '../remote-migration.js';
 
 export async function runRemoteCli(argv: string[]): Promise<void> {
   const mode = argv[0]; const rootIndex = argv.indexOf('--root');
   if ((mode !== '--serve' && mode !== '--stdio') || rootIndex < 0 || !argv[rootIndex + 1] || argv.length !== 3) throw new Error('用法：--serve|--stdio --root <已登记远端运行目录>');
   const root = resolve(argv[rootIndex + 1]!);
   if (mode === '--serve') {
+    ensureRemoteSemanticData(root);
     const daemon = new RemoteDaemon(root, loadRemoteConfig(root)); await daemon.listen();
     const stop = () => { void daemon.close().then(() => process.exit(0), () => process.exit(2)); };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);

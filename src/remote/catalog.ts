@@ -42,7 +42,7 @@ export function parseTargetRegistry(raw: unknown): RemoteTargetRegistration[] {
     return { id, label: string(value.label, '目标名称'), expectedHostname, sshConfig, alias,
       remoteRoot: remoteAbsolute(value.remoteRoot, '远端运行目录'), nodePath: remoteAbsolute(value.nodePath, '远端 Node 命令'), engines,
       ...(value.allowedUserIds === undefined ? {} : { allowedUserIds: (() => {
-        if (!Array.isArray(value.allowedUserIds) || value.allowedUserIds.length > 100 || value.allowedUserIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9_.:-]{1,199}$/.test(id))) throw new Error('目标电脑 allowedUserIds 无效。');
+        if (!Array.isArray(value.allowedUserIds) || value.allowedUserIds.length > 100 || value.allowedUserIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9_.:|\-]{1,199}$/.test(id))) throw new Error('目标电脑 allowedUserIds 无效。');
         return [...new Set(value.allowedUserIds as string[])];
       })() }) };
   });

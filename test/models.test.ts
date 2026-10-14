@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -240,7 +240,9 @@ test('配置可选model目录及参考默认，不自动覆盖CLI；安全ID校�
   const root = mkdtempSync(join(tmpdir(), 'bridge-model-config-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const path = join(root, 'config.json');
-  const raw = { token: 'fake', allowedUserIds: ['123456789012345678'], workspace: root, dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
+  mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
+  writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'fake', allowedUserIds: ['123456789012345678'] }));
+  const raw = { version: 2, startupProfile: 'discord/default', workspace: root, dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
     commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } },
     defaultModels: { codex: 'gpt-5.6-sol' }, modelOptions: { claude: ['gateway/gpt-6-sol'], codex: ['custom-v1'] } };
   writeFileSync(path, JSON.stringify(raw));

@@ -152,9 +152,9 @@ export class SessionManager {
     this.recovered = true;
     this.recovering = true;
     try {
-      this.options.taskRegistry?.recoverContexts();
+      this.options.taskRegistry?.recoverContexts(this.config.allowedUserIds);
       const notices = new Set<string>();
-      for (const item of [...this.store.interruptRunning(), ...this.store.unfinishedReplies()]) {
+      for (const item of [...this.store.interruptRunning(this.config.allowedUserIds), ...this.store.unfinishedReplies(this.config.allowedUserIds)]) {
         if (this.closed) return;
         if (!this.config.allowedUserIds.includes(item.userId)) continue;
         const key = `${item.channelId}:${item.conversationId}`;
@@ -171,7 +171,7 @@ export class SessionManager {
         const latest = active ? this.store.latestMessage(active.id) : null;
         if (active && latest) this.latestMessages.set(userId, { id: latest.id, channelId: latest.channelId, conversationId: active.id });
       }
-      for (const event of this.options.taskRegistry?.recoverProcessingEvents() ?? []) {
+      for (const event of this.options.taskRegistry?.recoverProcessingEvents(this.config.allowedUserIds) ?? []) {
         if (event.purpose === 'workspace-context') {
           const target = this.completionTarget(event);
           if (target && event.wakeAllowed && this.store.getActive(event.userId)?.id === target.id) this.store.prepareWorkspaceNotice(target.id, 'unknown');
@@ -190,7 +190,7 @@ export class SessionManager {
       }
     } finally { this.recovering = false; }
     if (this.closed) return;
-    for (const id of this.store.recoverWorkspaceNotices()) {
+    for (const id of this.store.recoverWorkspaceNotices(this.config.allowedUserIds)) {
       const target = this.store.getConversation(id); if (target) await this.sendWorkspaceNotice(target);
     }
     for (const userId of this.config.allowedUserIds) {
@@ -567,7 +567,7 @@ export class SessionManager {
   private wake(conversationId: string): void {
     if (this.closed || this.draining || this.recovering || this.workers.has(conversationId) || this.modelChanges.has(conversationId)) return;
     const target = this.store.getConversation(conversationId);
-    if (!target || this.userWorkers.has(target.userId)) return;
+    if (!target || (this.config.scopePrefix && !target.userId.startsWith(this.config.scopePrefix)) || this.userWorkers.has(target.userId)) return;
     const worker = Promise.resolve().then(() => this.processQueue(conversationId)).finally(() => {
       this.workers.delete(conversationId);
       if (this.userWorkers.get(target.userId) === worker) this.userWorkers.delete(target.userId);
@@ -751,6 +751,7 @@ export class SessionManager {
     if (this.closed || this.draining || this.recovering || !this.options.taskRegistry) return;
     this.refreshTaskCounts();
     for (const event of this.options.taskRegistry.queuedEvents()) {
+      if (!this.config.allowedUserIds.includes(event.userId)) continue;
       if (!this.store.getConversation(event.conversationId)) {
         if (this.options.taskRegistry.claimEvent(event.id)) this.options.taskRegistry.markUncertain(event.id, '原父会话不存在');
         continue;

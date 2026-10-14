@@ -49,7 +49,10 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 
 `.local/`、`node_modules/`、`dist/` 不进入 Git：
 
-- `.local/config.json`：机器人的凭据、白名单和机器路径，应限制文件 ACL。
+- `.local/config.json`：version:2 公共设置，CLI、工作区、默认启动 Profile。
+- `.local/bots/<平台>/<名称>.json`：对应 bot 的凭据、应用身份、白名单及启动功能。
+
+旧部署升级须先按 [Profile 语义迁移](profiles.md) 离线迁移数据，再改部署目录和登录任务；新运行版本不自动解释旧配置或旧归属。
 - `.local/runtime/win-x64/node.exe`：Node 24.13.0 便携运行时。
 - `.local/data/bridge.sqlite`：会话、当前绑定、消息去重、队列和上一条成功回复标识，含私聊数据，应备份。
 - `.local/data/tasks.sqlite`：后台任务及完成事件；与会话数据库一起备份。

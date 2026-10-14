@@ -157,7 +157,7 @@ export class ControllerRuntime {
     });
   }
   getGlobalWorkCounts(): WorkCounts {
-    const jobs = this.store.jobs();
+    const jobs = this.store.jobs().filter(job => this.config.allowedUserIds.includes(job.origin.userId));
     return { running: new Set(jobs.filter(job => job.status === 'running').map(job => job.workerId)).size,
       queued: jobs.filter(job => job.status === 'queued').length };
   }
@@ -238,17 +238,19 @@ export class ControllerRuntime {
     try { await recovery; } finally { this.starting = undefined; }
   }
   private async recoverStartup(): Promise<void> {
-    for (const worker of this.store.workers().filter(value => value.adoption?.status === 'pending')) {
+    for (const worker of this.store.workers().filter(value => value.adoption?.status === 'pending' && this.config.allowedUserIds.includes(value.origin.userId))) {
       try { await this.completeAdoption(worker.id); } catch (error) { this.error(error); }
     }
     if (this.stopping || this.closed) return;
     await this.workCountsChanged();
     for (const supplement of this.store.supplements()) {
+      if (!this.config.allowedUserIds.includes(supplement.origin.userId)) continue;
       if (supplement.status === 'pending' || supplement.status === 'steering') this.setSupplement(supplement,
         supplement.status === 'steering' ? 'uncertain' : 'not_delivered', '桥在补充期间重启；未自动重发。');
     }
     // Local interrupted work stays uncertain. A remote daemon follows the original dispatch only.
     for (const job of this.store.jobs().filter(job => job.status === 'running')) {
+      if (!this.config.allowedUserIds.includes(job.origin.userId)) continue;
       const worker = this.store.getWorker(job.workerId)!;
       if (worker.target?.transport === 'ssh' && worker.ownership !== 'user' && !worker.handoffPending) this.launchJob(worker.id, job, true);
       else await this.finish(worker, job, 'uncertain', '桥在执行期间重启；该轮结果未知，未自动重做。请检查已发生的操作。');
@@ -256,12 +258,14 @@ export class ControllerRuntime {
     // Completing the two SQLite journals cannot share a transaction. Reconcile a saved terminal
     // result before pumping queues so a crash between commits cannot leave a permanent count.
     for (const job of this.store.jobs().filter(job => !['queued', 'running'].includes(job.status) && job.taskId)) {
+      if (!this.config.allowedUserIds.includes(job.origin.userId)) continue;
       const task = this.registry.getTask(job.taskId!);
       if (task && ['registered', 'running'].includes(task.status)) {
         await this.finish(this.store.getWorker(job.workerId)!, job, job.status, job.result ?? '子任务已结束，但没有保存结果正文。');
       }
     }
     for (const worker of this.store.workers()) {
+      if (!this.config.allowedUserIds.includes(worker.origin.userId)) continue;
       if (!worker.blocked && this.store.jobs(worker.id).some(job => job.status === 'uncertain')) {
         worker.blocked = true; this.store.saveWorker(worker);
       }
@@ -660,6 +664,7 @@ export class ControllerRuntime {
   private kick(workerId: string): void {
     if (!this.started || this.stopping || this.closed || this.isDraining() || this.active.has(workerId) || this.store.getWorker(workerId)?.blocked || !this.store.nextJob(workerId)) return;
     const worker = this.store.getWorker(workerId)!;
+    if (!this.config.allowedUserIds.includes(worker.origin.userId)) return;
     if (worker.ownership === 'user' || worker.handoffPending) return;
     this.launchJob(workerId, this.store.nextJob(workerId)!);
   }
@@ -864,6 +869,7 @@ export class ControllerRuntime {
     if (this.closed || this.stopping || this.isDraining()) return;
     await this.observeStalls();
     for (const wake of this.store.wakes()) {
+      if (!this.config.allowedUserIds.includes(wake.origin.userId)) continue;
       if (wake.status === 'cancelled' || wake.status === 'fired' || Date.parse(wake.dueAt) > this.now()) continue;
       let taskId = wake.taskId;
       if (!taskId) {

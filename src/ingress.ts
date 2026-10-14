@@ -3,14 +3,16 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { OrderedInbox } from './inbox.js';
 import type { DiscordAttachment, IncomingDM } from './types.js';
+import { validMessageId as isSnowflake, validChannelId, compareMessageIds, laterMessageId as later } from './routing.js';
 
-export interface DMHistoryOptions { after?: string; before?: string; limit?: number }
+export interface DMHistoryOptions { after?: string; before?: string; limit?: number; since?: string; pageToken?: string }
 export interface DMHistoryPage {
   /** Authorized ordinary DMs only; pagination boundaries include bot messages too. */
   messages: IncomingDM[];
   oldestId: string | null;
   newestId: string | null;
   hasMore: boolean;
+  pageToken?: string;
 }
 export type DMHistoryReader = (channelId: string, options: DMHistoryOptions) => Promise<DMHistoryPage>;
 export interface IngressChannel { userId: string; channelId: string; cursor: string }
@@ -28,8 +30,6 @@ export interface DurableIngressOptions {
 }
 export type IngressState = 'received' | 'processing' | 'accepted' | 'failed';
 interface IngressRow extends IncomingDM { state: IngressState; sequence: number }
-const isSnowflake = (value: unknown): value is string => typeof value === 'string' && /^\d{1,20}$/.test(value);
-const later = (left: string, right: string): string => BigInt(left) >= BigInt(right) ? left : right;
 const control = (message: IncomingDM): boolean =>
   /^(?:\/(?:stop|new|cwd)(?:\s|$)|\/agent\s+\S|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
 
@@ -113,7 +113,7 @@ export class DurableIngress {
   /** Import only an existing trusted DM's latest persisted ID, never replay all history. */
   seedChannel(channel: IngressChannel): void {
     this.assertOpen();
-    if (!this.users.has(channel.userId) || !isSnowflake(channel.channelId) || !isSnowflake(channel.cursor)) {
+    if (!this.users.has(channel.userId) || !validChannelId(channel.channelId) || !isSnowflake(channel.cursor)) {
       throw new Error('已有私聊收件游标无效。');
     }
     const existing = this.db.prepare('SELECT user_id FROM channels WHERE channel_id = ?').get(channel.channelId);
@@ -133,7 +133,7 @@ export class DurableIngress {
   capture(message: IncomingDM): boolean {
     this.assertOpen();
     if (message.interaction) throw new Error('交互凭据不能写入持久收件箱。');
-    if (!this.users.has(message.userId) || !isSnowflake(message.id) || !isSnowflake(message.channelId) ||
+    if (!this.users.has(message.userId) || !isSnowflake(message.id) || !validChannelId(message.channelId) ||
         typeof message.text !== 'string' || !Array.isArray(message.attachments)) return false;
     const channel = this.db.prepare('SELECT user_id, cursor FROM channels WHERE channel_id = ?').get(message.channelId);
     if (channel && channel.user_id !== message.userId) return false;
@@ -141,6 +141,7 @@ export class DurableIngress {
     const attachments: DiscordAttachment[] = message.attachments.map(item => ({
       id: item.id, filename: item.filename, url: item.url, size: item.size,
       ...(item.content_type === undefined ? {} : { content_type: item.content_type }),
+      ...(item.resourceKey ? { resourceKey: item.resourceKey, messageId: item.messageId } : {}),
     }));
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
@@ -169,7 +170,7 @@ export class DurableIngress {
   async receive(message: IncomingDM): Promise<void> {
     this.assertOpen();
     if (message.interaction) {
-      if (!this.users.has(message.userId) || !isSnowflake(message.id) || !isSnowflake(message.channelId)) {
+      if (!this.users.has(message.userId) || !isSnowflake(message.id) || !validChannelId(message.channelId)) {
         throw new Error('私聊交互不属于已授权用户。');
       }
       const pending = this.interactions.get(message.id);
@@ -242,35 +243,39 @@ export class DurableIngress {
     // Snapshot old cursors before any REST call. Gateway messages cannot move them here.
     for (const channel of this.knownChannels()) {
       let before: string | undefined;
+      let pageToken: string | undefined;
       let high = channel.cursor;
+      const feishu = channel.cursor.startsWith('feishu:');
+      const time = (id: string) => BigInt(id.split('|')[1]!);
       let complete = false;
       for (let pageNumber = 0; pageNumber < maxPages; pageNumber++) {
         if (this.closed) return;
         // Start at the newest page, then walk backwards to the known cursor.
         // Discord's `after` pagination advances from the earliest matching page.
-        const page = await reader(channel.channelId, { limit, ...(before ? { before } : {}) });
+        const page = await reader(channel.channelId, { limit, ...(before ? { before } : {}),
+          ...(channel.cursor.startsWith('feishu:') ? { since: channel.cursor, ...(pageToken ? { pageToken } : {}) } : {}) });
         if (this.closed) return;
         if ((page.oldestId !== null && !isSnowflake(page.oldestId)) ||
             (page.newestId !== null && !isSnowflake(page.newestId)) ||
-            (page.hasMore && page.oldestId === null)) throw new Error('Discord 历史分页边界无效。');
+            (page.hasMore && page.oldestId === null)) throw new Error('通信平台历史分页边界无效。');
         if (page.newestId) high = later(high, page.newestId);
         for (const message of page.messages) {
           if (message.channelId !== channel.channelId || message.userId !== channel.userId || message.interaction ||
-              !isSnowflake(message.id) || BigInt(message.id) <= BigInt(channel.cursor)) continue;
+              !isSnowflake(message.id) || (feishu ? time(message.id) < time(channel.cursor) : compareMessageIds(message.id, channel.cursor) <= 0)) continue;
           this.capture(message);
         }
-        if (!page.hasMore || (page.oldestId !== null && BigInt(page.oldestId) <= BigInt(channel.cursor))) {
+        if (!page.hasMore || (page.oldestId !== null && (feishu ? time(page.oldestId) < time(channel.cursor) : compareMessageIds(page.oldestId, channel.cursor) <= 0))) {
           complete = true; break;
         }
-        if (before && page.oldestId !== null && BigInt(page.oldestId) >= BigInt(before)) {
-          throw new Error('Discord 历史分页没有前进，收件游标已保留。');
+        if (before && page.oldestId !== null && compareMessageIds(page.oldestId, before) >= 0 && !page.pageToken) {
+          throw new Error('通信平台历史分页没有前进，收件游标已保留。');
         }
         before = page.oldestId ?? undefined;
+        if (page.hasMore && channel.cursor.startsWith('feishu:') && (!page.pageToken || page.pageToken === pageToken)) throw new Error('飞书历史分页没有前进，游标已保留。');
+        pageToken = page.pageToken;
       }
-      if (!complete) throw new Error('Discord 停机期间消息超过补取页数，收件游标已保留。');
-      const newest = this.db.prepare(`SELECT id FROM messages WHERE channel_id = ? AND is_interaction = 0
-        ORDER BY length(id) DESC, id DESC LIMIT 1`).get(channel.channelId);
-      if (newest) high = later(high, String(newest.id));
+      if (!complete) throw new Error('停机期间消息超过补取页数，收件游标已保留。');
+      for (const row of this.db.prepare('SELECT id FROM messages WHERE channel_id = ? AND is_interaction = 0').all(channel.channelId)) high = later(high, String(row.id));
       this.db.prepare('UPDATE channels SET cursor = ? WHERE channel_id = ?').run(high, channel.channelId);
     }
   }
@@ -282,8 +287,7 @@ export class DurableIngress {
     for (const [id, pending] of this.interactions) if (!entries.has(id)) {
       entries.set(id, { id, state: 'memory', is_control: (this.options.isImmediate ?? control)(pending.message) ? 1 : 0 });
     }
-    const ordered = [...entries.values()].sort((left, right) => BigInt(String(left.id)) < BigInt(String(right.id)) ? -1 :
-      BigInt(String(left.id)) > BigInt(String(right.id)) ? 1 : 0);
+    const ordered = [...entries.values()].sort((left, right) => compareMessageIds(String(left.id), String(right.id)));
     for (const row of ordered) {
       const id = String(row.id);
       const pending = this.interactions.get(id);

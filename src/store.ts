@@ -179,10 +179,10 @@ export class SessionStore {
     this.db.prepare(`UPDATE workspace_initialization_notices SET state=CASE WHEN state='sending' THEN 'uncertain' ELSE 'cancelled' END,
       updated_at=? WHERE conversation_id=? AND state IN ('waiting','sending')`).run(new Date().toISOString(), conversationId);
   }
-  recoverWorkspaceNotices(): string[] {
-    this.db.prepare("UPDATE workspace_initialization_notices SET state='uncertain',updated_at=? WHERE state='sending'").run(new Date().toISOString());
-    return this.db.prepare("SELECT conversation_id FROM workspace_initialization_notices WHERE state='waiting' AND outcome IS NOT NULL")
-      .all().map(row => String(row.conversation_id));
+  recoverWorkspaceNotices(users?: string[]): string[] {
+    const rows = this.db.prepare("SELECT * FROM workspace_initialization_notices WHERE state IN ('sending','waiting')").all().filter(row => !users || users.includes(String(row.user_id)));
+    for (const row of rows) if (row.state === 'sending') this.db.prepare("UPDATE workspace_initialization_notices SET state='uncertain',updated_at=? WHERE conversation_id=?").run(new Date().toISOString(), row.conversation_id!);
+    return rows.filter(row => row.state === 'waiting' && row.outcome != null).map(row => String(row.conversation_id));
   }
 
   recentUserContext(conversationId: string): string {
@@ -331,17 +331,16 @@ export class SessionStore {
     return Number(row?.total ?? 0);
   }
 
-  unfinishedReplies(): InboxItem[] {
+  unfinishedReplies(users?: string[]): InboxItem[] {
     const items = this.db.prepare("SELECT * FROM inbox WHERE state = 'completed' AND reply_state = 'pending' ORDER BY sequence")
-      .all().map(inbox);
+      .all().map(inbox).filter(item => !users || users.includes(item.userId));
     for (const item of items) this.setReplyState([item.id], 'failed');
     return items;
   }
 
-  interruptRunning(): InboxItem[] {
-    const items = this.db.prepare("SELECT * FROM inbox WHERE state IN ('running', 'steering') ORDER BY sequence").all().map(inbox);
-    this.db.prepare("UPDATE inbox SET state = 'interrupted', updated_at = ? WHERE state IN ('running', 'steering')")
-      .run(new Date().toISOString());
+  interruptRunning(users?: string[]): InboxItem[] {
+    const items = this.db.prepare("SELECT * FROM inbox WHERE state IN ('running', 'steering') ORDER BY sequence").all().map(inbox).filter(item => !users || users.includes(item.userId));
+    for (const item of items) this.setState(item.id, 'interrupted');
     return items;
   }
 

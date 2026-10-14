@@ -22,6 +22,9 @@ const MAX_BYTES = 24 * 1024 * 1024;
 const identifier = (value: unknown, label: string): string => {
   if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(value)) throw new Error(`${label}无效。`); return value;
 };
+const principal = (value: unknown): string => {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:|\-]{0,199}$/.test(value)) throw new Error('用户编号无效。'); return value;
+};
 function text(value: unknown, label: string, limit = 1024 * 1024): string {
   if (typeof value !== 'string' || value.length > limit || value.includes('\0')) throw new Error(`${label}无效。`); return value;
 }
@@ -167,9 +170,9 @@ export class RemoteDaemon {
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
     if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
     if (method.startsWith('sessions/') && this.nativeClosing) throw new Error('远端会话服务正在关闭。');
-    if (method === 'sessions/list') return this.nativeOperation(this.nativeSessions.list({ ...(isObject(raw.query) ? raw.query : {}), agent: this.agent(raw.agent), userId: identifier(raw.userId, '用户编号') }));
-    if (method === 'sessions/read') return this.nativeOperation(this.nativeSessions.read(identifier(raw.userId, '用户编号'), raw.ref as NativeSessionRef, isObject(raw.options) ? raw.options : {}));
-    if (method === 'sessions/adopt') return this.nativeOperation(this.nativeSessions.adopt(identifier(raw.userId, '用户编号'), raw.adoption as unknown as NativeSessionAdoptArgs));
+    if (method === 'sessions/list') return this.nativeOperation(this.nativeSessions.list({ ...(isObject(raw.query) ? raw.query : {}), agent: this.agent(raw.agent), userId: principal(raw.userId) }));
+    if (method === 'sessions/read') return this.nativeOperation(this.nativeSessions.read(principal(raw.userId), raw.ref as NativeSessionRef, isObject(raw.options) ? raw.options : {}));
+    if (method === 'sessions/adopt') return this.nativeOperation(this.nativeSessions.adopt(principal(raw.userId), raw.adoption as unknown as NativeSessionAdoptArgs));
     if (method === 'query') {
       const id = identifier(raw.dispatchId, '派发编号');
       const pending = this.dispatches.get(id); if (pending) await pending.promise;
@@ -229,7 +232,7 @@ export class RemoteDaemon {
     const cwd = await this.directory(raw.cwd); const workerId = identifier(raw.workerId, '子任务编号');
     if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain'))) throw new Error('同一子会话尚在执行或结果未知，拒绝并发续接。');
     const nativeId = raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号');
-    const userId = identifier(raw.userId, '用户编号');
+    const userId = principal(raw.userId);
     if (nativeId) { await this.nativeSessions.assertRunOwnership({ agent, profile: 'default', nativeId }, userId, workerId); this.store.bindSession(nativeId, workerId, agent, cwd, userId); }
     if (raw.model != null && (typeof raw.model !== 'string' || !isModelId(raw.model))) throw new Error('模型选择无效。');
     if (raw.effort != null && (typeof raw.effort !== 'string' || raw.effort.length > 50)) throw new Error('推理强度无效。');

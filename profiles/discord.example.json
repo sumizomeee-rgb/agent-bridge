@@ -1,0 +1,13 @@
+{
+  "platform": "discord",
+  "applicationId": "FILL_IN_APPLICATION_ID",
+  "token": "FILL_IN_BOT_TOKEN",
+  "allowedUserIds": [
+    "FILL_IN_DISCORD_USER_ID"
+  ],
+  "features": {
+    "reactions": true,
+    "nativeCommands": true,
+    "presence": true
+  }
+}

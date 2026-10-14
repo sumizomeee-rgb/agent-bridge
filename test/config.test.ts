@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentEnvironment, loadConfig, redactText, safeError } from '../src/config.js';
@@ -18,7 +18,9 @@ test('port override and invalid ports are validated without printing token', () 
   const root = mkdtempSync(join(tmpdir(), 'bridge-config-'));
   try {
     const path = join(root, 'config.json');
-    writeFileSync(path, JSON.stringify({ token: 'private-test-value', allowedUserIds: ['123456789012345678'], workspace: join(root, 'workspace'), dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, proxyPort: 7898 }));
+    mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
+    writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
+    writeFileSync(path, JSON.stringify({ version: 2, startupProfile: 'discord/default', workspace: join(root, 'workspace'), dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, proxyPort: 7898 }));
     assert.equal(loadConfig(['--config', path, '--proxy-port', '7899']).proxyUrl, 'http://127.0.0.1:7899');
     assert.throws(() => loadConfig(['--config', path, '--proxy-port', '0']), /1–65535/);
     assert.throws(() => loadConfig(['--config', path, '--proxy-port', 'bad']), /1–65535/);
@@ -35,7 +37,9 @@ test('ordinary file limit defaults to 20 MiB and validates configuration before 
   const root = mkdtempSync(join(tmpdir(), 'bridge-config-'));
   try {
     const path = join(root, 'config.json');
-    const base = { token: 'private-test-value', allowedUserIds: ['123456789012345678'], workspace: join(root, 'workspace'),
+    mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
+    writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
+    const base = { version: 2, startupProfile: 'discord/default', workspace: join(root, 'workspace'),
       dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'),
       commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } };
     writeFileSync(path, JSON.stringify(base));

@@ -120,6 +120,8 @@ test('真实隔离supervisor收到76仅启动一次，不创建disabled并保存
   const countPath = join(root, 'starts.log');
   writeFileSync(join(dist, 'main.js'), `import {appendFileSync} from 'node:fs';\nappendFileSync(${JSON.stringify(countPath)}, 'started\\n');\nprocess.exitCode=76;\n`);
   const journal = new RestartJournal(dataDir); journal.request(origin); journal.mark('stopping'); journal.close();
+  copyFileSync(new URL('../../scripts/paths.ps1', import.meta.url), join(scripts, 'paths.ps1'));
+  writeFileSync(join(root, '.local', 'config.json'), JSON.stringify({ version: 2, startupProfile: 'discord/default' }));
   const child = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(scripts, 'supervise.ps1')],
     { encoding: 'utf8', timeout: 8000, windowsHide: true });
   assert.equal(child.error, undefined, child.stderr); assert.equal(child.status, 0, child.stderr);

@@ -2,25 +2,39 @@ import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { resolve, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgentCommand, AgentName, BridgeConfig } from './types.js';
+import { readJson, selectProfile, profileScope } from './profiles.js';
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export function isModelId(value: string): boolean {
   return value.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._:/@+\-]*(?:\[[A-Za-z0-9]+\])?$/.test(value);
 }
-export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
+export function loadConfig(argv = process.argv.slice(2), createDirectories = true): BridgeConfig {
   let configPath = resolve(projectRoot, '.local', 'config.json');
   let portOverride: number | undefined;
+  let profileOverride: string | undefined;
+  let platformOverride: 'discord' | 'feishu' | undefined;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--config') configPath = resolve(argv[++i] ?? '');
     else if (argv[i] === '--proxy-port') portOverride = parsePort(argv[++i]);
+    else if (argv[i] === '--profile') { profileOverride = argv[++i]; if (!profileOverride) throw new Error('--profile 缺少预设名称。'); }
+    else if (argv[i] === '--platform') { const platform = argv[++i]; if (platform !== 'discord' && platform !== 'feishu') throw new Error('--platform 必须是 discord 或 feishu。'); platformOverride = platform; }
     else if (!['--check', '--help'].includes(argv[i] ?? '')) throw new Error(`未知参数：${argv[i]}`);
   }
-  const raw = JSON.parse(readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '')) as Record<string, unknown>;
-  const token = String(raw.token ?? '').trim();
-  if (!token) throw new Error('配置缺少机器人 token');
-  if (!Array.isArray(raw.allowedUserIds) || !raw.allowedUserIds.length || raw.allowedUserIds.some(id => !/^\d{15,22}$/.test(String(id)))) {
-    throw new Error('allowedUserIds 必须包含明确的 Discord 用户 ID');
+  const raw = readJson(configPath);
+  if (raw.version !== 2 || ['token', 'applicationId', 'appId', 'appSecret', 'allowedUserIds'].some(key => key in raw)) throw new Error('请先执行一次性 Profile 语义迁移，运行配置仅支持 version:2。');
+  if (platformOverride && !profileOverride) {
+    const defaults = raw.platformProfiles as Record<string, unknown> | undefined;
+    const candidate = defaults?.[platformOverride] ?? (typeof raw.startupProfile === 'string' && raw.startupProfile.startsWith(platformOverride + '/') ? raw.startupProfile : undefined);
+    if (typeof candidate !== 'string') throw new Error('未配置该平台的默认 Profile。');
+    profileOverride = candidate;
   }
+  const profile = selectProfile(raw, configPath, profileOverride);
+  if (platformOverride && profile.platform !== platformOverride) throw new Error('Profile 与选择的平台不一致。');
+  const token = profile.token ?? '';
+  if (profile.platform === 'discord' && !token) throw new Error('配置缺少机器人 token');
+  if (profile.platform === 'feishu' && !profile.appSecret) throw new Error('飞书 Profile 缺少 appSecret。');
+  const userPattern = profile.platform === 'discord' ? /^\d{15,22}$/ : /^ou_[a-zA-Z0-9_-]+$/;
+  if (!profile.allowedUserIds.length || profile.allowedUserIds.some(id => !userPattern.test(id))) throw new Error(`allowedUserIds 必须包含明确的 ${profile.platform} 用户 ID。`);
   const localPath = (value: unknown, fallback: string): string => {
     const p = String(value ?? fallback);
     return isAbsolute(p) ? p : resolve(projectRoot, p);
@@ -63,18 +77,25 @@ export function loadConfig(argv = process.argv.slice(2)): BridgeConfig {
     throw new Error('maxFileBytes 必须是 1–25165824 的整数（单个回传文件大小上限）。');
   }
   if (raw.controllerMode != null && typeof raw.controllerMode !== 'boolean') throw new Error('controllerMode 必须是布尔值');
+  const dataDir = localPath(raw.dataDir, '.local/data');
+  const scopePrefix = profileScope(profile);
   const config: BridgeConfig = {
-    token, allowedUserIds: raw.allowedUserIds.map(String), defaultAgent,
+    token, allowedUserIds: profile.allowedUserIds.map(id => scopePrefix + id), defaultAgent,
+    platform: profile.platform, profile: profile.name, applicationId: profile.applicationId, appSecret: profile.appSecret,
+    externalAllowedUserIds: profile.allowedUserIds, scopePrefix, features: profile.features,
     workspace: localPath(raw.workspace, '.local/workspace'), proxyUrl,
     commands: { codex: command('codex'), claude: command('claude') },
-    dataDir: localPath(raw.dataDir, '.local/data'),
-    attachmentsDir: localPath(raw.attachmentsDir, '.local/data/attachments'),
-    logsDir: localPath(raw.logsDir, '.local/logs'), maxImageBytes: 20 * 1024 * 1024,
+    dataDir,
+    attachmentsDir: localPath(raw.attachmentsDir, `.local/data/attachments/${profile.name}`),
+    logsDir: localPath(raw.logsDir, `.local/logs/${profile.name}`), maxImageBytes: 20 * 1024 * 1024,
     defaultModels, modelOptions, maxFileBytes: maxFileBytes as number,
     controllerMode: raw.controllerMode === true,
   };
-  for (const p of [config.workspace, config.dataDir, config.attachmentsDir, config.logsDir]) mkdirSync(p, { recursive: true });
+  if (createDirectories) prepareConfigPaths(config);
   return config;
+}
+export function prepareConfigPaths(config: BridgeConfig): void {
+  for (const p of [config.workspace, config.dataDir, config.attachmentsDir, config.logsDir]) mkdirSync(p, { recursive: true });
 }
 function parsePort(value: string | undefined): number {
   if (!value || !/^\d+$/.test(value)) throw new Error('代理端口需要是 1–65535 的整数');

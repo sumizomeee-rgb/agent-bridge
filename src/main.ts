@@ -2,11 +2,13 @@ import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync, unli
 import { createServer, connect } from 'node:net';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { loadConfig, agentEnvironment, safeError, redactText } from './config.js';
+import { loadConfig, prepareConfigPaths, projectRoot, agentEnvironment, safeError, redactText } from './config.js';
 import { CodexAdapter } from './agents/codex.js';
 import { ClaudeAdapter } from './agents/claude.js';
 import { SessionManager } from './manager.js';
-import { DiscordTransport, ingressFailureText } from './discord.js';
+import { PlatformTransport } from './platform.js';
+import { acquireInstanceLock } from './instance-lock.js';
+import { ensureSemanticData } from './profile-migration.js';
 import { DurableIngress } from './ingress.js';
 import { NativeControllerAdapter } from './controller/native.js';
 import { ControllerRuntime } from './controller/runtime.js';
@@ -18,12 +20,13 @@ import { TargetCatalogService } from './remote/catalog.js';
 import { CapabilityHealthService } from './capabilities.js';
 
 if (process.argv.includes('--help')) {
-  console.log('启动：start.ps1 [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/agent、/stop');
+  console.log('启动：start.ps1 [-Profile discord/default] [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/agent、/stop');
   process.exit(0);
 }
-const config = loadConfig();
+const config = loadConfig(undefined, false);
+const secrets = [config.token, config.appSecret ?? ''];
 const log = (message: string): void => {
-  const line = `${new Date().toISOString()} ${safeError(message, [config.token])}\n`;
+  const line = `${new Date().toISOString()} ${safeError(message, secrets)}\n`;
   appendFileSync(join(config.logsDir, 'bridge.log'), line);
   process.stdout.write(line);
 };
@@ -38,33 +41,51 @@ async function checkProxy(): Promise<void> {
     socket.once('error', reject);
   });
 }
-const capabilityHealth = new CapabilityHealthService(config);
-try { log(capabilityHealth.startupSummary(await capabilityHealth.refresh(config.workspace))); }
-catch (error) { log('CAPABILITY_HEALTH_FAILED ' + safeError(error)); }
 await checkProxy();
 if (process.argv.includes('--check')) {
-  log(`CONFIG_OK agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'} allowedUsers=${config.allowedUserIds.length} workspace=${config.workspace}`);
+  console.log(`CONFIG_OK platform=${config.platform} profile=${config.profile} agent=${config.defaultAgent} allowedUsers=${config.allowedUserIds.length} workspace=${config.workspace}`);
   process.exit(0);
 }
-// One bot identity, one worker on this computer, including relocated copies.
+const projectGuard = await acquireInstanceLock(projectRoot, config.dataDir);
+prepareConfigPaths(config);
+ensureSemanticData(config.dataDir);
+let manager: SessionManager;
+let restart: RestartService;
+let ingress: DurableIngress;
+let closing = false;
+const transport: PlatformTransport = new PlatformTransport(config, message => {
+  if (restart.isDraining()) {
+    if (!message.interaction) ingress.capture(message);
+    return Promise.resolve();
+  }
+  return ingress.receive(message);
+}, {
+  logger: message => log(config.platform?.toUpperCase() + ' ' + message),
+  onReceive: message => { ingress.capture(message); },
+  onReady: () => restart.isDraining() ? Promise.resolve() : ingress.recover((channelId, options) => transport.readDMHistory(channelId, options)),
+});
+const applicationIdentity = await transport.verifyIdentity().catch(async error => {
+  await transport.close(); projectGuard.close(); throw new Error(safeError(error, secrets));
+});
+// Project selection is exclusive; the actual bot identity is also exclusive across relocated copies.
 const guard = createServer(socket => socket.destroy());
-const identity = createHash('sha256').update(config.token).digest('hex').slice(0, 24);
-const pipe = process.platform === 'win32' ? `\\\\.\\pipe\\discord-agent-bridge-${identity}` : join(config.dataDir, `bridge-${identity}.sock`);
-await new Promise<void>((resolve, reject) => {
-  guard.once('error', reject);
-  guard.listen(pipe, resolve);
+const identity = createHash('sha256').update(`${config.platform}:${applicationIdentity}`).digest('hex').slice(0, 24);
+const pipe = process.platform === 'win32' ? `\\\\.\\pipe\\agent-bridge-bot-${identity}` : join(config.dataDir, `bridge-${identity}.sock`);
+await new Promise<void>((resolve, reject) => { guard.once('error', reject); guard.listen(pipe, resolve); }).catch(async error => {
+  await transport.close(); projectGuard.close(); throw new Error('当前机器人已有桥实例运行。');
 });
 const pidFile = join(config.dataDir, 'bridge.pid.json');
 const stopFile = join(config.dataDir, 'stop.request');
 if (existsSync(stopFile)) unlinkSync(stopFile);
-writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), main: process.argv[1] }));
+writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), main: process.argv[1], platform: config.platform, profile: config.profile }));
+const capabilityHealth = new CapabilityHealthService(config);
+try { log(capabilityHealth.startupSummary(await capabilityHealth.refresh(config.workspace))); }
+catch (error) { log('CAPABILITY_HEALTH_FAILED ' + safeError(error, secrets)); }
 const env = agentEnvironment(config);
 const tasks = new TaskRegistry(config.dataDir);
 // Executing children retain the user's ordinary CLI, skills, approvals and provider routing.
 const executionAdapters = { codex: new CodexAdapter(config.commands.codex, env), claude: new ClaudeAdapter(config.commands.claude, env) };
 const targetCatalog = new TargetCatalogService(config, executionAdapters);
-let manager: SessionManager;
-let restart: RestartService;
 const runtime = config.controllerMode ? new ControllerRuntime(config, executionAdapters, tasks, {
   targetCatalog,
   onCheckCapabilities: (workspace, args) => capabilityHealth.query(workspace, args),
@@ -75,7 +96,7 @@ const runtime = config.controllerMode ? new ControllerRuntime(config, executionA
   },
   onCompletion: () => manager.completionAvailable(),
   onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
-  onWorkCountsChanged: counts => discord.setWorkCounts(counts),
+  onWorkCountsChanged: counts => transport.setWorkCounts(counts),
   onError: error => log('CONTROLLER_WORKER ' + safeError(error)),
   isDraining: () => restart?.isDraining() ?? false,
   onRequestRestart: origin => restart.request(origin),
@@ -111,7 +132,7 @@ const preparationEpochs = new Map<string, number>();
 const messageRevisions = new Map<string, number>();
 const isControl = (message: IncomingDM): boolean =>
   /^(?:\/(?:stop|new|cwd)(?:\s|$)|\/agent\s+\S|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
-const ingress = new DurableIngress(config.dataDir, {
+ingress = new DurableIngress(config.dataDir, {
   allowedUserIds: config.allowedUserIds,
   hasMessage: id => manager.hasMessage(id),
   isImmediate: isControl,
@@ -126,7 +147,7 @@ const ingress = new DurableIngress(config.dataDir, {
       await startupReady;
       if (closing || restart.isDraining()) return;
       if (manager.hasMessage(message.id)) {
-        if (message.interaction) await discord.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
+        if (message.interaction) await transport.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
         return;
       }
       const control = isControl(message);
@@ -134,7 +155,7 @@ const ingress = new DurableIngress(config.dataDir, {
         manager.discard({ id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths: [] });
         return;
       }
-      const imagePaths = control ? [] : await discord.downloadImages(message);
+      const imagePaths = control ? [] : await transport.downloadImages(message);
       if (closing || restart.isDraining()) return;
       const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths };
       if (!control && messageRevisions.get(message.id) !== (preparationEpochs.get(message.userId) ?? 0)) {
@@ -142,7 +163,7 @@ const ingress = new DurableIngress(config.dataDir, {
         return;
       }
       const commandReply = message.interaction
-        ? (text: string) => discord.sendInteractionText(message.interaction!, redactText(text, [config.token, message.interaction!.token]))
+        ? (text: string) => transport.sendInteractionText(message.interaction!, redactText(text, [...secrets, message.interaction!.token]))
         : undefined;
       await manager.handle(prepared, commandReply);
     } finally { messageRevisions.delete(message.id); }
@@ -150,32 +171,22 @@ const ingress = new DurableIngress(config.dataDir, {
   onError: (message, error) => {
     if (closing || restart.isDraining()) return;
     log('INGRESS_PREPARATION_FAILED ' + safeError(error));
-    void discord.sendText(message.channelId, ingressFailureText(error)).catch(() => log('收件错误反馈发送失败。'));
+    void transport.sendText(message.channelId, transport.failureText(error)).catch(() => log('收件错误反馈发送失败。'));
   },
 });
-const discord: DiscordTransport = new DiscordTransport(config, message => {
-  if (restart.isDraining()) {
-    if (!message.interaction) ingress.capture(message);
-    return Promise.resolve();
-  }
-  return ingress.receive(message);
-}, {
-  logger: message => log('DISCORD ' + message),
-  onReceive: message => { ingress.capture(message); },
-  onReady: () => restart.isDraining() ? Promise.resolve() : ingress.recover((channelId, options) => discord.readDMHistory(channelId, options)),
-});
+
 manager = new SessionManager(config, adapters, {
-  markReplyDelivered: messages => discord.markReplyDelivered(messages),
-  setTaskCount: (message, count) => discord.setTaskCount(message, count),
-  sendText: (channelId, text, options) => discord.sendText(channelId, redactText(text, [config.token]),
+  markReplyDelivered: messages => transport.markReplyDelivered(messages),
+  setTaskCount: (message, count) => transport.setTaskCount(message, count),
+  sendText: (channelId, text, options) => transport.sendText(channelId, redactText(text, secrets),
     options ? {
       ...options,
-      ...(options.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, [config.token]) } : {}),
+      ...(options.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, secrets) } : {}),
       ...(options.images ? { images: options.images.map(image => ({ ...image,
-        ...(image.description ? { description: redactText(image.description, [config.token]) } : {}),
+        ...(image.description ? { description: redactText(image.description, secrets) } : {}),
       })) } : {}),
       ...(options.files ? { files: options.files.map(file => ({ ...file,
-        ...(file.description ? { description: redactText(file.description, [config.token]) } : {}),
+        ...(file.description ? { description: redactText(file.description, secrets) } : {}),
       })) } : {}),
     } : undefined),
 }, { taskRegistry: tasks,
@@ -190,15 +201,14 @@ manager = new SessionManager(config, adapters, {
 restart = new RestartService(config.dataDir, {
   supervised: process.env.BRIDGE_SUPERVISED === '1',
   beginDrain: () => { ingress.pause(); manager.beginDrain(); runtime?.beginDrain(); },
-  isIdle: () => manager.isIdle() && (runtime?.isIdle() ?? true) && discord.isIdle(),
+  isIdle: () => manager.isIdle() && (runtime?.isIdle() ?? true) && transport.isIdle(),
   shutdown: () => shutdown(true),
   onShutdownComplete: exitCode => { process.exitCode = exitCode; restart.close(); },
-  presence: phase => discord.setPresence(phase),
+  presence: phase => transport.setPresence(phase),
   onError: error => log('RESTART ' + safeError(error)),
 });
 restart.beginRecovery();
 for (const channel of manager.knownChannels()) if (config.allowedUserIds.includes(channel.userId)) ingress.seedChannel(channel);
-let closing = false;
 async function shutdown(plannedRestart = false): Promise<void> {
   if (closing) return;
   closing = true;
@@ -209,7 +219,7 @@ async function shutdown(plannedRestart = false): Promise<void> {
   // Abort REST/backfill and stop fresh Gateway input before closing either journal.
   try {
     await closeResources([
-      { name: 'Discord', close: () => discord.close() },
+      { name: '通信平台', close: () => transport.close() },
       { name: '收件', close: () => ingress.close() },
       { name: '任务回执', close: () => taskService.close() },
       { name: '主控', close: () => manager.close() },
@@ -218,7 +228,7 @@ async function shutdown(plannedRestart = false): Promise<void> {
       ...Object.entries(executionAdapters).map(([agent, adapter]) => ({ name: `${agent} 执行器`, close: () => adapter.close() })),
       { name: '任务数据库', close: () => tasks.close() },
       { name: '进程标识', close: () => {
-        guard.close();
+        guard.close(); projectGuard.close();
         if (existsSync(pidFile)) unlinkSync(pidFile);
         if (existsSync(stopFile)) unlinkSync(stopFile);
       } },
@@ -237,13 +247,13 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) process.on(sign
 process.on('uncaughtException', e => { log(`FATAL ${safeError(e)}`); restart.failed(safeError(e)); void shutdown().finally(() => { if (process.exitCode !== 76) process.exitCode = 1; }); });
 process.on('unhandledRejection', e => log(`ERROR ${safeError(e)}`));
 try {
-  await discord.start();
-  log(`READY bot=${discord.botUser?.username ?? 'unknown'} agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'}`);
-  void discord.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, [config.token])}`));
+  await transport.start();
+  log(`READY bot=${transport.botUser?.username ?? 'unknown'} agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'}`);
+  void transport.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, secrets)}`));
   await manager.recover();
   if (!closing) await runtime?.start();
   if (!closing) taskService.start();
-  if (!closing && runtime) discord.setWorkCounts(runtime.getGlobalWorkCounts());
+  if (!closing && runtime) transport.setWorkCounts(runtime.getGlobalWorkCounts());
   releaseStartup();
   if (!closing) { ingress.start(); restart.ready(); }
 } catch (error) {

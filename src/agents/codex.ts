@@ -20,7 +20,7 @@ export class CodexAdapter implements AgentAdapter {
     const rpc = new JsonRpcClient(transport);
     let success = false;
     try {
-      await rpc.request('initialize', { clientInfo: { name: 'discord_agent_bridge', version: '0.1.0' }, capabilities: { experimentalApi: false } }, 15_000);
+      await rpc.request('initialize', { clientInfo: { name: 'agent_bridge', version: '0.1.0' }, capabilities: { experimentalApi: false } }, 15_000);
       rpc.notify('initialized');
       const configured = await rpc.request('config/read', { includeLayers: false, cwd }, 15_000);
       const config = isObject(configured.config) ? configured.config : {};
@@ -175,7 +175,7 @@ export class CodexAdapter implements AgentAdapter {
     try {
       if (turn.signal.aborted) { await cancel(); throw abortError(); }
       await rpc.request('initialize', {
-        clientInfo: { name: 'discord_agent_bridge', title: 'Discord Agent Bridge', version: '0.1.0' },
+        clientInfo: { name: 'agent_bridge', title: 'Agent Bridge', version: '0.1.0' },
         capabilities: { experimentalApi: false },
       });
       rpc.notify('initialized');

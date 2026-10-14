@@ -304,6 +304,7 @@ export class DiscordTransport {
   }
 
   private flushPresence(): void {
+    if (this.config.features?.presence === false) return;
     const state = this.desiredPresence === 'idle'
       ? [this.restartNotice ? '已重启' : '', this.workCounts.running ? `运行助手${this.workCounts.running}` : '',
         this.workCounts.queued ? `等待${this.workCounts.queued}轮` : ''].filter(Boolean).join(' · ') || '空闲'
@@ -405,6 +406,13 @@ export class DiscordTransport {
       this.applicationId = application.id;
     }
     await this.rest(`/applications/${this.applicationId}/commands`, 'PUT', SLASH_COMMANDS);
+  }
+
+  async verifyIdentity(): Promise<string> {
+    const application = await this.rest('/applications/@me', 'GET');
+    if (!record(application) || !snowflake(application.id)) throw new Error('Discord 没有返回有效应用标识。');
+    this.applicationId = application.id;
+    return application.id;
   }
 
   async sendInteractionText(interaction: SlashInteraction, text: string): Promise<void> {
@@ -769,7 +777,7 @@ export class DiscordTransport {
     this.knownDMChannels.add(message.channelId);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
     const receiptKey = `${data.channel_id}:${data.id}`;
-    const receipt = this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
+    const receipt = this.config.features?.reactions === false ? Promise.resolve() : this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
       'PUT', undefined, undefined, undefined, AbortSignal.timeout(5000))
       .then(() => {})
       .catch(() => { if (!this.closed) this.log('收件表情添加失败，消息继续处理。'); });
