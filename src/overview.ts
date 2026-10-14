@@ -17,6 +17,11 @@ export interface WorkerOverview {
   lastResultPreview?: string | null; unresolvedSupplements?: number;
 }
 
+export type WorkerView = 'active' | 'history';
+/** 未确认结束或交接的助手仍留在当前列表，避免把待处理状态藏进历史。 */
+export const isActiveWorker = (item: WorkerOverview): boolean => item.running || item.queued > 0
+  || ['queued', 'running', 'uncertain', 'handoff-pending'].includes(item.status);
+
 const clean = (value: string, limit = 120): string => {
   const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();
   return text.length <= limit ? text : text.slice(0, limit - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
@@ -29,7 +34,7 @@ const checkedTime = (value: string | null): string => {
 
 /** 仅识别本模块生成的总览，在完整条目之间分页，不改变普通回复。 */
 export function splitOverviewMessage(text: string, limit = 2000): string[] | null {
-  if (!/^```ansi\n\u001b\[33m(?:当前工作区的电脑 · 已登记\d+台|(?:当前对话|你的全部对话)的直属助手 · 运行\d+个 · 等待\d+轮(?: · 待核对\d+个)?)\u001b\[0m\n```(?:\n\n|$)/.test(text)) return null;
+  if (!/^```ansi\n\u001b\[33m(?:当前工作区的电脑 · 已登记\d+台|(?:当前对话|你的全部对话)的(?:直属助手 · 运行\d+个 · 等待\d+轮(?: · 待核对\d+个)?|历史助手 · 共\d+个))\u001b\[0m\n```(?:\n\n|$)/.test(text)) return null;
   const [heading, ...blocks] = text.split('\n\n');
   if (!heading || !heading.endsWith('\n```') || heading.length > limit) throw new Error('总览标题超过消息限制。');
   const parts: string[] = [];
@@ -69,7 +74,7 @@ function computerDetails(items: readonly ComputerOverview[]): BridgePresentation
 
 /** Discord 展示入口；核心使用上面的结构化总览。 */
 export const formatComputerOverview = (items: readonly ComputerOverview[], details = false): string => discordPresentationText(computerOverview(items, details));
-export const formatWorkerOverview = (items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false): string => discordPresentationText(workerOverview(items, scope, now, details));
+export const formatWorkerOverview = (items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false, view: WorkerView = 'active'): string => discordPresentationText(workerOverview(items, scope, now, details, view));
 
 
 /** 默认总览先呈现派发准备；原始检查证据只在 details 展开。 */
@@ -93,8 +98,8 @@ export function computerOverview(items: readonly ComputerOverview[], details = f
     })] : [{ kind: 'text', text: '当前工作区没有登记的电脑。' }],
     footer: '✅ 表示连接与 CLI 入口就绪，模型需实际调用确认。/computers details 查看检查时间和详情。' };
 }
-export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false): BridgePresentation {
-  if (details) return workerDetails(items, scope, now);
+export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false, view: WorkerView = 'active'): BridgePresentation {
+  if (details) return workerDetails(items, scope, now, view);
   const label = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length, queued = items.reduce((sum, item) => sum + item.queued, 0);
   const uncertain = items.filter(item => item.status === 'uncertain').length;
@@ -102,7 +107,7 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
   const sorted = [...items].sort((a, b) => rank(a) - rank(b));
   const states = { queued: '⏳ 等待执行', running: '🔄 运行中', completed: '✅ 已完成', failed: '❌ 失败', cancelled: '⏹ 已停止', uncertain: '⚠️ 待核对', idle: '💤 空闲', 'handed-off': '👤 已交给你', 'handoff-pending': '⚠️ 交接待确认' };
   const effortNames: Record<string, string> = { none: '无', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高' };
-  return { title: `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`, tone: 'info', purpose: 'overview',
+  return { title: view === 'history' ? `${label}的历史助手 · 共${items.length}个` : `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`, tone: 'info', purpose: 'overview',
     blocks: sorted.length ? sorted.map((item, index) => {
       const model = item.model ? clean(item.model, 60).replace(/^gpt-/i, '') : '模型未知';
       const effort = item.effort ? (Object.hasOwn(effortNames, item.effort.toLowerCase()) ? effortNames[item.effort.toLowerCase()]! : clean(item.effort, 30)) : '强度未知';
@@ -113,7 +118,7 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
       if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
       if (item.blocked || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`需核对：${clean(item.statusReason ?? '任务已阻塞', 80)}`);
       return { kind: 'entry', text: lines.join('\n') };
-    }) : [{ kind: 'text', text: `${label}没有已登记的直属助手。` }], footer: '/workers details 查看完整 ID、回执和详情。' };
+    }) : [{ kind: 'text', text: view === 'history' ? `${label}没有历史助手。` : `${label}没有正在执行、排队或待核对的助手。` }], footer: view === 'history' ? '/workers 查看未结束助手 · /workers history details 查看历史详情。' : '/workers history 查看历史 · /workers details 查看完整 ID 与回执。' };
 }
 
 export function elapsedText(startedAt: string | null, now = Date.now()): string {
@@ -130,13 +135,13 @@ function shortWorkerId(item: WorkerOverview, items: readonly WorkerOverview[]): 
   return clean(item.workerId.slice(0, length), 256);
 }
 
-function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): BridgePresentation {
+function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), view: WorkerView = 'active'): BridgePresentation {
   const prefix = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length;
   const queued = items.reduce((total, item) => total + item.queued, 0);
   const uncertain = items.filter(item => item.status === 'uncertain').length;
-  const title = `${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`;
-  if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: `${prefix}没有已登记的直属助手。` }] };
+  const title = view === 'history' ? `${prefix}的历史助手 · 共${items.length}个` : `${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`;
+  if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: view === 'history' ? `${prefix}没有历史助手。` : `${prefix}没有正在执行、排队或待核对的助手。` }] };
   const statuses = { queued: '等待执行', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已停止', uncertain: '状态待核对', idle: '空闲', 'handed-off': '已交给用户', 'handoff-pending': '交接待确认' };
   const effortLabels: Record<string, string> = { minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', none: '无' };
   return { title, tone: 'info', purpose: 'overview', blocks: items.map((item, index) => {

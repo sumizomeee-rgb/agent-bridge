@@ -63,7 +63,7 @@ const transport: PlatformTransport = new PlatformTransport(config, message => {
   return ingress.receive(message);
 }, {
   logger: message => log(config.platform?.toUpperCase() + ' ' + message),
-  onReceive: message => { ingress.capture(message); },
+  onReceive: message => ingress.capture(message),
   onReady: () => restart.isDraining() ? Promise.resolve() : ingress.recover((channelId, options) => transport.readDMHistory(channelId, options)),
 });
 const applicationIdentity = await transport.verifyIdentity().catch(async error => {

@@ -83,7 +83,7 @@ test('空列表、未知回报、完成、空闲及阻塞状态均可读，历�
   assert.match(text, /最近回执：真实执行失败/); assert.match(text, /失败 · 本轮耗时：30秒/);
   assert(!text.includes('主控对话：'));
   const empty = formatWorkerOverview([], 'all', now);
-  assert.match(empty, /运行0个 · 等待0轮/); assert.match(empty, /没有已登记的直属助手/);
+  assert.match(empty, /运行0个 · 等待0轮/); assert.match(empty, /没有正在执行、排队或待核对的助手/);
   assert.equal(elapsedText('invalid', now), '开始时间未记录');
   assert.equal(elapsedText('2026-10-13T09:00:00Z', now), '开始时间未记录');
   assert.equal(elapsedText('2026-10-13T06:00:00Z', now), '2小时0分');
@@ -226,4 +226,21 @@ test('并发查询的交互回复不会串到另一条命令或普通私聊', as
   assert.equal(first.length, 0); assert.equal(second.length, 1);
   release(computers); await pending;
   assert.equal(first.length, 1); assert.deepEqual(f.replies, []); assert.equal(f.adapter.turns.length, 0);
+});
+
+test('workers 当前与历史互斥，all 和 details 不改变筛选，查询不启动模型', async t => {
+  const items = [worker({ workerId: 'active', title: '当前运行' }),
+    worker({ workerId: 'queued', title: '正在排队', status: 'queued', running: false, queued: 1 }),
+    worker({ workerId: 'uncertain', title: '尚待核对', status: 'uncertain', running: false, queued: 0 }),
+    ...(['completed', 'failed', 'cancelled', 'idle', 'handed-off'] as const).map(status => worker({ workerId: status, title: '历史_' + status, status, running: false, queued: 0 }))];
+  const scopes: string[] = [];
+  const f = fixture(t, { onListWorkers: async (_conversation, scope) => { scopes.push(scope); return items; } });
+  await f.manager.handle(message('active-query', '/workers'));
+  assert.match(f.replies[0]!, /当前运行/); assert.match(f.replies[0]!, /正在排队/); assert.match(f.replies[0]!, /尚待核对/); assert(!f.replies[0]!.includes('历史_'));
+  await f.manager.handle(message('history-query', '/workers history all details'));
+  const history = f.replies[1]!;
+  assert.match(history, /你的全部对话的历史助手 · 共5个/);
+  for (const status of ['completed', 'failed', 'cancelled', 'idle', 'handed-off']) assert(history.includes('历史_' + status));
+  assert(!history.includes('当前运行')); assert(!history.includes('正在排队')); assert(!history.includes('尚待核对'));
+  assert.match(history, /workerId：completed/); assert.deepEqual(scopes, ['current', 'all']); assert.equal(f.adapter.turns.length, 0);
 });

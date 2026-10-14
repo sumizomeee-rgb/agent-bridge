@@ -63,7 +63,7 @@ steer 超时（10 秒）、连接断开、内部错误、响应损坏或返回�
 | `/agent` | 查看当前 Agent 和两种切换指令 |
 | `/status` | 查看当前会话和排队情况 |
 | `/computers` | 直接检查登记电脑的连接与 Agent CLI 入口；`cached` 使用缓存 |
-| `/workers` | 查看当前对话的已登记直属助手：电脑、实际模型/强度、会话名、状态和本轮耗时；`all` 查看本人所有对话 |
+| `/workers` | 默认仅显示执行、排队或待核对的直属助手；`history` 单独查看已结束或空闲的历史，`all` 跨本人对话，`details` 展开完整信息 |
 | `/model` | 查看 CLI 回报模型、会话选择和新会话默认 |
 | `/model list` 或 `/models` | 列出当前 Agent 的模型 |
 | `/model gpt-6.1-sol` | 在当前 Codex 会话切换模型，保留上下文 |

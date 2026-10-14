@@ -54,7 +54,7 @@ export function slashText(data: unknown): { text: string } | { error: string } {
     case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };
     case 'cwd': return { text: `/cwd ${values.get('path')}` };
     case 'computers': return { text: `/computers${values.has('refresh') ? values.get('refresh') ? ' refresh' : ' cached' : ''}${values.get('details') ? ' details' : ''}` };
-    case 'workers': return { text: `/workers${values.has('scope') ? ` ${values.get('scope')}` : ''}${values.get('details') ? ' details' : ''}` };
+    case 'workers': return { text: `/workers${values.get('history') ? ' history' : ''}${values.has('scope') ? ` ${values.get('scope')}` : ''}${values.get('details') ? ' details' : ''}` };
     case 'model': {
       const name = values.get('name');
       if (values.get('custom') === true && !name) return { error: '使用自定义模型时请填写模型 ID。' };

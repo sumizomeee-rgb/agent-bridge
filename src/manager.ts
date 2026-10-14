@@ -5,7 +5,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { SessionStore, type WorkspaceNoticeOutcome } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
-import { computerOverview, workerOverview, type ComputerOverview, type WorkerOverview } from './overview.js';
+import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview, type WorkerOverview } from './overview.js';
 import { commandHelp, parseCommand as command } from './commands.js';
 import { presentationText, type BridgePresentation } from './presentation.js';
 import { collectOutgoingAttachments } from './artifacts.js';
@@ -464,8 +464,8 @@ export class SessionManager {
       }
       case 'workers': {
         const args = argument.split(/\s+/).filter(Boolean);
-        if (args.some(value => !['current', 'all', 'details'].includes(value)) || new Set(args).size !== args.length || args.includes('current') && args.includes('all')) {
-          await reply('用法：/workers [all] [details]；默认查看当前对话的简要状态。'); return;
+        if (args.some(value => !['current', 'all', 'history', 'details'].includes(value)) || new Set(args).size !== args.length || args.includes('current') && args.includes('all')) {
+          await reply('用法：/workers [history] [all] [details]；默认只看未结束助手，history 看历史。'); return;
         }
         if (!this.options.onListWorkers) { await reply('桥尚未配置直属 Agent 查询。'); return; }
         const target = current ?? this.ensureActive(message.userId);
@@ -473,7 +473,9 @@ export class SessionManager {
         let items: WorkerOverview[];
         try { items = await this.options.onListWorkers(target, scope); }
         catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
-        const view = workerOverview(items, scope, Date.now(), args.includes('details')); await reply(presentationText(view), { presentation: view }); return;
+        const history = args.includes('history');
+        const selected = items.filter(item => isActiveWorker(item) !== history);
+        const view = workerOverview(selected, scope, Date.now(), args.includes('details'), history ? 'history' : 'active'); await reply(presentationText(view), { presentation: view }); return;
       }
       case 'status': {
         const running = current && this.running.get(message.userId)?.conversationId === current.id;

@@ -7,7 +7,7 @@
   ],
   "network": { "proxyPort": null },
   "features": {
-    "reactions": false,
+    "reactions": true,
     "nativeCommands": false,
     "presence": false
   }

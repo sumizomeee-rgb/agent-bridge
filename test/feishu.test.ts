@@ -111,3 +111,51 @@ test('Feishu recovery spans equal timestamps across pages without losing lower o
   ingress.start(); await ingress.whenIdle(); assert.deepEqual(handled, [make('om_a').id, make('om_z').id]);
   await ingress.receive(make('om_a')); await ingress.whenIdle(); assert.equal(handled.length, 2);
 });
+
+test('飞书收件回执不阻塞收件，快速完成等待处理中表情，去重并只清理自己的表情', async t => {
+  const { config, cleanup } = setup(t); config.features = { reactions: true };
+  const requests: Array<{ method: string; emoji?: string; path: string }> = [];
+  let finishTyping!: () => void, received = 0, capture = true;
+  const gate = new Promise<void>(resolve => { finishTyping = resolve; });
+  const http = (async (url: any, options: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path.includes('/auth/')) return response({ code: 0, tenant_access_token: 'private-token' });
+    const emoji = options.body ? JSON.parse(options.body).reaction_type?.emoji_type : undefined;
+    requests.push({ method: options.method, emoji, path });
+    if (emoji === 'Typing') { await gate; return response({ code: 0, data: { reaction_id: 'own-typing' } }); }
+    return response({ code: 0, data: { reaction_id: 'done' } });
+  }) as any;
+  const bridge = new FeishuTransport(config, async () => { received++; }, { fetch: http, onReceive: () => capture }); cleanup(() => bridge.close());
+  await bridge.receiveEvent(event()); assert.equal(received, 1);
+  const source = { id: prefix + '1700000000000|om_z', channelId: prefix + 'oc_chat' };
+  const completed = bridge.markReplyDelivered([source, source]);
+  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(requests.map(item => item.emoji), ['Typing']);
+  finishTyping(); await completed;
+  assert.deepEqual(requests.map(item => [item.method, item.emoji]), [['POST', 'Typing'], ['POST', 'DONE'], ['DELETE', undefined]]);
+  assert(requests[2]!.path.endsWith('/own-typing'));
+  const before = requests.length; await bridge.receiveEvent(event()); capture = false; await bridge.receiveEvent(event('om_replayed'));
+  await bridge.markReplyDelivered([{ ...source, id: 'feishu:cli_other|1700000000000|om_other' }]);
+  assert.equal(requests.length, before);
+});
+
+test('飞书重启后找回自己的处理中表情，送达失败时保留处理中，不影响消息处理', async t => {
+  const { config, cleanup } = setup(t); config.features = { reactions: true };
+  const deleted: string[] = [], logs: string[] = []; let failDone = false;
+  const http = (async (url: any, options: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path.includes('/auth/')) return response({ code: 0, tenant_access_token: 'private-token' });
+    if (options.method === 'GET') return response({ code: 0, data: { items: [
+      { reaction_id: 'ours', operator: { operator_type: 'app', operator_id: config.applicationId }, reaction_type: { emoji_type: 'Typing' } },
+      { reaction_id: 'user', operator: { operator_type: 'user', operator_id: 'ou_owner' }, reaction_type: { emoji_type: 'Typing' } },
+      { reaction_id: 'other-bot', operator: { operator_type: 'app', operator_id: 'cli_other' }, reaction_type: { emoji_type: 'Typing' } },
+    ] } });
+    if (options.method === 'DELETE') deleted.push(path.split('/').at(-1)!);
+    if (failDone && options.method === 'POST') return response({ code: 999, msg: 'private-token' }, 403);
+    return response({ code: 0, data: {} });
+  }) as any;
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: http, logger: log => logs.push(log) }); cleanup(() => bridge.close());
+  const source = { id: prefix + '1700000000000|om_old', channelId: prefix + 'oc_chat' };
+  await bridge.markReplyDelivered([source]); assert.deepEqual(deleted, ['ours']);
+  failDone = true; await bridge.markReplyDelivered([{ ...source, id: prefix + '1700000000000|om_failed' }]); assert.deepEqual(deleted, ['ours']);
+  assert.deepEqual(logs, ['FEISHU_RECEIPT_FAILED']); assert(!JSON.stringify(logs).includes('private-token'));
+});

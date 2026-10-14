@@ -9,7 +9,7 @@ import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 export class PlatformTransport {
   private readonly transport: DiscordTransport | FeishuTransport;
   constructor(private readonly config: BridgeConfig, receive: (message: IncomingDM) => Promise<void>, hooks: {
-    onReceive: (message: IncomingDM) => void; onReady: () => Promise<void>; logger: (message: string) => void;
+    onReceive: (message: IncomingDM) => boolean | void; onReady: () => Promise<void>; logger: (message: string) => void;
   }) {
     if (!config.scopePrefix || !config.applicationId || !['discord', 'feishu'].includes(config.platform ?? '')) throw new Error('缺少完整平台 Profile 身份。');
     this.transport = config.platform === 'feishu' ? new FeishuTransport(config, receive, hooks)

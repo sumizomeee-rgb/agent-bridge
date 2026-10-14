@@ -106,6 +106,9 @@ test('computer and worker options map to direct text queries and reject foreign 
   assert.deepEqual(result('workers'), { text: '/workers' });
   assert.deepEqual(result('workers', [option('scope', 'all')]), { text: '/workers all' });
   assert.deepEqual(result('workers', [option('scope', 'current')]), { text: '/workers current' });
+  assert.deepEqual(result('workers', [option('history', true)]), { text: '/workers history' });
+  assert.deepEqual(result('workers', [option('history', true), option('scope', 'all'), option('details', true)]), { text: '/workers history all details' });
+  assert.deepEqual(result('workers', [option('history', false)]), { text: '/workers' });
   assert('error' in result('workers', [option('scope', 'another-user')]));
   assert('error' in result('workers', [option('userId', '444')]));
   assert('error' in result('computers', [option('refresh', 'true')]));

@@ -27,10 +27,11 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'boolean', name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
     { type: 'boolean', name: 'details', description: '展开完整检查信息；默认简要展示' },
   ] },
-  { name: 'workers', help: "/workers [all] [details]：查看当前对话或自己的全部对话的直属助手", description: '查看已登记直属助手的电脑、会话、状态和本轮耗时', options: [
+  { name: 'workers', help: "/workers [history] [all] [details]：默认查看未结束助手；history 查看历史", description: '查看执行中的直属助手，或单独查询历史', options: [
     { type: 'string', name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [
       { name: '当前对话', value: 'current' }, { name: '我的全部对话', value: 'all' },
     ] },
+    { type: 'boolean', name: 'history', description: '查看已结束或空闲的历史助手；默认仅未结束助手' },
     { type: 'boolean', name: 'details', description: '展开完整 ID 与回执；默认简要展示' },
   ] },
   { name: 'stop', help: "/stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务", description: '停止当前任务并清空其队列，保留上下文' },

@@ -38,7 +38,7 @@ config.example.json                 # Git：公共配置模板，version:2
 
 新增 bot 时复制相应模板到本地预设目录，填入该 bot 的真实应用 ID、凭据和明确白名单，再选择它启动。飞书白名单使用该应用下的用户 Open ID；不同应用的 Open ID 不通用。凭据、白名单、实际路径、私聊记录、运行数据和认证副本均不提交 Git；模板、格式校验、启动代码和使用说明提交 Git。
 
-Discord 可选 `reactions`、`nativeCommands`、`presence`；飞书当前支持可选完成反应，不支持后两项。`features` 在启动时加载，改动后须重启。飞书用文字 `/status` 查询状态。
+Discord 可选 `reactions`、`nativeCommands`、`presence`；飞书支持可选收件和送达表情回执，不支持后两项。两端都在持久收件后标记处理中、最终回复送达后标记完成；Discord 使用 ⏳／✅，飞书使用原生 Typing／DONE。飞书应用需有表情回复读写权限；重启后仅清理当前 bot 自己的处理中表情。`features` 在启动时加载，改动后须重启。飞书用文字 `/status` 查询状态。
 
 ## 现有部署的离线语义迁移
 

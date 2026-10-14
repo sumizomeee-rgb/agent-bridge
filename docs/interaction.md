@@ -6,7 +6,7 @@
 
 核心使用 `BridgePresentation` 描述标题、语义色、正文或条目及说明；不生成 ANSI 或平台卡片 JSON。Discord 渲染器保留绿色回复头、黄色电脑／助手总览。飞书使用 JSON 2.0 卡片，回复头和就绪通知为绿色，状态与帮助为蓝色，总览为橙色；正文支持 Markdown 和代码块，长回复分页重复标题，条目和元数据按文字展示，不触发提及。图片、文件仍作为附件按顺序发送。总览和状态字段在飞书使用原生 `plain_text` 组件保留换行，不把内部字段拼成 Markdown 段落。
 
-`/computers` 默认按就绪程度排序，逐行标记各 Agent 的可派发、不可用和待确认；检查证据用 `/computers details` 展开。`/workers` 默认只显示电脑／Agent／模型／强度／短编号、状态与耗时、任务名；完整 ID 和回执用 `/workers details` 展开。`all` 仍只访问当前 bot 下本用户的会话。
+`/computers` 默认按就绪程度排序，逐行标记各 Agent 的可派发、不可用和待确认；检查证据用 `/computers details` 展开。`/workers` 默认仅列执行、排队或待核对的助手，简要显示电脑／Agent／模型／强度／短编号、状态与耗时、任务名；`/workers history` 单独查看已结束或空闲的历史，可组合 `all`、`details`。完整 ID 和回执用 `/workers details` 展开。`all` 仍只访问当前 bot 下本用户的会话。
 
 显式 `/new` 的初始化结果进入原主控后，触发同一次完成事件中的主动介绍，复用 `bridge_send_user`；成功介绍不再由程序固定文案代替，不追加一次模型调用或伪造用户消息。
 
@@ -15,3 +15,19 @@
 生命周期投递在 `.local/data/lifecycle.sqlite` 中记录。发送前记 attempted，成功记 delivered，失败或结果不确定记 uncertain；同一进程不会重复尝试，重连也不补发。通知失败不阻止桥继续处理消息。启动成功只代表连接与恢复完成，不代表模型提供方已通过实测。
 
 飞书结构参照[卡片 JSON 2.0](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-json-v2-structure)及[Markdown 组件](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-json-v2-components/content-components/rich-text)。
+
+## 当前平台差异
+
+会话、模型与强度、主控派工、电脑和助手查询、原生会话登记、重启恢复共用核心。以下为当前适配器的具体行为；“未实现”不表示平台本身做不到。
+
+| 项目 | Discord | 飞书 |
+| --- | --- | --- |
+| 命令入口 | 原生斜杠菜单、参数选项，以及同名文字命令 | 当前仅同名文字命令；使用相同定义、参数和处理逻辑 |
+| 收件与回复送达 | ⏳ 收件、✅ 回复已送达 | Typing 收件、DONE 回复已送达；同一语义，表情读写需应用权限 |
+| 持续运行状态 | bot 在线状态显示全桥运行／排队数 | 未实现持续状态栏；通过 `/status`、`/workers` 查询 |
+| 启动完成 | 在线状态显示“已重启” | 给当前 bot 最近联系的白名单用户发就绪卡片 |
+| 消息展示 | 绿色回复头、黄色总览，正文使用 Discord Markdown | 语义相同的飞书卡片，原生标题色与正文 Markdown；分页长度由平台决定 |
+| 普通文件输入 | 目前跳过非图片附件，随附文字仍可处理 | 目前明确报不支持，带普通附件的该条消息不交给模型；这部分仍待统一 |
+| 图片、文件输出 | 支持图片和文件附件 | 支持图片和文件附件，按平台要求分别上传、发送 |
+
+飞书表情 API：[添加](https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create)、[删除](https://open.feishu.cn/document/server-docs/im-v1/message-reaction/delete)。

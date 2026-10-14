@@ -14,7 +14,7 @@ type Json = Record<string, any>;
 export interface FeishuOptions {
   apiBase?: string; fetch?: typeof fetch;
   socketFactory?: (options: ConstructorParameters<typeof WSClient>[0]) => Pick<WSClient, 'start' | 'close'>;
-  onReceive?: (message: IncomingDM) => void;
+  onReceive?: (message: IncomingDM) => boolean | void;
   onReady?: () => Promise<void>;
   logger?: (message: string) => void;
 }
@@ -27,6 +27,9 @@ export class FeishuTransport {
   private readonly apiBase: string;
   private socket?: Pick<WSClient, 'start' | 'close'>;
   private readonly sends = new Map<string, Promise<void>>();
+  private readonly receipts = new Map<string, Promise<void>>();
+  private readonly processingReactions = new Map<string, string>();
+  private readonly seenMessages = new Set<string>();
   private closed = false;
   constructor(private readonly config: BridgeConfig, private readonly receive: (message: IncomingDM) => Promise<void>,
     private readonly options: FeishuOptions = {}) {
@@ -141,7 +144,12 @@ export class FeishuTransport {
     if (typeof user !== 'string' || !this.config.externalAllowedUserIds?.includes(user)) return;
     const normalized = this.normalize(message, user);
     // This must finish durable capture before SDK acknowledgement; it never waits for model work.
-    this.options.onReceive?.(normalized);
+    const captured = this.options.onReceive?.(normalized);
+    if (captured !== false && !this.seenMessages.has(normalized.id)) {
+      this.seenMessages.add(normalized.id);
+      if (this.seenMessages.size > 5000) this.seenMessages.delete(this.seenMessages.values().next().value!);
+      void this.markReceived(normalized);
+    }
     await this.receive(normalized);
   }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
@@ -225,12 +233,43 @@ export class FeishuTransport {
         content: JSON.stringify({ [isImage ? 'image_key' : 'file_key']: key }) }, options?.signal);
     }
   }
+  /** 回执只表示持久收件与回复送达；更新失败不影响任务，串行避免完成后留下处理中表情。 */
+  private receipt(message: Pick<BridgeMessage, 'id' | 'channelId'>, update: (id: string) => Promise<void>): Promise<void> {
+    const prefix = this.config.scopePrefix!;
+    if (this.closed || !this.config.features?.reactions || !message.id.startsWith(prefix) || !message.channelId.startsWith(prefix)) return Promise.resolve();
+    const id = message.id.slice(prefix.length).split('|').at(-1)!;
+    if (!/^om_[a-zA-Z0-9_-]+$/.test(id)) return Promise.resolve();
+    const previous = this.receipts.get(id) ?? Promise.resolve();
+    const work = previous.catch(() => {}).then(async () => { if (!this.closed) await update(id); })
+      .catch(() => { if (!this.closed) this.log('FEISHU_RECEIPT_FAILED'); });
+    this.receipts.set(id, work);
+    void work.finally(() => { if (this.receipts.get(id) === work) this.receipts.delete(id); }).catch(() => {});
+    return work;
+  }
+  private markReceived(message: IncomingDM): Promise<void> {
+    return this.receipt(message, async id => {
+      const result = await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'Typing' } }, AbortSignal.timeout(5000));
+      if (typeof result.reaction_id === 'string') this.processingReactions.set(id, result.reaction_id);
+    });
+  }
   async markReplyDelivered(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void> {
-    if (!this.config.features?.reactions) return;
-    for (const message of messages) {
-      const id = message.id.split('|').at(-1)!;
-      await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'DONE' } }).catch(() => this.log('FEISHU_REACTION_FAILED'));
-    }
+    await Promise.all([...new Map(messages.map(message => [message.id, message])).values()].map(message => this.receipt(message, async id => {
+      await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'DONE' } }, AbortSignal.timeout(5000));
+      const cached = this.processingReactions.get(id), pending: string[] = cached ? [cached] : [];
+      // 重启后按平台身份找回自己的处理中表情，只删除当前 bot 的回执。
+      if (!cached) {
+        let pageToken: string | undefined;
+        do {
+          const params = new URLSearchParams({ reaction_type: 'Typing', page_size: '50', ...(pageToken ? { page_token: pageToken } : {}) });
+          const page = await this.api(`/im/v1/messages/${id}/reactions?${params}`, 'GET', undefined, AbortSignal.timeout(5000));
+          for (const item of page.items ?? []) if (item.operator?.operator_type === 'app' && item.operator.operator_id === this.config.applicationId
+            && item.reaction_type?.emoji_type === 'Typing' && typeof item.reaction_id === 'string') pending.push(item.reaction_id);
+          pageToken = page.has_more === true && typeof page.page_token === 'string' ? page.page_token : undefined;
+        } while (pageToken);
+      }
+      for (const reactionId of pending) await this.api(`/im/v1/messages/${id}/reactions/${encodeURIComponent(reactionId)}`, 'DELETE', undefined, AbortSignal.timeout(5000));
+      this.processingReactions.delete(id);
+    })));
   }
   async onBridgeLifecycle(event: BridgeLifecycleEvent): Promise<void> {
     if (event.phase !== 'ready' || !event.recipient) return;
@@ -243,11 +282,11 @@ export class FeishuTransport {
       footer: '/status 查看当前状态 · /help 查看命令 · /new 明确新建会话' };
     await this.sendText(event.recipient.channelId.slice(prefix.length), '', { presentation: view });
   }
-  isIdle(): boolean { return this.sends.size === 0; }
+  isIdle(): boolean { return this.sends.size === 0 && this.receipts.size === 0; }
   setPresence(): void {} setWorkCounts(): void {} async syncSlashCommands(): Promise<void> {} async setTaskCount(): Promise<void> {}
   async close(): Promise<void> {
     if (this.closed) return; this.closed = true; this.shutdown.abort(); this.socket?.close({ force: true });
-    await Promise.allSettled([...this.sends.values()]); this.token = ''; this.expires = 0;
+    await Promise.allSettled([...this.sends.values(), ...this.receipts.values()]); this.processingReactions.clear(); this.seenMessages.clear(); this.token = ''; this.expires = 0;
     await this.dispatcher?.close();
   }
 }

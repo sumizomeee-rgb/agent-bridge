@@ -31,7 +31,7 @@ export interface DiscordTransportOptions {
   maxTotalImageBytes?: number;
   logger?: (message: string) => void;
   /** Synchronous ordinary-DM journal hook, before receipts or queued preparation. */
-  onReceive?: (message: IncomingDM) => void;
+  onReceive?: (message: IncomingDM) => boolean | void;
   /** Called on both READY and RESUMED; initial start waits for recovery to finish. */
   onReady?: () => Promise<void>;
 }
@@ -779,13 +779,13 @@ export class DiscordTransport {
   private incoming(data: RecordValue): void {
     const message = this.parseIncoming(data);
     if (!message || this.seenMessages.has(message.id)) return;
-    this.options.onReceive?.(message);
+    const captured = this.options.onReceive?.(message);
     this.seenMessages.add(message.id);
     this.consumeRestartNotice();
     this.knownDMChannels.add(message.channelId);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
     const receiptKey = `${data.channel_id}:${data.id}`;
-    const receipt = this.config.features?.reactions === false ? Promise.resolve() : this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
+    const receipt = captured === false || this.config.features?.reactions === false ? Promise.resolve() : this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
       'PUT', undefined, undefined, undefined, AbortSignal.timeout(5000))
       .then(() => {})
       .catch(() => { if (!this.closed) this.log('收件表情添加失败，消息继续处理。'); });

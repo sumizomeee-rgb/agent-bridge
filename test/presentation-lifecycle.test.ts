@@ -36,7 +36,7 @@ test('结构化总览无平台颜色代码，渲染器保持 Discord 样式并�
   assert(!encoded.includes('ansi'));
   assert((cards[0]!.body as any).elements.some((element: any) => element.tag === 'div' && element.text.tag === 'plain_text'));
   assert(!encoded.includes('原生会话 ID'));
-  assert.match(JSON.stringify(feishuPresentationCards(workerOverview([], 'current'))), /没有已登记/); assert.equal(cards[0]!.schema, '2.0');
+  assert.match(JSON.stringify(feishuPresentationCards(workerOverview([], 'current'))), /没有正在执行、排队或待核对/); assert.equal(cards[0]!.schema, '2.0');
   assert.equal(feishuPresentationCards(computerOverview([])).length, 1);
 });
 test('长中文和代码回复按实际 JSON 大小分页，标题每页重复且代码围栏闭合', () => {
