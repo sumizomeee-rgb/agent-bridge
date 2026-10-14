@@ -9,7 +9,7 @@ import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, Outgoi
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 import { splitOverviewMessage, type WorkCounts } from './overview.js';
 import { discordPresentationPages } from './presentation.js';
-import type { BridgeLifecycleEvent } from './lifecycle.js';
+import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { discordReplyHeader } from './reply.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
@@ -312,9 +312,9 @@ export class DiscordTransport {
   private flushPresence(): void {
     if (this.config.features?.presence === false) return;
     const state = this.desiredPresence === 'idle'
-      ? [this.restartNotice ? '已重启' : '', this.workCounts.running ? `运行助手${this.workCounts.running}` : '',
+      ? [this.restartNotice ? BRIDGE_LIFECYCLE_COPY.restart : '', this.workCounts.running ? `运行助手${this.workCounts.running}` : '',
         this.workCounts.queued ? `等待${this.workCounts.queued}轮` : ''].filter(Boolean).join(' · ') || '空闲'
-      : { draining: '准备重启', recovering: '恢复中', failed: '重启失败' }[this.desiredPresence];
+      : BRIDGE_LIFECYCLE_COPY[this.desiredPresence];
     const payload = { since: null, activities: [{ name: 'Bridge', type: 4, state }],
       status: this.desiredPresence === 'idle' ? 'online' : this.desiredPresence === 'failed' ? 'dnd' : 'idle', afk: false };
     const signature = JSON.stringify(payload);

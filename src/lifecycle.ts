@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import type { BridgeConfig } from './types.js';
 
 export type BridgeLifecyclePhase = 'draining' | 'recovering' | 'ready' | 'failed';
+/** 平台共用生命周期文案；适配器只决定状态栏或卡片展示。 */
+export const BRIDGE_LIFECYCLE_COPY = { ready: '已就绪', restart: '已重启', draining: '准备重启', recovering: '恢复中', failed: '重启失败', continuation: '可以继续。' } as const;
 export interface BridgeLifecycleEvent {
   phase: BridgeLifecyclePhase;
   reason?: 'start' | 'restart';

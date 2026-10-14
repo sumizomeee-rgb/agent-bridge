@@ -98,7 +98,10 @@ test('飞书实际发送路径使用卡片展示命令和模型回复，生命�
   await bridge.onBridgeLifecycle({ phase: 'ready' }); assert.equal(messages.length, 1);
   await bridge.onBridgeLifecycle({ phase: 'ready', reason: 'restart', recipient: { userId: prefix + 'ou_owner', channelId: prefix + 'oc_chat' } });
   assert.equal(messages.length, 2); assert.equal(messages[1].receive_id, 'oc_chat');
-  assert.match(JSON.parse(messages[1].content).header.title.content, /重启成功/);
+  const readyCard = JSON.parse(messages[1].content);
+  assert.equal(readyCard.header.title.content, '已重启');
+  assert.match(JSON.stringify(readyCard.body), /可以继续。/);
+  assert(!/机器人：|Profile：|默认 Agent：|\/help|连接与恢复/.test(JSON.stringify(readyCard)), '启动通知只给必要状态');
   assert.equal(JSON.parse(messages[1].content).header.template, 'orange', '系统成功通知也使用黄框，模型回复保留绿框');
 });
 test('Feishu recovery spans equal timestamps across pages without losing lower opaque IDs or replaying duplicates', async t => {
@@ -123,16 +126,16 @@ test('飞书收件回执不阻塞收件，快速完成等待处理中表情，�
     if (path.includes('/auth/')) return response({ code: 0, tenant_access_token: 'private-token' });
     const emoji = options.body ? JSON.parse(options.body).reaction_type?.emoji_type : undefined;
     requests.push({ method: options.method, emoji, path });
-    if (emoji === 'Typing') { await gate; return response({ code: 0, data: { reaction_id: 'own-typing' } }); }
+    if (emoji === 'Status_PrivateMessage') { await gate; return response({ code: 0, data: { reaction_id: 'own-typing' } }); }
     return response({ code: 0, data: { reaction_id: 'done' } });
   }) as any;
   const bridge = new FeishuTransport(config, async () => { received++; }, { fetch: http, onReceive: () => capture }); cleanup(() => bridge.close());
   await bridge.receiveEvent(event()); assert.equal(received, 1);
   const source = { id: prefix + '1700000000000|om_z', channelId: prefix + 'oc_chat' };
   const completed = bridge.markReplyDelivered([source, source]);
-  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(requests.map(item => item.emoji), ['Typing']);
+  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(requests.map(item => item.emoji), ['Status_PrivateMessage']);
   finishTyping(); await completed;
-  assert.deepEqual(requests.map(item => [item.method, item.emoji]), [['POST', 'Typing'], ['POST', 'DONE'], ['DELETE', undefined]]);
+  assert.deepEqual(requests.map(item => [item.method, item.emoji]), [['POST', 'Status_PrivateMessage'], ['POST', 'CheckMark'], ['DELETE', undefined]]);
   assert(requests[2]!.path.endsWith('/own-typing'));
   const before = requests.length; await bridge.receiveEvent(event()); capture = false; await bridge.receiveEvent(event('om_replayed'));
   await bridge.markReplyDelivered([{ ...source, id: 'feishu:cli_other|1700000000000|om_other' }]);
@@ -146,9 +149,9 @@ test('飞书重启后找回自己的处理中表情，送达失败时保留处�
     const path = new URL(String(url)).pathname;
     if (path.includes('/auth/')) return response({ code: 0, tenant_access_token: 'private-token' });
     if (options.method === 'GET') return response({ code: 0, data: { items: [
-      { reaction_id: 'ours', operator: { operator_type: 'app', operator_id: config.applicationId }, reaction_type: { emoji_type: 'Typing' } },
-      { reaction_id: 'user', operator: { operator_type: 'user', operator_id: 'ou_owner' }, reaction_type: { emoji_type: 'Typing' } },
-      { reaction_id: 'other-bot', operator: { operator_type: 'app', operator_id: 'cli_other' }, reaction_type: { emoji_type: 'Typing' } },
+      { reaction_id: 'ours', operator: { operator_type: 'app', operator_id: config.applicationId }, reaction_type: { emoji_type: 'Status_PrivateMessage' } },
+      { reaction_id: 'user', operator: { operator_type: 'user', operator_id: 'ou_owner' }, reaction_type: { emoji_type: 'Status_PrivateMessage' } },
+      { reaction_id: 'other-bot', operator: { operator_type: 'app', operator_id: 'cli_other' }, reaction_type: { emoji_type: 'Status_PrivateMessage' } },
     ] } });
     if (options.method === 'DELETE') deleted.push(path.split('/').at(-1)!);
     if (failDone && options.method === 'POST') return response({ code: 999, msg: 'private-token' }, 403);

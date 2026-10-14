@@ -1,5 +1,5 @@
 import { feishuPresentationCards, type BridgePresentation } from './presentation.js';
-import type { BridgeLifecycleEvent } from './lifecycle.js';
+import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -248,22 +248,22 @@ export class FeishuTransport {
   }
   private markReceived(message: IncomingDM): Promise<void> {
     return this.receipt(message, async id => {
-      const result = await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'Typing' } }, AbortSignal.timeout(5000));
+      const result = await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'Status_PrivateMessage' } }, AbortSignal.timeout(5000));
       if (typeof result.reaction_id === 'string') this.processingReactions.set(id, result.reaction_id);
     });
   }
   async markReplyDelivered(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void> {
     await Promise.all([...new Map(messages.map(message => [message.id, message])).values()].map(message => this.receipt(message, async id => {
-      await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'DONE' } }, AbortSignal.timeout(5000));
+      await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'CheckMark' } }, AbortSignal.timeout(5000));
       const cached = this.processingReactions.get(id), pending: string[] = cached ? [cached] : [];
       // 重启后按平台身份找回自己的处理中表情，只删除当前 bot 的回执。
       if (!cached) {
         let pageToken: string | undefined;
         do {
-          const params = new URLSearchParams({ reaction_type: 'Typing', page_size: '50', ...(pageToken ? { page_token: pageToken } : {}) });
+          const params = new URLSearchParams({ reaction_type: 'Status_PrivateMessage', page_size: '50', ...(pageToken ? { page_token: pageToken } : {}) });
           const page = await this.api(`/im/v1/messages/${id}/reactions?${params}`, 'GET', undefined, AbortSignal.timeout(5000));
           for (const item of page.items ?? []) if (item.operator?.operator_type === 'app' && item.operator.operator_id === this.config.applicationId
-            && item.reaction_type?.emoji_type === 'Typing' && typeof item.reaction_id === 'string') pending.push(item.reaction_id);
+            && item.reaction_type?.emoji_type === 'Status_PrivateMessage' && typeof item.reaction_id === 'string') pending.push(item.reaction_id);
           pageToken = page.has_more === true && typeof page.page_token === 'string' ? page.page_token : undefined;
         } while (pageToken);
       }
@@ -276,10 +276,8 @@ export class FeishuTransport {
     if (!this.config.allowedUserIds.includes(event.recipient.userId)) return;
     const prefix = this.config.scopePrefix!;
     if (!event.recipient.channelId.startsWith(prefix)) throw new Error('启动通知不属于当前机器人。');
-    const view: BridgePresentation = { title: event.reason === 'restart' ? '重启成功 · 飞书主控已就绪' : '飞书主控已就绪', tone: 'success', purpose: 'lifecycle',
-      blocks: [{ kind: 'entry', text: `机器人：${this.botUser?.username ?? this.config.applicationId}\nProfile：${this.config.profile}\n模式：${this.config.controllerMode ? '主控' : '直接执行'}\n默认 Agent：${this.config.defaultAgent === 'codex' ? 'Codex CLI' : 'Claude Code'}` },
-        { kind: 'text', text: '连接与恢复已完成。已有会话可以继续；没有会话时，第一条文字或图片会自动新建。' }],
-      footer: '/status 查看当前状态 · /help 查看命令 · /new 明确新建会话' };
+    const view: BridgePresentation = { title: event.reason === 'restart' ? BRIDGE_LIFECYCLE_COPY.restart : BRIDGE_LIFECYCLE_COPY.ready,
+      tone: 'success', purpose: 'lifecycle', blocks: [{ kind: 'text', text: BRIDGE_LIFECYCLE_COPY.continuation }] };
     await this.sendText(event.recipient.channelId.slice(prefix.length), '', { presentation: view });
   }
   isIdle(): boolean { return this.sends.size === 0 && this.receipts.size === 0; }
