@@ -5,7 +5,7 @@ import { DatabaseSync, backup } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { remoteEndpoint } from './remote/daemon.js';
 import { fingerprint } from './remote/store.js';
-import { migrateValue } from './profile-migration.js';
+import { migrateValue, adoptionFingerprint } from './profile-migration.js';
 
 /** Offline, one-time ownership migration for registered execution machines. */
 export async function migrateRemoteData(root: string, applicationId: string): Promise<string> {
@@ -33,6 +33,7 @@ export async function migrateRemoteData(root: string, applicationId: string): Pr
             const value = migrateValue(JSON.parse(String(row.value)), prefix, root, root);
             db.prepare(`UPDATE ${table} SET ${column}=? WHERE rowid=?`).run(JSON.stringify(value), row.migration_row_id!);
             if (table === 'jobs') db.prepare('UPDATE jobs SET fingerprint=? WHERE rowid=?').run(fingerprint(value), row.migration_row_id!);
+            else db.prepare('UPDATE native_session_adoptions SET fingerprint=? WHERE rowid=?').run(adoptionFingerprint(value as Record<string, unknown>), row.migration_row_id!);
           }
         }
         for (const table of ['sessions', 'native_session_leases']) {

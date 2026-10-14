@@ -119,5 +119,5 @@ export function safeError(error: unknown, secrets: string[] = []): string {
 export function redactText(text: string, secrets: string[] = []): string {
   let message = text;
   for (const secret of secrets.filter(Boolean)) message = message.replaceAll(secret, '[redacted]');
-  return message.replace(/(Bearer|Bot)\s+[\w.\-]+/gi, '$1 [redacted]');
+  return message.replace(/\b(Bearer|Bot)\s+[\w.\-]+/gi, '$1 [redacted]');
 }

@@ -12,6 +12,9 @@ import { externalId } from '../src/routing.js';
 import { SessionStore } from '../src/store.js';
 import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 import { DurableIngress } from '../src/ingress.js';
+import { RestartJournal } from '../src/restart.js';
+import { NativeSessionLeaseStore } from '../src/native-sessions.js';
+import { createHash } from 'node:crypto';
 
 const app = '123456789012345678', user = '234567890123456789', channel = '345678901234567890';
 const scope = 'discord:' + app + '|';
@@ -60,6 +63,13 @@ test('offline migration scopes routes and preserves native IDs, text, credential
   const created = registry.createContext({ conversationId: conversation.id, userId: user, channelId: channel, originMessageId: '456789012345678901', agent: 'codex', nativeId: 'native-unchanged', cwd: join(root, 'working') });
   const context = JSON.parse(readFileSync(created.contextPath, 'utf8')) as TaskContextFile;
   const task = registry.register(context, 'preserved'); registry.acceptObservedResult(task.taskId, 'completed', 'kept');
+  const restart = new RestartJournal(data);
+  const restartOrigin = { conversationId: conversation.id, userId: user, channelId: channel, originMessageId: '456789012345678901', nativeId: 'native-unchanged' };
+  const restartReceipt = restart.request(restartOrigin); restart.mark('ready'); restart.close();
+  const leases = new NativeSessionLeaseStore(join(data, 'native-session-leases.sqlite'));
+  const ref = { agent: 'codex' as const, profile: 'default' as const, nativeId: 'native-adopted' };
+  const adoption = { ref, workerId: 'worker-stable', adoptionId: 'adoption-stable', expectedRevision: 'r1' };
+  leases.claim({ ref, nativeId: ref.nativeId, profile: 'default', cwd: root, title: 'preserved', model: null, effort: null, provider: null, revision: 'r1', health: 'healthy', busyEvidence: [] }, user, adoption, null); leases.close();
   await ingress.close(); registry.close(); store.close();
   const home = join(data, 'controller-homes', 'codex', conversation.id); mkdirSync(home, { recursive: true });
   const native = new DatabaseSync(join(home, 'state_5.sqlite')); native.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,cwd TEXT)'); native.prepare('INSERT INTO threads VALUES(?,?,?)').run('native-unchanged', join(home, 'sessions', 'rollout.jsonl'), join(root, 'working')); native.close();
@@ -76,6 +86,11 @@ test('offline migration scopes routes and preserves native IDs, text, credential
   const newContext = JSON.parse(readFileSync(created.contextPath, 'utf8')); assert.equal(newContext.token, context.token); assert.equal(newContext.registryDir, join(next, '.local', 'data'));
   const nativeAfter = new DatabaseSync(join(home, 'state_5.sqlite')); assert.equal(nativeAfter.prepare('SELECT rollout_path FROM threads').get()?.rollout_path, join(next, '.local', 'data', 'controller-homes', 'codex', conversation.id, 'sessions', 'rollout.jsonl')); nativeAfter.close();
   ensureSemanticData(data); await assert.rejects(migrateProject(path, { resolveIdentity: async () => app }), /已完成/);
+  const restartAfter = new RestartJournal(data);
+  assert.deepEqual(restartAfter.request({ ...restartOrigin, userId: scope + user, channelId: scope + channel, originMessageId: scope + restartOrigin.originMessageId }), { accepted: true, status: 'ready', requestId: restartReceipt.requestId, duplicate: true }); restartAfter.close();
+  const leaseAfter = new NativeSessionLeaseStore(join(data, 'native-session-leases.sqlite'));
+  const hash = createHash('sha256').update(JSON.stringify({ userId: scope + user, ...adoption })).digest('hex');
+  assert.equal(leaseAfter.previous(adoption.adoptionId, hash)?.nativeId, ref.nativeId); leaseAfter.close();
 });
 test('migration refuses live bridge processes and leaves old files unchanged after invalid staging', async t => {
   const root = directory(t), local = join(root, '.local'), data = join(local, 'data'), path = join(local, 'config.json'); mkdirSync(data, { recursive: true });

@@ -31,6 +31,7 @@ test('redaction preserves long replies while limiting diagnostic errors', () => 
   assert.equal(redactText(long, ['secret']).length, 5010);
   assert.equal(safeError(long, ['secret']).length, 1500);
   assert.ok(!redactText('Bot abc.def secret', ['secret']).includes('abc.def'));
+  assert.equal(redactText('READY bot=黄永熙 BridgeBot agent=codex'), 'READY bot=黄永熙 BridgeBot agent=codex');
 });
 
 test('ordinary file limit defaults to 20 MiB and validates configuration before startup', () => {

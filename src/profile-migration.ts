@@ -1,12 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { fetch, ProxyAgent } from 'undici';
 import { readJson } from './profiles.js';
 import { acquireInstanceLock } from './instance-lock.js';
 
-const databases = ['bridge.sqlite', 'ingress.sqlite', 'controller.sqlite', 'tasks.sqlite', 'native-session-leases.sqlite'];
+const databases = ['bridge.sqlite', 'ingress.sqlite', 'controller.sqlite', 'tasks.sqlite', 'native-session-leases.sqlite', 'restart.sqlite'];
 const scalarRoutes = new Set(['user_id', 'channel_id', 'source_message_id', 'userId', 'channelId', 'sourceMessageId', 'originMessageId']);
 const pathKeys = new Set(['cwd', 'rollout_path', 'registryDir', 'helperPath', 'nodePath', 'contextPath', 'ticketPath', 'ticket_path', 'completionFile', 'exitFile', 'resultFile', 'sshConfig', 'home', 'transcriptPath', 'imagePaths', 'images_json', 'attachmentPaths', 'command', 'workspace', 'dataDir', 'logsDir', 'attachmentsDir']);
 /** Change structural routes and owned paths, preserving text, native IDs and receipt tokens. */
@@ -36,10 +36,16 @@ function migrateDatabase(path: string, prefix: string, oldRoot: string, newRoot:
         const messageId = ['inbox', 'messages'].includes(table) && column === 'id' || table === 'channels' && column === 'cursor';
         if (routes && (scalarRoutes.has(column) || messageId)) {
           db.prepare(`UPDATE ${table} SET ${column}=? || ${column} WHERE ${column} IS NOT NULL AND ${column} <> '' AND ${column} NOT GLOB '*[^0-9]*'`).run(prefix);
-        } else if (routes && column.endsWith('_json') && column !== 'attachments_json') {
+        } else if (routes && (column.endsWith('_json') && column !== 'attachments_json' || table === 'restart_requests' && column === 'origin')) {
           for (const row of db.prepare(`SELECT rowid AS migration_row_id,${column} value FROM ${table} WHERE ${column} IS NOT NULL`).all()) {
             const migrated = migrateValue(JSON.parse(String(row.value)), prefix, oldRoot, newRoot, column);
             db.prepare(`UPDATE ${table} SET ${column}=? WHERE rowid=?`).run(JSON.stringify(migrated), row.migration_row_id!);
+            if (table === 'restart_requests') {
+              const origin = migrated as Record<string, unknown>;
+              const key = createHash('sha256').update(JSON.stringify([origin.conversationId, origin.userId, origin.channelId, origin.originMessageId])).digest('hex');
+              db.prepare('UPDATE restart_requests SET request_key=? WHERE rowid=?').run(key, row.migration_row_id!);
+            }
+            if (table === 'native_session_adoptions' && column === 'result_json') db.prepare('UPDATE native_session_adoptions SET fingerprint=? WHERE rowid=?').run(adoptionFingerprint(migrated as Record<string, unknown>), row.migration_row_id!);
           }
         } else if (pathKeys.has(column)) {
           for (const row of db.prepare(`SELECT rowid AS migration_row_id,${column} value FROM ${table} WHERE ${column} IS NOT NULL`).all()) {
@@ -52,6 +58,10 @@ function migrateDatabase(path: string, prefix: string, oldRoot: string, newRoot:
     db.exec('COMMIT'); db.exec('PRAGMA journal_mode=DELETE');
   } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
   finally { db.close(); }
+}
+export function adoptionFingerprint(result: Record<string, unknown>): string {
+  return createHash('sha256').update(JSON.stringify({ userId: result.userId, ref: result.ref, workerId: result.workerId,
+    adoptionId: result.adoptionId, expectedRevision: result.revision })).digest('hex');
 }
 async function discordIdentity(raw: Record<string, unknown>): Promise<string> {
   const proxy = raw.proxyPort == null ? undefined : new ProxyAgent(`http://127.0.0.1:${raw.proxyPort}`);

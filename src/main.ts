@@ -249,7 +249,8 @@ process.on('unhandledRejection', e => log(`ERROR ${safeError(e)}`));
 try {
   await transport.start();
   log(`READY bot=${transport.botUser?.username ?? 'unknown'} agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'}`);
-  void transport.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, secrets)}`));
+  if (config.platform === 'discord' && config.features?.nativeCommands !== false)
+    void transport.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, secrets)}`));
   await manager.recover();
   if (!closing) await runtime?.start();
   if (!closing) taskService.start();
