@@ -78,7 +78,7 @@ test('真实manager关闭失败先持久failed，再只报告76；所有关闭�
       assert.match(service.journal.current()!.error!, /unknownStop/);
       exitCodes.push(code); service.close();
     },
-    presence: state => presence.push(state), pollMs: 60000,
+    onPhase: state => presence.push(state), pollMs: 60000,
   });
   t.after(() => service.close());
   await service.request(origin); await Promise.all([service.check(), service.check()]); await service.check();
@@ -99,7 +99,7 @@ test('75只在最后必要关闭真正结束后报告，不提前报告重启成
     supervised: true, beginDrain: () => {}, isIdle: () => true,
     shutdown: async () => { closing = true; await held; },
     onShutdownComplete: code => { assert.equal(service.journal.current()!.phase, 'stopping'); exitCodes.push(code); service.close(); },
-    presence: () => {}, pollMs: 60000,
+    onPhase: () => {}, pollMs: 60000,
   });
   t.after(() => { finish(); service.close(); });
   await service.request(origin); const checking = service.check();

@@ -1,8 +1,8 @@
 import { DiscordTransport, ingressFailureText } from './discord.js';
 import { FeishuTransport } from './feishu.js';
+import type { BridgeLifecycleEvent } from './lifecycle.js';
 import { externalId } from './routing.js';
 import type { BridgeConfig, IncomingDM, ReplyOptions, BridgeMessage } from './types.js';
-import type { BridgePresence } from './discord.js';
 import type { WorkCounts } from './overview.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
@@ -34,9 +34,9 @@ export class PlatformTransport {
   close(): Promise<void> { return this.transport.close(); }
   isIdle(): boolean { return this.transport.isIdle(); }
   sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> { return this.transport.sendText(this.raw(channelId), text, options); }
-  sendInteractionText(interaction: NonNullable<IncomingDM['interaction']>, text: string): Promise<void> {
+  sendInteractionText(interaction: NonNullable<IncomingDM['interaction']>, text: string, options?: ReplyOptions): Promise<void> {
     if (!(this.transport instanceof DiscordTransport)) throw new Error('当前平台没有原生斜杠交互。');
-    return this.transport.sendInteractionText(interaction, text);
+    return this.transport.sendInteractionText(interaction, text, options);
   }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
     if (this.transport instanceof FeishuTransport) return this.transport.readDMHistory(this.raw(channelId), options);
@@ -54,7 +54,7 @@ export class PlatformTransport {
     if (this.config.features?.reactions === false || this.transport instanceof FeishuTransport) return;
     await this.transport.setTaskCount({ id: this.raw(message.id), channelId: this.raw(message.channelId) }, count);
   }
-  setPresence(phase: BridgePresence): void { if (this.config.features?.presence !== false && this.transport instanceof DiscordTransport) this.transport.setPresence(phase); }
+  onBridgeLifecycle(event: BridgeLifecycleEvent): Promise<void> { return this.transport.onBridgeLifecycle(event); }
   setWorkCounts(counts: WorkCounts): void { if (this.transport instanceof DiscordTransport) this.transport.setWorkCounts(counts); }
   async syncSlashCommands(): Promise<void> { if (this.config.features?.nativeCommands !== false) await this.transport.syncSlashCommands(); }
   failureText(error: unknown): string {

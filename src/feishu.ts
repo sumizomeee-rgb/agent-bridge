@@ -1,3 +1,5 @@
+import { feishuPresentationCards, type BridgePresentation } from './presentation.js';
+import type { BridgeLifecycleEvent } from './lifecycle.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -197,11 +199,16 @@ export class FeishuTransport {
       const max = images.includes(item as any) ? Math.min(this.config.maxImageBytes, 10 * 1024 * 1024) : this.config.maxFileBytes ?? 20 * 1024 * 1024;
       if (!item.data.length || item.data.length > max) throw new Error('回传附件为空或超过限额；未重新运行 Agent。');
     }
-    const clean = (value: string) => value.replace(/\u001b\[[0-9;]*m/g, '').replace(/```ansi\n/g, '```\n');
-    const header = options?.repeatHeader ? clean(options.repeatHeader) : '';
-    for (const chunk of splitUtf8(clean(text), 24 * 1024 - Buffer.byteLength(header, 'utf8') - 2)) {
-      await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', { receive_id: channelId, msg_type: 'text', uuid: randomUUID(),
-        content: JSON.stringify({ text: header && !chunk.startsWith(header) ? header + '\n' + chunk : chunk }) }, options?.signal);
+    let view = options?.presentation;
+    if (!view && options?.repeatHeader) {
+      const prefix = options.repeatHeader + '\n\n';
+      if (!text.startsWith(prefix)) throw new Error('回复头与正文不一致。');
+      view = { title: options.repeatHeader.startsWith('[') && options.repeatHeader.endsWith(']') ? options.repeatHeader.slice(1, -1) : options.repeatHeader, tone: 'success', purpose: 'reply', blocks: [{ kind: 'text', text: text.slice(prefix.length) }] };
+    }
+    if (view) for (const card of feishuPresentationCards(view)) {
+      await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', { receive_id: channelId, msg_type: 'interactive', uuid: randomUUID(), content: JSON.stringify(card) }, options?.signal);
+    } else for (const chunk of splitUtf8(text, 24 * 1024)) {
+      await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', { receive_id: channelId, msg_type: 'text', uuid: randomUUID(), content: JSON.stringify({ text: chunk }) }, options?.signal);
     }
     for (const item of [...images, ...files]) {
       const isImage = images.includes(item as any);
@@ -224,6 +231,17 @@ export class FeishuTransport {
       const id = message.id.split('|').at(-1)!;
       await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'DONE' } }).catch(() => this.log('FEISHU_REACTION_FAILED'));
     }
+  }
+  async onBridgeLifecycle(event: BridgeLifecycleEvent): Promise<void> {
+    if (event.phase !== 'ready' || !event.recipient) return;
+    if (!this.config.allowedUserIds.includes(event.recipient.userId)) return;
+    const prefix = this.config.scopePrefix!;
+    if (!event.recipient.channelId.startsWith(prefix)) throw new Error('启动通知不属于当前机器人。');
+    const view: BridgePresentation = { title: event.reason === 'restart' ? '重启成功 · 飞书主控已就绪' : '飞书主控已就绪', tone: 'success', purpose: 'lifecycle',
+      blocks: [{ kind: 'entry', text: `机器人：${this.botUser?.username ?? this.config.applicationId}\nProfile：${this.config.profile}\n模式：${this.config.controllerMode ? '主控' : '直接执行'}\n默认 Agent：${this.config.defaultAgent === 'codex' ? 'Codex CLI' : 'Claude Code'}` },
+        { kind: 'text', text: '连接与恢复已完成。已有会话可以继续；没有会话时，第一条文字或图片会自动新建。' }],
+      footer: '/status 查看当前状态 · /help 查看命令 · /new 明确新建会话' };
+    await this.sendText(event.recipient.channelId.slice(prefix.length), '', { presentation: view });
   }
   isIdle(): boolean { return this.sends.size === 0; }
   setPresence(): void {} setWorkCounts(): void {} async syncSlashCommands(): Promise<void> {} async setTaskCount(): Promise<void> {}

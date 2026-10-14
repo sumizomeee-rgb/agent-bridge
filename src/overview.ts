@@ -1,4 +1,5 @@
 import type { AgentName } from './types.js';
+import { discordPresentationText, type BridgePresentation } from './presentation.js';
 
 export interface WorkCounts { running: number; queued: number }
 export interface ComputerOverview {
@@ -21,8 +22,6 @@ const clean = (value: string, limit = 120): string => {
   return text.length <= limit ? text : text.slice(0, limit - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
 };
 const agentLabel = (agent: AgentName): string => agent === 'codex' ? 'Codex' : 'Claude Code';
-const box = (lines: string[]): string => ['```', ...lines, '```'].join('\n');
-const yellowHeading = (text: string): string => ['```ansi', `\u001b[33m${clean(text, 500)}\u001b[0m`, '```'].join('\n');
 const checkedTime = (value: string | null): string => {
   const parsed = value ? Date.parse(value) : NaN;
   return Number.isFinite(parsed) ? new Date(parsed).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '尚未检查';
@@ -44,10 +43,10 @@ export function splitOverviewMessage(text: string, limit = 2000): string[] | nul
   return parts;
 }
 
-export function formatComputerOverview(items: readonly ComputerOverview[]): string {
-  const heading = yellowHeading(`当前工作区的电脑 · 已登记${items.length}台`);
-  if (!items.length) return heading + '\n\n当前工作区没有登记的电脑。';
-  return [heading, ...items.map((item, index) => {
+export function computerOverview(items: readonly ComputerOverview[]): BridgePresentation {
+  const title = `当前工作区的电脑 · 已登记${items.length}台`;
+  if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: '当前工作区没有登记的电脑。' }] };
+  return { title, tone: 'info', purpose: 'overview', blocks: items.map((item, index) => {
     const connection = { connected: '已连接', unreachable: '连接不可用', unknown: '连接尚未确认' }[item.connection];
     const hello = item.transport === 'local' ? '本机执行器（无需 SSH hello）'
       : item.connection === 'connected' ? '已回报' : '未确认';
@@ -64,9 +63,13 @@ export function formatComputerOverview(items: readonly ComputerOverview[]): stri
       if (engine?.reason || engine?.cli === 'unavailable') lines.push(`${agentLabel(agent)} 失败原因：${engine.reason ? clean(engine.reason, 140) : 'CLI 静态入口检查未通过，具体原因未回报'}`);
     }
     lines.push('模型实测：未提供实测结果');
-    return box(lines);
-  }), '登记仅表示已配置；连接和 CLI 静态入口检查不代表模型服务或现有会话一定健康。'].join('\n\n');
+    return { kind: 'entry', text: lines.join('\n') };
+  }), footer: '登记仅表示已配置；连接和 CLI 静态入口检查不代表模型服务或现有会话一定健康。' };
 }
+
+/** Discord 展示入口；核心使用上面的结构化总览。 */
+export const formatComputerOverview = (items: readonly ComputerOverview[]): string => discordPresentationText(computerOverview(items));
+export const formatWorkerOverview = (items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): string => discordPresentationText(workerOverview(items, scope, now));
 
 export function elapsedText(startedAt: string | null, now = Date.now()): string {
   const started = startedAt ? Date.parse(startedAt) : NaN;
@@ -82,16 +85,16 @@ function shortWorkerId(item: WorkerOverview, items: readonly WorkerOverview[]): 
   return clean(item.workerId.slice(0, length), 256);
 }
 
-export function formatWorkerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): string {
+export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now()): BridgePresentation {
   const prefix = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length;
   const queued = items.reduce((total, item) => total + item.queued, 0);
   const uncertain = items.filter(item => item.status === 'uncertain').length;
-  const heading = yellowHeading(`${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`);
-  if (!items.length) return heading + `\n\n${prefix}没有已登记的直属助手。`;
+  const title = `${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`;
+  if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: `${prefix}没有已登记的直属助手。` }] };
   const statuses = { queued: '等待执行', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已停止', uncertain: '状态待核对', idle: '空闲', 'handed-off': '已交给用户', 'handoff-pending': '交接待确认' };
   const effortLabels: Record<string, string> = { minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', none: '无' };
-  return [heading, ...items.map((item, index) => {
+  return { title, tone: 'info', purpose: 'overview', blocks: items.map((item, index) => {
     const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? statuses[item.status]
       : item.running ? '运行中' : item.queued > 0 ? '等待执行' : statuses[item.status];
     const elapsed = item.status === 'uncertain' ? '未知（状态待核对）' : item.running ? elapsedText(item.startedAt, now)
@@ -111,6 +114,6 @@ export function formatWorkerOverview(items: readonly WorkerOverview[], scope: 'c
     if (item.lastResultPreview != null) lines.push(`最近回执：${clean(item.lastResultPreview, 180)}`);
     if (item.unresolvedSupplements) lines.push(`未确认补充回执：${item.unresolvedSupplements}条`);
     lines.push(`${status} · 本轮耗时：${elapsed} · 等待${item.queued}轮`);
-    return box(lines);
-  }), '模型和强度为最近 CLI 回报；未回报则未知。完整会话名、回执及续接/取消/交接操作可由主控按完整 workerId 查询，原有权限检查仍适用。'].join('\n\n');
+    return { kind: 'entry', text: lines.join('\n') };
+  }), footer: '模型和强度为最近 CLI 回报；未回报则未知。完整会话名、回执及续接/取消/交接操作可由主控按完整 workerId 查询，原有权限检查仍适用。' };
 }

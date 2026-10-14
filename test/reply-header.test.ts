@@ -80,7 +80,7 @@ test('回复头来自本轮实际 metadata 和最终 nativeId，不使用选择�
   assert.equal(active.actualEffort, 'high');
   await send('/status');
   assert.match(f.replies.at(-1)!.text, /推理强度：high/);
-  assert.match(f.replies.at(-1)!.text, /原生会话：…abcdef/);
+  assert.match(f.replies.at(-1)!.text, /原生会话：actual-abcdef/);
 });
 
 test('本轮未回报 metadata 时不把旧实际值、参考默认或已选别名冒充实际值', async t => {

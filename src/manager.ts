@@ -5,10 +5,12 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { SessionStore, type WorkspaceNoticeOutcome } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
-import { formatComputerOverview, formatWorkerOverview, type ComputerOverview, type WorkerOverview } from './overview.js';
+import { computerOverview, workerOverview, type ComputerOverview, type WorkerOverview } from './overview.js';
+import { commandHelp, parseCommand as command } from './commands.js';
+import { presentationText, type BridgePresentation } from './presentation.js';
 import { collectOutgoingAttachments } from './artifacts.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
-import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, BridgeMessage, Conversation, ReplySink } from './types.js';
+import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
 interface RunningTurn {
   messageId: string;
@@ -20,29 +22,8 @@ interface RunningTurn {
   supplements: Promise<void>;
   completionEventId?: string;
 }
-const HELP = `直接发送文字或图片即可继续当前会话。
-/new [codex|claude] 或 new chat：新会话
-/agent：查看 Agent 选项；/agent codex 或 /agent claude：切换并续接会话
-/chats：只读查看自己的历史会话
-/cwd 路径：在指定目录新建会话
-/model：查看当前模型；/model list 或 /models：列出模型
-/model 模型名：切换当前会话模型，保留上下文
-/model default：恢复 CLI 当前默认；/model custom 模型名：指定网关自定义模型
-/effort [level|default]：查询或设置当前会话推理强度
-/status：查看当前会话和排队情况
-/computers [refresh|cached]：查看已登记电脑及 Agent 的连接和 CLI 入口
-/workers [all]：查看当前对话或本用户全部对话的已登记直属助手
-/stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务
-/help：查看帮助`;
-
-function command(text: string): { name: string; argument: string } | null {
-  const trimmed = text.trim();
-  if (/^(?:new\s+chat|新会话|新聊天)$/i.test(trimmed)) return { name: 'new', argument: '' };
-  const match = /^\/([a-z]+)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  return match ? { name: match[1]!.toLowerCase(), argument: (match[2] ?? '').trim() } : null;
-}
-
 export interface SessionManagerOptions {
+  botName?: () => string | undefined;
   mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry;
   onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void;
   controllerSeed?: (previous: Conversation) => string; onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>;
@@ -95,7 +76,7 @@ export class SessionManager {
 
   knownChannels(): Array<{ userId: string; channelId: string; cursor: string }> { return this.store.knownChannels(); }
 
-  async handle(message: BridgeMessage, commandReply?: (text: string) => Promise<void>): Promise<void> {
+  async handle(message: BridgeMessage, commandReply?: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
     if (this.closed) throw new Error('桥已关闭');
     if (!this.config.allowedUserIds.includes(message.userId) || this.hasMessage(message.id)) return;
     const parsed = command(message.text);
@@ -104,7 +85,11 @@ export class SessionManager {
       if (this.draining) return;
       if (!this.store.addMessage(message, null, 'command')) return;
       // An interaction reply belongs to this command invocation, never to a channel or queued turn.
-      const reply = commandReply ?? ((text: string) => this.sink.sendText(message.channelId, text));
+      const deliver = commandReply ?? ((text: string, options?: ReplyOptions) => this.sink.sendText(message.channelId, text, options));
+      const reply = (text: string, options?: ReplyOptions) => {
+        const view: BridgePresentation = options?.presentation ?? { title: `命令结果 · /${parsed.name}`, tone: 'info', blocks: [{ kind: 'entry', text }] };
+        return deliver(text, { ...options, presentation: view });
+      };
       this.activeCommands++;
       try {
         await this.handleCommand(message, parsed.name, parsed.argument, reply);
@@ -395,15 +380,16 @@ export class SessionManager {
   }
 
   private async handleCommand(message: BridgeMessage, name: string, argument: string,
-    reply: (text: string) => Promise<void>): Promise<void> {
+    reply: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
     const current = this.store.getActive(message.userId);
     if (!current && ['stop', 'new', 'cwd', 'agent'].includes(name)) {
       this.revisions.set(message.userId, this.revision(message.userId) + 1);
     }
     switch (name) {
-      case 'help': await reply(this.config.controllerMode
-        ? HELP.replace('/stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务', '/stop：停止桥管理的执行子 Agent、清空队列并取消预约；独立远端进程需要另行核对')
-        : HELP); return;
+      case 'help': {
+        const view: BridgePresentation = { title: '命令与用法', tone: 'info', purpose: 'help', blocks: [{ kind: 'text', text: commandHelp(this.config.controllerMode) }], footer: '平台和 bot 在启动前选择，不通过聊天命令切换。' };
+        await reply(presentationText(view), { presentation: view }); return;
+      }
       case 'model': await this.handleModel(message, argument, reply); return;
       case 'effort': await this.handleEffort(message, argument, reply); return;
       case 'models': await this.handleModel(message, '', reply, true); return;
@@ -469,7 +455,7 @@ export class SessionManager {
         let items: ComputerOverview[];
         try { items = await this.options.onListComputers(target, argument !== 'cached'); }
         catch { throw new Error('电脑清单检查失败，请稍后重试。'); }
-        await reply(formatComputerOverview(items)); return;
+        const view = computerOverview(items); await reply(presentationText(view), { presentation: view }); return;
       }
       case 'workers': {
         if (argument && argument !== 'current' && argument !== 'all') {
@@ -481,13 +467,19 @@ export class SessionManager {
         let items: WorkerOverview[];
         try { items = await this.options.onListWorkers(target, scope); }
         catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
-        await reply(formatWorkerOverview(items, scope)); return;
+        const view = workerOverview(items, scope); await reply(presentationText(view), { presentation: view }); return;
       }
-      case 'status':
-        await reply(current
-          ? `${agentDisplayName(current.agent)} · ${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n目录：${current.cwd}\n${this.running.get(message.userId)?.conversationId === current.id ? this.config.controllerMode ? '主控处理1' : '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条；${current.nativeId ? '已有可续接的 Agent 会话' : '尚未创建 Agent 会话'}${this.options.taskRegistry ? `\n已登记未结束的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}`
-          : '还没有会话，发送文字或图片即可开始。');
-        return;
+      case 'status': {
+        const running = current && this.running.get(message.userId)?.conversationId === current.id;
+        const blocks: BridgePresentation['blocks'] = [{ kind: 'entry', text:
+          `平台：${this.config.platform === 'feishu' ? '飞书' : 'Discord'}\n机器人：${this.options.botName?.() ?? this.config.applicationId ?? '未回报'}\nProfile：${this.config.profile ?? '未设置'}\n模式：${this.config.controllerMode ? '主控' : '直接执行'}\nAgent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}` }];
+        if (current) blocks.push({ kind: 'entry', text: `会话：${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ?? '尚未创建'}\n目录：${current.cwd}\n状态：${running ? this.config.controllerMode ? '主控处理1' : '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条${this.options.taskRegistry ? `\n已登记未结束的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}` });
+        else blocks.push({ kind: 'entry', text: `会话：尚未创建\n模型选择：CLI 默认\n强度选择：CLI 默认\n实际模型／强度：尚未由 CLI 回报\n目录：${this.config.workspace}\n状态：空闲；排队 0 条` });
+        const view: BridgePresentation = { title: '桥状态', tone: 'info', purpose: 'status', blocks, footer: current
+          ? '直接发送文字或图片继续；/new 新建会话，/help 查看命令。'
+          : '发送第一条文字或图片即可新建会话。/status 只查询状态，不创建会话。' };
+        await reply(presentationText(view), { presentation: view }); return;
+      }
       case 'stop': {
         const count = current ? this.cancel(current) : 0;
         if (current) await this.options.onStop?.(current.id);

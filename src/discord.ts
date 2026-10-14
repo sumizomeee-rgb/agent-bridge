@@ -8,6 +8,8 @@ import WebSocket from 'ws';
 import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
 import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 import { splitOverviewMessage, type WorkCounts } from './overview.js';
+import { discordPresentationPages } from './presentation.js';
+import type { BridgeLifecycleEvent } from './lifecycle.js';
 import { discordReplyHeader } from './reply.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
@@ -284,7 +286,11 @@ export class DiscordTransport {
 
   isIdle(): boolean { return this.sendQueues.size === 0; }
 
-  /** Presence is the only restart notification: no channel messages or broadcasts. */
+  async onBridgeLifecycle(event: BridgeLifecycleEvent): Promise<void> {
+    this.setPresence(event.phase === 'ready' ? 'idle' : event.phase);
+  }
+
+  /** Discord 生命周期通过在线状态呈现，不发私聊广播。 */
   setPresence(phase: BridgePresence): void {
     this.desiredPresence = phase;
     clearTimeout(this.workPresenceTimer); this.workPresenceTimer = undefined;
@@ -339,7 +345,9 @@ export class DiscordTransport {
     const rawPrefix = options?.repeatHeader ? `${options.repeatHeader}\n\n` : '';
     const prefix = options?.repeatHeader ? `${discordReplyHeader(options.repeatHeader)}\n\n` : '';
     if (prefix && (prefix.length >= 1998 || (text.length > 0 && !text.startsWith(rawPrefix)))) throw new Error('回复头过长或与正文不一致。');
-    const parts = prefix ? chunks(text.slice(rawPrefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`) : splitOverviewMessage(text) ?? chunks(text);
+    const parts = options?.presentation ? discordPresentationPages(options.presentation)
+      : prefix ? chunks(text.slice(rawPrefix.length), 2000 - prefix.length).map(part => `${prefix}${part}`)
+      : splitOverviewMessage(text) ?? chunks(text);
     const previous = this.sendQueues.get(channelId) ?? Promise.resolve();
     const job = previous.catch(() => undefined).then(async () => {
       signal?.throwIfAborted();
@@ -415,11 +423,11 @@ export class DiscordTransport {
     return application.id;
   }
 
-  async sendInteractionText(interaction: SlashInteraction, text: string): Promise<void> {
+  async sendInteractionText(interaction: SlashInteraction, text: string, options?: ReplyOptions): Promise<void> {
     if (!snowflake(interaction.id) || !snowflake(interaction.applicationId) || !interaction.token || interaction.token.length > 4096) {
       throw new Error('无效的 Discord 交互回复信息。');
     }
-    const parts = splitOverviewMessage(text) ?? chunks(text || '命令已完成。');
+    const parts = options?.presentation ? discordPresentationPages(options.presentation) : splitOverviewMessage(text) ?? chunks(text || '命令已完成。');
     const endpoint = `/webhooks/${interaction.applicationId}/${encodeURIComponent(interaction.token)}`;
     for (let index = 0; index < parts.length; index++) {
       await this.interactionRest(index === 0 ? `${endpoint}/messages/@original` : endpoint,

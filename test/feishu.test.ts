@@ -79,6 +79,27 @@ test('Feishu SDK startup waits for core recovery and force-closes on shutdown', 
     socketFactory: parameters => ({ start: async () => { parameters.onReady?.(); }, close: () => { closed = true; } }) });
   await bridge.start(); assert.equal(ready, 1); await bridge.close(); assert.equal(closed, true);
 });
+
+test('飞书实际发送路径使用卡片展示命令和模型回复，生命周期只通知就绪时的当前用户', async t => {
+  const { config, cleanup } = setup(t); const messages: any[] = [];
+  const http = (async (url: any, options: any) => {
+    if (String(url).includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    if (String(url).includes('/messages?')) messages.push(JSON.parse(options.body));
+    return response({ code: 0, data: {} });
+  }) as any;
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: http }); cleanup(() => bridge.close());
+  const header = '[Codex · 6.1-sol · 极高 · 1234]';
+  await bridge.sendText('oc_chat', header + '\n\n**完成**\n```ts\nconst x = 1;\n```', { repeatHeader: header });
+  assert.equal(messages[0].msg_type, 'interactive');
+  const card = JSON.parse(messages[0].content); assert.equal(card.header.template, 'green');
+  assert.equal(card.header.title.content, 'Codex · 6.1-sol · 极高 · 1234'); assert.match(card.body.elements[0].content, /```ts/);
+  await bridge.onBridgeLifecycle({ phase: 'recovering', recipient: { userId: prefix + 'ou_owner', channelId: prefix + 'oc_chat' } });
+  await bridge.onBridgeLifecycle({ phase: 'ready', recipient: { userId: prefix + 'ou_outside', channelId: prefix + 'oc_chat' } });
+  await bridge.onBridgeLifecycle({ phase: 'ready' }); assert.equal(messages.length, 1);
+  await bridge.onBridgeLifecycle({ phase: 'ready', reason: 'restart', recipient: { userId: prefix + 'ou_owner', channelId: prefix + 'oc_chat' } });
+  assert.equal(messages.length, 2); assert.equal(messages[1].receive_id, 'oc_chat');
+  assert.match(JSON.parse(messages[1].content).header.title.content, /重启成功/);
+});
 test('Feishu recovery spans equal timestamps across pages without losing lower opaque IDs or replaying duplicates', async t => {
   const { root, config, cleanup } = setup(t), handled: string[] = [];
   const make = (id: string): IncomingDM => ({ id: prefix + '1700000000000|' + id, userId: prefix + 'ou_owner', channelId: prefix + 'oc_chat', text: id, attachments: [] });

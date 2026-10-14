@@ -117,7 +117,7 @@ test('普通命令的异步回调不会被同频道下一条命令替换', async
   await f.manager.handle(message('interaction-status', '/status'), async text => { secondReplies.push(text); });
   assert.equal(secondReplies.length, 1);
   assert.match(firstReplies[0]!, /直接发送文字或图片/);
-  assert.match(secondReplies[0]!, /还没有会话/);
+  assert.match(secondReplies[0]!, /会话：尚未创建/);
   release();
   await first;
   assert.deepEqual(f.sinkReplies, []);

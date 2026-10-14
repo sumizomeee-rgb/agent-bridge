@@ -13,7 +13,9 @@ import { DurableIngress } from './ingress.js';
 import { NativeControllerAdapter } from './controller/native.js';
 import { ControllerRuntime } from './controller/runtime.js';
 import { TaskRegistry, TaskService } from './tasks.js';
-import type { IncomingDM } from './types.js';
+import { BridgeLifecycle } from './lifecycle.js';
+import { mapPresentation } from './presentation.js';
+import type { ReplyOptions, IncomingDM } from './types.js';
 import { RestartService } from './restart.js';
 import { closeResources } from './shutdown.js';
 import { TargetCatalogService } from './remote/catalog.js';
@@ -163,7 +165,7 @@ ingress = new DurableIngress(config.dataDir, {
         return;
       }
       const commandReply = message.interaction
-        ? (text: string) => transport.sendInteractionText(message.interaction!, redactText(text, [...secrets, message.interaction!.token]))
+        ? (text: string, options?: ReplyOptions) => transport.sendInteractionText(message.interaction!, redactText(text, [...secrets, message.interaction!.token]), options?.presentation ? { ...options, presentation: mapPresentation(options.presentation, value => redactText(value, [...secrets, message.interaction!.token])) } : options)
         : undefined;
       await manager.handle(prepared, commandReply);
     } finally { messageRevisions.delete(message.id); }
@@ -181,6 +183,7 @@ manager = new SessionManager(config, adapters, {
   sendText: (channelId, text, options) => transport.sendText(channelId, redactText(text, secrets),
     options ? {
       ...options,
+      ...(options.presentation ? { presentation: mapPresentation(options.presentation, value => redactText(value, secrets)) } : {}),
       ...(options.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, secrets) } : {}),
       ...(options.images ? { images: options.images.map(image => ({ ...image,
         ...(image.description ? { description: redactText(image.description, secrets) } : {}),
@@ -189,7 +192,7 @@ manager = new SessionManager(config, adapters, {
         ...(file.description ? { description: redactText(file.description, secrets) } : {}),
       })) } : {}),
     } : undefined),
-}, { taskRegistry: tasks,
+}, { taskRegistry: tasks, botName: () => transport.botUser?.username,
   onListComputers: (conversation, refresh) => targetCatalog.computerOverview(conversation.cwd, refresh),
   onListWorkers: (conversation, scope) => Promise.resolve(runtime?.queryWorkerOverview(conversation, scope) ?? []),
   ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
@@ -198,13 +201,15 @@ manager = new SessionManager(config, adapters, {
     onInitializationError: (_conversation, error) => log('workspace initialization: ' + safeError(error)),
     controllerSeed: conversation => migrationSeeds.get(conversation.id) ?? '' } : {}),
 });
+const lifecycle = new BridgeLifecycle(config, event => transport.onBridgeLifecycle(event), () => ingress.lastAuthorizedContact(),
+  error => log('LIFECYCLE_NOTICE_FAILED ' + safeError(error, secrets)));
 restart = new RestartService(config.dataDir, {
   supervised: process.env.BRIDGE_SUPERVISED === '1',
   beginDrain: () => { ingress.pause(); manager.beginDrain(); runtime?.beginDrain(); },
   isIdle: () => manager.isIdle() && (runtime?.isIdle() ?? true) && transport.isIdle(),
   shutdown: () => shutdown(true),
   onShutdownComplete: exitCode => { process.exitCode = exitCode; restart.close(); },
-  presence: phase => transport.setPresence(phase),
+  onPhase: phase => { if (phase !== 'ready') void transport.onBridgeLifecycle({ phase }).catch(error => log('LIFECYCLE_FAILED ' + safeError(error, secrets))); },
   onError: error => log('RESTART ' + safeError(error)),
 });
 restart.beginRecovery();
@@ -226,6 +231,7 @@ async function shutdown(plannedRestart = false): Promise<void> {
       { name: '执行任务', close: async () => { await runtime?.close(); } },
       { name: '远程目录', close: () => targetCatalog.close() },
       ...Object.entries(executionAdapters).map(([agent, adapter]) => ({ name: `${agent} 执行器`, close: () => adapter.close() })),
+      { name: '生命周期', close: () => lifecycle.close() },
       { name: '任务数据库', close: () => tasks.close() },
       { name: '进程标识', close: () => {
         guard.close(); projectGuard.close();
@@ -256,7 +262,11 @@ try {
   if (!closing) taskService.start();
   if (!closing && runtime) transport.setWorkCounts(runtime.getGlobalWorkCounts());
   releaseStartup();
-  if (!closing) { ingress.start(); restart.ready(); }
+  if (!closing) {
+    restart.ready();
+    await lifecycle.ready();
+    if (!closing) ingress.start();
+  }
 } catch (error) {
   log(`START_FAILED ${safeError(error)}`);
   restart.failed(safeError(error));

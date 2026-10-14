@@ -16,7 +16,7 @@ function rootFor(t: TestContext): { root: string; closers: Array<() => void> } {
 test('重启请求快速持久返回，重复请求及重复check仅关闭一次，不派检查任务', async t => {
   const { root, closers } = rootFor(t); let idle = false; let drains = 0; let stops = 0; const presence: string[] = [];
   const service = new RestartService(root, { supervised: true, beginDrain: () => { drains++; }, isIdle: () => idle,
-    shutdown: async () => { stops++; }, presence: state => presence.push(state), pollMs: 60000 });
+    shutdown: async () => { stops++; }, onPhase: state => presence.push(state), pollMs: 60000 });
   closers.push(() => service.close());
   const requested = await service.request(origin);
   assert.equal(requested.accepted, true); assert.equal(requested.status, 'draining');
@@ -33,7 +33,7 @@ test('永久请求key跨进程保留，已完成请求不再次drain；新消息
   assert.equal(together.requestId, first.requestId); journal.mark('stopping'); journal.supervisorExited(75);
   assert.equal(journal.current()!.phase, 'starting'); assert.equal(journal.beginRecovery(), true); journal.mark('ready'); journal.close();
   let drains = 0; const service = new RestartService(root, { supervised: true, beginDrain: () => { drains++; }, isIdle: () => false,
-    shutdown: async () => { assert.fail('不能重启已完成的请求'); }, presence: () => {}, pollMs: 60000 });
+    shutdown: async () => { assert.fail('不能重启已完成的请求'); }, onPhase: () => {}, pollMs: 60000 });
   closers.push(() => service.close());
   const duplicate = await service.request(origin); assert.equal(duplicate.status, 'ready'); assert.equal(duplicate.requestId, first.requestId);
   const newlyBound = await service.request({ ...origin, nativeId: 'newly-bound-native' });
@@ -49,23 +49,23 @@ test('启动失败记录持久保存，普通READY不误称重启；只有明确
   journal.supervisorExited(1); assert.equal(journal.current()!.phase, 'failed'); journal.close();
   const presence: string[] = [];
   const service = new RestartService(root, { supervised: true, beginDrain: () => {}, isIdle: () => false,
-    shutdown: async () => {}, presence: state => presence.push(state) });
+    shutdown: async () => {}, onPhase: state => presence.push(state) });
   closers.push(() => service.close());
   assert.equal(service.journal.current()!.requestId, first.requestId); assert.match(service.journal.current()!.error!, /退出（1）/);
   service.beginRecovery(); assert.equal(service.journal.current()!.phase, 'recovering'); assert.equal(service.journal.current()!.attempts, 1);
   service.ready(); assert.equal(service.journal.current()!.phase, 'ready');
   service.beginRecovery(); assert.equal(service.journal.current()!.attempts, 1, '已经ready不重复当重启');
-  assert.deepEqual(presence, ['recovering', 'idle']);
+  assert.deepEqual(presence, ['recovering', 'ready']);
 });
 
 test('没有监督器拒绝退出，普通stop取消pending并保持停用语义', async t => {
   const { root, closers } = rootFor(t); let drains = 0;
   const unsupervised = new RestartService(root, { supervised: false, beginDrain: () => { drains++; }, isIdle: () => true,
-    shutdown: async () => { assert.fail('直接启动不可自杀'); }, presence: () => {} });
+    shutdown: async () => { assert.fail('直接启动不可自杀'); }, onPhase: () => {} });
   assert.deepEqual(await unsupervised.request(origin), { accepted: false, status: 'supervisor_required' });
   assert.equal(unsupervised.journal.current(), null); unsupervised.close(); assert.equal(drains, 0);
   const service = new RestartService(root, { supervised: true, beginDrain: () => { drains++; }, isIdle: () => false,
-    shutdown: async () => {}, presence: () => {}, pollMs: 60000 });
+    shutdown: async () => {}, onPhase: () => {}, pollMs: 60000 });
   closers.push(() => service.close()); await service.request(origin); service.cancel();
   assert.equal(service.journal.current()!.phase, 'cancelled');
   assert.equal(service.isDraining(), false); await service.check();

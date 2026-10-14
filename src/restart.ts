@@ -86,7 +86,7 @@ export interface RestartServiceOptions {
   isIdle: () => boolean;
   shutdown: () => Promise<void>;
   onShutdownComplete?: (exitCode: 75 | 76) => void;
-  presence: (phase: 'draining' | 'recovering' | 'idle' | 'failed') => void;
+  onPhase: (phase: import('./lifecycle.js').BridgeLifecyclePhase) => void;
   pollMs?: number;
   onError?: (error: unknown) => void;
 }
@@ -101,19 +101,19 @@ export class RestartService {
   private accepting = true;
   constructor(dataDir: string, private readonly options: RestartServiceOptions) { this.journal = new RestartJournal(dataDir); }
   isDraining(): boolean { return this.draining; }
-  beginRecovery(): void { if (!this.closed && this.journal.beginRecovery()) this.options.presence('recovering'); }
+  beginRecovery(): void { if (!this.closed && this.journal.beginRecovery()) this.options.onPhase('recovering'); }
   ready(): void {
     if (this.closed) return;
     if (this.journal.current()?.phase === 'recovering') this.journal.mark('ready');
-    this.options.presence('idle');
+    this.options.onPhase('ready');
   }
-  failed(error: string): void { if (this.closed) return; if (this.journal.current() && this.journal.current()!.phase !== 'ready') this.journal.mark('failed', error); this.options.presence('failed'); }
+  failed(error: string): void { if (this.closed) return; if (this.journal.current() && this.journal.current()!.phase !== 'ready') this.journal.mark('failed', error); this.options.onPhase('failed'); }
   async request(origin: RestartOrigin): Promise<RestartReceipt> {
     if (this.closed || !this.accepting) return { accepted: false, status: 'cancelled' };
     if (!this.options.supervised) return { accepted: false, status: 'supervisor_required' };
     const result = this.journal.request(origin);
     if (result.status === 'draining' && !this.draining) {
-      this.draining = true; this.options.beginDrain(); this.options.presence('draining');
+      this.draining = true; this.options.beginDrain(); this.options.onPhase('draining');
       this.timer = setInterval(() => { void this.check().catch(error => this.options.onError?.(error)); }, this.options.pollMs ?? 500);
     }
     return result;

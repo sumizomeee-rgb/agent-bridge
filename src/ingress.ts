@@ -129,6 +129,14 @@ export class DurableIngress {
       .map(row => ({ channelId: String(row.channel_id), userId: String(row.user_id), cursor: String(row.cursor) }));
   }
 
+  /** 最近收到消息的一个当前白名单联系人；不跨机器人、不广播。 */
+  lastAuthorizedContact(): { userId: string; channelId: string } | undefined {
+    this.assertOpen();
+    const users = [...this.users]; if (!users.length) return undefined;
+    const row = this.db.prepare(`SELECT user_id,channel_id FROM messages WHERE is_interaction=0 AND user_id IN (${users.map(() => '?').join(',')}) ORDER BY sequence DESC LIMIT 1`).get(...users);
+    return row ? { userId: String(row.user_id), channelId: String(row.channel_id) } : undefined;
+  }
+
   /** Synchronous Gateway hook. Throws before acknowledgement if journaling fails. */
   capture(message: IncomingDM): boolean {
     this.assertOpen();
