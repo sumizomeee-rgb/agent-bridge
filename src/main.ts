@@ -105,11 +105,11 @@ const runtime = config.controllerMode ? new ControllerRuntime(config, executionA
 }) : undefined;
 const adapters = runtime ? {
   codex: new NativeControllerAdapter(config.commands.codex, env, {
-    agent: 'codex', dataDir: config.dataDir, metadataAdapter: executionAdapters.codex,
+    agent: 'codex', dataDir: config.dataDir, metadataAdapter: executionAdapters.codex, defaultModels: config.defaultModels,
     invokeTool: (turn, name, args, id) => runtime.invoke(turn, name, args, id),
   }),
   claude: new NativeControllerAdapter(config.commands.claude, env, {
-    agent: 'claude', dataDir: config.dataDir, metadataAdapter: executionAdapters.claude,
+    agent: 'claude', dataDir: config.dataDir, metadataAdapter: executionAdapters.claude, defaultModels: config.defaultModels,
     invokeTool: (turn, name, args, id) => runtime.invoke(turn, name, args, id),
   }),
 } : executionAdapters;

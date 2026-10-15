@@ -10,6 +10,7 @@ import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
+import { SessionHandoffs } from './handoff.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
@@ -97,9 +98,15 @@ export class ControllerRuntime {
     else if (origin.userId !== this.config.allowedUserIds[0]) throw new Error('当前用户未获此电脑原生历史访问权限');
   }
   private selectedWorkerModel(value: unknown, inherited: string | null): string | null {
-    if (value === undefined) return inherited;
-    if (value === 'default') return null;
+    if (value === undefined || value === 'default') return inherited;
     const model = text(value, '模型', 200); if (!isModelId(model)) throw new Error('模型标识无效'); return model;
+  }
+  private async defaultWorkerModel(turn: AgentTurn, agent: AgentName): Promise<string> {
+    const inherited = agent === turn.conversation.agent ? turn.conversation.model ?? turn.conversation.actualModel : null;
+    const model = inherited ?? this.config.defaultModels?.[agent]
+      ?? (await this.adapters[agent].getModelInfo?.(turn.conversation.cwd))?.defaultModel;
+    if (!model || model === 'default' || !isModelId(model)) throw new Error('无法确定桥的助手默认模型，本次未派发；请明确 model 或配置 defaultModels。');
+    return model;
   }
   private selectedWorkerEffort(value: unknown, agent: AgentName, inherited: string | null): string | null {
     if (value === undefined) return inherited;
@@ -312,7 +319,7 @@ export class ControllerRuntime {
   }
   /** One trusted, silent workspace-reading child per parent, including parents created before this feature. */
   async initializeWorkspace(turn: AgentTurn): Promise<unknown> {
-    return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', prompt: workspacePrompt, imagePaths: [] }, undefined, true);
+    return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', prompt: workspacePrompt + new SessionHandoffs(this.config.dataDir).prompt(turn.conversation, this.origin(turn).channelId), imagePaths: [] }, undefined, true);
   }
   async invoke(turn: AgentTurn, name: string, input: unknown, callId?: string): Promise<unknown> {
     return this.coalescedDispatch(turn, name, input, callId);
@@ -523,9 +530,19 @@ export class ControllerRuntime {
       const unsettled = active && this.store.getJob(active.job.id)?.status === 'running';
       // A subsequent queued round inherits the latest queued selection; a current-round supplement uses the active selection.
       const inherited = args.delivery === 'next' || !unsettled ? this.store.jobs(worker.id).filter(job => job.status === 'queued').at(-1)?.execution : undefined;
-      const execution = { model: this.selectedWorkerModel(args.model, inherited?.model === undefined ? worker.model : inherited.model),
+      const execution = { model: args.model === 'default' ? await this.defaultWorkerModel(turn, worker.agent)
+          : this.selectedWorkerModel(args.model, inherited?.model === undefined ? worker.model : inherited.model),
         effort: this.selectedWorkerEffort(args.effort, worker.agent, inherited?.effort === undefined ? worker.effort : inherited.effort),
-        ...((args.model === 'default' || (args.model === undefined && (inherited ? inherited.modelPolicy : worker.modelPolicy) === 'cli-default')) ? { modelPolicy: 'cli-default' as const } : {}) };
+        ...((args.model === undefined && (inherited ? inherited.modelPolicy : worker.modelPolicy) === 'cli-default') ? { modelPolicy: 'cli-default' as const } : {}) };
+      // Resolving an unconfigured bridge default may await local metadata. Do not act on an obsolete worker/turn.
+      this.origin(turn);
+      const afterSelection = this.ownedWorker(origin, worker.id);
+      this.assertBridgeOwnership(afterSelection);
+      if (afterSelection.blocked || afterSelection.model !== worker.model || afterSelection.effort !== worker.effort
+        || afterSelection.modelPolicy !== worker.modelPolicy || this.active.get(worker.id) !== active
+        || Boolean(active && this.store.getJob(active.job.id)?.status === 'running') !== Boolean(unsettled)) {
+        throw new Error('确定默认模型期间子 Agent 状态已改变，本次未发送或排队；请核对后重试。');
+      }
       if (unsettled && args.delivery !== 'next' && (execution.model !== worker.model || execution.effort !== worker.effort || execution.modelPolicy !== worker.modelPolicy)) throw new Error('运行中的 Agent 不能在当前轮切换模型或强度；请用 delivery=next 为下一轮设置参数。');
       if (unsettled && args.delivery !== 'next') {
         const supplement: ControllerSupplement = { id: randomUUID(), workerId: worker.id, jobId: active.job.id, origin, prompt, imagePaths: images,
@@ -602,11 +619,11 @@ export class ControllerRuntime {
         args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
       if (target.agent !== agent || target.id !== (args.targetId ?? 'local')) throw new Error('执行目标服务返回的电脑或引擎与请求不一致');
       if (target.transport === 'local' && (!isAbsolute(target.cwd) || /[\r\n]/.test(target.cwd) || !statSync(target.cwd).isDirectory())) throw new Error('工作目录必须是本机已有目录的绝对路径');
-      const model = this.selectedWorkerModel(args.model, agent === turn.conversation.agent ? turn.conversation.model ?? null : null);
+      const model = args.model === undefined || args.model === 'default' ? await this.defaultWorkerModel(turn, agent) : this.selectedWorkerModel(args.model, null);
       const effort = this.selectedWorkerEffort(args.effort, agent, agent === turn.conversation.agent
         ? turn.effort ?? turn.conversation.effort ?? turn.conversation.actualEffort ?? null : null);
       preparedWorker = { id: randomUUID(), origin, agent, model, actualModel: null, target, ownership: 'bridge',
-        effort, ...((args.model === 'default' || (args.model === undefined && agent === turn.conversation.agent && turn.conversation.modelPolicy === 'cli-default')) ? { modelPolicy: 'cli-default' as const } : {}), cwd: target.cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
+        effort, cwd: target.cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
         imagePaths: this.images(turn, args.imagePaths), wakeAllowed: true, blocked: false,
         createdAt: this.timestamp(), updatedAt: this.timestamp() };
       text(args.prompt, '任务内容', 128 * 1024);
@@ -843,6 +860,17 @@ export class ControllerRuntime {
     let taskId = job.taskId;
     // A crash before task registration still needs one durable failure routed to the original parent.
     if (!taskId) taskId = this.register(worker, job);
+    if (job.origin.purpose === 'workspace-context') {
+      const handoffs = new SessionHandoffs(this.config.dataDir);
+      const owner = { id: job.origin.conversationId, userId: job.origin.userId, cwd: job.origin.cwd };
+      try {
+        if (status === 'completed') result = handoffs.finish(owner, job.origin.channelId, result);
+        else handoffs.fail(owner, job.origin.channelId, result);
+      } catch (error) {
+        status = 'failed'; result = `会话交接未完成：${error instanceof Error ? error.message : String(error)}`;
+        try { handoffs.fail(owner, job.origin.channelId, result); } catch (failure) { this.error(failure); }
+      }
+    }
     const supplements = this.store.supplements(job.id);
     if (supplements.length) result += '\n\n当前轮补充接收记录：\n' + supplements.map(value => `${value.id}: ${value.status}${value.reason ? ` · ${value.reason}` : ''}`).join('\n');
     this.store.transaction(() => {

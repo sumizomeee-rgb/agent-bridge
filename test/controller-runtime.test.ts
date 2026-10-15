@@ -74,6 +74,46 @@ async function launch(runtime: ControllerRuntime, turn: AgentTurn, args: Record<
   return await runtime.invoke(turn, 'bridge_start_worker', { title: '温度调查', prompt: '检查温度', ...args }, callId) as Handle;
 }
 
+test('omitted and default models inherit confirmed actual parent model before any remote CLI default', async () => {
+  const f = fixture(); f.turn.conversation.model = null; f.turn.conversation.actualModel = 'gpt-6.1-sol';
+  f.codex.getModelInfo = async () => ({ defaultModel: 'gpt-6-astra', models: [
+    { id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['medium'] },
+    { id: 'gpt-6-astra', displayName: 'Astra', supportedEfforts: ['medium'] },
+  ] });
+  try {
+    const first = await launch(f.runtime, f.turn); const second = await launch(f.runtime, f.turn, { model: 'default' }); await flush();
+    assert.deepEqual(f.codex.turns.map(turn => turn.conversation.model), ['gpt-6.1-sol', 'gpt-6.1-sol']);
+    assert.deepEqual(f.codex.turns.map(turn => turn.effort), ['medium', 'medium']);
+    assert.equal(f.runtime.store.getWorker(first.workerId)!.modelPolicy, undefined);
+    f.codex.finish(first.workerId); f.codex.finish(second.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('unknown bridge worker default rejects without launching or persisting a worker', async () => {
+  const f = fixture(); f.turn.conversation.model = null; f.turn.conversation.actualModel = null;
+  f.codex.getModelInfo = async () => ({ defaultModel: null as unknown as string, models: [] });
+  try {
+    await assert.rejects(launch(f.runtime, f.turn), /无法确定桥的助手默认模型/);
+    assert.equal(f.runtime.store.workers().length, 0); assert.equal(f.codex.turns.length, 0);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('a worker finishing while bridge default metadata resolves cannot turn a current supplement into an automatic next round', async () => {
+  const f = fixture();
+  try {
+    const handle = await launch(f.runtime, f.turn); await flush();
+    f.turn.conversation.model = null; f.turn.conversation.actualModel = null;
+    let resolve!: (info: Awaited<ReturnType<FakeAdapter['getModelInfo']>>) => void;
+    f.codex.getModelInfo = () => new Promise(done => { resolve = done; });
+    const pending = f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '仅补充当前轮', model: 'default', effort: 'default' });
+    await flush(); assert.ok(resolve);
+    f.codex.finish(handle.workerId); await flush(); await flush();
+    resolve({ defaultModel: 'gpt-6.1-sol', models: [] });
+    await assert.rejects(pending, /状态已改变/);
+    assert.equal(f.runtime.store.jobs(handle.workerId).length, 1); assert.equal(f.codex.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
 test('scheduled worker starts directly once, retains selection, and only wakes its controller on result', async () => {
   const f = fixture();
   try {
@@ -533,11 +573,11 @@ test('independent children run concurrently and the counter only includes starte
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
-test('changing agent without an explicit model preserves CLI defaults and recorded actual model never overwrites an alias', async () => {
+test('changing agent uses the bridge backend default and recorded actual model never overwrites an alias', async () => {
   const f = fixture();
   try {
     const defaultChild = await launch(f.runtime, f.turn, { agent: 'claude' }); await flush();
-    assert.equal(f.claude.turns[0]?.conversation.model, null); f.claude.finish(defaultChild.workerId); await flush();
+    assert.equal(f.claude.turns[0]?.conversation.model, 'haiku'); assert.equal(f.claude.turns[0]?.effort, undefined); f.claude.finish(defaultChild.workerId); await flush();
     const aliasChild = await launch(f.runtime, f.turn, { agent: 'claude', model: 'haiku' }); await flush();
     f.claude.turns[1]?.onModel?.('DeepSeek'); f.claude.finish(aliasChild.workerId); await flush();
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: aliasChild.workerId, prompt: '保留路由继续' }); await flush();

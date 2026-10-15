@@ -45,7 +45,7 @@ export interface BridgeConfig {
   controllerMode?: boolean;
   /** Outgoing ordinary files; defaults to 20 MiB, at most 24 MiB. */
   maxFileBytes?: number;
-  /** Reference defaults for display/fallback only, never an automatic CLI override. */
+  /** Bridge worker defaults when parent model inheritance does not apply; independent of a remote CLI's default. */
   defaultModels?: Partial<Record<AgentName, string>>;
   modelOptions?: Partial<Record<AgentName, string[]>>;
 }

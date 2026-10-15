@@ -128,7 +128,8 @@ function fixture(t: TestContext, controllerMode = true) {
   return f;
 }
 
-test('/new cancels both plan kinds and stops a launched scheduled agent before initializing the new controller', async t => {
+for (const resetCommand of ['/new', '/new continue']) {
+test(`${resetCommand} cancels both plan kinds and stops a launched scheduled agent before initializing the new controller`, async t => {
   const f = fixture(t);
   f.controller.hook = async turn => {
     if (turn.text !== '安排后续') return;
@@ -147,7 +148,7 @@ test('/new cancels both plan kinds and stops a launched scheduled agent before i
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   f.children.interrupt = async id => { if (id === plan.worker!.id) await gate; await interrupt(id); };
-  const resetting = f.send('reset-plans', '/new');
+  const resetting = f.send('reset-plans', resetCommand);
   await until(() => !!f.runtime.store.getJob(plan.job!.id)?.cancelReason);
   assert.equal(f.inspect.getActive('user')!.id, original.id);
   assert.ok(!f.replies.some(reply => reply.text.includes('新会话已创建')));
@@ -159,14 +160,15 @@ test('/new cancels both plan kinds and stops a launched scheduled agent before i
   assert.ok(f.runtime.store.schedules().every(value => value.status === 'cancelled'));
   for (const value of f.runtime.store.schedules()) { value.dueAt = new Date(Date.now()-1000).toISOString(); f.runtime.store.saveSchedule(value); }
   await f.runtime.poll();
-  f.children.finish(2); await until(() => f.controller.turns.filter(turn => turn.event?.kind === 'workspace-context').length === 2 && f.registry.queuedEvents().length === 0);
+  f.children.finish(2, resetCommand.includes('continue') ? JSON.stringify({ workspaceContext: '本机工作区', continuation: '旧定时已取消，真实消息在新会话继续。' }) : undefined);
+  await until(() => f.controller.turns.filter(turn => turn.event?.kind === 'workspace-context').length === 2 && f.registry.queuedEvents().length === 0);
   assert.equal(f.controller.turns.filter(turn => ['wake', 'worker-result'].includes(turn.event?.kind ?? '')).length, 0);
   assert.equal(f.children.turns.length, 3, 'cancelled plans never launch later');
   await until(() => f.controller.turns.some(turn => turn.text === '新会话继续这个问题'));
   assert.equal(f.inspect.getMessage('during-reset')!.conversationId, f.inspect.getActive('user')!.id);
 });
 
-test('/new reports unconfirmed scheduled process termination and does not activate a new controller', async t => {
+test(`${resetCommand} reports unconfirmed scheduled process termination and does not activate a new controller`, async t => {
   const f = fixture(t);
   f.controller.hook = async turn => {
     if (turn.text === '定时核查') await f.runtime.invoke(turn, 'bridge_schedule_worker', { afterSeconds: 60, title: '定时核查', prompt: '核对' });
@@ -182,12 +184,13 @@ test('/new reports unconfirmed scheduled process termination and does not activa
     const error = Object.assign(new Error('termination unconfirmed'), { name: 'AgentProcessStopError', processStillRunning: true });
     f.children.pending.get(id)?.reject(error); f.children.pending.delete(id); throw error;
   };
-  await f.send('failed-reset', '/new');
+  await f.send('failed-reset', resetCommand);
   await until(() => f.replies.some(reply => reply.text.includes('不能宣称全部停止')));
   assert.equal(f.inspect.getActive('user')!.id, original.id); assert.equal(f.children.turns.length, 2);
   assert.equal(f.runtime.store.getSchedule(plan.id)!.status, 'uncertain');
   f.children.interrupt = interrupt;
 });
+}
 
 test('a scheduled result can immediately continue the same child while its completed run is settling', async t => {
   const f = fixture(t); let workerId = '', followed = false;
@@ -763,4 +766,55 @@ test('重启发现初始化事件处理中断时只报结果无法确认，不�
   assert.equal(initializationReceipts(f).length, 1);
   assert.match(initializationReceipts(f)[0]!.text, /结果无法确认/);
   assert(!initializationReceipts(f)[0]!.text.includes('已载入'));
+});
+
+test('/new continue freezes parent selection, uses one initializer, persists a bounded private handoff and survives restart without repeating', async t => {
+  const f = fixture(t);
+  await f.send('old-request', '目标：先调查，不能保留数据重装'); await until(() => f.children.turns.length === 1);
+  f.children.finish(0); await until(() => f.manager.isIdle());
+  const previous = f.inspect.getActive('user')!;
+  assert.equal(previous.model ?? null, null); assert.equal(previous.actualModel, 'gpt-6.1-sol');
+  const registered = f.registry.createContext({ conversationId: previous.id, userId: 'user', channelId: 'dm',
+    originMessageId: 'old-request', nativeId: previous.nativeId, agent: 'codex', cwd: f.root });
+  const scheduled = await f.runtime.invoke({ conversation: previous, taskContextPath: registered.contextPath,
+    text: '', imagePaths: [], signal: new AbortController().signal, onProgress: () => {} },
+    'bridge_schedule_controller', { afterSeconds: 60, text: '旧提醒' }) as { scheduleId: string };
+  f.registry.closeContext(registered.contextId);
+  await f.send('continue', '/new continue'); await until(() => f.children.turns.length === 2);
+  const parent = f.inspect.getActive('user')!;
+  assert.notEqual(parent.id, previous.id); assert.equal(parent.model, 'gpt-6.1-sol'); assert.equal(parent.effort, 'medium');
+  assert.equal(f.runtime.store.getSchedule(scheduled.scheduleId)!.status, 'cancelled');
+  assert.equal(f.children.turns[1]!.conversation.model, parent.model); assert.equal(f.children.turns[1]!.effort, parent.effort);
+  assert.match(f.children.turns[1]!.text, /只启动这一个初始化助手/);
+  const directory = join(f.config.dataDir, 'session-handoffs', parent.id);
+  assert.match(readFileSync(join(directory, 'source.json'), 'utf8'), /不能保留数据重装/);
+  assert.equal(f.replies.filter(reply => reply.text.includes('正在整理上一会话')).length, 1);
+  f.children.finish(1, JSON.stringify({ workspaceContext: 'WORKSPACE_CONTEXT', continuation: '用户要求先调查；纠正：不能保留数据重装。仍需核实，禁止自动重派。' }));
+  await until(() => f.manager.isIdle() && f.inspect.workspaceNotice(parent.id)!.state === 'delivered');
+  const event = f.controller.turns.find(turn => turn.conversation.id === parent.id && turn.event);
+  assert.ok(event); assert.match(event.text, /WORKSPACE_CONTEXT/); assert.match(event.text, /不能保留数据重装/);
+  assert.match(event.text, /关键纠正和真正待办/);
+  assert.match(readFileSync(join(directory, 'context.md'), 'utf8'), /不能保留数据重装/);
+  await f.restart(); await delay(30);
+  assert.equal(f.children.turns.length, 2);
+  await f.send('fresh', '/new'); await until(() => f.children.turns.length === 3);
+  assert(!f.children.turns[2]!.text.includes('source.json')); assert(!f.children.turns[2]!.text.includes('不能保留数据重装'));
+});
+
+test('/new continue without a prior controller does not switch, and malformed handoff never claims readiness', async t => {
+  const f = fixture(t);
+  await f.send('empty', '/new continue'); assert.equal(f.inspect.getActive('user'), null); assert.equal(f.children.turns.length, 0);
+  await f.send('old', '授权的目标'); await until(() => f.children.turns.length === 1);
+  f.children.finish(0); await until(() => f.manager.isIdle());
+  await f.send('continue', '/new continue'); await until(() => f.children.turns.length === 2);
+  const target = f.inspect.getActive('user')!;
+  f.children.finish(1, 'INVALID_NOT_JSON');
+  await until(() => f.manager.isIdle() && f.inspect.workspaceNotice(target.id)!.state === 'delivered');
+  assert.equal(f.runtime.store.jobs().at(-1)!.status, 'failed');
+  const manifest = JSON.parse(readFileSync(join(f.config.dataDir, 'session-handoffs', target.id, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.status, 'failed');
+  const failure = f.controller.turns.filter(turn => turn.conversation.id === target.id);
+  assert.equal(failure.length, 1); assert.equal(failure[0]!.event?.introductionRequested, false);
+  assert.match(failure[0]!.text, /交接未完成/);
+  assert.equal(f.inspect.workspaceNotice(target.id)!.outcome, 'read-failed');
 });

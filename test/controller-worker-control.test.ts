@@ -114,7 +114,7 @@ test('invalid worker selections reject before enqueuing while explicit defaults 
     await assert.rejects(launch(f, { agent: 'claude', effort: 'ultra' }), /不支持/);
     assert.equal(f.runtime.store.jobs().length, 0);
     const h = await launch(f, { model: 'default', effort: 'default' }); await flush();
-    assert.equal(f.codex.turns[0]!.conversation.model, null); assert.equal(f.codex.turns[0]!.effort, undefined);
+    assert.equal(f.codex.turns[0]!.conversation.model, 'gpt-6.1-sol'); assert.equal(f.codex.turns[0]!.effort, undefined);
     assert.equal(f.turn.conversation.effort, 'xhigh'); f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }
 });
@@ -292,11 +292,11 @@ test('model/effort incompatibility rejects before start/next persistence and nev
     }
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'current change', model: 'gpt-6-astra' }), /delivery=next/);
     const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'default next', delivery: 'next', model: 'default', effort: 'default' }) as Handle;
-    assert.deepEqual(f.runtime.store.getJob(next.jobId!)!.execution, { model: null, effort: null, modelPolicy: 'cli-default' });
+    assert.deepEqual(f.runtime.store.getJob(next.jobId!)!.execution, { model: 'gpt-6.1-sol', effort: null });
     assert.deepEqual(f.runtime.store.getWorker(h.workerId), { ...before, updatedAt: f.runtime.store.getWorker(h.workerId)!.updatedAt });
     f.codex.finish(h.workerId); await flush(); await flush();
-    assert.equal(f.runtime.store.getWorker(h.workerId)!.model, null);
-    assert.equal(f.runtime.store.getWorker(h.workerId)!.modelPolicy, 'cli-default');
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.model, 'gpt-6.1-sol');
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.modelPolicy, undefined);
     assert.equal(f.codex.turns[1]!.conversation.nativeId, before.nativeId);
     f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }

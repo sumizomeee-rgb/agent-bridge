@@ -136,6 +136,10 @@ test('persistent controller publishes only explicit messages with native IDs and
     assert.equal(first.text, ''); assert.equal(first.controlledOutput, true);
     assert.deepEqual(s.published.map(p => p.key), ['call-1', 'call-2']); assert.deepEqual(s.invokes, []);
     assert.notEqual(s.launches[0]?.env.CODEX_HOME, join(s.userHome, '.codex'));
+    const input = (s.transports[0]!.written.find(message => message.method === 'turn/start')!.params as JsonObject).input as { text: string }[];
+    const runtime = input.find(item => item.text?.includes('[Bridge runtime;'))!.text;
+    assert.match(runtime, /"observedModel":"gpt-6.1-sol"/); assert.match(runtime, /"observedEffort":"medium"/);
+    assert.match(runtime, /before dispatch/);
   } finally { await s.cleanup(); }
 });
 test('unsupported tool execution is rejected and never dispatched', async () => {
@@ -156,7 +160,9 @@ test('background evidence uses standalone tool output and may quietly continue',
     const result = await s.adapter.run(turn); assert.equal(result.controlledOutput, true);
     const start = s.transports[0]?.written.find(m => m.method === 'turn/start')?.params as JsonObject;
     assert.deepEqual(start.input, []); assert.deepEqual({ ...start.toolOutput as object, output: 'confirmed evidence' }, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
-    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge clock.*UTC: .*timezone: .*\n\nconfirmed evidence$/);
+    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge clock.*UTC: .*timezone: .*/);
+    assert.match((start.toolOutput as { output: string }).output, /\[Bridge runtime;.*"observedModel":"gpt-6.1-sol"/);
+    assert.match((start.toolOutput as { output: string }).output, /\n\nconfirmed evidence$/);
   } finally { await s.cleanup(); }
 });
 
@@ -538,6 +544,8 @@ test('Claude maps parallel same-name MCP calls by exact arguments and closes MCP
     assert.deepEqual(invoked.sort((a,b) => String(a.title).localeCompare(String(b.title))), [{ title: 'A', id: 'id-A' }, { title: 'B', id: 'id-B' }]);
     assert.deepEqual(publicKeys, ['id-public']);
     assert.ok(receivedContent.some(item => (item as JsonObject).type === 'image'));
+    assert.ok(receivedContent.some(item => String((item as JsonObject).text).includes('[Bridge runtime;')));
+    assert.ok(receivedContent.some(item => String((item as JsonObject).text).includes('Preserve user aliases and gateway mappings')));
     assert.ok(receivedContent.some(item => (item as JsonObject).type === 'text' && String((item as JsonObject).text).includes(JSON.stringify(image))));
     transport.stop = async () => { throw new Error('process exit unconfirmed'); };
     await assert.rejects(adapter.close(), /process exit unconfirmed/);

@@ -49,7 +49,7 @@ export function slashText(data: unknown): { text: string } | { error: string } {
     return { error: '请填写命令需要的参数，再重新发送。' };
   }
   switch (definition.name) {
-    case 'new':
+    case 'new': return { text: `/new${values.get('continue') ? ' continue' : ''}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'agent': return { text: `/${definition.name}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };
     case 'cwd': return { text: `/cwd ${values.get('path')}` };

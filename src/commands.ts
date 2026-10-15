@@ -8,7 +8,7 @@ const agentOption: CommandOption = { type: 'string', name: 'agent', description:
 
 /** 两个平台的唯一命令定义；平台菜单只做参数编码。 */
 export const COMMANDS: CommandDefinition[] = [
-  { name: 'new', help: "/new [codex|claude] 或 new chat：新建会话，沿用工作目录", description: '新建会话，清空当前上下文', options: [{ ...agentOption, description: '新会话使用的 Agent；留空沿用当前 Agent' }] },
+  { name: 'new', help: "/new [continue] [codex|claude]：新建会话；continue 提炼上一会话后续接。两者都会取消旧定时", description: '新建会话，可提炼上一会话后续接', options: [{ ...agentOption, description: '新会话使用的 Agent；留空沿用当前 Agent' }, { type: 'boolean', name: 'continue', description: '初始化时提炼上一会话；仍取消旧定时，不接管旧助手' }] },
   { name: 'agent', help: "/agent [codex|claude]：查看或切换 Agent，续接该目录的上次会话", description: '切换 Agent 并自动续接该目录的上下文', options: [agentOption] },
   { name: 'chats', help: "/chats：只读查看当前 bot 下自己的历史会话", description: '只读查看自己的历史会话' },
   { name: 'cwd', help: "/cwd 路径：在指定目录新建会话", description: '在指定工作目录新建会话', options: [
@@ -41,6 +41,12 @@ export const COMMANDS: CommandDefinition[] = [
 export function commandHelp(controllerMode = false): string {
   return ['直接发送文字或图片即可继续当前会话。命令只在 bot 私聊中使用。', ...COMMANDS.map(command =>
     controllerMode && command.name === 'stop' ? '/stop：停止桥管理的执行子 Agent、清空队列并取消预约；独立远端进程需要另行核对' : command.help)].join('\n');
+}
+export function parseNewArguments(argument: string): { agent?: 'codex' | 'claude'; continue: boolean } | null {
+  const parts = argument.toLowerCase().split(/\s+/).filter(Boolean);
+  if (new Set(parts).size !== parts.length || parts.some(value => !['continue', 'codex', 'claude'].includes(value))
+    || parts.includes('codex') && parts.includes('claude')) return null;
+  return { continue: parts.includes('continue'), ...(parts.includes('codex') ? { agent: 'codex' as const } : parts.includes('claude') ? { agent: 'claude' as const } : {}) };
 }
 export function parseCommand(text: string): { name: string; argument: string } | null {
   const trimmed = text.trim();

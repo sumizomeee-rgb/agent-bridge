@@ -101,6 +101,8 @@ export class SessionStore {
     if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
     const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
     if (!inboxColumns.has('reply_state')) this.db.exec('ALTER TABLE inbox ADD COLUMN reply_state TEXT');
+    const publicColumns = new Set(this.db.prepare('PRAGMA table_info(controller_public_messages)').all().map(row => String(row.name)));
+    if (!publicColumns.has('text')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN text TEXT');
   }
 
   hasMessage(id: string): boolean {
@@ -130,7 +132,7 @@ export class SessionStore {
   }
 
   claimPublicMessage(id: string, conversationId: string, nativeId: string, channelId: string,
-    contentHash: string): 'send' | 'delivered' | 'uncertain' {
+    contentHash: string, text?: string): 'send' | 'delivered' | 'uncertain' {
     const previous = this.db.prepare('SELECT * FROM controller_public_messages WHERE id=?').get(id);
     if (previous) {
       if (previous.conversation_id !== conversationId || previous.native_id !== nativeId
@@ -141,13 +143,28 @@ export class SessionStore {
     }
     const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO controller_public_messages
-      (id,conversation_id,native_id,channel_id,content_hash,state,created_at,updated_at)
-      VALUES (?,?,?,?,?,'pending',?,?)`).run(id, conversationId, nativeId, channelId, contentHash, now, now);
+      (id,conversation_id,native_id,channel_id,content_hash,text,state,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,'pending',?,?)`).run(id, conversationId, nativeId, channelId, contentHash, text ?? null, now, now);
     return 'send';
   }
   finishPublicMessage(id: string, state: 'delivered' | 'uncertain'): void {
     this.db.prepare('UPDATE controller_public_messages SET state=?,updated_at=? WHERE id=?')
       .run(state, new Date().toISOString(), id);
+  }
+
+  /** Genuine inputs and confirmed public replies, confined to this user's exact conversation and chat. */
+  handoffHistory(conversationId: string, userId: string, channelId: string): Array<{ role: 'user' | 'assistant'; text: string; at: string; state: string }> {
+    const owner = this.getConversation(conversationId);
+    if (!owner || owner.userId !== userId) throw new Error('不能读取其他用户的会话。');
+    const inputs = this.db.prepare(`SELECT text,created_at,state FROM inbox WHERE id IN (
+      SELECT id FROM (SELECT id FROM inbox WHERE conversation_id=? AND user_id=? AND channel_id=? ORDER BY sequence LIMIT 2)
+      UNION SELECT id FROM (SELECT id FROM inbox WHERE conversation_id=? AND user_id=? AND channel_id=? ORDER BY sequence DESC LIMIT 160)
+    ) ORDER BY sequence`).all(conversationId, userId, channelId, conversationId, userId, channelId);
+    const replies = this.db.prepare(`SELECT text,created_at,state FROM controller_public_messages
+      WHERE conversation_id=? AND channel_id=? AND state='delivered' AND text IS NOT NULL ORDER BY created_at DESC LIMIT 160`).all(conversationId, channelId);
+    return [...inputs.map(row => ({ role: 'user' as const, text: String(row.text), at: String(row.created_at), state: String(row.state) })),
+      ...replies.map(row => ({ role: 'assistant' as const, text: String(row.text), at: String(row.created_at), state: String(row.state) }))]
+      .sort((a, b) => a.at.localeCompare(b.at));
   }
 
   requestWorkspaceNotice(conversationId: string, message: BridgeMessage): void {

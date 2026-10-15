@@ -55,7 +55,7 @@
 
 核实后用 `bridge_adopt_native_session` 传入真实原生 ID 和检查版本，建立空闲直属 Agent。它保持原 ID、原目录和完整原生历史；只有随后明确续接才运行 CLI，不会用摘要新建替代会话。`bridge_handoff_worker` 可将空闲会话交还用户，用户结束 CLI 后可再接管，旧 worker 只保留历史，不再派工。正在使用、结果未知、供应商不匹配或检查后已变化的会话会返回具体原因；先处理原因再重新查询。不要同时用人工 CLI 和桥操作同一会话。
 
-`bridge_start_worker` 和 `bridge_continue_worker` 支持独立的 `model`、`effort`，例如派发 `codex`、`gpt-6-astra`、`low`，或 `claude`、`haiku`。参数原样提交对应目标 CLI，沿用用户的供应商与模型别名路由；不修改主控选择或全局配置。续接空闲会话时直接指定；忙碌时用 `delivery: "next"` 为下一轮选择，已运行的一轮不受影响。后续排队轮次不写参数时继承前一条排队选择。`default` 清除桥的显式覆盖，交由 CLI 处理；实际兼容性仍以目标 CLI 回报为准，不偷偷更换模型。
+`bridge_start_worker` 和 `bridge_continue_worker` 支持独立的 `model`、`effort`，例如派发 `codex`、`gpt-6-astra`、`low`，或 `claude`、`haiku`。参数原样提交对应目标 CLI，沿用用户的供应商与模型别名路由；不修改主控选择或全局配置。续接空闲会话时直接指定；忙碌时用 `delivery: "next"` 为下一轮选择，已运行的一轮不受影响。后续排队轮次不写参数时继承前一条排队选择。新建助手的 `model` 省略或填 `default` 时，同后端优先沿用主控显式选择，再取已确认的实际模型；跨后端使用桥的 `defaultModels`。未配置时仅查询桥本机对应 CLI 的默认元数据，无法确定则拒绝派发，不交给远端 CLI 决定。续接省略 `model` 保留该助手或最近排队轮的选择，显式 `default` 重新应用桥的上述规则；`effort: "default"` 仍清除强度覆盖。用户的模型别名原样提交，不根据实际网关模型改写别名。
 
 这批新工具及参数声明需要主控 `/new` 一次；普通重启续接的旧主控不会自动获得新工具。接管的执行会话本身保持原 ID，不需新建。
 
@@ -79,6 +79,7 @@ steer 超时（10 秒）、连接断开、内部错误、响应损坏或返回�
 | --- | --- |
 | `new chat` 或 `/new` | 新建当前 Agent 的会话 |
 | `/new codex`、`/new claude` | 新建指定 Agent 会话 |
+| `/new continue [codex|claude]` | 同一次初始化读取工作区并提炼上一会话；取消旧定时，不转移旧助手归属 |
 | `/chats` | 只读查看自己的历史会话 |
 | `/agent codex`、`/agent claude` | 切换 Agent，优先续接当前目录下的上次会话；没有则新建 |
 | `/agent` | 查看当前 Agent 和两种切换指令 |

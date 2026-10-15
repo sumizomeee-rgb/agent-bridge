@@ -91,6 +91,9 @@ test('native registry contains twelve supported DM-only commands, never resume/s
 test('native options map to existing text commands including custom models and Windows paths', () => {
   for (const name of ['help', 'status', 'chats', 'models', 'stop', 'new', 'agent', 'model']) assert.deepEqual(result(name), { text: `/${name}` });
   assert.deepEqual(result('new', [option('agent', 'claude')]), { text: '/new claude' });
+  assert.deepEqual(result('new', [option('continue', true)]), { text: '/new continue' });
+  assert.deepEqual(result('new', [option('continue', true), option('agent', 'claude')]), { text: '/new continue claude' });
+  assert.deepEqual(result('new', [option('continue', false)]), { text: '/new' });
   assert.deepEqual(result('agent', [option('agent', 'codex')]), { text: '/agent codex' });
   assert.deepEqual(result('cwd', [option('path', 'C:\\My Project\\src')]), { text: '/cwd C:\\My Project\\src' });
   assert.deepEqual(result('model', [option('name', 'list')]), { text: '/model list' });
