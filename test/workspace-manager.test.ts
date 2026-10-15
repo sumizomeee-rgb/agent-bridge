@@ -128,6 +128,88 @@ function fixture(t: TestContext, controllerMode = true) {
   return f;
 }
 
+test('/new cancels both plan kinds and stops a launched scheduled agent before initializing the new controller', async t => {
+  const f = fixture(t);
+  f.controller.hook = async turn => {
+    if (turn.text !== '安排后续') return;
+    await f.runtime.invoke(turn, 'bridge_schedule_worker', { afterSeconds: 60, title: '已启动的定时任务', prompt: '核对' });
+    await f.runtime.invoke(turn, 'bridge_schedule_worker', { afterSeconds: 120, title: '尚未触发', prompt: '以后核对' });
+    await f.runtime.invoke(turn, 'bridge_schedule_controller', { afterSeconds: 120, text: '以后提醒' });
+  };
+  await f.send('schedule-source', '安排后续');
+  await until(() => f.runtime.store.schedules().length === 3 && f.children.turns.length === 1 && f.inspect.getMessage('schedule-source')?.state === 'completed');
+  f.children.finish(0); await until(() => f.controller.turns.some(turn => turn.event?.kind === 'workspace-context') && f.registry.queuedEvents().length === 0);
+  const original = f.inspect.getActive('user')!;
+  const plan = f.runtime.store.schedules().find(value => value.title === '已启动的定时任务')!;
+  plan.dueAt = new Date(Date.now()-1000).toISOString(); f.runtime.store.saveSchedule(plan);
+  await f.runtime.poll(); await until(() => f.children.turns.length === 2);
+  const interrupt = f.children.interrupt.bind(f.children);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.children.interrupt = async id => { if (id === plan.worker!.id) await gate; await interrupt(id); };
+  const resetting = f.send('reset-plans', '/new');
+  await until(() => !!f.runtime.store.getJob(plan.job!.id)?.cancelReason);
+  assert.equal(f.inspect.getActive('user')!.id, original.id);
+  assert.ok(!f.replies.some(reply => reply.text.includes('新会话已创建')));
+  await f.send('during-reset', '新会话继续这个问题');
+  release(); await resetting; f.children.interrupt = interrupt;
+  await until(() => f.children.turns.length === 3);
+  assert.notEqual(f.inspect.getActive('user')!.id, original.id);
+  assert.equal(f.children.pending.has(plan.worker!.id), false, 'scheduled process has exited before new initialization starts');
+  assert.ok(f.runtime.store.schedules().every(value => value.status === 'cancelled'));
+  for (const value of f.runtime.store.schedules()) { value.dueAt = new Date(Date.now()-1000).toISOString(); f.runtime.store.saveSchedule(value); }
+  await f.runtime.poll();
+  f.children.finish(2); await until(() => f.controller.turns.filter(turn => turn.event?.kind === 'workspace-context').length === 2 && f.registry.queuedEvents().length === 0);
+  assert.equal(f.controller.turns.filter(turn => ['wake', 'worker-result'].includes(turn.event?.kind ?? '')).length, 0);
+  assert.equal(f.children.turns.length, 3, 'cancelled plans never launch later');
+  await until(() => f.controller.turns.some(turn => turn.text === '新会话继续这个问题'));
+  assert.equal(f.inspect.getMessage('during-reset')!.conversationId, f.inspect.getActive('user')!.id);
+});
+
+test('/new reports unconfirmed scheduled process termination and does not activate a new controller', async t => {
+  const f = fixture(t);
+  f.controller.hook = async turn => {
+    if (turn.text === '定时核查') await f.runtime.invoke(turn, 'bridge_schedule_worker', { afterSeconds: 60, title: '定时核查', prompt: '核对' });
+  };
+  await f.send('plan-source', '定时核查');
+  await until(() => f.runtime.store.schedules().length === 1 && f.children.turns.length === 1 && f.inspect.getMessage('plan-source')?.state === 'completed');
+  f.children.finish(0); await until(() => f.controller.turns.some(turn => turn.event?.kind === 'workspace-context') && f.registry.queuedEvents().length === 0);
+  const original = f.inspect.getActive('user')!;
+  const plan = f.runtime.store.schedules()[0]!; plan.dueAt = new Date(Date.now()-1000).toISOString(); f.runtime.store.saveSchedule(plan);
+  await f.runtime.poll(); await until(() => f.children.turns.length === 2);
+  const interrupt = f.children.interrupt.bind(f.children);
+  f.children.interrupt = async id => {
+    const error = Object.assign(new Error('termination unconfirmed'), { name: 'AgentProcessStopError', processStillRunning: true });
+    f.children.pending.get(id)?.reject(error); f.children.pending.delete(id); throw error;
+  };
+  await f.send('failed-reset', '/new');
+  await until(() => f.replies.some(reply => reply.text.includes('不能宣称全部停止')));
+  assert.equal(f.inspect.getActive('user')!.id, original.id); assert.equal(f.children.turns.length, 2);
+  assert.equal(f.runtime.store.getSchedule(plan.id)!.status, 'uncertain');
+  f.children.interrupt = interrupt;
+});
+
+test('a scheduled result can immediately continue the same child while its completed run is settling', async t => {
+  const f = fixture(t); let workerId = '', followed = false;
+  f.controller.hook = async turn => {
+    if (turn.text === '定时跟进') {
+      const handle = await f.runtime.invoke(turn, 'bridge_schedule_worker', { afterSeconds: 60, title: '定时跟进', prompt: '核查' }) as { workerId: string };
+      workerId = handle.workerId;
+    } else if (turn.event?.kind === 'worker-result' && !followed) {
+      followed = true;
+      await f.runtime.invoke(turn, 'bridge_continue_worker', { workerId, prompt: '核实相关细节' });
+    }
+  };
+  await f.send('follow-source', '定时跟进');
+  await until(() => f.runtime.store.schedules().length === 1 && f.children.turns.length === 1 && f.inspect.getMessage('follow-source')?.state === 'completed');
+  f.children.finish(0); await until(() => f.controller.turns.some(turn => turn.event?.kind === 'workspace-context') && f.registry.queuedEvents().length === 0);
+  const plan = f.runtime.store.schedules()[0]!; plan.dueAt = new Date(Date.now()-1000).toISOString(); f.runtime.store.saveSchedule(plan);
+  await f.runtime.poll(); await until(() => f.children.turns.length === 2);
+  f.children.finish(1); await until(() => followed && f.children.turns.length === 3);
+  assert.equal(f.children.turns[2]!.conversation.id, workerId);
+  f.children.finish(2); await until(() => f.controller.turns.filter(turn => turn.event?.kind === 'worker-result').length === 2 && f.registry.queuedEvents().length === 0);
+});
+
 test('首条普通消息并行派只读初始化，真实任务计数且不改写用户文字或图片', async t => {
   const f = fixture(t); const image = join(f.root, 'user-picture.png');
   await f.send('first', 'USER_TEXT_IS_NOT_INITIALIZATION', [image]);

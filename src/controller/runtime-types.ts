@@ -18,6 +18,7 @@ export interface ControllerWorker {
 }
 export interface ControllerJob {
   id: string; workerId: string; origin: TaskOrigin; prompt: string; imagePaths: string[];
+  scheduleId?: string;
   status: ControllerJobStatus; taskId: string | null; result: string | null; cancelReason: string | null;
   /** Optional metadata keeps old JSON rows compatible; no native payloads are stored. */
   progress?: AgentExecutionProgress;
@@ -34,9 +35,13 @@ export interface ControllerSupplement {
   status: 'pending' | 'steering' | 'accepted' | 'not_delivered' | 'unsupported' | 'uncertain' | 'cancelled';
   reason?: string; callKey?: string; createdAt: string; updatedAt: string;
 }
-export interface ControllerWake {
-  id: string; origin: TaskOrigin; dueAt: string; text: string;
-  status: 'pending' | 'firing' | 'fired' | 'cancelled'; taskId: string | null; createdAt: string;
+export interface ControllerSchedule {
+  id: string; origin: TaskOrigin; dueAt: string; title: string; text: string;
+  kind: 'controller' | 'worker';
+  status: 'pending' | 'dispatching' | 'running' | 'triggered' | 'completed' | 'failed' | 'cancelled' | 'uncertain';
+  taskId: string | null; createdAt: string; updatedAt: string;
+  /** Frozen execution selection, prepared at registration; no controller turn is needed when due. */
+  worker?: ControllerWorker; job?: ControllerJob; error?: string;
 }
 export interface ControllerTargetCatalog {
   listTargets(workspace: string, refresh?: boolean): Promise<TargetSummary[]>;

@@ -10,7 +10,7 @@ import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['AGENTS.md', 'CLAUDE.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json'];
+const templates = ['AGENTS.md', 'MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 
@@ -52,7 +52,7 @@ test('workspace initializer generates usable templates from another working dire
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'agents.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
     assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities.json'), 'utf8'))), []);
     assert.ok(readFileSync(join(workspace, 'AGENTS.md'), 'utf8').trim());
-    assert.match(readFileSync(join(workspace, 'CLAUDE.md'), 'utf8'), /AGENTS\.md/);
+    assert.match(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), /AGENTS\.md/);
   } finally { cleanup(); }
 });
 

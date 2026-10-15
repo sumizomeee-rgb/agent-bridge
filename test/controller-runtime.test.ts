@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ControllerRuntime } from '../src/controller/runtime.js';
 import { ControllerStore } from '../src/controller/store.js';
@@ -73,6 +74,111 @@ async function launch(runtime: ControllerRuntime, turn: AgentTurn, args: Record<
   return await runtime.invoke(turn, 'bridge_start_worker', { title: '温度调查', prompt: '检查温度', ...args }, callId) as Handle;
 }
 
+test('scheduled worker starts directly once, retains selection, and only wakes its controller on result', async () => {
+  const f = fixture();
+  try {
+    const input = { title: '稍后检查', prompt: '只读检查并回报', afterSeconds: 30, agent: 'claude', model: 'haiku', effort: 'high' };
+    const plan = await f.runtime.invoke(f.turn, 'bridge_schedule_worker', input, 'plan-worker') as { scheduleId: string; workerId: string; jobId: string };
+    assert.deepEqual(await f.runtime.invoke(f.turn, 'bridge_schedule_worker', input, 'plan-worker'), plan);
+    assert.equal(f.runtime.store.workers().length, 0); assert.equal(f.runtime.store.jobs().length, 0);
+    assert.deepEqual(f.runtime.getGlobalWorkCounts(), { running: 0, queued: 0 });
+    f.turn.conversation.model = 'other-parent-model';
+    f.advance(29000); await f.runtime.poll(); assert.equal(f.claude.turns.length, 0);
+    f.advance(2000); await Promise.all([f.runtime.poll(), f.runtime.poll()]); await flush();
+    assert.equal(f.codex.turns.length, 0); assert.equal(f.claude.turns.length, 1); assert.equal(f.events.length, 0);
+    assert.equal(f.claude.turns[0]!.conversation.model, 'haiku'); assert.equal(f.claude.turns[0]!.effort, 'high');
+    assert.equal(f.runtime.store.getSchedule(plan.scheduleId)!.status, 'running');
+    f.claude.finish(plan.workerId, '已检查'); await flush(); await flush();
+    assert.equal(f.events.length, 1); assert.equal(f.events[0]!.purpose, 'schedule'); assert.equal(f.events[0]!.wakeAllowed, true);
+    assert.equal(f.runtime.store.getSchedule(plan.scheduleId)!.status, 'completed');
+    await f.runtime.poll(); assert.equal(f.claude.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('both schedule kinds support parent-scoped query, timezone-aware rescheduling and cancellation', async () => {
+  const f = fixture();
+  try {
+    const controller = await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { dueAt: '2026-10-09T18:00:30+08:00', text: '按原目标判断下一步' }) as { scheduleId: string; dueAt: string };
+    const worker = await f.runtime.invoke(f.turn, 'bridge_schedule_worker', { afterSeconds: 60, title: '定时工作', prompt: '按已确认边界执行' }) as { scheduleId: string };
+    assert.equal(controller.dueAt, '2026-10-09T10:00:30.000Z');
+    const context = JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile;
+    const origin = f.registry.getContextOrigin(context);
+    const turn = f.turn;
+    const listed = await f.runtime.invoke(turn, 'bridge_list_schedules', {}) as { schedules: unknown[]; total: number };
+    assert.equal(listed.total, 2); assert.equal(listed.schedules.length, 2);
+    await f.runtime.invoke(turn, 'bridge_update_schedule', { scheduleId: worker.scheduleId, afterSeconds: 120 });
+    assert.equal(f.runtime.store.getSchedule(worker.scheduleId)!.dueAt, '2026-10-09T10:02:00.000Z');
+    for (const changed of [{ userId: 'user-B' }, { conversationId: 'parent-B' }, { channelId: 'other-channel' }, { cwd: join(f.dir, 'other-workspace') }]) {
+      const foreign = f.registry.createContext({ ...origin, ...changed });
+      const foreignTurn = { ...f.turn, conversation: { ...f.turn.conversation, ...changed, id: changed.conversationId ?? f.turn.conversation.id }, taskContextPath: foreign.contextPath };
+      await assert.rejects(f.runtime.invoke(foreignTurn, 'bridge_cancel_schedule', { scheduleId: controller.scheduleId }), /不属于/);
+    }
+    await f.runtime.invoke(turn, 'bridge_cancel_schedule', { scheduleId: controller.scheduleId });
+    await f.runtime.invoke(turn, 'bridge_cancel_schedule', { scheduleId: worker.scheduleId });
+    f.advance(200000); await f.runtime.poll(); await flush(); assert.equal(f.codex.turns.length, 0); assert.equal(f.events.length, 0);
+    for (const args of [{}, { afterSeconds: 0 }, { afterSeconds: 2592001 }, { afterSeconds: 2, dueAt: '2026-10-09T10:00:30Z' }, { dueAt: '2026-10-09T18:00:30' }]) {
+      await assert.rejects(f.runtime.invoke(turn, 'bridge_schedule_controller', { ...args, text: '无效时间' }));
+    }
+    assert.equal(f.runtime.store.schedules().length, 2);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('scheduled worker committed before crash starts from its saved queue once after recovery', async () => {
+  const f = fixture(); let second: ControllerRuntime | undefined;
+  try {
+    const handle = await f.runtime.invoke(f.turn, 'bridge_schedule_worker', { afterSeconds: 30, title: '恢复定时工作', prompt: '检查' }) as { scheduleId: string; workerId: string };
+    const plan = f.runtime.store.getSchedule(handle.scheduleId)!;
+    f.runtime.store.transaction(() => { f.runtime.store.addWorker(plan.worker!); f.runtime.store.addJob(plan.job!); plan.status = 'running'; f.runtime.store.saveSchedule(plan); });
+    await f.runtime.close(); f.advance(31000);
+    const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: adapter }, f.registry, f.callbacks);
+    await second.start(); await flush(); await second.poll();
+    assert.equal(adapter.turns.length, 1); assert.equal(second.store.jobs().length, 1);
+    adapter.finish(handle.workerId); await flush(); await flush();
+    assert.equal(second.store.getSchedule(handle.scheduleId)!.status, 'completed'); assert.equal(f.events.length, 1);
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('reset during model validation prevents a late schedule registration', async () => {
+  const f = fixture();
+  try {
+    let entered!: () => void, release!: () => void;
+    const validating = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const info = await f.codex.getModelInfo();
+    f.codex.getModelInfo = async () => { entered(); await gate; return info; };
+    const creating = f.runtime.invoke(f.turn, 'bridge_schedule_worker', { afterSeconds: 30, title: '晚到登记', prompt: '不能创建' });
+    const rejected = assert.rejects(creating, /本轮已结束/);
+    await validating; await f.runtime.detachConversation('parent-A'); release(); await rejected;
+    f.advance(31000); await f.runtime.poll();
+    assert.equal(f.runtime.store.schedules().length, 0); assert.equal(f.codex.turns.length, 0);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('wake-only storage migrates once to controller plans, including an already registered task', async () => {
+  const f = fixture(); let second: ControllerRuntime | undefined;
+  try {
+    await f.runtime.close();
+    const context = JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile;
+    const origin = f.registry.getContextOrigin(context);
+    const ids = [randomUUID(), randomUUID()];
+    f.registry.register(context, '预约唤醒 · 主控', ids[1]);
+    const db = new DatabaseSync(join(f.dir, 'controller.sqlite'));
+    db.exec('CREATE TABLE controller_wakes (id TEXT PRIMARY KEY,parent_id TEXT,status TEXT,due_at TEXT,task_id TEXT,value_json TEXT)');
+    for (let i = 0; i < ids.length; i++) {
+      const value = { id: ids[i], origin, dueAt: '2026-10-09T10:00:30Z', text: '原预约' + i, status: i ? 'firing' : 'pending', taskId: i ? ids[i] : null, createdAt: '2026-10-09T10:00:00Z' };
+      db.prepare('INSERT INTO controller_wakes VALUES (?,?,?,?,?,?)').run(value.id!, origin.conversationId, value.status, value.dueAt, value.taskId!, JSON.stringify(value));
+    }
+    db.close(); f.advance(31000);
+    second = new ControllerRuntime(f.config, { codex: new FakeAdapter(), claude: new FakeAdapter() }, f.registry, f.callbacks);
+    await second.start(); await second.poll();
+    assert.equal(second.store.schedules().length, 2); assert.ok(second.store.schedules().every(value => value.kind === 'controller' && value.status === 'triggered'));
+    assert.equal(f.events.length, 2); assert.ok(f.events.every(event => event.purpose === 'schedule' && event.scheduleKind === 'controller'));
+    const inspect = new DatabaseSync(join(f.dir, 'controller.sqlite'));
+    assert.equal(inspect.prepare("SELECT 1 FROM sqlite_master WHERE name='controller_wakes'").get(), undefined); inspect.close();
+    await assert.rejects(second.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 1, text: '旧入口' }), /未知/);
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
 
 test('worker list preserves routing, active work and attachment state while results are previews', async () => {
   const f = fixture(); const image = join(f.dir, '用户附件.png'); f.turn.imagePaths = [image];
@@ -87,9 +193,9 @@ test('worker list preserves routing, active work and attachment state while resu
     f.runtime.store.saveWorker(stored);
     const b = await launch(f.runtime, f.turn, { agent: 'claude', title: '仍在执行的任务' }); await flush();
     const queued = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: b.workerId, prompt: '排队工作', delivery: 'next' }) as Handle;
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '预约说明'.repeat(1000) });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '预约说明'.repeat(1000) });
     const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as {
-      workers: Record<string, unknown>[]; wakes: Record<string, unknown>[];
+      workers: Record<string, unknown>[]; schedules: Record<string, unknown>[];
     };
     assert.equal(listed.workers.length, 2);
     const remote = listed.workers.find(value => value.workerId === a.workerId)!;
@@ -101,8 +207,8 @@ test('worker list preserves routing, active work and attachment state while resu
     assert.equal(remote.lastResultPreviewTruncated, true); assert.equal('lastResult' in remote, false); assert.equal('supplements' in remote, false);
     const busy = listed.workers.find(value => value.workerId === b.workerId)!;
     assert.equal(busy.running, true); assert.equal(busy.queued, 1); assert.equal(busy.lastJobId, queued.jobId);
-    assert.equal(listed.wakes.length, 1); assert.equal('text' in listed.wakes[0]!, false);
-    assert.ok((listed.wakes[0]!.textPreview as string).length <= 256);
+    assert.equal(listed.schedules.length, 1); assert.equal('text' in listed.schedules[0]!, false);
+    assert.ok((listed.schedules[0]!.textPreview as string).length <= 256);
     assert.deepEqual(f.runtime.store.getWorker(a.workerId)!.imagePaths, [image]);
     assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
     assert.equal(f.codex.turns.length, 1); assert.equal(f.claude.turns.length, 1);
@@ -129,7 +235,7 @@ test('one worker details retain every unresolved receipt and only recent bounded
       workerId: string; lastResult: string; lastResultTruncated: boolean; supplementsTotal: number; supplementsTruncated: boolean;
       supplements: { supplementId: string; reason: string; reasonTruncated: boolean }[];
       activeSupplements: { supplementId: string; status: string }[];
-    }[]; wakes: unknown[] };
+    }[]; schedules: unknown[] };
     assert.equal(details.workers.length, 1); const value = details.workers[0]!;
     assert.equal(value.workerId, a.workerId); assert.equal(value.lastResult.length, 4096); assert.equal(value.lastResultTruncated, true);
     assert.equal(value.supplementsTotal, 67); assert.equal(value.supplementsTruncated, true);
@@ -137,7 +243,7 @@ test('one worker details retain every unresolved receipt and only recent bounded
     assert.ok(value.supplements.every(receipt => receipt.reason.length <= 256 && receipt.reasonTruncated));
     assert.equal(value.activeSupplements.length, 27);
     for (const status of ['pending', 'steering', 'uncertain']) assert.equal(value.activeSupplements.filter(receipt => receipt.status === status).length, 9);
-    assert.deepEqual(details.wakes, []); assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
+    assert.deepEqual(details.schedules, []); assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
     f.runtime.store.addWorker({ ...worker, id: 'foreign-worker', origin: { ...origin, userId: 'user-B' } });
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: 'foreign-worker' }), /不属于/);
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: '' }), /workerId/);
@@ -157,18 +263,18 @@ test('all-worker result and wake previews share an 8 KiB budget without dropping
       f.runtime.store.addWorker({ ...worker, id: workerId, nativeId: 'native-' + workerId });
       f.runtime.store.addJob({ ...job, id: 'retained-job-' + index, workerId });
     }
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '唤醒说明'.repeat(1000) });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '唤醒说明'.repeat(1000) });
     const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: {
       workerId: string; nativeId: string; lastResultPreview: string; lastResultPreviewTruncated: boolean;
-    }[]; wakes: { wakeId: string; textPreview: string; textPreviewTruncated: boolean }[] };
+    }[]; schedules: { scheduleId: string; textPreview: string; textPreviewTruncated: boolean }[] };
     assert.equal(listed.workers.length, 40); assert.equal(new Set(listed.workers.map(value => value.workerId)).size, 40);
     assert.ok(listed.workers.every(value => value.nativeId && value.lastResultPreviewTruncated));
-    const previews = [...listed.workers.map(value => value.lastResultPreview), ...listed.wakes.map(value => value.textPreview)];
+    const previews = [...listed.workers.map(value => value.lastResultPreview), ...listed.schedules.map(value => value.textPreview)];
     assert.ok(previews.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0) <= 8 * 1024);
     assert.ok(previews.every(value => !value.includes('\uFFFD')));
     const previous = { workers: listed.workers.map(({ lastResultPreview: _preview, lastResultPreviewTruncated: _truncated, ...value }) =>
       ({ ...value, lastResult: result.slice(0, 4096), supplements: [] })),
-    wakes: listed.wakes.map(value => ({ wakeId: value.wakeId, text: '唤醒说明'.repeat(1000) })) };
+    schedules: listed.schedules.map(value => ({ scheduleId: value.scheduleId, text: '唤醒说明'.repeat(1000) })) };
     const before = Buffer.byteLength(JSON.stringify(previous), 'utf8'); const after = Buffer.byteLength(JSON.stringify(listed), 'utf8');
     assert.ok(after < before * 0.15, 'large histories no longer dominate the default response');
     t.diagnostic('同样40个任务与1个预约：默认返回由 ' + before + ' 字节降至 ' + after + ' 字节。');
@@ -449,9 +555,9 @@ test('native tool call ids deduplicate dispatch, continuation, alarms, and rejec
     const input = { workerId: a.workerId, prompt: '下一轮', delivery: 'next' };
     const b = await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'call-continue');
     assert.deepEqual(await f.runtime.invoke(f.turn, 'bridge_continue_worker', input, 'call-continue'), b);
-    const wake = await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '查看下载' }, 'call-wake');
-    assert.deepEqual(await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { text: '查看下载', afterSeconds: 30 }, 'call-wake'), wake);
-    assert.equal(f.runtime.store.jobs().length, 2); assert.equal(f.runtime.store.wakes().length, 1);
+    const wake = await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '查看下载' }, 'call-wake');
+    assert.deepEqual(await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { text: '查看下载', afterSeconds: 30 }, 'call-wake'), wake);
+    assert.equal(f.runtime.store.jobs().length, 2); assert.equal(f.runtime.store.schedules().length, 1);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
@@ -508,10 +614,10 @@ test('shutdown stops a running CLI, persists uncertainty, and retains queued wor
   try {
     const a = await launch(f.runtime, f.turn); await flush();
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '独立的下一轮', delivery: 'next' });
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 60, text: '恢复下载检查' });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 60, text: '恢复下载检查' });
     await f.runtime.close(); assert.equal(f.codex.pending.size, 0); assert.equal(f.registry.activeCount('parent-A'), 0);
     const inspect = new ControllerStore(f.dir);
-    assert.deepEqual(inspect.jobs(a.workerId).map(job => job.status), ['uncertain', 'queued']); assert.equal(inspect.wakes()[0]?.status, 'pending'); inspect.close();
+    assert.deepEqual(inspect.jobs(a.workerId).map(job => job.status), ['uncertain', 'queued']); assert.equal(inspect.schedules()[0]?.status, 'pending'); inspect.close();
     const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
     await second.start(); await flush(); assert.equal(adapter.turns.length, 0);
     assert.equal(second.store.getWorker(a.workerId)?.blocked, true);
@@ -532,26 +638,27 @@ test('shutdown stops a running CLI, persists uncertainty, and retains queued wor
 test('overdue alarms survive restart, fire exactly once, and never count as running agents', async () => {
   const f = fixture(); let second: ControllerRuntime | undefined;
   try {
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '查看温度' });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '查看温度' });
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.runtime.store.jobs().length, 0);
     await f.runtime.close(); f.advance(31000);
     second = new ControllerRuntime(f.config, { codex: new FakeAdapter(), claude: new FakeAdapter() }, f.registry, f.callbacks);
     await second.start(); await second.poll(); await second.poll();
-    assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /查看温度/); assert.equal(f.events[0]!.displayText, '查看温度'); assert.match(f.events[0]!.text, /wakeId:/); assert.equal(f.registry.activeCount('parent-A'), 0);
-    assert.deepEqual(f.counts, []); assert.equal(second.store.wakes()[0]?.status, 'fired');
+    assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /查看温度/); assert.equal(f.events[0]!.displayText, '查看温度'); assert.match(f.events[0]!.text, /scheduleId:/); assert.equal(f.registry.activeCount('parent-A'), 0);
+    assert.deepEqual(f.counts, []); assert.equal(second.store.schedules()[0]?.status, 'triggered');
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });
 
-test('detaching a parent keeps engineering jobs running but suppresses future automatic resume and alarms', async () => {
+test('detaching keeps engineering jobs but cancels both schedule kinds', async () => {
   const f = fixture();
   try {
     const a = await launch(f.runtime, f.turn); await flush();
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续工程', delivery: 'next' });
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '旧会话预约' });
-    f.runtime.detachConversation('parent-A'); assert.equal(f.codex.pending.size, 1);
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '旧会话预约' });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_worker', { afterSeconds: 30, title: '未触发', prompt: '不会执行' });
+    await f.runtime.detachConversation('parent-A'); assert.equal(f.codex.pending.size, 1);
     f.codex.finish(a.workerId); await flush(); f.codex.finish(a.workerId); await flush();
     assert.equal(f.events.length, 2); assert.ok(f.events.every(event => event.wakeAllowed === false));
-    f.advance(60000); await f.runtime.poll(); assert.equal(f.events.length, 2); assert.equal(f.runtime.store.wakes()[0]?.status, 'cancelled');
+    f.advance(60000); await f.runtime.poll(); assert.equal(f.events.length, 2); assert.ok(f.runtime.store.schedules().every(plan => plan.status === 'cancelled')); assert.equal(f.codex.turns.length, 2);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
@@ -560,7 +667,7 @@ test('returning to a detached parent can continue the idle child without revivin
   try {
     const a = await launch(f.runtime, f.turn); await flush();
     const oldQueued = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '切走前排队任务', delivery: 'next' }) as Handle;
-    f.runtime.detachConversation('parent-A');
+    await f.runtime.detachConversation('parent-A');
     const currentContext = f.registry.createContext({ conversationId: 'parent-A', userId: 'user-A', channelId: 'dm-A', originMessageId: 'message-return',
       nativeId: 'native-parent', agent: 'codex', cwd: f.dir });
     const returned = { ...f.turn, taskContextPath: currentContext.contextPath };
@@ -615,16 +722,16 @@ test('abrupt previous execution is reported once after recovery and never rerun'
 test('crash between wake registration and saving its task id reuses the same registry row', async () => {
   const f = fixture(); let second: ControllerRuntime | undefined;
   try {
-    const handle = await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '跨库恢复' }) as { wakeId: string };
-    const wake = f.runtime.store.getWake(handle.wakeId)!;
+    const handle = await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '跨库恢复' }) as { scheduleId: string };
+    const wake = f.runtime.store.getSchedule(handle.scheduleId)!;
     const context = JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile;
-    f.registry.register(context, '预约唤醒 · 主控', wake.id);
+    f.registry.register(context, '定时自唤醒 · 主控自唤醒', wake.id);
     assert.equal(f.registry.activeCount('parent-A'), 1);
     await f.runtime.close(); f.advance(31000);
     second = new ControllerRuntime(f.config, { codex: new FakeAdapter(), claude: new FakeAdapter() }, f.registry, f.callbacks);
     await second.start(); await second.poll();
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.registry.queuedEvents().length, 1);
-    assert.equal(second.store.getWake(wake.id)?.taskId, wake.id); assert.equal(f.events.length, 1);
+    assert.equal(second.store.getSchedule(wake.id)?.taskId, wake.id); assert.equal(f.events.length, 1);
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });
 
@@ -777,7 +884,7 @@ test('new, stop and user ownership suppress old-parent stall notifications witho
     try {
       const a = await launch(f.runtime, f.turn); await flush();
       f.codex.turns[0]!.onActivity?.({ at: '2026-10-09T10:00:00Z', type: 'tool-started', itemId: 'browser', toolName: 'browser' });
-      if (mode === 'new') f.runtime.detachConversation('parent-A');
+      if (mode === 'new') await f.runtime.detachConversation('parent-A');
       else if (mode === 'stop') await f.runtime.cancelConversation('parent-A');
       else { const worker = f.runtime.store.getWorker(a.workerId)!; worker.ownership = 'user'; f.runtime.store.saveWorker(worker); }
       f.advance(2 * 600000); await f.runtime.poll(); assert.equal(f.stalls.length, 0);

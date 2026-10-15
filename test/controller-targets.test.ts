@@ -161,7 +161,7 @@ test('draining keeps querying original unknown remote dispatches and clears only
   try {
     const a = await launch(f); await flush();
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '保留下一轮', delivery: 'next' });
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 1, text: '保留预约' });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 1, text: '保留预约' });
     f.remote.reject(a.workerId, new RemoteDispatchUncertain()); await flush(); f.runtime.beginDrain();
     f.callbacks.now = () => Date.now() + 10000;
     await f.runtime.poll(); assert.equal(f.runtime.isIdle(), false);
@@ -171,7 +171,7 @@ test('draining keeps querying original unknown remote dispatches and clears only
     assert.equal(f.remote.turns.length, 1); assert.equal(f.runtime.store.getWorker(a.workerId)!.blocked, true);
     assert.equal(f.runtime.store.getJob(a.jobId)!.status, 'uncertain');
     assert.equal(f.runtime.store.jobs(a.workerId).at(-1)!.status, 'queued');
-    assert.equal(f.runtime.store.wakes()[0]!.status, 'pending');
+    assert.equal(f.runtime.store.schedules()[0]!.status, 'pending');
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
@@ -374,16 +374,16 @@ test('safe restart registers immediately on genuine origin, drains running work 
   try {
     const a = await launch(f); await flush();
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '保留队列', delivery: 'next' });
-    await f.runtime.invoke(f.turn, 'bridge_schedule_wake', { afterSeconds: 30, text: '未来预约' });
+    await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '未来预约' });
     const [first, duplicate] = await Promise.all([f.runtime.invoke(f.turn, 'bridge_request_restart', {}, 'restart'), f.runtime.invoke(f.turn, 'bridge_request_restart', {}, 'restart')]);
     assert.deepEqual(first, { accepted: true, status: 'draining', requestId: 'request-1' }); assert.deepEqual(first, duplicate); assert.equal(requests, 1);
     assert.equal(received!.originMessageId, 'real-human'); assert.equal(f.runtime.isIdle(), false);
     await assert.rejects(launch(f), /暂停/);
     f.remote.finish(a.workerId); await flush(); assert.equal(f.runtime.isIdle(), true); assert.equal(f.remote.turns.length, 1);
-    assert.equal(f.runtime.store.jobs(a.workerId).at(-1)!.status, 'queued'); assert.equal(f.runtime.store.wakes()[0]!.status, 'pending');
+    assert.equal(f.runtime.store.jobs(a.workerId).at(-1)!.status, 'queued'); assert.equal(f.runtime.store.schedules()[0]!.status, 'pending');
     await f.runtime.close();
     next = new ControllerRuntime(f.config, { codex: f.local, claude: f.local }, f.registry, f.callbacks);
     await next.start(); await flush(); assert.equal(f.remote.turns.length, 2); f.remote.finish(a.workerId); await flush();
-    assert.equal(next.store.wakes()[0]!.status, 'pending');
+    assert.equal(next.store.schedules()[0]!.status, 'pending');
   } finally { await next?.close(); await f.runtime.close(); f.registry.close(); }
 });

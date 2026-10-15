@@ -9,13 +9,13 @@ import { effortValues, resolveDefaultModel, validateEffort } from '../effort.js'
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
-import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSupplement, ControllerWake, ControllerWorker } from './runtime-types.js';
+import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
 const workspaceWorkerInstruction = '你是桥已登记并管理的工作区上下文调查子 Agent。只完成下面的只读调查，不执行新的工程或生活任务，不自行登记桥后台任务、向聊天平台发消息或伪造完成回执。\n\n';
 const workspacePrompt = '这是当前父会话的一次性工作区初始化。以当前工作目录中的 AGENTS.md、README.md 为用户入口，遵循其中定义的初始化入口、只读范围和回传要求；仅在它们明确要求初始化读取时，沿导航读取指定的本机上下文文件。初始化读取范围和回传内容由用户文件维护，不预设业务栏目；没有额外定义时，仅返回这两个文件中与后续会话有关的必要指导。不要扫描未指定的目录或技能目录，不连接远程电脑、联网检查、修改文件或启动新工作。缺失文件、读取失败或不明确的范围如实报告，不猜测环境；区分文件声明与实际核实的事实。仅将结果作为本任务回执返回。';
-const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_wake', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_adopt_native_session']);
+const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_list_schedules', 'bridge_cancel_schedule', 'bridge_update_schedule', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_adopt_native_session']);
 function pathKey(value: string): string { const result = resolve(value); return process.platform === 'win32' ? result.toLowerCase() : result; }
 function text(value: unknown, label: string, limit: number): string {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value, 'utf8') > limit || value.includes('\0')) throw new Error(`${label}为空或超过限制`);
@@ -220,6 +220,31 @@ export class ControllerRuntime {
       || worker.origin.channelId !== origin.channelId) throw new Error('子 Agent 不属于当前用户和父会话');
     return worker;
   }
+  private scheduleScope(value: ControllerSchedule, origin: TaskOrigin): boolean {
+    return value.origin.conversationId === origin.conversationId && value.origin.userId === origin.userId && value.origin.channelId === origin.channelId && pathKey(value.origin.cwd) === pathKey(origin.cwd);
+  }
+  private dueAt(args: Record<string, unknown>): string {
+    if ((args.afterSeconds === undefined) === (args.dueAt === undefined)) throw new Error('必须且只能指定 afterSeconds 或带时区的 dueAt');
+    const now = this.now(); let due: number;
+    if (args.dueAt !== undefined) {
+      const value = text(args.dueAt, '预约时间', 128);
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) throw new Error('dueAt 必须是带明确时区的 ISO 时间');
+      due = Date.parse(value);
+    } else {
+      if (typeof args.afterSeconds !== 'number' || !Number.isFinite(args.afterSeconds)) throw new Error('afterSeconds 必须是有限数字');
+      due = now + args.afterSeconds * 1000;
+    }
+    if (!Number.isFinite(due) || due - now < 1000 || due - now > 30 * 86400_000) throw new Error('预约时间必须在 1 秒至 30 天内');
+    return new Date(due).toISOString();
+  }
+  private scheduleView(value: ControllerSchedule, details = false): unknown {
+    const job = value.job ? this.store.getJob(value.job.id) : null;
+    return { scheduleId: value.id, kind: value.kind, title: value.title, dueAt: value.dueAt, status: value.status,
+      createdAt: value.createdAt, updatedAt: value.updatedAt, error: value.error ?? null,
+      ...(value.worker ? { workerId: value.worker.id, jobId: value.job!.id, agent: value.worker.agent, model: value.worker.model,
+        effort: value.worker.effort, targetId: value.worker.target?.id ?? 'local', cwd: value.worker.cwd, executionStatus: job?.status ?? 'not-started' } : {}),
+      textPreview: listText(value.text, details ? 4096 : 256), textPreviewTruncated: value.text.length > (details ? 4096 : 256) };
+  }
   private images(turn: AgentTurn, value: unknown, worker?: ControllerWorker): string[] {
     const current = [...turn.imagePaths, ...(turn.input ?? []).flatMap(input => input.type === 'localImage' ? [input.path] : [])];
     const candidates = value === undefined ? turn.imagePaths : value;
@@ -239,6 +264,7 @@ export class ControllerRuntime {
     try { await recovery; } finally { this.starting = undefined; }
   }
   private async recoverStartup(): Promise<void> {
+    for (const value of this.store.schedules()) if (value.taskId) this.registry.migrateScheduleTask(value.taskId, value.kind);
     for (const worker of this.store.workers().filter(value => value.adoption?.status === 'pending' && this.config.allowedUserIds.includes(value.origin.userId))) {
       try { await this.completeAdoption(worker.id); } catch (error) { this.error(error); }
     }
@@ -310,10 +336,11 @@ export class ControllerRuntime {
   private async dispatch(turn: AgentTurn, name: string, input: unknown, callId?: string, workspaceInitialization = false): Promise<unknown> {
     if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
     if (!tools.has(name)) throw new Error('未知桥调度工具');
-    if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_wake', 'bridge_adopt_native_session'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
+    if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_update_schedule', 'bridge_adopt_native_session'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
     const contextOrigin = this.origin(turn);
     await this.start();
-    if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
+    this.origin(turn);
+    if (turn.signal.aborted || this.closed || this.stopping) throw new Error('主控会话已停止或执行服务正在关闭');
     const origin: TaskOrigin = workspaceInitialization ? { ...contextOrigin, purpose: 'workspace-context' } : contextOrigin;
     const key = workspaceInitialization || callId === undefined ? null : `${origin.conversationId}:${text(callId, '工具调用编号', 512)}`;
     const fingerprint = createHash('sha256').update(canonical({ name, input })).digest('hex');
@@ -493,13 +520,14 @@ export class ControllerRuntime {
       const images = this.images(turn, args.imagePaths, worker);
       const prompt = text(args.prompt, '任务内容', 128 * 1024);
       const active = this.active.get(worker.id);
+      const unsettled = active && this.store.getJob(active.job.id)?.status === 'running';
       // A subsequent queued round inherits the latest queued selection; a current-round supplement uses the active selection.
-      const inherited = args.delivery === 'next' || !active ? this.store.jobs(worker.id).filter(job => job.status === 'queued').at(-1)?.execution : undefined;
+      const inherited = args.delivery === 'next' || !unsettled ? this.store.jobs(worker.id).filter(job => job.status === 'queued').at(-1)?.execution : undefined;
       const execution = { model: this.selectedWorkerModel(args.model, inherited?.model === undefined ? worker.model : inherited.model),
         effort: this.selectedWorkerEffort(args.effort, worker.agent, inherited?.effort === undefined ? worker.effort : inherited.effort),
         ...((args.model === 'default' || (args.model === undefined && (inherited ? inherited.modelPolicy : worker.modelPolicy) === 'cli-default')) ? { modelPolicy: 'cli-default' as const } : {}) };
-      if (active && args.delivery !== 'next' && (execution.model !== worker.model || execution.effort !== worker.effort || execution.modelPolicy !== worker.modelPolicy)) throw new Error('运行中的 Agent 不能在当前轮切换模型或强度；请用 delivery=next 为下一轮设置参数。');
-      if (active && args.delivery !== 'next') {
+      if (unsettled && args.delivery !== 'next' && (execution.model !== worker.model || execution.effort !== worker.effort || execution.modelPolicy !== worker.modelPolicy)) throw new Error('运行中的 Agent 不能在当前轮切换模型或强度；请用 delivery=next 为下一轮设置参数。');
+      if (unsettled && args.delivery !== 'next') {
         const supplement: ControllerSupplement = { id: randomUUID(), workerId: worker.id, jobId: active.job.id, origin, prompt, imagePaths: images,
           status: !this.adapter(worker).steer ? 'unsupported' : active.abort.signal.aborted ? 'cancelled' : !active.executing ? 'not_delivered' : 'pending',
           ...(key ? { callKey: key } : {}), createdAt: this.timestamp(), updatedAt: this.timestamp() };
@@ -513,9 +541,11 @@ export class ControllerRuntime {
       }
       const queueBefore = this.store.jobs(worker.id).filter(job => job.status === 'queued').map(job => [job.id, job.execution]);
       await this.validateWorkerSelection(worker, execution);
+      this.origin(turn);
       const latest = this.ownedWorker(origin, worker.id);
       this.assertBridgeOwnership(latest);
-      if (this.closed || this.stopping || this.isDraining() || latest.blocked || this.active.get(worker.id) !== active
+      const currentActive = this.active.get(worker.id);
+      if (this.closed || this.stopping || this.isDraining() || latest.blocked || (currentActive !== active && !(active && !unsettled && !currentActive))
         || latest.model !== worker.model || latest.effort !== worker.effort || latest.modelPolicy !== worker.modelPolicy
         || canonical(this.store.jobs(worker.id).filter(job => job.status === 'queued').map(job => [job.id, job.execution])) !== canonical(queueBefore)) {
         throw new Error('校验期间子会话或队列状态已改变，未排队；请按当前状态重试。');
@@ -532,10 +562,40 @@ export class ControllerRuntime {
       await this.workCountsChanged();
       return result;
     }
+    if (['bridge_list_schedules', 'bridge_cancel_schedule', 'bridge_update_schedule'].includes(name)) {
+      const args = object(input, name === 'bridge_list_schedules' ? ['scheduleId', 'includeFinished', 'limit', 'offset']
+        : name === 'bridge_cancel_schedule' ? ['scheduleId'] : ['scheduleId', 'afterSeconds', 'dueAt']);
+      if (args.includeFinished !== undefined && typeof args.includeFinished !== 'boolean') throw new Error('includeFinished 必须是布尔值');
+      const id = args.scheduleId === undefined ? undefined : text(args.scheduleId, 'scheduleId', 256);
+      const value = id ? this.store.getSchedule(id) : null;
+      if (id && (!value || !this.scheduleScope(value, origin))) throw new Error('计划不属于当前用户、父会话、聊天入口和工作区');
+      const limit = args.limit ?? 20, offset = args.offset ?? 0;
+      if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 100 || !Number.isSafeInteger(offset) || Number(offset) < 0) throw new Error('计划分页参数无效');
+      let result: unknown;
+      this.store.transaction(() => {
+        if (name === 'bridge_list_schedules') {
+          const all = this.store.schedules().filter(value => this.scheduleScope(value, origin)
+            && (args.includeFinished || ['pending', 'dispatching', 'running'].includes(value.status)));
+          result = { schedules: value ? [this.scheduleView(value, true)] : all.slice(Number(offset), Number(offset) + Number(limit)).map(value => this.scheduleView(value)),
+            total: value ? 1 : all.length, nextOffset: !value && all.length > Number(offset) + Number(limit) ? Number(offset) + Number(limit) : null };
+        }
+        else {
+          if (!value) throw new Error('必须指定 scheduleId');
+          if (name === 'bridge_cancel_schedule' && value.status === 'cancelled') result = this.scheduleView(value);
+          else {
+            if (value.status !== 'pending') throw new Error(`计划已${value.status}，不能取消或改期；运行中的助手请使用 bridge_cancel_worker`);
+            if (name === 'bridge_cancel_schedule') value.status = 'cancelled'; else value.dueAt = this.dueAt(args);
+            value.updatedAt = this.timestamp(); this.store.saveSchedule(value); result = this.scheduleView(value);
+          }
+        }
+        if (key) this.store.saveCall(key, fingerprint, result);
+      });
+      return result;
+    }
     let target: ExecutionTargetBinding | undefined;
     let preparedWorker: ControllerWorker | undefined;
-    if (name === 'bridge_start_worker') {
-      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId']);
+    if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
+      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
       const agent = args.agent === undefined ? turn.conversation.agent : args.agent;
       if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
       target = await this.resolveTarget(turn.conversation.cwd, args.targetId === undefined ? 'local' : text(args.targetId, '执行目标', 256), agent,
@@ -551,30 +611,39 @@ export class ControllerRuntime {
         createdAt: this.timestamp(), updatedAt: this.timestamp() };
       text(args.prompt, '任务内容', 128 * 1024);
       await this.validateWorkerSelection(preparedWorker);
-      if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或安全重启，已暂停派发');
+      this.origin(turn);
+      if (turn.signal.aborted || this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或会话已停止，已暂停派发');
     }
     let workerToStart: string | undefined;
     const result = this.store.transaction(() => {
       let result: unknown;
-      if (name === 'bridge_start_worker') {
-        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId']);
+      if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
+        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
         const worker = preparedWorker!;
         const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), worker.imagePaths);
-        this.store.addWorker(worker); this.store.addJob(job); workerToStart = worker.id;
-        result = { workerId: worker.id, jobId: job.id, status: 'queued', agent: worker.agent, model: worker.model, effort: worker.effort, nativeId: worker.nativeId, target: worker.target, ownership: worker.ownership };
-      } else if (name === 'bridge_schedule_wake') {
-        const args = object(input, ['afterSeconds', 'text']);
-        if (typeof args.afterSeconds !== 'number' || !Number.isFinite(args.afterSeconds) || args.afterSeconds < 1 || args.afterSeconds > 30 * 86400) {
-          throw new Error('唤醒间隔必须在 1 秒至 30 天之间');
+        if (name === 'bridge_schedule_worker') {
+          const scheduledOrigin: TaskOrigin = { ...origin, purpose: 'schedule', scheduleKind: 'worker' };
+          worker.origin = scheduledOrigin; job.origin = scheduledOrigin;
+          const value: ControllerSchedule = { id: randomUUID(), kind: 'worker', origin: scheduledOrigin, title: worker.title,
+            text: job.prompt, dueAt: this.dueAt(args), status: 'pending', taskId: null, worker, job,
+            createdAt: this.timestamp(), updatedAt: this.timestamp() };
+          job.scheduleId = value.id; this.store.addSchedule(value); result = this.scheduleView(value, true);
+        } else {
+          this.store.addWorker(worker); this.store.addJob(job); workerToStart = worker.id;
+          result = { workerId: worker.id, jobId: job.id, status: 'queued', agent: worker.agent, model: worker.model, effort: worker.effort, nativeId: worker.nativeId, target: worker.target, ownership: worker.ownership };
         }
-        const wake: ControllerWake = { id: randomUUID(), origin, dueAt: new Date(this.now() + args.afterSeconds * 1000).toISOString(),
-          text: text(args.text, '唤醒提示', 16 * 1024), status: 'pending', taskId: null, createdAt: this.timestamp() };
-        this.store.addWake(wake); result = { wakeId: wake.id, dueAt: wake.dueAt, status: 'scheduled' };
+      } else if (name === 'bridge_schedule_controller') {
+        const args = object(input, ['afterSeconds', 'dueAt', 'title', 'text']);
+        const value: ControllerSchedule = { id: randomUUID(), kind: 'controller', origin: { ...origin, purpose: 'schedule', scheduleKind: 'controller' },
+          title: args.title === undefined ? '主控自唤醒' : text(args.title, '计划名称', 1024), text: text(args.text, '唤醒提示', 16 * 1024),
+          dueAt: this.dueAt(args), status: 'pending', taskId: null, createdAt: this.timestamp(), updatedAt: this.timestamp() };
+        this.store.addSchedule(value); result = this.scheduleView(value, true);
       } else {
         const args = object(input, ['workerId']);
         const details = args.workerId !== undefined;
-        const workers = details ? [this.ownedWorker(origin, args.workerId)] : this.store.workers(origin.conversationId)
-          .filter(worker => worker.origin.userId === origin.userId && worker.origin.channelId === origin.channelId);
+        const workers = details ? [this.ownedWorker(origin, args.workerId)] : this.store.workers()
+          .filter(worker => worker.origin.userId === origin.userId && worker.origin.channelId === origin.channelId
+            && worker.origin.conversationId === origin.conversationId);
         let previewBytes = 8 * 1024;
         const preview = (value: string): string => {
           const result = listText(value, 256, previewBytes); previewBytes -= Buffer.byteLength(result, 'utf8'); return result;
@@ -608,8 +677,8 @@ export class ControllerRuntime {
               lastResultTruncated: (latest?.result?.length ?? 0) > 4096, activeSupplements: active.map(receipt),
               supplements: history.slice(-20).map(receipt), supplementsTotal: supplements.length,
               supplementsTruncated: history.length > 20 } : {}) };
-        }), wakes: details ? [] : this.store.wakes(origin.conversationId).filter(wake => wake.origin.userId === origin.userId && wake.status === 'pending')
-          .map(wake => { const textPreview = preview(wake.text); return { wakeId: wake.id, dueAt: wake.dueAt, textPreview, textPreviewTruncated: textPreview !== wake.text }; }) };
+        }), schedules: details ? [] : this.store.schedules().filter(value => this.scheduleScope(value, origin) && value.status === 'pending')
+          .map(value => { const textPreview = preview(value.text); return { scheduleId: value.id, kind: value.kind, dueAt: value.dueAt, textPreview, textPreviewTruncated: textPreview !== value.text }; }) };
       }
       if (workspaceInitialization) this.store.saveWorkspaceInitialization(origin.conversationId, result);
       else if (key) this.store.saveCall(key, fingerprint, result);
@@ -776,7 +845,13 @@ export class ControllerRuntime {
     if (!taskId) taskId = this.register(worker, job);
     const supplements = this.store.supplements(job.id);
     if (supplements.length) result += '\n\n当前轮补充接收记录：\n' + supplements.map(value => `${value.id}: ${value.status}${value.reason ? ` · ${value.reason}` : ''}`).join('\n');
-    this.store.setJob(job.id, status, { taskId, result });
+    this.store.transaction(() => {
+      this.store.setJob(job.id, status, { taskId, result });
+      const plan = job.scheduleId ? this.store.getSchedule(job.scheduleId) : null;
+      if (plan) { plan.status = status as ControllerSchedule['status']; plan.taskId = taskId;
+        plan.updatedAt = this.timestamp(); if (status === 'failed' || status === 'uncertain') plan.error = listText(result, 1024);
+        this.store.saveSchedule(plan); }
+    });
     const terminal: TaskTerminalStatus = status === 'uncertain' || status === 'failed' ? 'failed' : status === 'cancelled' ? 'cancelled' : 'completed';
     const current = this.store.getWorker(worker.id)!;
     if (status === 'uncertain') { current.blocked = true; this.store.saveWorker(current); }
@@ -787,7 +862,11 @@ export class ControllerRuntime {
   }
   private requestCancellation(workerId: string, reason: string): void {
     for (const job of this.store.jobs(workerId)) {
-      if (job.status === 'queued') this.store.setJob(job.id, 'cancelled', { result: reason, cancelReason: reason });
+      if (job.status === 'queued') {
+        this.store.setJob(job.id, 'cancelled', { result: reason, cancelReason: reason });
+        const plan = job.scheduleId ? this.store.getSchedule(job.scheduleId) : null;
+        if (plan) { plan.status = 'cancelled'; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan); }
+      }
       else if (job.status === 'running') this.store.setJob(job.id, 'running', { cancelReason: reason });
     }
   }
@@ -811,27 +890,38 @@ export class ControllerRuntime {
     if (worker.target?.transport === 'ssh') this.unconfirmedStops.delete(workerId);
     return !this.active.has(workerId) && !this.unconfirmedStops.has(workerId);
   }
-  /** /new and agent switches retain engineering jobs, but disable their former automatic resume route. */
-  detachConversation(conversationId: string): void {
-    for (const worker of this.store.workers(conversationId)) {
-      for (const job of this.store.jobs(worker.id)) if (job.status === 'queued' || job.status === 'running') {
-        this.store.setJob(job.id, job.status, { wakeAllowed: false });
-        if (job.taskId) this.registry.disableTaskWake(job.taskId);
-      }
-    }
-    for (const wake of this.store.wakes(conversationId)) if (wake.status === 'pending') this.store.setWake(wake.id, 'cancelled');
-    this.registry.cancelConversation(conversationId);
-  }
-  /** /stop explicitly terminates this service's child CLIs and cancels unstarted jobs and alarms. */
-  async cancelConversation(conversationId: string): Promise<void> {
-    this.detachConversation(conversationId);
+  private detachJobs(conversationId: string): ControllerWorker[] {
     const workers = this.store.workers(conversationId);
-    for (const worker of workers) if (worker.ownership !== 'user') this.requestCancellation(worker.id, '用户停止了父会话');
-    const stopped = await Promise.all(workers.filter(worker => worker.ownership !== 'user').map(worker => this.stopWorker(worker.id, '用户停止了父会话')));
+    // All reset effects are durable before the first await, including a due-but-unclaimed plan.
+    for (const plan of this.store.schedules()) if (plan.origin.conversationId === conversationId && ['pending', 'dispatching'].includes(plan.status)) {
+      plan.status = 'cancelled'; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
+      if (plan.taskId) this.registry.disableTaskWake(plan.taskId);
+    }
+    for (const worker of workers) for (const job of this.store.jobs(worker.id)) if (['queued', 'running'].includes(job.status)) {
+      this.store.setJob(job.id, job.status, { wakeAllowed: false });
+      if (job.taskId) this.registry.disableTaskWake(job.taskId);
+    }
+    this.registry.cancelConversation(conversationId);
+    return workers;
+  }
+  private async terminateWorkers(workers: ControllerWorker[], reason: string): Promise<void> {
+    const owned = workers.filter(worker => worker.ownership !== 'user');
+    for (const worker of owned) this.requestCancellation(worker.id, reason);
+    const stopped = await Promise.all(owned.map(worker => this.stopWorker(worker.id, reason)));
     if (stopped.some(result => result === false)) {
       throw Object.assign(new Error('部分执行子 Agent 的进程停止尚未确认，不能宣称全部停止；请核对未知任务。'),
         { name: 'AgentProcessStopError', processStillRunning: true });
     }
+  }
+  /** Reset cancels every plan and stops scheduled workers; ordinary engineering jobs retain their original result route. */
+  async detachConversation(conversationId: string): Promise<void> {
+    const workers = this.detachJobs(conversationId);
+    await this.terminateWorkers(workers.filter(worker => worker.origin.purpose === 'schedule'), '新会话或切换会话已取消定时任务');
+  }
+  /** /stop also terminates ordinary bridge-owned engineering workers. */
+  async cancelConversation(conversationId: string): Promise<void> {
+    const workers = this.detachJobs(conversationId);
+    await this.terminateWorkers(workers, '用户停止了父会话');
   }
   private async confirmUncertainStops(): Promise<void> {
     const workers = [...this.unconfirmedStops].map(id => this.store.getWorker(id))
@@ -871,20 +961,32 @@ export class ControllerRuntime {
     await this.confirmUncertainStops();
     if (this.closed || this.stopping || this.isDraining()) return;
     await this.observeStalls();
-    for (const wake of this.store.wakes()) {
-      if (!this.config.allowedUserIds.includes(wake.origin.userId)) continue;
-      if (wake.status === 'cancelled' || wake.status === 'fired' || Date.parse(wake.dueAt) > this.now()) continue;
-      let taskId = wake.taskId;
+    for (const candidate of this.store.schedules()) {
+      const plan = this.store.getSchedule(candidate.id)!;
+      if (!this.config.allowedUserIds.includes(plan.origin.userId)
+        || !['pending', 'dispatching'].includes(plan.status) || Date.parse(plan.dueAt) > this.now()) continue;
+      if (plan.kind === 'worker') {
+        // Worker creation and enqueue share the same durable transaction as the due claim.
+        // A crash before kick is resumed from the queue, never by creating a second worker.
+        this.store.transaction(() => {
+          const worker = plan.worker!, job = plan.job!;
+          this.store.addWorker(worker); this.store.addJob(job);
+          plan.status = 'running'; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
+        });
+        this.kick(plan.worker!.id);
+        continue;
+      }
+      let taskId = plan.taskId;
       if (!taskId) {
-        const created = this.registry.createContext(wake.origin);
+        const created = this.registry.createContext(plan.origin);
         try {
           const context = JSON.parse(readFileSync(created.contextPath, 'utf8')) as TaskContextFile;
-          taskId = this.registry.register(context, '预约唤醒 · 主控', wake.id).taskId;
-          this.store.setWake(wake.id, 'firing', taskId);
+          taskId = this.registry.register(context, `定时自唤醒 · ${plan.title}`, plan.id).taskId;
+          plan.status = 'dispatching'; plan.taskId = taskId; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
         } finally { this.registry.closeContext(created.contextId); }
       }
-      const changed = this.registry.acceptObservedResult(taskId, 'completed', `这是主控此前登记的预约触发。\nwakeId: ${wake.id}\n预约时间: ${wake.dueAt}\n提示: ${wake.text}`, wake.text);
-      this.store.setWake(wake.id, 'fired', taskId);
+      const changed = this.registry.acceptObservedResult(taskId, 'completed', `这是主控此前登记的自唤醒计划。\nscheduleId: ${plan.id}\n计划时间: ${plan.dueAt}\n原用户消息: ${plan.origin.originMessageId}\n唤醒提示: ${plan.text}`, plan.text);
+      plan.status = 'triggered'; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
       // register + complete are synchronous: a sleeping alarm never appears as a running agent.
       if (changed) await this.notify(taskId);
     }

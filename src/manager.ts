@@ -25,7 +25,7 @@ interface RunningTurn {
 export interface SessionManagerOptions {
   botName?: () => string | undefined;
   mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry;
-  onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void;
+  onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void | Promise<void>;
   controllerSeed?: (previous: Conversation) => string; onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>;
   onInitializationError?: (conversation: Conversation, error: unknown) => void;
   onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
@@ -39,6 +39,8 @@ export class SessionManager {
   private readonly latestMessages = new Map<string, { id: string; channelId: string; conversationId: string }>();
   private readonly running = new Map<string, RunningTurn>();
   private readonly interruptPromises = new Set<Promise<void>>();
+  private readonly detachPromises = new Map<string, Promise<void>>();
+  private readonly resetCommands = new Map<string, number>();
   private readonly modelChanges = new Set<string>();
   private readonly initializationAttempts = new Set<string>();
   private readonly initializations = new Map<string, { controller: AbortController; promise: Promise<void> }>();
@@ -66,7 +68,7 @@ export class SessionManager {
   beginDrain(): void { this.draining = true; }
   isIdle(): boolean {
     return this.workers.size === 0 && this.userWorkers.size === 0 && this.running.size === 0
-      && this.initializations.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
+      && this.initializations.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.detachPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
   }
 
   discard(message: BridgeMessage): void {
@@ -95,6 +97,8 @@ export class SessionManager {
       const done = new Promise<void>(resolve => { finish = resolve; });
       this.commandReplies.set(message.id, { done, finish });
       this.activeCommands++;
+      const resetting = ['new', 'agent', 'cwd', 'stop'].includes(parsed.name);
+      if (resetting) this.resetCommands.set(message.userId, (this.resetCommands.get(message.userId) ?? 0) + 1);
       try {
         await this.handleCommand(message, parsed.name, parsed.argument, reply);
         if (this.closed) return;
@@ -108,7 +112,18 @@ export class SessionManager {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
         await reply(`命令失败：${error instanceof Error ? error.message : String(error)}`);
-      } finally { this.activeCommands--; finish(); this.commandReplies.delete(message.id); }
+      } finally {
+        this.activeCommands--; finish(); this.commandReplies.delete(message.id);
+        if (resetting) {
+          const left = (this.resetCommands.get(message.userId) ?? 1) - 1;
+          if (left) this.resetCommands.set(message.userId, left); else this.resetCommands.delete(message.userId);
+          if (!this.closed) {
+            this.completionAvailable();
+            const active = this.store.getActive(message.userId);
+            if (active && this.store.nextQueued(active.id)) this.wake(active.id);
+          }
+        }
+      }
       return;
     }
     if (!message.text.trim() && message.imagePaths.length === 0) {
@@ -247,11 +262,19 @@ export class SessionManager {
     return this.store.getConversation(item.id)!;
   }
 
-  private cancel(conversation: Conversation): number {
+  private cancel(conversation: Conversation, detach = true): number {
     this.noticeSends.get(conversation.id)?.controller.abort();
     this.store.cancelWorkspaceNotice(conversation.id);
     this.initializations.get(conversation.id)?.controller.abort();
-    this.options.onDetach?.(conversation.id);
+    const detaching = detach ? this.options.onDetach?.(conversation.id) : undefined;
+    if (detaching) {
+      const promise = Promise.resolve(detaching).finally(() => {
+        if (this.detachPromises.get(conversation.id) === promise) this.detachPromises.delete(conversation.id);
+      });
+      this.detachPromises.set(conversation.id, promise);
+      // Commands await and report this rejection; suppress only the unhandled-promise warning.
+      void promise.catch(() => undefined);
+    }
     this.options.taskRegistry?.cancelConversation(conversation.id);
     const latest = this.latestMessages.get(conversation.userId);
     if (latest?.conversationId === conversation.id) {
@@ -273,9 +296,14 @@ export class SessionManager {
     return total;
   }
 
-  private activate(userId: string, target: Conversation): void {
+  private async awaitDetach(conversationId: string): Promise<void> {
+    try { await this.detachPromises.get(conversationId); }
+    finally { this.detachPromises.delete(conversationId); }
+  }
+
+  private async activate(userId: string, target: Conversation): Promise<void> {
     const previous = this.store.getActive(userId);
-    if (previous) this.cancel(previous);
+    if (previous) { this.cancel(previous); await this.awaitDetach(previous.id); this.store.rebindQueued(previous.id, target.id); }
     this.store.setActive(userId, target.id);
     this.completionAvailable();
   }
@@ -412,7 +440,7 @@ export class SessionManager {
         if (name === 'agent') {
           const previous = this.store.latestAgentConversation(message.userId, agent, current?.cwd ?? this.config.workspace, this.config.controllerMode === true);
           if (previous) {
-            this.activate(message.userId, previous);
+            await this.activate(message.userId, previous);
             this.initializeWorkspace(previous, message);
             await reply(`已切换到 ${agentDisplayName(agent)}，恢复会话 ${previous.id.slice(0, 8)}：${previous.title}\n原生会话：${previous.nativeId ? `…${previous.nativeId.slice(-6)}` : '尚未创建'}\n目录：${previous.cwd}`);
             this.wake(previous.id);
@@ -422,7 +450,7 @@ export class SessionManager {
         const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true });
         if (current?.agent === agent && (current.model || current.modelPolicy === 'cli-default')) this.store.setModel(target.id, current.model ?? null);
         if (current?.agent === agent && current.effort) this.store.setEffort(target.id, current.effort);
-        this.activate(message.userId, target);
+        await this.activate(message.userId, target);
         if (this.config.controllerMode && name === 'new') this.store.requestWorkspaceNotice(target.id, message);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
         const text = `已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? '正在初始化工作区；完成后由主控发送介绍。' : '可以直接发消息开始。'}\n目录：${target.cwd}`;
@@ -438,7 +466,7 @@ export class SessionManager {
         const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd, { controllerMode: this.config.controllerMode === true });
         if (current?.model || current?.modelPolicy === 'cli-default') this.store.setModel(target.id, current.model ?? null);
         if (current?.effort) this.store.setEffort(target.id, current.effort);
-        this.activate(message.userId, target);
+        await this.activate(message.userId, target);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
         await reply(`已在 ${cwd} 新建 ${target.agent} 会话 ${target.id.slice(0, 8)}。`);
         return;
@@ -491,7 +519,7 @@ export class SessionManager {
         await reply(presentationText(view), { presentation: view }); return;
       }
       case 'stop': {
-        const count = current ? this.cancel(current) : 0;
+        const count = current ? this.cancel(current, false) : 0;
         if (current) await this.options.onStop?.(current.id);
         await reply(`${count ? `已停止当前任务，取消 ${count} 条待处理任务。会话保留，可继续发送消息。` : '当前没有待处理任务。'}${this.options.taskRegistry ? this.config.controllerMode ? '\n已停止桥管理的子 Agent，并取消后台自动汇总和预约；独立远端进程需另行确认。' : '\n已取消后台结果的自动汇总；远端子任务仍可继续，完成后仅发送带来源的通知。' : ''}`);
         this.completionAvailable();
@@ -567,6 +595,10 @@ export class SessionManager {
   }
 
   private wake(conversationId: string): void {
+    const conversation = this.store.getConversation(conversationId);
+    if (conversation && this.resetCommands.has(conversation.userId)
+      && !(this.store.getActive(conversation.userId)?.id === conversationId
+        && this.options.taskRegistry?.getNextEvent(conversationId)?.purpose === 'workspace-context')) return;
     if (this.closed || this.draining || this.recovering || this.workers.has(conversationId) || this.modelChanges.has(conversationId)) return;
     const target = this.store.getConversation(conversationId);
     if (!target || (this.config.scopePrefix && !target.userId.startsWith(this.config.scopePrefix)) || this.userWorkers.has(target.userId)) return;
@@ -624,6 +656,12 @@ export class SessionManager {
     if (!this.config.controllerMode && this.options.mergeDelayMs !== 0) await new Promise<void>(resolve => setTimeout(resolve, this.options.mergeDelayMs ?? 1000));
     while (!this.closed && !this.draining && !this.modelChanges.has(conversationId)) {
       const owner = this.store.getConversation(conversationId);
+      if (owner && this.resetCommands.has(owner.userId)) {
+        const initialization = this.options.taskRegistry?.getNextEvent(conversationId);
+        if (this.store.getActive(owner.userId)?.id !== conversationId || initialization?.purpose !== 'workspace-context') return;
+        // Initialization can settle while ACK delivery waits; its own publication already awaits that ACK.
+        await this.processCompletion(initialization); continue;
+      }
       const active = owner ? this.store.getActive(owner.userId) : null;
       if (active && active.id !== conversationId && this.store.nextQueued(active.id)) return;
       const item = this.store.nextQueued(conversationId);
@@ -753,7 +791,7 @@ export class SessionManager {
     if (this.closed || this.draining || this.recovering || !this.options.taskRegistry) return;
     this.refreshTaskCounts();
     for (const event of this.options.taskRegistry.queuedEvents()) {
-      if (!this.config.allowedUserIds.includes(event.userId)) continue;
+      if (!this.config.allowedUserIds.includes(event.userId) || (this.resetCommands.has(event.userId) && event.purpose !== 'workspace-context')) continue;
       if (!this.store.getConversation(event.conversationId)) {
         if (this.options.taskRegistry.claimEvent(event.id)) this.options.taskRegistry.markUncertain(event.id, '原父会话不存在');
         continue;
@@ -839,7 +877,7 @@ export class SessionManager {
     const notice = `后台任务「${event.title}」${status}（${agentDisplayName(event.agent)} · 原会话 ${event.conversationId.slice(0, 8)} · 任务 ${event.taskId.slice(0, 8)}）。`;
     const active = this.store.getActive(event.userId);
     if (!event.wakeAllowed || active?.id !== event.conversationId) {
-      if (workspaceContext || observation) { registry.markDelivered(event.id); return; }
+      if (workspaceContext || observation || event.purpose === 'schedule') { registry.markDelivered(event.id); return; }
       try {
         await this.sink.sendText(event.channelId, `${notice}\n原会话已停止或切换，未唤醒当前会话。\n${event.displayText == null ? '结果已保存，请在原会话核对。' : event.displayText.slice(0, 1500)}`);
         registry.markDelivered(event.id);
@@ -890,8 +928,8 @@ export class SessionManager {
       const result = await this.adapters[target.agent].run({
         conversation: target, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
-        event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.title.startsWith('预约唤醒') ? 'wake' : 'worker-result',
-          toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.title.startsWith('预约唤醒') ? 'bridge_schedule_wake' : 'bridge_worker_result', text: eventText, introductionRequested },
+        event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
+          toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.scheduleKind === 'controller' ? 'bridge_schedule_controller' : 'bridge_worker_result', text: eventText, introductionRequested },
         onNativeId: workspaceContext ? nativeId => {
           if (!current() || !nativeId) return;
           if (boundNativeId && boundNativeId !== nativeId) throw new Error('工作区初始化返回了不同父会话');
@@ -976,7 +1014,7 @@ export class SessionManager {
       catch (cause) { throw new Error(`${agent} close: ${cause instanceof Error ? cause.message : String(cause)}`, { cause }); }
     }));
     await Promise.allSettled([...this.initializations.values()].map(initialization => initialization.promise));
-    await Promise.allSettled([...this.workers.values(), ...this.interruptPromises, ...[...this.noticeSends.values()].map(notice => notice.promise)]);
+    await Promise.allSettled([...this.workers.values(), ...this.interruptPromises, ...this.detachPromises.values(), ...[...this.noticeSends.values()].map(notice => notice.promise)]);
     const failures = adapterResults.flatMap(result => result.status === 'rejected' ? [result.reason as Error] : []);
     try { this.store.close(); }
     catch (cause) { failures.push(new Error(`会话数据库关闭失败: ${String(cause)}`, { cause })); }

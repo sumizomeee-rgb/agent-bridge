@@ -155,7 +155,8 @@ test('background evidence uses standalone tool output and may quietly continue',
     const turn = s.makeTurn(); turn.event = { kind: 'worker-result', toolName: 'bridge_worker_result', text: 'confirmed evidence' };
     const result = await s.adapter.run(turn); assert.equal(result.controlledOutput, true);
     const start = s.transports[0]?.written.find(m => m.method === 'turn/start')?.params as JsonObject;
-    assert.deepEqual(start.input, []); assert.deepEqual(start.toolOutput, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
+    assert.deepEqual(start.input, []); assert.deepEqual({ ...start.toolOutput as object, output: 'confirmed evidence' }, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
+    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge clock.*UTC: .*timezone: .*\n\nconfirmed evidence$/);
   } finally { await s.cleanup(); }
 });
 
@@ -167,7 +168,8 @@ test('workspace bootstrap can finish quietly and feeds evidence into the same na
     assert.equal(s.published.length, 0);
     const params = s.transports[0]!.written.find(message => message.method === 'turn/start')!.params as JsonObject;
     assert.deepEqual(params.input, []);
-    assert.deepEqual(params.toolOutput, { name: 'bridge_workspace_context', namespace: null, output: turn.event.text });
+    assert.deepEqual({ ...params.toolOutput as object, output: turn.event.text }, { name: 'bridge_workspace_context', namespace: null, output: turn.event.text });
+    assert.ok((params.toolOutput as { output: string }).output.endsWith(turn.event.text));
     const created = s.transports[0]!.written.find(message => message.method === 'thread/start')!.params as JsonObject;
     const bridgePrompt = `${created.baseInstructions} ${created.developerInstructions}`;
     assert(!bridgePrompt.includes(turn.event.text));

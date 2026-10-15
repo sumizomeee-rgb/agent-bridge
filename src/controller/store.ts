@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { ControllerJob, ControllerJobStatus, ControllerSupplement, ControllerWake, ControllerWorker } from './runtime-types.js';
+import type { ControllerJob, ControllerJobStatus, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
 function worker(row: Row): ControllerWorker {
@@ -13,8 +13,8 @@ function job(row: Row): ControllerJob {
   return { ...value, status: String(row.status) as ControllerJobStatus, taskId: row.task_id ? String(row.task_id) : null,
     result: row.result == null ? null : String(row.result), cancelReason: row.cancel_reason == null ? null : String(row.cancel_reason) };
 }
-function wake(row: Row): ControllerWake {
-  return { ...JSON.parse(String(row.value_json)) as ControllerWake, status: String(row.status) as ControllerWake['status'],
+function schedule(row: Row): ControllerSchedule {
+  return { ...JSON.parse(String(row.value_json)) as ControllerSchedule, status: String(row.status) as ControllerSchedule['status'],
     taskId: row.task_id ? String(row.task_id) : null };
 }
 
@@ -32,12 +32,26 @@ export class ControllerStore {
         id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, status TEXT NOT NULL, task_id TEXT, result TEXT,
         cancel_reason TEXT, value_json TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS controller_job_queue ON controller_jobs(worker_id,status,created_at);
-      CREATE TABLE IF NOT EXISTS controller_wakes (
+      CREATE TABLE IF NOT EXISTS controller_schedules (
         id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, status TEXT NOT NULL, due_at TEXT NOT NULL, task_id TEXT, value_json TEXT NOT NULL);
-      CREATE INDEX IF NOT EXISTS controller_wake_due ON controller_wakes(status,due_at);
+      CREATE INDEX IF NOT EXISTS controller_schedule_due ON controller_schedules(status,due_at);
       CREATE TABLE IF NOT EXISTS controller_supplements (
         id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, job_id TEXT NOT NULL, value_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS controller_calls (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL);`);
+    // Convert the former wake-only table once, then retire it. There is no old API or dual write path.
+    if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='controller_wakes'").get()) {
+      this.transaction(() => {
+        for (const row of this.db.prepare('SELECT * FROM controller_wakes').all()) {
+          const old = JSON.parse(String(row.value_json));
+          const value: ControllerSchedule = { ...old, kind: 'controller', title: '主控自唤醒',
+            origin: { ...old.origin, purpose: 'schedule', scheduleKind: 'controller' },
+            status: (row.status === 'fired' ? 'triggered' : row.status === 'firing' ? 'dispatching' : String(row.status)) as ControllerSchedule['status'],
+            taskId: row.task_id ? String(row.task_id) : null, updatedAt: old.createdAt };
+          this.addSchedule(value);
+        }
+        this.db.exec('DROP TABLE controller_wakes');
+      });
+    }
   }
   close(): void { this.db.close(); }
   transaction<T>(operation: () => T): T {
@@ -128,19 +142,18 @@ export class ControllerStore {
       : this.db.prepare('SELECT value_json FROM controller_supplements ORDER BY rowid').all();
     return rows.map(row => JSON.parse(String(row.value_json)) as ControllerSupplement);
   }
-  addWake(value: ControllerWake): void {
-    this.db.prepare('INSERT INTO controller_wakes (id,parent_id,status,due_at,task_id,value_json) VALUES (?,?,?,?,?,?)')
+  addSchedule(value: ControllerSchedule): void {
+    this.db.prepare('INSERT INTO controller_schedules (id,parent_id,status,due_at,task_id,value_json) VALUES (?,?,?,?,?,?)')
       .run(value.id, value.origin.conversationId, value.status, value.dueAt, value.taskId, JSON.stringify(value));
   }
-  getWake(id: string): ControllerWake | null {
-    const row = this.db.prepare('SELECT * FROM controller_wakes WHERE id=?').get(id); return row ? wake(row) : null;
+  getSchedule(id: string): ControllerSchedule | null {
+    const row = this.db.prepare('SELECT * FROM controller_schedules WHERE id=?').get(id); return row ? schedule(row) : null;
   }
-  wakes(parentId?: string): ControllerWake[] {
-    const rows = parentId ? this.db.prepare('SELECT * FROM controller_wakes WHERE parent_id=? ORDER BY due_at,rowid').all(parentId)
-      : this.db.prepare('SELECT * FROM controller_wakes ORDER BY due_at,rowid').all();
-    return rows.map(wake);
+  schedules(): ControllerSchedule[] {
+    return this.db.prepare('SELECT * FROM controller_schedules ORDER BY due_at,rowid').all().map(schedule);
   }
-  setWake(id: string, status: ControllerWake['status'], taskId?: string): void {
-    this.db.prepare('UPDATE controller_wakes SET status=?,task_id=COALESCE(?,task_id) WHERE id=?').run(status, taskId ?? null, id);
+  saveSchedule(value: ControllerSchedule): void {
+    this.db.prepare('UPDATE controller_schedules SET status=?,due_at=?,task_id=?,value_json=? WHERE id=?')
+      .run(value.status, value.dueAt, value.taskId, JSON.stringify(value), value.id);
   }
 }

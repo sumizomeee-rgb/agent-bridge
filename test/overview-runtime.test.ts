@@ -38,7 +38,7 @@ test('只读总览使用实际 metadata 与本轮 job 时间，计数排除空�
     runtime.store.addJob(job('next-1', 'running'));
     runtime.store.addJob(job('next-2', 'running'));
     runtime.store.addJob(job('failed', 'blocked', { status: 'uncertain', result: '退出未确认', cancelReason: '禁止自动续接' }));
-    runtime.store.addWake({ id: 'wake', origin, dueAt: '2026-10-13T09:00:00Z', text: '预约', status: 'pending', taskId: null, createdAt: '' });
+    runtime.store.addSchedule({ id: 'plan', kind: 'controller', title: '预约', origin, dueAt: '2026-10-13T09:00:00Z', text: '预约', status: 'pending', taskId: null, createdAt: '', updatedAt: '' });
     runtime.store.saveSupplement({ id: 'supplement', workerId: 'blocked', jobId: 'failed', origin, prompt: '补充', imagePaths: [], status: 'uncertain', createdAt: '', updatedAt: '' });
     assert.deepEqual(runtime.getGlobalWorkCounts(), { running: 1, queued: 2 });
     const overview = runtime.queryWorkerOverview(conversation);

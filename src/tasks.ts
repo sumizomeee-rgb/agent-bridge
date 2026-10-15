@@ -11,7 +11,8 @@ export interface TaskOrigin {
   nativeId: string | null; agent: AgentName; cwd: string;
   helperPath?: string; nodePath?: string;
   /** Program-created internal workspace initialization, never a user/tool parameter. */
-  purpose?: 'workspace-context';
+  purpose?: 'workspace-context' | 'schedule';
+  scheduleKind?: 'controller' | 'worker';
 }
 export interface TaskContextFile {
   version: 1; registryDir: string; contextId: string; token: string; helperPath: string; nodePath: string;
@@ -278,11 +279,26 @@ export class TaskRegistry {
   cancelConversation(conversationId: string): void {
     // Wake cancellation is not a claim that the remote worker was killed.
     for (const context of this.db.prepare('SELECT id,origin_json FROM task_contexts').all()) {
-      if ((JSON.parse(String(context.origin_json)) as TaskOrigin).conversationId === conversationId) {
+      const origin = JSON.parse(String(context.origin_json)) as TaskOrigin;
+      if (origin.conversationId === conversationId) {
         this.db.prepare('UPDATE task_contexts SET wake_allowed=0,open=0 WHERE id=?').run(String(context.id));
         this.db.prepare('UPDATE tasks SET wake_allowed=0 WHERE context_id=?').run(String(context.id));
       }
     }
+  }
+  /** One-time semantic migration of existing scheduler tasks and queued events. */
+  migrateScheduleTask(taskId: string, kind: 'controller' | 'worker'): void {
+    const row = this.db.prepare('SELECT origin_json FROM tasks WHERE id=?').get(taskId);
+    if (!row) return;
+    const origin = JSON.parse(String(row.origin_json)) as TaskOrigin;
+    if (origin.purpose === 'schedule' && origin.scheduleKind === kind) return;
+    const value = JSON.stringify({ ...origin, purpose: 'schedule', scheduleKind: kind });
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE tasks SET origin_json=? WHERE id=?').run(value, taskId);
+      this.db.prepare('UPDATE task_events SET origin_json=? WHERE task_id=?').run(value, taskId);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   activeCounts(): Map<string, number> {
     const counts = new Map<string, number>();

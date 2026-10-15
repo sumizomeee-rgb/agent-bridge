@@ -45,7 +45,7 @@ Agent 工作区独立于桥代码，可放在任意指定目录：
 ```text
 D:\Agent Workspace/
 ├─ AGENTS.md                  简短约定与产物回传格式
-├─ CLAUDE.md                  引用 AGENTS.md
+├─ MEMORY.md                  持续维护的偏好、纠正与已核实事实
 ├─ README.md                  本机职责、上下文初始化入口与工作导航
 ├─ agents.json                实际跨电脑注册表，默认空表
 ├─ agents.example.json        远端登记示例，不自动启用
