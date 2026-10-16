@@ -35,6 +35,7 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'boolean', name: 'details', description: '展开完整 ID 与回执；默认简要展示' },
   ] },
   { name: 'stop', help: "/stop：停止当前任务、清空队列和取消后台自动汇总；不会停止远端子任务", description: '停止当前任务并清空其队列，保留上下文' },
+  { name: 'restart', help: '/restart：待当前任务结束后重启桥，保留会话与定时计划', description: '待当前任务结束后重启桥，保留会话与定时计划' },
   { name: 'help', help: "/help：查看共用命令与用法", description: '查看可用命令和用法' },
 ];
 

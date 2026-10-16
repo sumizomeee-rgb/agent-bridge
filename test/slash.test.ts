@@ -81,15 +81,15 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
   };
 }
 
-test('native registry contains twelve supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'computers', 'workers', 'stop', 'help']);
+test('native registry contains thirteen supported DM-only commands, never resume/startup', () => {
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'computers', 'workers', 'stop', 'restart', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);
 });
 
 test('native options map to existing text commands including custom models and Windows paths', () => {
-  for (const name of ['help', 'status', 'chats', 'models', 'stop', 'new', 'agent', 'model']) assert.deepEqual(result(name), { text: `/${name}` });
+  for (const name of ['help', 'status', 'chats', 'models', 'stop', 'restart', 'new', 'agent', 'model']) assert.deepEqual(result(name), { text: `/${name}` });
   assert.deepEqual(result('new', [option('agent', 'claude')]), { text: '/new claude' });
   assert.deepEqual(result('new', [option('continue', true)]), { text: '/new continue' });
   assert.deepEqual(result('new', [option('continue', true), option('agent', 'claude')]), { text: '/new continue claude' });
@@ -127,6 +127,15 @@ test('real DM slash computer and worker interactions use type5 ACK and carry que
   assert(f.received.every(message => message.userId === '111' && message.interaction != null));
 });
 
+test('native restart uses the shared command and ACK path without a model call', async t => {
+  const f = await fixture(t);
+  f.dispatch({ data: { name: 'restart', type: 1 } });
+  await until(() => f.received.length === 1);
+  assert.equal(f.received[0]!.text, '/restart');
+  assert.deepEqual(f.callbacks()[0]!.body, { type: 5 });
+  assert('error' in result('restart', [option('force', true)]));
+});
+
 test('unsupported names, incomplete options, types, duplicates and unsafe line breaks are rejected', () => {
   const invalid = [result('resume'), result('startup'), result('cwd'), result('agent', [option('agent', 'other')]),
     result('model', [option('custom', true)]), result('model', [option('name', 'a'.repeat(201))]),
@@ -137,7 +146,7 @@ test('unsupported names, incomplete options, types, duplicates and unsafe line b
   assert(invalid.every(value => 'error' in value));
 });
 
-test('registration uses READY application ID and PUTs twelve global BOT_DM definitions', async t => {
+test('registration uses READY application ID and PUTs the shared global BOT_DM definitions', async t => {
   const f = await fixture(t);
   await f.transport.syncSlashCommands();
   assert.equal(f.requests.length, 1);

@@ -13,6 +13,7 @@ import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
 import { SessionHandoffs } from './controller/handoff.js';
+import type { RestartOrigin, RestartReceipt } from './restart.js';
 
 interface RunningTurn {
   messageId: string;
@@ -32,6 +33,7 @@ export interface SessionManagerOptions {
   onInitializationError?: (conversation: Conversation, error: unknown) => void;
   onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
+  onRequestRestart?: (origin: RestartOrigin) => Promise<RestartReceipt>;
 }
 
 export class SessionManager {
@@ -540,6 +542,17 @@ export class SessionManager {
           ? '直接发送文字或图片继续；/new 新建会话，/help 查看命令。'
           : '发送第一条文字或图片即可新建会话。/status 只查询状态，不创建会话。' };
         await reply(presentationText(view), { presentation: view }); return;
+      }
+      case 'restart': {
+        if (argument) { await reply('用法：/restart'); return; }
+        if (!this.options.onRequestRestart) { await reply('当前部署未启用桥重启。'); return; }
+        const result = await this.options.onRequestRestart({
+          conversationId: current?.id ?? 'bridge', userId: message.userId, channelId: message.channelId,
+          originMessageId: message.id, nativeId: current?.nativeId ?? null,
+        });
+        await reply(result.accepted ? '已安排重启，当前任务结束后执行。'
+          : result.status === 'supervisor_required' ? '当前桥未通过监督器启动，无法自动重启。' : '桥正在关闭，未安排重启。');
+        return;
       }
       case 'stop': {
         const count = current ? this.cancel(current, false) : 0;

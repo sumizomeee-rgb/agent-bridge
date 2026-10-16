@@ -195,6 +195,7 @@ manager = new SessionManager(config, adapters, {
 }, { taskRegistry: tasks, botName: () => transport.botUser?.username,
   onListComputers: (conversation, refresh) => targetCatalog.computerOverview(conversation.cwd, refresh),
   onListWorkers: (conversation, scope) => Promise.resolve(runtime?.queryWorkerOverview(conversation, scope) ?? []),
+  onRequestRestart: origin => restart.request(origin),
   ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
   ...(runtime ? { onStop: id => runtime.cancelConversation(id), onDetach: id => runtime.detachConversation(id),
     onInitializeWorkspace: turn => runtime.initializeWorkspace(turn),
