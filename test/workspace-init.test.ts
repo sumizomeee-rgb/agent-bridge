@@ -47,10 +47,12 @@ test('workspace initializer generates usable templates from another working dire
   try {
     const workspace = join(root, '上下文 空间', '新工作区[原样]');
     requireSuccess(run(workspace, root));
-    assert.deepEqual(readdirSync(workspace).sort(), [...new Set(templates.map(file => file.split('/')[0]!))].sort());
+    assert.deepEqual(readdirSync(workspace).sort(), [...new Set([...templates.map(file => file.split('/')[0]!), '.local'])].sort());
     for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), readFileSync(join(project, 'workspace-template', file)));
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'agents.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
     assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities.json'), 'utf8'))), []);
+    assert.deepEqual(readdirSync(join(workspace, '.local')).sort(), ['deliveries', 'tmp']);
+    assert.deepEqual(readdirSync(join(workspace, '.local', 'tmp')), []);
     assert.ok(readFileSync(join(workspace, 'AGENTS.md'), 'utf8').trim());
     assert.match(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), /AGENTS\.md/);
   } finally { cleanup(); }
@@ -66,6 +68,8 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     const capabilities = Buffer.from('{\r\n  \"version\": 1, \"capabilities\": [], \"note\": \"用户维护\"\r\n}\r\n');
     writeFileSync(join(workspace, 'capabilities.json'), capabilities);
     writeFileSync(join(workspace, 'private.txt'), 'existing unrelated context');
+    mkdirSync(join(workspace, '.local', 'tmp'), { recursive: true });
+    writeFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'unfinished task evidence');
     mkdirSync(join(workspace, '聊天平台'));
     writeFileSync(join(workspace, '聊天平台', '飞书.md'), custom);
     requireSuccess(run(workspace, root));
@@ -74,6 +78,7 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     assert.deepEqual(readFileSync(join(workspace, 'AGENTS.md')), custom);
     assert.deepEqual(readFileSync(join(workspace, 'capabilities.json')), capabilities);
     assert.deepEqual(readFileSync(join(workspace, '聊天平台', '飞书.md')), custom);
+    assert.equal(readFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'utf8'), 'unfinished task evidence');
     for (const [file, bytes] of before) assert.deepEqual(readFileSync(join(workspace, file)), bytes);
   } finally { cleanup(); }
 });
@@ -149,4 +154,22 @@ test('平台文档目标被目录占用时，不生成其他模板', windowsOnly
     assert.deepEqual(readdirSync(workspace), ['聊天平台']);
     assert.deepEqual(readdirSync(join(workspace, '聊天平台')), ['飞书.md']);
   } finally { cleanup(); }
+});
+
+
+test('临时及交付目录路径被文件占用时提前失败，不生成部分骨架', windowsOnly, () => {
+  for (const collision of ['.local', '.local/tmp', '.local/deliveries']) {
+    const { root, cleanup } = fixture();
+    try {
+      const workspace = join(root, '运行目录碰撞');
+      mkdirSync(dirname(join(workspace, collision)), { recursive: true });
+      writeFileSync(join(workspace, collision), '用户文件');
+      const result = run(workspace, root);
+      assert.equal(result.error, undefined, result.error?.message);
+      assert.notEqual(result.status, 0, result.stdout + result.stderr);
+      assert.deepEqual(readdirSync(workspace), ['.local']);
+      assert.equal(readFileSync(join(workspace, collision), 'utf8'), '用户文件');
+      if (collision !== '.local') assert.deepEqual(readdirSync(join(workspace, '.local')), [collision.split('/')[1]!]);
+    } finally { cleanup(); }
+  }
 });

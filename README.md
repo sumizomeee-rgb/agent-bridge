@@ -51,10 +51,11 @@ D:\Agent Workspace/
 ├─ agents.example.json        远端登记示例，不自动启用
 ├─ capabilities.json          能力入口与验收范围，默认空表
 ├─ capabilities.example.json  能力登记示例，不自动启用
-└─ 聊天平台/                  飞书.md、Discord.md，初始化只读当前平台
+├─ 聊天平台/                  飞书.md、Discord.md，初始化只读当前平台
+└─ .local/                    tmp/ 临时产物、deliveries/ 正式交付
 ```
 
-机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
+工作区 Markdown 骨架为 3 + 平台数：AGENTS 放稳定约定、README 放导航、MEMORY 放持续记忆，每个平台另有一份指南。根目录不放临时产物，生成器预建 `.local/tmp/` 与 `.local/deliveries/`；收工规则见工作区 AGENTS。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
 
 ## 使用与维护
 
