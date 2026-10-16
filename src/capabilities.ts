@@ -166,7 +166,7 @@ export class CapabilityHealthService {
     const present = await directory(workspace);
     entries.push(item({ id: 'workspace', label: '工作区入口', targetId: 'local', kind: 'workspace' }, [
       check('directory', present ? 'ready' : 'missing', present ? '工作区目录存在。' : '工作区目录不存在。'),
-      check('AGENTS.md', await regularFile(join(workspace, 'AGENTS.md')) ? 'ready' : 'missing', '主控工作区导航入口；不读取正文。'),
+      check('MEMORY.md', await regularFile(join(workspace, 'MEMORY.md')) ? 'ready' : 'missing', '持续记忆入口；不读取正文。'),
       check('README.md', await regularFile(join(workspace, 'README.md')) ? 'ready' : 'missing', '工作区说明入口；不读取正文。'),
     ]));
     for (const agent of ['codex', 'claude'] as const) entries.push(await this.cli(agent, `cli-${agent}`));

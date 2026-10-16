@@ -439,7 +439,7 @@ test('workspace initialization uses one durable child with the parent backend/mo
     assert.equal(job.origin.nativeId, 'native-parent'); assert.equal(job.origin.channelId, 'dm-A');
     const child = f.codex.turns[0]!;
     assert.equal(child.conversation.model, 'gpt-6.1-sol'); assert.equal(child.effort, 'high'); assert.deepEqual(child.imagePaths, []);
-    assert.match(child.text, /AGENTS\.md、README\.md/); assert.match(child.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
+    assert.match(child.text, /README\.md 为用户入口/); assert.match(child.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
     assert.match(child.text, /不要扫描未指定的目录或技能目录/); assert.match(child.text, /不连接远程电脑/);
     assert(!child.text.includes('用户职责和偏好、当前电脑用途'));
     assert.match(child.text, /不自行登记桥后台任务、向聊天平台发消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
@@ -492,7 +492,7 @@ test('a persisted initialization queued before process startup resumes its singl
     store.transaction(() => {
       store.addWorker({ id: handle.workerId, origin, agent: 'codex', model: 'gpt-6.1-sol', actualModel: null, effort: 'medium', cwd: f.dir,
         title: '工作区上下文', nativeId: null, imagePaths: [], wakeAllowed: true, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
-      store.addJob({ id: handle.jobId, workerId: handle.workerId, origin, prompt: '只读 AGENTS.md 与 README.md', imagePaths: [], status: 'queued',
+      store.addJob({ id: handle.jobId, workerId: handle.workerId, origin, prompt: '只读 README.md', imagePaths: [], status: 'queued',
         taskId: null, result: null, cancelReason: null, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
       store.saveWorkspaceInitialization('parent-A', handle);
     }); store.close();

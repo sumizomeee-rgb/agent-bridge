@@ -12,7 +12,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'bridge-capabilities-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const workspace = join(root, 'workspace'); mkdirSync(workspace);
-  writeFileSync(join(workspace, 'AGENTS.md'), 'private-work-habits'); writeFileSync(join(workspace, 'README.md'), 'private-business-navigation');
+  writeFileSync(join(workspace, 'MEMORY.md'), 'private-work-habits'); writeFileSync(join(workspace, 'README.md'), 'private-business-navigation');
   const config: BridgeConfig = { token: 'private-bot-token', allowedUserIds: ['123456789012345678'], defaultAgent: 'codex', workspace, proxyUrl: null,
     commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), maxImageBytes: 1024 };
   const registry = (capabilities: unknown[]) => writeFileSync(join(workspace, 'capabilities.json'), JSON.stringify({ version: 1, capabilities }));
@@ -48,6 +48,8 @@ test('Chrome newAllowFileAccess is recognized while missing enable-state fields 
   assert.match(chrome.checks.find(value => value.name === 'extension')!.note, /不等于已禁用/);
   assert.equal(chrome.checks.find(value => value.name === 'native-host')?.status, 'ready');
   assert.equal(chrome.runtimeStatus, 'unknown'); assert.equal(report.scope, 'static-prerequisites');
+  assert.equal(entry(report, 'workspace').status, 'ready');
+  assert.deepEqual(entry(report, 'workspace').checks.map(value => value.name).sort(), ['MEMORY.md', 'README.md', 'directory']);
   const serialized = JSON.stringify(report);
   for (const secret of ['private-cookie-value', 'private-profile-field', 'private-manifest-extra', 'private-bot-token', 'private-work-habits', 'private-business-navigation']) assert.ok(!serialized.includes(secret));
 });

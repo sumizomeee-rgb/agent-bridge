@@ -250,10 +250,8 @@ test('首条普通消息并行派只读初始化，真实任务计数且不改�
 test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd 换入口、续聊去重（模拟只读子 Agent）', async t => {
   const f = fixture(t);
   const other = join(f.root, 'other'); mkdirSync(other);
-  writeFileSync(join(f.root, 'AGENTS.md'), '初始化按 README.md 的用户入口和范围读取。');
   writeFileSync(join(f.root, 'README.md'), '初始化入口：context-a.md\n回传要求：只返回指定文件的执行规范。');
   writeFileSync(join(f.root, 'context-a.md'), 'WORKSPACE_POLICY_A');
-  writeFileSync(join(other, 'AGENTS.md'), '初始化按 README.md 的用户入口和范围读取。');
   writeFileSync(join(other, 'README.md'), '初始化入口：context-b.md\n回传要求：只返回指定文件的执行规范。');
   writeFileSync(join(other, 'context-b.md'), 'WORKSPACE_POLICY_B');
   const reads: string[] = [];
@@ -262,7 +260,6 @@ test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd �
     assert.match(turn.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
     assert(!/WORKSPACE_POLICY_[AB]/.test(turn.text));
     const cwd = turn.conversation.cwd;
-    readFileSync(join(cwd, 'AGENTS.md'), 'utf8');
     const guide = readFileSync(join(cwd, 'README.md'), 'utf8');
     const entry = guide.match(/初始化入口：([^\r\n]+)/)![1]!;
     const selected = join(cwd, entry); reads.push(selected);

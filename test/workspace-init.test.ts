@@ -10,7 +10,7 @@ import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['AGENTS.md', 'MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', '聊天平台/飞书.md', '聊天平台/Discord.md'];
+const templates = ['MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', '聊天平台/飞书.md', '聊天平台/Discord.md'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 
@@ -53,8 +53,9 @@ test('workspace initializer generates usable templates from another working dire
     assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities.json'), 'utf8'))), []);
     assert.deepEqual(readdirSync(join(workspace, '.local')).sort(), ['deliveries', 'tmp']);
     assert.deepEqual(readdirSync(join(workspace, '.local', 'tmp')), []);
-    assert.ok(readFileSync(join(workspace, 'AGENTS.md'), 'utf8').trim());
-    assert.match(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), /AGENTS\.md/);
+    assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').trim());
+    assert.equal(existsSync(join(workspace, 'AGENTS.md')), false, 'New skeleton has only README, MEMORY and platform Markdown.');
+    assert.match(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), /README\.md/);
   } finally { cleanup(); }
 });
 
@@ -64,7 +65,7 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     const workspace = join(root, '已有 工作区');
     mkdirSync(workspace);
     const custom = Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('用户工作习惯\r\n保留原样\r\n')]);
-    writeFileSync(join(workspace, 'AGENTS.md'), custom);
+    writeFileSync(join(workspace, 'README.md'), custom);
     const capabilities = Buffer.from('{\r\n  \"version\": 1, \"capabilities\": [], \"note\": \"用户维护\"\r\n}\r\n');
     writeFileSync(join(workspace, 'capabilities.json'), capabilities);
     writeFileSync(join(workspace, 'private.txt'), 'existing unrelated context');
@@ -75,7 +76,7 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     requireSuccess(run(workspace, root));
     const before = new Map([...templates, 'private.txt'].map(file => [file, readFileSync(join(workspace, file))]));
     requireSuccess(run(workspace, root));
-    assert.deepEqual(readFileSync(join(workspace, 'AGENTS.md')), custom);
+    assert.deepEqual(readFileSync(join(workspace, 'README.md')), custom);
     assert.deepEqual(readFileSync(join(workspace, 'capabilities.json')), capabilities);
     assert.deepEqual(readFileSync(join(workspace, '聊天平台', '飞书.md')), custom);
     assert.equal(readFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'utf8'), 'unfinished task evidence');

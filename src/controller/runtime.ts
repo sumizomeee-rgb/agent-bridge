@@ -15,7 +15,7 @@ import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
 const workspaceWorkerInstruction = '你是桥已登记并管理的工作区上下文调查子 Agent。只完成下面的只读调查，不执行新的工程或生活任务，不自行登记桥后台任务、向聊天平台发消息或伪造完成回执。\n\n';
-const workspacePrompt = '这是当前父会话的一次性工作区初始化。以当前工作目录中的 AGENTS.md、README.md 为用户入口，遵循其中定义的初始化入口、只读范围和回传要求；仅在它们明确要求初始化读取时，沿导航读取指定的本机上下文文件。初始化读取范围和回传内容由用户文件维护，不预设业务栏目；没有额外定义时，仅返回这两个文件中与后续会话有关的必要指导。不要扫描未指定的目录或技能目录，不连接远程电脑、联网检查、修改文件或启动新工作。缺失文件、读取失败或不明确的范围如实报告，不猜测环境；区分文件声明与实际核实的事实。仅将结果作为本任务回执返回。';
+const workspacePrompt = '这是当前父会话的一次性工作区初始化。以当前工作目录中的 README.md 为用户入口，遵循其中定义的初始化入口、只读范围和回传要求；仅在 README 明确要求初始化读取时，沿导航读取指定的本机上下文文件。初始化读取范围和回传内容由用户文件维护，不预设业务栏目；没有额外定义时，仅返回 README 中与后续会话有关的必要指导。不要扫描未指定的目录或技能目录，不连接远程电脑、联网检查、修改文件或启动新工作。缺失文件、读取失败或不明确的范围如实报告，不猜测环境；区分文件声明与实际核实的事实。仅将结果作为本任务回执返回。';
 const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_list_schedules', 'bridge_cancel_schedule', 'bridge_update_schedule', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_adopt_native_session']);
 function pathKey(value: string): string { const result = resolve(value); return process.platform === 'win32' ? result.toLowerCase() : result; }
 function text(value: unknown, label: string, limit: number): string {

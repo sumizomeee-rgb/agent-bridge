@@ -2,7 +2,7 @@
 
 [返回项目首页](../README.md)
 
-工作区的 `capabilities.json` 保存能力入口和验收记录，桥的 `.local/data/capability-health` 保存当前检查缓存。登记属于用户上下文；检查和任务观测由桥提供。启动、重启做轻检查，主控按需调用 `bridge_check_capabilities`；新会话以 `AGENTS.md`、`README.md` 为入口，并只读 README 明确要求的 MEMORY 及当前平台文档；桥提供 platform、固定应用 ID 和 Profile，未知时不猜测。不会为初始化远连或探测业务页面，也不逐轮注入完整报告。
+工作区的 `capabilities.json` 保存能力入口和验收记录，桥的 `.local/data/capability-health` 保存当前检查缓存。登记属于用户上下文；检查和任务观测由桥提供。启动、重启做轻检查，主控按需调用 `bridge_check_capabilities`；新会话以 `README.md` 为唯一入口，并只读 README 明确要求的 MEMORY 及当前平台文档；桥提供 platform、固定应用 ID 和 Profile，未知时不猜测。不会为初始化远连或探测业务页面，也不逐轮注入完整报告。
 
 ## 登记
 

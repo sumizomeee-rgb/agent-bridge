@@ -44,9 +44,8 @@ Agent 工作区独立于桥代码，可放在任意指定目录：
 
 ```text
 D:\Agent Workspace/
-├─ AGENTS.md                  简短约定与产物回传格式
 ├─ MEMORY.md                  持续维护的偏好、纠正与已核实事实
-├─ README.md                  本机职责、上下文初始化入口与工作导航
+├─ README.md                  稳定行为约定、初始化入口与工作导航
 ├─ agents.json                实际跨电脑注册表，默认空表
 ├─ agents.example.json        远端登记示例，不自动启用
 ├─ capabilities.json          能力入口与验收范围，默认空表
@@ -55,7 +54,7 @@ D:\Agent Workspace/
 └─ .local/                    tmp/ 临时产物、deliveries/ 正式交付
 ```
 
-工作区 Markdown 骨架为 3 + 平台数：AGENTS 放稳定约定、README 放导航、MEMORY 放持续记忆，每个平台另有一份指南。根目录不放临时产物，生成器预建 `.local/tmp/` 与 `.local/deliveries/`；收工规则见工作区 AGENTS。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
+工作区 Markdown 骨架为 2 + 平台数：README 统一保存稳定约定与导航，MEMORY 保存持续记忆，每个平台另有一份指南。根目录不放临时产物，生成器预建 `.local/tmp/` 与 `.local/deliveries/`；收工规则见工作区 README。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
 
 ## 使用与维护
 
@@ -66,6 +65,6 @@ D:\Agent Workspace/
 - [能力登记与就绪检查](docs/capabilities.md)：启动体检、按需查询、验收范围和任务进度。
 - [开发与验证](docs/development.md)：构建、测试和版本升级。
 - [群聊与多个长期主控 Bot（设计，未实现）](docs/group-controller-design.md)：共享主控、单操作者、多群、命令与交接边界、反例验收及开发顺序。
-- [飞书通信适配可行性](docs/feishu-bridge-feasibility.md)：共享核心、单平台互斥启动、能力边界与后续验收；保留最初调研证据。
+- [飞书适配历史调研（非群聊设计）](docs/feishu-bridge-feasibility.md)：共享核心、单平台互斥启动、能力边界与后续验收；保留最初调研证据。
 
 新增或改变主控工具声明后，已有 Codex 原生会话需要 `/new` 才能加载新声明；普通重启仍续接旧会话。工作区模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化；普通模型、强度切换可以保留当前会话。
