@@ -1,8 +1,8 @@
 import { effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { statSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import { SessionStore, type WorkspaceNoticeOutcome } from './store.js';
+import { SessionStore, type WorkspaceNoticeOutcome, type ControllerBinding, type InboxItem, type InboxState } from './store.js';
 import { isModelId } from './config.js';
 import { agentDisplayName, replyHeader } from './reply.js';
 import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview, type WorkerOverview } from './overview.js';
@@ -15,7 +15,15 @@ import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, 
 import { SessionHandoffs } from './controller/handoff.js';
 import type { RestartOrigin, RestartReceipt } from './restart.js';
 
-interface RunningTurn {
+interface WorkspaceInitializationJournal {
+  version: 1; conversationId: string; userId: string; sourceMessageId: string; channelId: string;
+  outcome: 'pending' | WorkspaceNoticeOutcome; nativeId: string | null; updatedAt: string;
+}
+interface AgentSwitchJournal {
+  version: 1; source: Conversation; target: Conversation; channelId: string;
+  phase: 'preparing' | 'prepared' | 'committing' | 'committed' | 'failed';
+  createdAt: string; updatedAt: string; error?: string;
+}interface RunningTurn {
   messageId: string;
   conversationId: string;
   controller: AbortController;
@@ -25,12 +33,23 @@ interface RunningTurn {
   supplements: Promise<void>;
   completionEventId?: string;
 }
+export type GroupTurnContext = NonNullable<AgentTurn['groupContext']>;
 export interface SessionManagerOptions {
+  binding?: ControllerBinding; authorizeUser?: (userId: string) => boolean;
+  onGroupTurnStart?: (context: GroupTurnContext) => Promise<string>;
+  onGroupTurnFinished?: (context: GroupTurnContext, outcome: 'completed' | 'silent' | 'failed') => Promise<void>;
+  onGroupSilent?: (context: GroupTurnContext) => Promise<void>;
+  onGroupCompletion?: (event: TaskCompletionEvent) => Promise<'queued' | 'retain'>;
+  onGroupPublish?: (context: GroupTurnContext, text: string, paths: string[], deliver: () => Promise<void>) => Promise<void>;
+  onPrepareSwitch?: (source: Conversation, target: Conversation, channelId: string, prompt: string, signal: AbortSignal) => Promise<{ contextSeed: string }>;
+  onRebindSwitch?: (source: Conversation, target: Conversation) => void | Promise<void>;
+  onPauseSwitch?: (source: Conversation) => Promise<void>; onResumeSwitch?: (source: Conversation) => void | Promise<void>;
   botName?: () => string | undefined;
   mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry;
   onStop?: (conversationId: string) => Promise<void>; onDetach?: (conversationId: string) => void | Promise<void>;
   controllerSeed?: (previous: Conversation) => string; onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>;
   onInitializationError?: (conversation: Conversation, error: unknown) => void;
+  onInitializationState?: (conversation: Conversation, outcome: WorkspaceNoticeOutcome) => void | Promise<void>;
   onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
   onRequestRestart?: (origin: RestartOrigin) => Promise<RestartReceipt>;
@@ -48,6 +67,7 @@ export class SessionManager {
   private readonly resetCommands = new Map<string, number>();
   private readonly modelChanges = new Set<string>();
   private readonly initializationAttempts = new Set<string>();
+  private readonly initializationRecoveries = new Set<Promise<void>>();
   private readonly initializations = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private readonly noticeSends = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private closed = false;
@@ -58,22 +78,119 @@ export class SessionManager {
   private recovered = false;
   private recovering = false;
   private readonly receipts = new Map<string, number>();
+  private readonly preparedResets = new Map<string, { sourceId: string | null; userId: string }>();
+  private readonly switches = new Map<string, { journal: AgentSwitchJournal; controller: AbortController }>();
+  private readonly pendingSwitches = new Set<string>();
   private readonly revisions = new Map<string, number>();
+  private readonly authorizedGroupEvents = new Map<string, { conversationId: string; contextKey: string }>();
 
   constructor(
     private readonly config: BridgeConfig,
     private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly sink: ReplySink,
     private readonly options: SessionManagerOptions = {},
-  ) { this.store = new SessionStore(config.dataDir); this.handoffs = new SessionHandoffs(config.dataDir); }
+  ) { this.store = new SessionStore(config.dataDir, options.binding); this.handoffs = new SessionHandoffs(config.dataDir); }
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
 
-  /** Pause new turns without aborting a CLI, supplement or reply already executing. */
+  currentConversation(userId: string): Conversation | null { return this.store.getActive(userId); }
+  conversationById(id: string): Conversation | null { return this.store.getConversation(id); }
+  private authorizedUsers(): string[] { return this.config.allowedUserIds.filter(user => this.options.authorizeUser?.(user) !== false); }
+
+  private selectedConversation(userId: string, agent: AgentName, cwd: string, previous?: Conversation | null): Conversation {
+    if (previous) this.store.savePreferences(previous);
+    const target = this.store.createConversation(userId, agent, cwd, { controllerMode: this.config.controllerMode === true });
+    const preference = this.store.preferences(agent);
+    if (preference && (preference.model != null || preference.modelPolicy === 'cli-default')) this.store.setModel(target.id, preference.model);
+    if (preference?.effort != null) this.store.setEffort(target.id, preference.effort);
+    return this.store.getConversation(target.id)!;
+  }
+
+  /** Stop the reset lifecycle and prepare a replacement, without changing the bot's active binding. */
+  async prepareReset(userId: string): Promise<Conversation> {
+    if (this.closed || this.draining || !this.config.allowedUserIds.includes(userId) || this.options.authorizeUser?.(userId) === false) throw new Error('当前账号不能重置此 Bot。');
+    const previous = this.store.getActive(userId);
+    this.resetCommands.set(userId, (this.resetCommands.get(userId) ?? 0) + 1);
+    try {
+      if (previous) { this.cancel(previous); await this.awaitDetach(previous.id); }
+      if (this.store.getActive(userId)?.id !== previous?.id) throw new Error('准备重置时当前主控已改变。');
+      const target = this.selectedConversation(userId, previous?.agent ?? this.config.defaultAgent, previous?.cwd ?? this.config.workingCwd ?? this.config.workspace, previous);
+      this.preparedResets.set(target.id, { sourceId: previous?.id ?? null, userId }); return target;
+    } catch (error) { this.releaseResetBarrier(userId); throw error; }
+  }
+  private releaseResetBarrier(userId: string): void {
+    const count = (this.resetCommands.get(userId) ?? 1) - 1;
+    if (count > 0) this.resetCommands.set(userId, count); else this.resetCommands.delete(userId);
+  }
+  abortPreparedReset(target: Conversation): void {
+    const prepared = this.preparedResets.get(target.id); if (!prepared) return;
+    this.preparedResets.delete(target.id); this.releaseResetBarrier(prepared.userId);
+  }
+  private initializationJournalPath(id: string): string {
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(id)) throw new Error('初始化会话标识无效。');
+    return join(this.config.dataDir, 'workspace-initialization', id + '.json');
+  }
+  private readInitializationJournal(target: Conversation): WorkspaceInitializationJournal | null {
+    const path = this.initializationJournalPath(target.id); if (!existsSync(path)) return null;
+    if (statSync(path).size > 16384) throw new Error('初始化状态记录过大。');
+    const value = JSON.parse(readFileSync(path, 'utf8')) as WorkspaceInitializationJournal;
+    if (value.version !== 1 || value.conversationId !== target.id || value.userId !== target.userId
+      || typeof value.sourceMessageId !== 'string' || typeof value.channelId !== 'string'
+      || !['pending', 'ready', 'read-failed', 'read-cancelled', 'load-failed', 'request-failed', 'introduction-failed', 'unknown'].includes(value.outcome)) throw new Error('初始化状态记录与当前 Bot 主控不匹配。');
+    return value;
+  }
+  private writeInitializationJournal(journal: WorkspaceInitializationJournal): void {
+    const path = this.initializationJournalPath(journal.conversationId); mkdirSync(join(this.config.dataDir, 'workspace-initialization'), { recursive: true });
+    const temp = path + '.' + randomUUID() + '.tmp'; journal.updatedAt = new Date().toISOString(); writeFileSync(temp, JSON.stringify(journal), { mode: 0o600 }); renameSync(temp, path);
+  }
+  private async reportInitializationState(target: Conversation, outcome: WorkspaceNoticeOutcome, source?: BridgeMessage): Promise<void> {
+    const previous = this.readInitializationJournal(target), origin = source ?? this.initializationSource(target);
+    if (previous || origin) this.writeInitializationJournal({ version: 1, conversationId: target.id, userId: target.userId,
+      sourceMessageId: previous?.sourceMessageId ?? origin!.id, channelId: previous?.channelId ?? origin!.channelId,
+      nativeId: this.store.getConversation(target.id)?.nativeId ?? target.nativeId, outcome, updatedAt: new Date().toISOString() });
+    try { await this.options.onInitializationState?.(this.store.getConversation(target.id) ?? target, outcome); }
+    catch (error) { try { this.options.onInitializationError?.(target, error); } catch { /* The accepted native state remains durably recorded. */ } }
+  }
+  /** Replay only the initialization side of an already committed batch. This never cancels work or changes generation. */
+  async ensureCommittedResetInitialized(target: Conversation, source: BridgeMessage): Promise<void> {
+    const current = this.store.getActive(target.userId), stored = this.store.getConversation(target.id);
+    if (this.closed || !stored || current?.id !== target.id || target.userId !== source.userId
+      || this.options.authorizeUser?.(target.userId) === false || command(source.text)?.name !== 'new') throw new Error('只能为已提交的当前主控恢复群初始化。');
+    let journal = this.readInitializationJournal(stored);
+    if (journal && (journal.sourceMessageId !== source.id || journal.channelId !== source.channelId)) throw new Error('群初始化来源与已提交批次不匹配。');
+    const registered = this.store.getMessage(source.id);
+    if (registered && (registered.userId !== source.userId || registered.channelId !== source.channelId || command(registered.text)?.name !== 'new')) throw new Error('群初始化命令来源不匹配。');
+    if (!registered) { this.store.addMessage(source, null, 'command'); this.store.setState(source.id, 'completed'); }
+    this.store.cancelWorkspaceNotice(target.id);
+    if (journal && journal.outcome !== 'pending') {
+      const outcome = journal.outcome === 'ready' && (!stored.nativeId || journal.nativeId !== stored.nativeId) ? 'unknown' : journal.outcome;
+      await this.reportInitializationState(stored, outcome, source); return;
+    }
+    if (!journal) { journal = { version: 1, conversationId: stored.id, userId: stored.userId, sourceMessageId: source.id, channelId: source.channelId, outcome: 'pending', nativeId: stored.nativeId, updatedAt: new Date().toISOString() }; this.writeInitializationJournal(journal); }
+    this.initializeWorkspace(stored, source); this.completionAvailable();
+  }
+  commitPreparedReset(target: Conversation, source: BridgeMessage, initialize = true, suppressIntroduction = false): void {
+    if (target.userId !== source.userId || !this.store.getConversation(target.id)) throw new Error('重置目标不属于发起账号。');
+    const prepared = this.preparedResets.get(target.id), active = this.store.getActive(target.userId);
+    if (active?.id !== target.id) {
+      if (!prepared || (active?.id ?? null) !== prepared.sourceId) throw new Error('重置来源已改变，拒绝覆盖当前主控。');
+      this.store.setActive(target.userId, target.id);
+    }
+    this.store.savePreferences(target); this.abortPreparedReset(target);
+    if (initialize && suppressIntroduction) {
+      const recovery = this.ensureCommittedResetInitialized(target, source).catch(error => this.options.onInitializationError?.(target, error)).finally(() => this.initializationRecoveries.delete(recovery));
+      this.initializationRecoveries.add(recovery);
+    } else if (initialize) {
+      if (!this.store.hasMessage(source.id)) { this.store.addMessage(source, null, 'command'); this.store.setState(source.id, 'completed'); }
+      if (!source.groupContext && !suppressIntroduction) this.store.requestWorkspaceNotice(target.id, source);
+      this.initializeWorkspace(target, source);
+    }
+    this.completionAvailable(); if (this.store.nextQueued(target.id)) this.wake(target.id);
+  }  /** Pause new turns without aborting a CLI, supplement or reply already executing. */
   beginDrain(): void { this.draining = true; }
   isIdle(): boolean {
     return this.workers.size === 0 && this.userWorkers.size === 0 && this.running.size === 0
-      && this.initializations.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.detachPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
+      && this.initializations.size === 0 && this.initializationRecoveries.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.detachPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
   }
 
   discard(message: BridgeMessage): void {
@@ -82,12 +199,62 @@ export class SessionManager {
 
   hasMessage(id: string): boolean { return this.store.hasMessage(id); }
 
-  knownChannels(): Array<{ userId: string; channelId: string; cursor: string }> { return this.store.knownChannels(); }
+  storedHostEvent(id: string): BridgeMessage | null {
+    const item = this.store.getMessage(id); return item?.groupContext ? item : null;
+  }
+  private groupContextKey(context: GroupTurnContext, includeGeneration = true): string {
+    return JSON.stringify([context.eventId, context.rootId, context.botId, context.spaceId,
+      ...(includeGeneration ? [context.generation] : []), context.bindingEpoch, context.originChannelId,
+      context.principalId, context.eventKind ?? null]);
+  }
+  private authorizeGroupEvent(item: BridgeMessage, conversationId: string): void {
+    if (item.groupContext) this.authorizedGroupEvents.set(item.id, { conversationId, contextKey: this.groupContextKey(item.groupContext) });
+  }
+  private canProcessQueued(item: InboxItem): boolean {
+    if (!item.groupContext) return true;
+    const accepted = this.authorizedGroupEvents.get(item.id);
+    return accepted?.conversationId === item.conversationId && accepted.contextKey === this.groupContextKey(item.groupContext);
+  }
+  /** Only the host's fresh reservation may resume a durable group inbox row after restart. */
+  async resumeHostEvent(message: BridgeMessage, options: { allowContinuousRebind?: boolean } = {}): Promise<{ status: 'queued' | 'running' | 'terminal'; state: InboxState }> {
+    if (this.closed || this.draining) throw new Error('当前桥不能恢复群事件。');
+    const item = this.store.getMessage(message.id), incoming = message.groupContext;
+    if (!item?.groupContext || !incoming || item.userId !== message.userId || item.channelId !== message.channelId
+      || item.text !== message.text || JSON.stringify(item.imagePaths) !== JSON.stringify(message.imagePaths)
+      || this.groupContextKey(item.groupContext, false) !== this.groupContextKey(incoming, false)
+      || !this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) throw new Error('群恢复事件与已持久输入或路由不匹配。');
+    if (item.state !== 'queued') return { status: item.state === 'running' || item.state === 'steering' ? 'running' : 'terminal', state: item.state };
+    const active = this.store.getActive(item.userId);
+    if (!active || active.id !== item.conversationId || this.pendingSwitches.has(item.userId)) throw new Error('群恢复事件尚未绑定当前主控。');
+    if (incoming.generation !== item.groupContext.generation) {
+      if (!options.allowContinuousRebind || !Number.isSafeInteger(incoming.generation) || incoming.generation <= item.groupContext.generation) throw new Error('群恢复事件代次与持久输入不一致。');
+      if (!this.store.updateQueuedGroupContext(item.id, active.id, incoming)) throw new Error('群恢复事件已不在原排队状态。');
+    }
+    const persisted = this.store.getMessage(item.id)!;
+    this.authorizeGroupEvent(persisted, active.id); this.setLatestMessage(persisted, active.id);
+    this.wake(active.id); return { status: 'queued', state: 'queued' };
+  }
+  /** A cancelled host event releases its FIFO barrier without replaying uncertain or started work. */
+  cancelHostEvent(id: string, reason = '宿主群事件已取消'): boolean {
+    const item = this.store.getMessage(id);
+    if (this.closed || !item?.groupContext || item.state !== 'queued') return false;
+    this.authorizedGroupEvents.delete(id); this.store.setState(id, 'cancelled', reason);
+    if (item.conversationId) this.wake(item.conversationId); return true;
+  }
 
-  async handle(message: BridgeMessage, commandReply?: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
+  knownChannels(): Array<{ userId: string; channelId: string; cursor: string }> { const users = this.authorizedUsers(); return this.store.knownChannels().filter(route => users.includes(route.userId)); }
+
+  knownDMChannels(): Array<{ userId: string; channelId: string; cursor: string }> { const users = this.authorizedUsers(); return this.store.knownDMChannels().filter(route => users.includes(route.userId)); }
+
+  /** Trusted host events retain their kind in group_json; they never become new human instructions after restart. */
+  async handleHostEvent(message: BridgeMessage, kind: 'worker-result' | 'wake' | 'group-event'): Promise<void> {
+    if (!message.groupContext || !this.store.getActive(message.userId)) throw new Error('群内部事件缺少当前主控或可信现场。');
+    await this.handle({ ...message, groupContext: { ...message.groupContext, eventKind: kind } });
+  }  async handle(message: BridgeMessage, commandReply?: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
     if (this.closed) throw new Error('桥已关闭');
-    if (!this.config.allowedUserIds.includes(message.userId) || this.hasMessage(message.id)) return;
-    const parsed = command(message.text);
+    if (!this.config.allowedUserIds.includes(message.userId) || this.options.authorizeUser?.(message.userId) === false || this.hasMessage(message.id)) return;
+    const parsed = message.groupContext?.eventKind ? null : command(message.text);
+    if (this.pendingSwitches.has(message.userId) && parsed?.name !== 'status' && parsed?.name !== 'help') throw new Error('上次 Agent 切换提交尚待核对；请先恢复操作日志。');
     if (parsed) {
       // Raw command receipt stays in DurableIngress until the next process can execute it.
       if (this.draining) return;
@@ -139,12 +306,15 @@ export class SessionManager {
       }
       return;
     }
-    const active = this.ensureActive(message.userId);
+    const active = message.groupContext?.eventKind ? this.store.getActive(message.userId) : this.ensureActive(message.userId);
+    if (!active) throw new Error('内部事件不能自动创建主控。');
     if (!this.store.addMessage(message, active.id, 'queued')) return;
+    this.authorizeGroupEvent(message, active.id);
     this.store.nameConversation(active.id, message.text);
     this.setLatestMessage(message, active.id);
     if (this.draining) return;
-    this.initializeWorkspace(active, message);
+    const head = this.store.nextQueued(active.id);
+    if (!head || this.canProcessQueued(head)) this.initializeWorkspace(active, message);
     this.refreshTaskCounts(active.id);
     this.wake(active.id);
     const running = this.running.get(message.userId);
@@ -161,9 +331,10 @@ export class SessionManager {
     this.recovered = true;
     this.recovering = true;
     try {
-      this.options.taskRegistry?.recoverContexts(this.config.allowedUserIds);
+      await this.recoverAgentSwitches();
+      this.options.taskRegistry?.recoverContexts(this.authorizedUsers());
       const notices = new Set<string>();
-      for (const item of [...this.store.interruptRunning(this.config.allowedUserIds), ...this.store.unfinishedReplies(this.config.allowedUserIds)]) {
+      for (const item of [...this.store.interruptRunning(this.authorizedUsers()), ...this.store.unfinishedReplies(this.authorizedUsers())]) {
         if (this.closed) return;
         if (!this.config.allowedUserIds.includes(item.userId)) continue;
         const key = `${item.channelId}:${item.conversationId}`;
@@ -174,16 +345,19 @@ export class SessionManager {
           .catch(() => undefined);
       }
       if (this.closed) return;
-      for (const userId of this.config.allowedUserIds) {
+      for (const userId of this.authorizedUsers()) {
         if (this.store.getActive(userId)) this.ensureActive(userId);
         const active = this.store.getActive(userId);
         const latest = active ? this.store.latestMessage(active.id) : null;
         if (active && latest) this.latestMessages.set(userId, { id: latest.id, channelId: latest.channelId, conversationId: active.id });
       }
-      for (const event of this.options.taskRegistry?.recoverProcessingEvents(this.config.allowedUserIds) ?? []) {
+      for (const event of this.options.taskRegistry?.recoverProcessingEvents(this.authorizedUsers()) ?? []) {
         if (event.purpose === 'workspace-context') {
           const target = this.completionTarget(event);
-          if (target && event.wakeAllowed && this.store.getActive(event.userId)?.id === target.id) this.store.prepareWorkspaceNotice(target.id, 'unknown');
+          if (target && event.wakeAllowed && this.store.getActive(event.userId)?.id === target.id) {
+            this.store.prepareWorkspaceNotice(target.id, 'unknown');
+            await this.reportInitializationState(target, 'unknown', this.store.getMessage(event.originMessageId) ?? undefined);
+          }
           this.options.taskRegistry?.markUncertainNotified(event.id);
           continue;
         }
@@ -199,13 +373,14 @@ export class SessionManager {
       }
     } finally { this.recovering = false; }
     if (this.closed) return;
-    for (const id of this.store.recoverWorkspaceNotices(this.config.allowedUserIds)) {
+    for (const id of this.store.recoverWorkspaceNotices(this.authorizedUsers())) {
       const target = this.store.getConversation(id); if (target) await this.sendWorkspaceNotice(target);
     }
-    for (const userId of this.config.allowedUserIds) {
+    for (const userId of this.authorizedUsers()) {
       const active = this.store.getActive(userId);
       const source = active ? this.initializationSource(active) : null;
-      if (active && source) this.initializeWorkspace(active, source);
+      const head = active ? this.store.nextQueued(active.id) : null;
+      if (active && source && !source.groupContext && (!head || this.canProcessQueued(head))) this.initializeWorkspace(active, source);
     }
     for (const id of this.store.queuedConversations()) this.wake(id);
     this.completionAvailable();
@@ -221,6 +396,8 @@ export class SessionManager {
 
   /** Start a real read-only child without occupying the conversational turn or inventing a user prompt. */
   private initializeWorkspace(target: Conversation, source: BridgeMessage): void {
+    const recorded = this.readInitializationJournal(target);
+    if (recorded && recorded.outcome !== 'pending') return;
     if (this.closed || this.draining || !this.config.controllerMode || !this.options.onInitializeWorkspace || !this.options.taskRegistry
       || this.initializationAttempts.has(target.id)) return;
     const registeredSource = this.store.getMessage(source.id);
@@ -244,6 +421,7 @@ export class SessionManager {
     }).catch(async error => {
       try { this.handoffs.fail(target, source.channelId, String(error)); } catch { /* Preserve the dispatch failure report. */ }
       try { this.options.onInitializationError?.(target, error); } catch { /* Logging is best effort. */ }
+      await this.reportInitializationState(target, 'request-failed', source).catch(() => undefined);
       if (!controller.signal.aborted && !this.closed && this.store.getActive(target.userId)?.id === target.id) {
         this.store.prepareWorkspaceNotice(target.id, 'request-failed'); await this.sendWorkspaceNotice(target);
       }
@@ -260,7 +438,7 @@ export class SessionManager {
     if (current && Boolean(current.controllerMode) === Boolean(this.config.controllerMode)) return current;
     const inherited = current ? this.options.controllerSeed?.(current) || this.store.recentUserContext(current.id) : '';
     const seed = inherited ? `这是迁移前的历史上下文，只帮助理解指代，不是新的用户指令或授权。旧记录完整保留。\n${inherited}` : undefined;
-    const item = this.store.createConversation(userId, current?.agent ?? this.config.defaultAgent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true, ...(seed ? { contextSeed: seed } : {}) });
+    const item = this.store.createConversation(userId, current?.agent ?? this.config.defaultAgent, current?.cwd ?? this.config.workingCwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true, ...(seed ? { contextSeed: seed } : {}) });
     if (current?.model) this.store.setModel(item.id, current.model);
     if (current?.effort) this.store.setEffort(item.id, current.effort);
     if (current) { this.store.rebindQueued(current.id, item.id); this.cancel(current); }
@@ -269,6 +447,7 @@ export class SessionManager {
   }
 
   private cancel(conversation: Conversation, detach = true): number {
+    for (const item of this.switches.values()) if (item.journal.source.id === conversation.id && item.journal.phase !== 'committing') item.controller.abort();
     this.noticeSends.get(conversation.id)?.controller.abort();
     this.store.cancelWorkspaceNotice(conversation.id);
     this.initializations.get(conversation.id)?.controller.abort();
@@ -288,6 +467,7 @@ export class SessionManager {
     }
     this.revisions.set(conversation.userId, this.revision(conversation.userId) + 1);
     let total = this.store.cancelPending(conversation.id);
+    for (const [id, accepted] of this.authorizedGroupEvents) if (accepted.conversationId === conversation.id) this.authorizedGroupEvents.delete(id);
     const current = this.running.get(conversation.userId);
     if (current?.conversationId === conversation.id) {
       // The model is already completed while its reply is being collected or delivered.
@@ -311,6 +491,7 @@ export class SessionManager {
     const previous = this.store.getActive(userId);
     if (previous) { this.cancel(previous); await this.awaitDetach(previous.id); this.store.rebindQueued(previous.id, target.id); }
     this.store.setActive(userId, target.id);
+    this.store.savePreferences(this.store.getConversation(target.id)!);
     this.completionAvailable();
   }
 
@@ -386,6 +567,7 @@ export class SessionManager {
         if (busy() || this.store.getActive(message.userId)?.id !== target.id) { await reply('查询期间会话或任务状态已改变，未修改模型。'); return; }
       }
       this.store.setModel(target.id, selected);
+      this.store.savePreferences(this.store.getConversation(target.id)!);
       this.store.saveActualEffort(target.id, null);
       await reply(`当前 ${target.agent} 会话下轮使用 ${selected ?? 'CLI 默认（已清除显式覆盖）'}，上下文保留。${unverified ? '\n已设置模型 ID，提供方可用性尚未验证。' : ''}`);
     } finally {
@@ -410,6 +592,7 @@ export class SessionManager {
       if (this.closed) return;
       if (busy() || this.store.getActive(message.userId)?.id !== target.id) { await reply('查询期间会话或任务状态已改变，未修改强度。'); return; }
       this.store.setEffort(target.id, effort);
+      this.store.savePreferences(this.store.getConversation(target.id)!);
       await reply(`已设置当前 ${target.agent} 会话强度为 ${effort ?? 'CLI 默认'}，下轮提交；实际生效尚未由 CLI 确认。上下文保留，现有子任务不变。`);
     } finally {
       this.modelChanges.delete(target.id);
@@ -417,7 +600,93 @@ export class SessionManager {
     }
   }
 
-  private async handleCommand(message: BridgeMessage, name: string, argument: string,
+  private switchJournalPath(id: string): string {
+    if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error('Agent 切换操作标识无效。');
+    return join(this.config.dataDir, 'agent-switches', id + '.json');
+  }
+  private saveSwitchJournal(journal: AgentSwitchJournal): void {
+    const path = this.switchJournalPath(journal.target.id); mkdirSync(join(this.config.dataDir, 'agent-switches'), { recursive: true });
+    journal.updatedAt = new Date().toISOString(); const temp = path + '.' + randomUUID() + '.tmp';
+    writeFileSync(temp, JSON.stringify(journal), { mode: 0o600 }); renameSync(temp, path);
+  }
+  private async commitAgentSwitch(journal: AgentSwitchJournal): Promise<void> {
+    const source = this.store.getConversation(journal.source.id), target = this.store.getConversation(journal.target.id);
+    const active = source ? this.store.getActive(source.userId) : null;
+    if (!source || !target || source.userId !== target.userId || active?.id !== source.id && active?.id !== target.id
+      || (this.config.controllerMode && !target.nativeId)) throw new Error('切换操作的来源、目标或原生会话无法确认，拒绝重新派发。');
+    journal.phase = 'committing'; this.pendingSwitches.add(source.userId); this.saveSwitchJournal(journal);
+    if (this.config.controllerMode && !this.options.onRebindSwitch) throw new Error('Agent 切换提交缺少任务重绑入口。');
+    await this.options.onRebindSwitch?.(source, target);
+    this.store.rebindQueued(source.id, target.id);
+    if (this.store.getActive(source.userId)?.id !== target.id) this.store.setActive(source.userId, target.id, 'agent-switch');
+    this.store.savePreferences(target);
+    journal.phase = 'committed'; journal.target = this.store.getConversation(target.id)!; this.saveSwitchJournal(journal); this.pendingSwitches.delete(source.userId);
+    const latest = this.latestMessages.get(source.userId); if (latest?.conversationId === source.id) this.latestMessages.set(source.userId, { ...latest, conversationId: target.id });
+  }
+  private async recoverAgentSwitches(): Promise<void> {
+    const directory = join(this.config.dataDir, 'agent-switches'); if (!existsSync(directory)) return;
+    for (const file of readdirSync(directory).filter(name => /^[a-f0-9-]{36}\.json$/i.test(name))) {
+      const journal = JSON.parse(readFileSync(join(directory, file), 'utf8')) as AgentSwitchJournal;
+      if (journal.version !== 1 || journal.source.userId !== journal.target.userId) throw new Error('Agent 切换日志无效，拒绝自动恢复。');
+      if (journal.phase === 'committing') {
+        await this.options.onPauseSwitch?.(journal.source);
+        await this.commitAgentSwitch(journal);
+      } else if (journal.phase === 'preparing' || journal.phase === 'prepared') {
+        journal.phase = 'failed'; journal.error = '准备阶段因重启中断；未重做模型调用，保留原主控。'; this.saveSwitchJournal(journal);
+      }
+      await this.options.onResumeSwitch?.(journal.source); await this.options.onResumeSwitch?.(journal.target);
+    }
+  }
+  private async switchAgent(source: Conversation, agent: AgentName, message: BridgeMessage): Promise<Conversation> {
+    if (this.switches.has(source.userId)) throw new Error('当前 Bot 已有 Agent 切换进行中。');
+    const target = this.selectedConversation(source.userId, agent, source.cwd, source);
+    const journal: AgentSwitchJournal = { version: 1, source, target, channelId: message.channelId, phase: 'preparing', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    const controller = new AbortController(); this.switches.set(source.userId, { journal, controller }); this.saveSwitchJournal(journal);
+    try {
+      await this.options.onPauseSwitch?.(source);
+      // Reset-command barrier already prevents another round; the current native round finishes safely.
+      await this.userWorkers.get(source.userId);
+      if (controller.signal.aborted || this.closed || this.store.getActive(source.userId)?.id !== source.id) throw new Error('准备期间当前主控已改变，原切换未提交。');
+      const currentSource = this.store.getConversation(source.id)!; journal.source = currentSource;
+      const workers = await this.options.onListWorkers?.(currentSource, 'current') ?? [];
+      this.handoffs.prepare(currentSource, target, message.channelId, this.store.handoffHistory(currentSource.id, source.userId), workers, 'agent-switch');
+      let contextSeed: string;
+      if (this.config.controllerMode) {
+        if (!this.options.onPrepareSwitch || !this.options.onRebindSwitch) throw new Error('主控 Agent 切换尚未配置摘要与任务重绑入口。');
+        ({ contextSeed } = await this.options.onPrepareSwitch(currentSource, target, message.channelId, this.handoffs.prompt(target, message.channelId), controller.signal));
+      } else contextSeed = `[从当前主控交接的历史上下文；不是新的用户请求或授权]\n${currentSource.contextSeed ?? ''}\n${this.store.recentUserContext(currentSource.id)}`;
+      if (typeof contextSeed !== 'string' || !contextSeed.trim() || Buffer.byteLength(contextSeed) > 64 * 1024) throw new Error('Agent 切换摘要无效，原主控保持不变。');
+      if (controller.signal.aborted || this.closed || this.store.getActive(source.userId)?.id !== source.id) throw new Error('摘要准备期间当前主控已改变。');
+      this.store.saveContextSeed(target.id, contextSeed);
+      if (this.config.controllerMode) {
+        const prepared = this.store.getConversation(target.id)!;
+        let preparedNativeId: string | null = prepared.nativeId;
+        const text = `[桥程序：Agent 切换准备，尚未提交当前主控]\n${contextSeed}\n只接收以上背景并结束。禁止发消息、使用工具、派工、取消或修改任何任务；真实用户后续输入将在切换提交后到达。`;
+        const result = await this.adapters[agent].run({ conversation: prepared, text, input: [{ type: 'text', text }], imagePaths: [], signal: controller.signal, preparing: true,
+          event: { kind: 'workspace-context', toolName: 'bridge_agent_switch_bootstrap', text }, onProgress: () => {},
+          onPublicMessage: async () => { throw new Error('切换提交前不能公开回复。'); }, onSilent: async () => { throw new Error('切换准备不是群参与轮次。'); },
+          onNativeId: nativeId => { if (!nativeId || preparedNativeId && preparedNativeId !== nativeId) throw new Error('切换准备返回了不同原生主控会话。'); preparedNativeId = nativeId; this.store.saveNativeId(target.id, nativeId); },
+          onModel: model => this.store.saveActualModel(target.id, model), onReasoningEffort: effort => this.store.saveActualEffort(target.id, effort),
+        });
+        if (!result.nativeId || preparedNativeId && result.nativeId !== preparedNativeId) throw new Error('目标 Agent 没有确认一致的原生主控会话，未切换。');
+        this.store.saveNativeId(target.id, result.nativeId);
+      }
+      if (controller.signal.aborted || this.closed || this.store.getActive(source.userId)?.id !== source.id) throw new Error('目标准备期间当前主控已改变。');
+      journal.target = this.store.getConversation(target.id)!; journal.phase = 'prepared'; this.saveSwitchJournal(journal);
+      await this.commitAgentSwitch(journal);
+      // Close only the old idle controller transport. Execution workers and plans were rebound, not cancelled.
+      await this.adapters[source.agent].interrupt(source.id).catch(() => undefined);
+      return this.store.getConversation(target.id)!;
+    } catch (error) {
+      if (journal.phase !== 'committing') { journal.phase = 'failed'; journal.error = String(error).slice(0, 1500); this.saveSwitchJournal(journal); }
+      else this.pendingSwitches.add(source.userId);
+      throw error;
+    } finally {
+      this.switches.delete(source.userId);
+      if (journal.phase !== 'committing') { await this.options.onResumeSwitch?.(source); await this.options.onResumeSwitch?.(target); }
+      if (!this.closed && !this.pendingSwitches.has(source.userId)) this.completionAvailable();
+    }
+  }  private async handleCommand(message: BridgeMessage, name: string, argument: string,
     reply: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
     const current = this.store.getActive(message.userId);
     if (!current && ['stop', 'new', 'cwd', 'agent'].includes(name)) {
@@ -434,7 +703,7 @@ export class SessionManager {
       case 'new':
       case 'agent': {
         if (name === 'agent' && !argument) {
-          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}\n/agent codex → Codex CLI\n/agent claude → Claude Code\n切换自动续接当前目录下的上次会话；/new 明确新建，/chats 只读查看历史。`); return;
+          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}\n/agent codex → Codex CLI\n/agent claude → Claude Code\n真正切换时交接当前 Bot 的最新上下文，保留助手与计划；/new 明确新建，/chats 只读查看历史。`); return;
         }
         const request = name === 'new' ? parseNewArguments(argument) : argument === 'codex' || argument === 'claude' ? { agent: argument, continue: false } : null;
         if (!request) {
@@ -449,17 +718,13 @@ export class SessionManager {
         if (name === 'agent' && current?.agent === agent) {
           await reply(`当前已是 ${agentDisplayName(agent)}，继续原会话 ${current.id.slice(0, 8)}。\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n需要清空上下文请用 /new。`); return;
         }
-        if (name === 'agent') {
-          const previous = this.store.latestAgentConversation(message.userId, agent, current?.cwd ?? this.config.workspace, this.config.controllerMode === true);
-          if (previous) {
-            await this.activate(message.userId, previous);
-            this.initializeWorkspace(previous, message);
-            await reply(`已切换到 ${agentDisplayName(agent)}，恢复会话 ${previous.id.slice(0, 8)}：${previous.title}\n原生会话：${previous.nativeId ? `…${previous.nativeId.slice(-6)}` : '尚未创建'}\n目录：${previous.cwd}`);
-            this.wake(previous.id);
-            return;
-          }
+        if (name === 'agent' && current) {
+          const switched = await this.switchAgent(current, agent, message);
+          await reply(`已切换到 ${agentDisplayName(agent)}，接续当前 Bot 的最新上下文。\n会话：${switched.id.slice(0, 8)}\n原生会话：${switched.nativeId ? `…${switched.nativeId.slice(-6)}` : '下轮创建'}\n普通助手与定时计划保留。`);
+          if (this.store.nextQueued(switched.id)) this.wake(switched.id);
+          return;
         }
-        const target = this.store.createConversation(message.userId, agent, current?.cwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true });
+        const target = this.selectedConversation(message.userId, agent, current?.cwd ?? this.config.workingCwd ?? this.config.workspace, current);
         if (request.continue) {
           // Freeze the confirmed parent selection before cancelling old work; a remote default cannot choose it.
           const model = (current!.agent === agent ? current!.model ?? current!.actualModel : null)
@@ -469,7 +734,7 @@ export class SessionManager {
           this.store.setModel(target.id, model);
           if (current!.agent === agent) this.store.setEffort(target.id, current!.effort ?? current!.actualEffort ?? null);
           this.handoffs.prepare(current!, this.store.getConversation(target.id)!, message.channelId,
-            this.store.handoffHistory(current!.id, message.userId, message.channelId), previousWorkers);
+            this.store.handoffHistory(current!.id, message.userId), previousWorkers);
         } else {
           if (current?.agent === agent && (current.model || current.modelPolicy === 'cli-default')) this.store.setModel(target.id, current.model ?? null);
           if (current?.agent === agent && current.effort) this.store.setEffort(target.id, current.effort);
@@ -486,7 +751,7 @@ export class SessionManager {
       case 'cwd': {
         if (!argument) { await reply('用法：/cwd 目录路径'); return; }
         const value = argument.replace(/^(["'])([\s\S]*)\1$/, '$2');
-        const cwd = isAbsolute(value) ? value : resolve(current?.cwd ?? this.config.workspace, value);
+        const cwd = isAbsolute(value) ? value : resolve(current?.cwd ?? this.config.workingCwd ?? this.config.workspace, value);
         if (!statSync(cwd).isDirectory()) { await reply('指定路径不是目录。'); return; }
         const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd, { controllerMode: this.config.controllerMode === true });
         if (current?.model || current?.modelPolicy === 'cli-default') this.store.setModel(target.id, current.model ?? null);
@@ -503,7 +768,7 @@ export class SessionManager {
         return;
       }
       case 'resume': {
-        await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 自动续接当前目录的会话；/new 新建，/chats 只读查看历史。'); return;
+        await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 交接当前 Bot 的最新上下文；/new 新建，/chats 只读查看历史。'); return;
       }
       case 'computers': {
         const args = argument.split(/\s+/).filter(Boolean);
@@ -588,11 +853,12 @@ export class SessionManager {
   }
 
   private pumpSupplements(target: Conversation, turn: RunningTurn): void {
-    if (this.config.controllerMode) return;
+    if (this.config.controllerMode || this.store.getMessage(turn.messageId)?.groupContext) return;
     turn.supplements = turn.supplements.then(async () => {
       const adapter = this.adapters[target.agent];
       if (!adapter.steer || !turn.ready || !turn.executing || turn.controller.signal.aborted || this.closed || this.draining) return;
       for (const item of this.store.queuedBatch(target.id)) {
+        if (item.groupContext) return;
         if (!turn.executing || turn.controller.signal.aborted || this.closed || this.draining
           || this.store.getActive(item.userId)?.id !== target.id) return;
         // 在 RPC 写入前持久化；崩溃后 steering 不能按 queued 自动重做。
@@ -637,7 +903,9 @@ export class SessionManager {
         && this.options.taskRegistry?.getNextEvent(conversationId)?.purpose === 'workspace-context')) return;
     if (this.closed || this.draining || this.recovering || this.workers.has(conversationId) || this.modelChanges.has(conversationId)) return;
     const target = this.store.getConversation(conversationId);
-    if (!target || (this.config.scopePrefix && !target.userId.startsWith(this.config.scopePrefix)) || this.userWorkers.has(target.userId)) return;
+    if (!target || (this.config.scopePrefix && !target.userId.startsWith(this.config.scopePrefix)) || this.options.authorizeUser?.(target.userId) === false || this.userWorkers.has(target.userId)) return;
+    const head = this.store.nextQueued(conversationId);
+    if (head && !this.canProcessQueued(head)) return;
     const worker = Promise.resolve().then(() => this.processQueue(conversationId)).finally(() => {
       this.workers.delete(conversationId);
       if (this.userWorkers.get(target.userId) === worker) this.userWorkers.delete(target.userId);
@@ -655,7 +923,7 @@ export class SessionManager {
   }
 
   /** Explicit coordinating output never treats prose file citations as upload requests. */
-  private async publishControlled(target: Conversation, route: { userId: string; channelId: string },
+  private async publishControlled(target: Conversation, route: { userId: string; channelId: string; groupContext?: GroupTurnContext },
     text: string, paths: string[], messageKey: string | undefined, signal: AbortSignal,
     current: () => boolean, model: string | null, effort: string | null): Promise<void> {
     if (!current()) throw new Error('当前主控轮次已经停止');
@@ -677,10 +945,11 @@ export class SessionManager {
       const header = replyHeader(identity, this.store.getLastDelivery(route.userId, route.channelId), model, effort);
       const fallback = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '';
       if (!text.trim() && !fallback) throw new Error('公开回复不能为空');
-      await this.sink.sendText(route.channelId, `${header}\n\n${text || fallback}`, {
+      const deliver = () => this.sink.sendText(route.channelId, `${header}\n\n${text || fallback}`, {
         repeatHeader: header, signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
         ...(outgoing.files.length ? { files: outgoing.files } : {}),
       });
+      if (route.groupContext && this.options.onGroupPublish) await this.options.onGroupPublish(route.groupContext, text, paths, deliver); else await deliver();
       if (!current()) throw new Error('主控轮次在投递期间停止');
       this.store.finishPublicMessage(key, 'delivered');
       this.store.saveDelivery(route.userId, route.channelId, identity);
@@ -708,12 +977,17 @@ export class SessionManager {
         continue;
       }
       const target = this.store.getConversation(conversationId);
-      if (!target || !this.config.allowedUserIds.includes(item.userId)
+      if (!target || !this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false
         || this.store.getActive(item.userId)?.id !== conversationId) {
-        this.store.setState(item.id, 'cancelled'); continue;
+        this.authorizedGroupEvents.delete(item.id); this.store.setState(item.id, 'cancelled'); continue;
       }
+      if (!this.canProcessQueued(item)) return;
+      this.initializeWorkspace(target, item);
       const controller = new AbortController();
-      const batch = this.config.controllerMode || this.options.mergeDelayMs === 0 ? [item] : this.store.queuedBatch(conversationId);
+      const pending = this.store.queuedBatch(conversationId), firstGroup = pending.findIndex(value => value.groupContext);
+      const batch = this.config.controllerMode || this.options.mergeDelayMs === 0 || item.groupContext ? [item]
+        : firstGroup < 0 ? pending : pending.slice(0, firstGroup);
+      this.authorizedGroupEvents.delete(item.id);
       const turn: RunningTurn = { messageId: item.id, messageIds: batch.map(value => value.id),
         conversationId, controller, ready: false, executing: true, supplements: Promise.resolve() };
       this.running.set(item.userId, turn);
@@ -725,14 +999,20 @@ export class SessionManager {
       let actualModel: string | null = null;
       let actualEffort: string | null = null;
       let contextId: string | undefined;
+      let groupContext = item.groupContext;
+      let groupOutcome: 'completed' | 'silent' | 'failed' = 'failed';
+      let silent = false;
       try {
+        if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
         const context = this.options.taskRegistry?.createContext({
           conversationId, userId: item.userId, channelId: item.channelId, originMessageId: item.id,
-          cwd: target.cwd, agent: target.agent, nativeId: target.nativeId,
+          cwd: target.cwd, agent: target.agent, nativeId: target.nativeId, ...(groupContext ? { groupContext, ...(groupContext.eventKind ? { purpose: 'host-event' as const } : {}) } : {}),
         });
         contextId = context?.contextId;
         const result = await this.adapters[target.agent].run({
           ...(context ? { taskContextPath: context.contextPath } : {}),
+          ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
+          ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: item.text } } : {}),
           conversation: target, text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
           imagePaths: batch.flatMap(value => value.imagePaths), input: [
             ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...this.input(batch),
@@ -757,7 +1037,7 @@ export class SessionManager {
           onPublicMessage: async (text, paths = [], key) => {
             if (!current()) throw new Error('当前主控轮次已经停止');
             this.store.setReplyState(turn.messageIds, 'pending');
-            await this.publishControlled(target, item, text, paths, key, controller.signal, current, actualModel, actualEffort);
+            await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort);
             if (current()) { this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds); }
           },
         });
@@ -776,6 +1056,7 @@ export class SessionManager {
           || this.store.getMessage(item.id)?.state !== 'completed') continue;
         for (const id of turn.messageIds) this.store.setState(id, 'completed');
         if (result.controlledOutput) {
+          groupOutcome = silent ? 'silent' : 'completed';
           this.store.setReplyState(turn.messageIds, 'delivered');
           continue;
         }
@@ -790,14 +1071,16 @@ export class SessionManager {
         const identity = { conversationId, agent: target.agent, nativeId: result.nativeId };
         const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort);
         const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '本轮完成（没有文本输出）。';
-        await this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
+        const deliver = () => this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
           { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
             ...(outgoing.files.length ? { files: outgoing.files } : {}) });
+        if (groupContext && this.options.onGroupPublish) await this.options.onGroupPublish(groupContext, outgoing.text || attachmentText, [], deliver); else await deliver();
         if (!delivering()) continue;
         // Failed or partially delivered replies never establish successful continuity.
         this.store.saveDelivery(item.userId, item.channelId, identity);
         this.store.setReplyState(turn.messageIds, 'delivered');
         this.markReplyDelivered(turn.messageIds);
+        groupOutcome = 'completed';
       } catch (error) {
         turn.executing = false;
         await turn.supplements;
@@ -816,6 +1099,7 @@ export class SessionManager {
         turn.executing = false;
         await turn.supplements;
         if (contextId) this.options.taskRegistry?.closeContext(contextId);
+        if (groupContext) await this.options.onGroupTurnFinished?.(groupContext, groupOutcome).catch(() => undefined);
         if (this.running.get(item.userId) === turn) this.running.delete(item.userId);
         this.refreshTaskCounts(conversationId);
       }
@@ -827,7 +1111,7 @@ export class SessionManager {
     if (this.closed || this.draining || this.recovering || !this.options.taskRegistry) return;
     this.refreshTaskCounts();
     for (const event of this.options.taskRegistry.queuedEvents()) {
-      if (!this.config.allowedUserIds.includes(event.userId) || (this.resetCommands.has(event.userId) && event.purpose !== 'workspace-context')) continue;
+      if (!this.config.allowedUserIds.includes(event.userId) || this.options.authorizeUser?.(event.userId) === false || (this.resetCommands.has(event.userId) && event.purpose !== 'workspace-context')) continue;
       if (!this.store.getConversation(event.conversationId)) {
         if (this.options.taskRegistry.claimEvent(event.id)) this.options.taskRegistry.markUncertain(event.id, '原父会话不存在');
         continue;
@@ -891,9 +1175,9 @@ export class SessionManager {
     // Even a corrupt completion journal cannot select another person's DM or session.
     const workspaceContext = event.purpose === 'workspace-context' && target?.controllerMode;
     if (!target || !origin || (!workspaceContext && origin.state === 'command')
-      || (origin.conversationId !== target.id && !(workspaceContext && origin.conversationId === null && command(origin.text)))
+      || (origin.conversationId !== target.id && !(workspaceContext && origin.conversationId === null && command(origin.text)) && !event.reboundFrom?.some(previous => previous.conversationId === origin.conversationId && this.store.getConversation(previous.conversationId)?.userId === event.userId))
       || target.userId !== event.userId || origin.userId !== event.userId || origin.channelId !== event.channelId
-      || target.agent !== event.agent || target.cwd !== event.cwd || !this.config.allowedUserIds.includes(event.userId)) return null;
+      || target.agent !== event.agent || target.cwd !== event.cwd || !this.config.allowedUserIds.includes(event.userId) || this.options.authorizeUser?.(event.userId) === false) return null;
     return target;
   }
 
@@ -905,6 +1189,12 @@ export class SessionManager {
       return;
     }
     if (!registry.claimEvent(event.id)) return;
+    if (event.groupContext) {
+      if (!event.wakeAllowed || !this.options.onGroupCompletion) { registry.markDelivered(event.id); return; }
+      try { await this.options.onGroupCompletion(event); registry.markDelivered(event.id); }
+      catch (error) { registry.markUncertain(event.id, String(error)); }
+      return;
+    }
     const observation = event.kind === 'worker-progress';
     const workspaceContext = event.purpose === 'workspace-context';
     if (observation && (!this.config.controllerMode || !target.controllerMode || !registry.observationRelevant(event.id))) { registry.markDelivered(event.id); return; }
@@ -933,7 +1223,7 @@ export class SessionManager {
     if ((!workspaceContext && !boundNativeId) || target.nativeId !== boundNativeId) {
       registry.markUncertain(event.id, '原生父会话未绑定或已改变，未自动新建或切换会话');
       if (workspaceContext) {
-        this.store.prepareWorkspaceNotice(target.id, 'unknown'); await this.sendWorkspaceNotice(target);
+        this.store.prepareWorkspaceNotice(target.id, 'unknown'); await this.reportInitializationState(target, 'unknown', this.store.getMessage(event.originMessageId) ?? undefined); await this.sendWorkspaceNotice(target);
         registry.markUncertainNotified(event.id); return;
       }
       await this.sink.sendText(event.channelId, `${notice}\n父会话身份无法确认，未自动汇总。结果已保留，请先核对。`)
@@ -999,6 +1289,7 @@ export class SessionManager {
         if (introductionRequested) {
           if (!introductionSent) this.store.prepareWorkspaceNotice(target.id, 'introduction-failed');
         } else if (event.status !== 'completed') this.store.prepareWorkspaceNotice(target.id, event.status === 'cancelled' ? 'read-cancelled' : 'read-failed');
+        await this.reportInitializationState(this.store.getConversation(target.id)!, event.status === 'completed' ? 'ready' : event.status === 'cancelled' ? 'read-cancelled' : 'read-failed', this.store.getMessage(event.originMessageId) ?? undefined);
         registry.markDelivered(event.id);
         await this.sendWorkspaceNotice(target);
         return;
@@ -1019,7 +1310,7 @@ export class SessionManager {
     } catch (error) {
       registry.markUncertain(event.id, String(error));
       if (workspaceContext) {
-        if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.sendWorkspaceNotice(target); }
+        if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.reportInitializationState(target, 'load-failed').catch(() => undefined); await this.sendWorkspaceNotice(target); }
         registry.markUncertainNotified(event.id);
       } else if (observation) registry.markUncertainNotified(event.id);
       else if (!this.closed) await this.sink.sendText(event.channelId,
@@ -1041,6 +1332,7 @@ export class SessionManager {
   }
 
   private async closeResources(): Promise<void> {
+    for (const item of this.switches.values()) item.controller.abort();
     for (const turn of this.running.values()) {
       turn.controller.abort();
       this.store.setReplyState(turn.messageIds, 'cancelled');
@@ -1052,6 +1344,7 @@ export class SessionManager {
       catch (cause) { throw new Error(`${agent} close: ${cause instanceof Error ? cause.message : String(cause)}`, { cause }); }
     }));
     await Promise.allSettled([...this.initializations.values()].map(initialization => initialization.promise));
+    await Promise.allSettled([...this.initializationRecoveries]);
     await Promise.allSettled([...this.workers.values(), ...this.interruptPromises, ...this.detachPromises.values(), ...[...this.noticeSends.values()].map(notice => notice.promise)]);
     const failures = adapterResults.flatMap(result => result.status === 'rejected' ? [result.reason as Error] : []);
     try { this.store.close(); }

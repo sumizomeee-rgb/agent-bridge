@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { AgentName, BridgeMessage, Conversation } from './types.js';
+import { validMessageId } from './routing.js';
 
 export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
 export interface InboxItem extends BridgeMessage {
@@ -36,17 +37,22 @@ function inbox(row: Row): InboxItem {
   return {
     id: String(row.id), userId: String(row.user_id), channelId: String(row.channel_id),
     text: String(row.text), imagePaths: JSON.parse(String(row.images_json)) as string[],
+    ...(row.group_json ? { groupContext: JSON.parse(String(row.group_json)) as BridgeMessage['groupContext'] } : {}),
     conversationId: row.conversation_id === null ? null : String(row.conversation_id),
     state: String(row.state) as InboxState,
     replyState: row.reply_state == null ? null : String(row.reply_state) as InboxItem['replyState'],
   };
 }
 
+export interface ControllerBinding {
+  getActive(userId: string): string | null;
+  setActive(userId: string, conversationId: string, reason?: 'reset' | 'agent-switch'): void;
+}
 export class SessionStore {
   readonly path: string;
   private readonly db: DatabaseSync;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, private readonly binding?: ControllerBinding) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'bridge.sqlite');
     this.db = new DatabaseSync(this.path);
@@ -83,6 +89,9 @@ export class SessionStore {
         channel_id TEXT NOT NULL, source_message_id TEXT NOT NULL, outcome TEXT,
         state TEXT NOT NULL DEFAULT 'waiting', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS bot_preferences (
+        agent TEXT PRIMARY KEY, model TEXT, model_policy TEXT, effort TEXT
+      );
       CREATE TABLE IF NOT EXISTS delivered_replies (
         user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
         conversation_id TEXT NOT NULL REFERENCES conversations(id),
@@ -100,6 +109,7 @@ export class SessionStore {
     if (!columns.has('controller_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN controller_mode INTEGER NOT NULL DEFAULT 0');
     if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
     const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
+    if (!inboxColumns.has('group_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN group_json TEXT');
     if (!inboxColumns.has('reply_state')) this.db.exec('ALTER TABLE inbox ADD COLUMN reply_state TEXT');
     const publicColumns = new Set(this.db.prepare('PRAGMA table_info(controller_public_messages)').all().map(row => String(row.name)));
     if (!publicColumns.has('text')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN text TEXT');
@@ -112,10 +122,10 @@ export class SessionStore {
   addMessage(message: BridgeMessage, conversationId: string | null, state: InboxState): boolean {
     const now = new Date().toISOString();
     const result = this.db.prepare(`INSERT OR IGNORE INTO inbox
-      (id, user_id, channel_id, text, images_json, conversation_id, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      (id, user_id, channel_id, text, images_json, conversation_id, state, created_at, updated_at, group_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       message.id, message.userId, message.channelId, message.text,
-      JSON.stringify(message.imagePaths), conversationId, state, now, now,
+      JSON.stringify(message.imagePaths), conversationId, state, now, now, message.groupContext ? JSON.stringify(message.groupContext) : null,
     );
     return Number(result.changes) === 1;
   }
@@ -129,6 +139,22 @@ export class SessionStore {
       });
     }
     return [...channels.values()];
+  }
+
+  /** Only genuine platform DM inputs can seed the platform history journal. */
+  knownDMChannels(): Array<{ userId: string; channelId: string; cursor: string }> {
+    const channels = new Map<string, { userId: string; channelId: string; cursor: string }>();
+    for (const row of this.db.prepare('SELECT user_id,channel_id,id FROM inbox WHERE group_json IS NULL ORDER BY sequence').all()) {
+      if (!validMessageId(String(row.id))) continue;
+      const route = { userId: String(row.user_id), channelId: String(row.channel_id), cursor: String(row.id) };
+      channels.set(JSON.stringify([route.userId, route.channelId]), route);
+    }
+    return [...channels.values()];
+  }
+
+  /** Only a trusted host can reauthorize an already queued group event after a continuous switch. */
+  updateQueuedGroupContext(id: string, conversationId: string, context: NonNullable<BridgeMessage['groupContext']>): boolean {
+    return Number(this.db.prepare("UPDATE inbox SET group_json=? WHERE id=? AND conversation_id=? AND state='queued'").run(JSON.stringify(context), id, conversationId).changes) === 1;
   }
 
   claimPublicMessage(id: string, conversationId: string, nativeId: string, channelId: string,
@@ -153,15 +179,17 @@ export class SessionStore {
   }
 
   /** Genuine inputs and confirmed public replies, confined to this user's exact conversation and chat. */
-  handoffHistory(conversationId: string, userId: string, channelId: string): Array<{ role: 'user' | 'assistant'; text: string; at: string; state: string }> {
+  handoffHistory(conversationId: string, userId: string, channelId?: string): Array<{ role: 'user' | 'assistant'; text: string; at: string; state: string }> {
     const owner = this.getConversation(conversationId);
     if (!owner || owner.userId !== userId) throw new Error('不能读取其他用户的会话。');
+    const channelFilter = channelId === undefined ? '' : ' AND channel_id=?';
+    const bindings = channelId === undefined ? [conversationId, userId] : [conversationId, userId, channelId];
     const inputs = this.db.prepare(`SELECT text,created_at,state FROM inbox WHERE id IN (
-      SELECT id FROM (SELECT id FROM inbox WHERE conversation_id=? AND user_id=? AND channel_id=? ORDER BY sequence LIMIT 2)
-      UNION SELECT id FROM (SELECT id FROM inbox WHERE conversation_id=? AND user_id=? AND channel_id=? ORDER BY sequence DESC LIMIT 160)
-    ) ORDER BY sequence`).all(conversationId, userId, channelId, conversationId, userId, channelId);
+      SELECT id FROM (SELECT id FROM inbox WHERE conversation_id=? AND user_id=?${channelFilter} ORDER BY sequence LIMIT 2)
+      UNION SELECT id FROM (SELECT id FROM inbox WHERE conversation_id=? AND user_id=?${channelFilter} ORDER BY sequence DESC LIMIT 160)
+    ) ORDER BY sequence`).all(...bindings, ...bindings);
     const replies = this.db.prepare(`SELECT text,created_at,state FROM controller_public_messages
-      WHERE conversation_id=? AND channel_id=? AND state='delivered' AND text IS NOT NULL ORDER BY created_at DESC LIMIT 160`).all(conversationId, channelId);
+      WHERE conversation_id=?${channelId === undefined ? '' : ' AND channel_id=?'} AND state='delivered' AND text IS NOT NULL ORDER BY created_at DESC LIMIT 160`).all(conversationId, ...(channelId === undefined ? [] : [channelId]));
     return [...inputs.map(row => ({ role: 'user' as const, text: String(row.text), at: String(row.created_at), state: String(row.state) })),
       ...replies.map(row => ({ role: 'assistant' as const, text: String(row.text), at: String(row.created_at), state: String(row.state) }))]
       .sort((a, b) => a.at.localeCompare(b.at));
@@ -248,18 +276,33 @@ export class SessionStore {
   }
 
   getActive(userId: string): Conversation | null {
+    if (this.binding) { const id = this.binding.getActive(userId); return id ? this.getConversation(id) : null; }
     const row = this.db.prepare(`SELECT c.* FROM conversations c
       JOIN active_conversations a ON a.conversation_id = c.id WHERE a.user_id = ?`).get(userId);
     return row ? conversation(row) : null;
   }
 
-  setActive(userId: string, conversationId: string): void {
+  setActive(userId: string, conversationId: string, reason: 'reset' | 'agent-switch' = 'reset'): void {
     const target = this.getConversation(conversationId);
     if (!target || target.userId !== userId) throw new Error('会话不属于当前用户');
+    if (this.binding) { this.binding.setActive(userId, conversationId, reason); return; }
     this.db.prepare(`INSERT INTO active_conversations (user_id, conversation_id) VALUES (?, ?)
       ON CONFLICT(user_id) DO UPDATE SET conversation_id = excluded.conversation_id`).run(userId, conversationId);
   }
 
+  savePreferences(item: Conversation): void {
+    this.db.prepare(`INSERT INTO bot_preferences(agent,model,model_policy,effort) VALUES(?,?,?,?)
+      ON CONFLICT(agent) DO UPDATE SET model=excluded.model,model_policy=excluded.model_policy,effort=excluded.effort`)
+      .run(item.agent, item.model ?? null, item.modelPolicy ?? null, item.effort ?? null);
+  }
+  preferences(agent: AgentName): { model: string | null; modelPolicy?: 'cli-default'; effort: string | null } | null {
+    const row = this.db.prepare('SELECT * FROM bot_preferences WHERE agent=?').get(agent);
+    return row ? { model: row.model == null ? null : String(row.model), effort: row.effort == null ? null : String(row.effort),
+      ...(row.model_policy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}) } : null;
+  }
+  saveContextSeed(id: string, contextSeed: string): void {
+    this.db.prepare('UPDATE conversations SET context_seed=?,updated_at=? WHERE id=?').run(contextSeed, new Date().toISOString(), id);
+  }
   saveNativeId(id: string, nativeId: string): void {
     this.db.prepare('UPDATE conversations SET native_id = ?, updated_at = ? WHERE id = ?')
       .run(nativeId, new Date().toISOString(), id);

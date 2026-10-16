@@ -169,7 +169,7 @@ test('用户和私聊的投递历史独立，另一个 channel 的回复不会�
   assert(inspect(store => store.getLastDelivery('owner', 'second-dm')));
 });
 
-test('/agent 菜单和选择当前 Agent 不重置，来回切换恢复原上下文和模型选择', async t => {
+test('/agent 菜单和同后端选择不重置，来回切换向前交接并保留后端模型选择', async t => {
   const { f, send, respond, inspect } = fixture(t);
   await send('/agent');
   assert.match(f.replies.at(-1)!.text, /Codex CLI/);
@@ -182,22 +182,23 @@ test('/agent 菜单和选择当前 Agent 不重置，来回切换恢复原上下
   assert.equal(inspect(store => store.getActive('owner'))!.id, codex.id);
   assert(!((await respond('same agent')).text.includes('✅')));
   await send('/agent claude');
-  assert.match(f.replies.at(-1)!.text, /已新建 Claude Code/);
+  assert.match(f.replies.at(-1)!.text, /已切换到 Claude Code/);
   const claudeReply = await respond('claude context');
   assert.match(claudeReply.text, /^\[Claude · 模型未知 · 强度未知/);
   assert(!claudeReply.text.includes('✅'));
   const claude = inspect(store => store.getActive('owner')!);
   await send('/agent codex');
-  assert.match(f.replies.at(-1)!.text, /恢复会话/);
-  assert.equal(inspect(store => store.getActive('owner'))!.id, codex.id);
+  assert.match(f.replies.at(-1)!.text, /最新上下文/);
+  assert.notEqual(inspect(store => store.getActive('owner'))!.id, codex.id);
+  assert.match(inspect(store => store.getActive('owner'))!.contextSeed!, /claude context/);
   assert.equal(inspect(store => store.getActive('owner'))!.model, 'chosen-codex-model');
   assert(!((await respond('back to codex')).text.includes('✅')));
-  assert.equal(f.codex.turns.at(-1)!.conversation.nativeId, codex.nativeId);
+  assert.equal(f.codex.turns.at(-1)!.conversation.nativeId, null);
   await send('/agent claude');
-  assert.equal(inspect(store => store.getActive('owner'))!.id, claude.id);
+  assert.notEqual(inspect(store => store.getActive('owner'))!.id, claude.id);
 });
 
-test('/agent 按用户、Agent 和 cwd 精确恢复，超过会话列表上限仍能找到旧上下文', async t => {
+test('/agent 不从历史列表猜目标后端分支，即使同用户和目录存在旧会话', async t => {
   const { f, send, inspect } = fixture(t);
   const otherCwd = join(f.root, 'other-cwd'); mkdirSync(otherCwd);
   const expected = inspect(store => {
@@ -209,8 +210,9 @@ test('/agent 按用户、Agent 和 cwd 精确恢复，超过会话列表上限�
     return target;
   });
   await send('/agent claude');
-  assert.equal(inspect(store => store.getActive('owner'))!.id, expected.id);
-  assert.match(f.replies.at(-1)!.text, /原生会话：…abcdef/);
+  assert.notEqual(inspect(store => store.getActive('owner'))!.id, expected.id);
+  assert.equal(inspect(store => store.getActive('owner'))!.nativeId, null);
+  assert.match(f.replies.at(-1)!.text, /原生会话：下轮创建/);
   assert.equal(f.claude.turns.length, 0);
 });
 

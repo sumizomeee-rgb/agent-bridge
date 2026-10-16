@@ -5,7 +5,7 @@ import { Response, type fetch } from 'undici';
 import WebSocket, { WebSocketServer } from 'ws';
 import { DiscordTransport } from '../src/discord.js';
 import { OrderedInbox } from '../src/inbox.js';
-import { SLASH_COMMANDS, slashText, type SlashInteraction } from '../src/slash.js';
+import { SLASH_COMMANDS, GROUP_SLASH_COMMANDS, slashText, type SlashInteraction } from '../src/slash.js';
 import type { BridgeConfig, IncomingDM } from '../src/types.js';
 
 interface Request { path: string; method: string; headers: Headers; body: any; signal?: AbortSignal }
@@ -18,7 +18,7 @@ async function until(check: () => boolean): Promise<void> {
   while (!check()) { if (Date.now() > deadline) throw new Error('等待模拟交互超时'); await delay(5); }
 }
 
-async function fixture(t: TestContext, readyApplication = true, allowedUserIds = ['111']) {
+async function fixture(t: TestContext, readyApplication = true, allowedUserIds = ['111'], groupMode = false) {
   const requests: Request[] = [], received: IncomingDM[] = [], logs: string[] = [], sockets: WebSocket[] = [];
   let handler: (request: Request) => Promise<Response> | Response = request =>
     request.path === '/applications/@me' ? new Response('{"id":"777"}', { status: 200 }) : ok();
@@ -41,7 +41,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
     });
   });
   const config: BridgeConfig = {
-    token: 'FAKE_BOT_SECRET', allowedUserIds, defaultAgent: 'codex', workspace: '.', proxyUrl: null,
+    token: 'FAKE_BOT_SECRET', allowedUserIds, groupMode, defaultAgent: 'codex', workspace: '.', proxyUrl: null,
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } },
     dataDir: '.', attachmentsDir: '.', logsDir: '.', maxImageBytes: 100,
   };
@@ -465,4 +465,35 @@ test('effort slash uses level, supports query/default, and rejects unknown optio
   assert.deepEqual(result('effort', [option('level', 'default')]), { text: '/effort default' });
   assert.ok('error' in result('effort', [option('level', 'extreme')]));
   assert.ok('error' in result('effort', [option('name', 'high')]));
+});
+
+
+test('群原生菜单来自唯一命令表，限定参数并独立注册在明确guild', async t => {
+  assert.deepEqual(GROUP_SLASH_COMMANDS.map(command => command.name), ['group', 'new', 'status', 'workers', 'stop', 'help']);
+  assert(GROUP_SLASH_COMMANDS.every(command => command.contexts.length === 1 && command.contexts[0] === 0));
+  assert.deepEqual(slashText({ name: 'group', options: [option('action', 'start')] }, 'group'), { text: '/group start' });
+  assert.deepEqual(slashText({ name: 'new' }, 'group'), { text: '/new' });
+  assert('error' in slashText({ name: 'new', options: [option('continue', true)] }, 'group'));
+  assert('error' in slashText({ name: 'workers', options: [option('scope', 'all')] }, 'group'));
+  assert('error' in slashText({ name: 'agent' }, 'group'));
+  assert('error' in slashText({ name: 'group', options: [option('action', 'start')] }));
+  const f = await fixture(t, true, ['111'], true); await f.transport.syncGroupSlashCommands('333');
+  assert.equal(f.requests[0]!.path, '/applications/777/guilds/333/commands');
+  assert.deepEqual(f.requests[0]!.body, GROUP_SLASH_COMMANDS);
+});
+
+test('Discord群原生命令取member.user并标记所选应用，禁用命令和非真人不执行', async t => {
+  const f = await fixture(t, true, ['111'], true);
+  const guild = { guild_id: '333', context: 0, channel: { id: '222', type: 11 }, user: undefined, member: { user: { id: '111', bot: false } } };
+  const id = f.dispatch({ ...guild, data: { name: 'group', type: 1, options: [option('action', 'start')] } });
+  await until(() => f.received.length === 1);
+  assert.deepEqual(f.callbacks()[0]!.body, { type: 5 });
+  assert.equal(f.received[0]!.id, id); assert.equal(f.received[0]!.text, '/group start');
+  assert.deepEqual(f.received[0]!.space, { kind: 'group', spaceId: '222', mentionedUserIds: ['999'] });
+  f.dispatch({ ...guild, data: { name: 'agent', type: 1 } });
+  f.dispatch({ ...guild, data: { name: 'new', type: 1, options: [option('agent', 'claude')] } });
+  f.dispatch({ ...guild, member: { user: { id: '444' } } });
+  f.dispatch({ ...guild, member: { user: { id: '111', bot: true } } });
+  await until(() => f.callbacks().length === 5);
+  assert.equal(f.received.length, 1); assert(f.callbacks().slice(1).every(request => request.body.type === 4));
 });

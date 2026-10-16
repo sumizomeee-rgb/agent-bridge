@@ -341,7 +341,7 @@ test('new chat 取消旧队列，迟到结果和进度不会回复新会话', as
   finally { db.close(); }
 });
 
-test('/agent 切换 backend 创建独立会话，切回自动恢复原 backend 上下文', async t => {
+test('/agent 来回切换始终交接最新上下文，不恢复旧后端分支', async t => {
   const f = fixture(t);
   await f.manager.handle(message('codex-start', 'codex context'));
   await waitFor(() => f.sink.replies.length === 1);
@@ -354,8 +354,10 @@ test('/agent 切换 backend 创建独立会话，切回自动恢复原 backend �
   await f.manager.handle(message('switch-back', '/agent codex'));
   await f.manager.handle(message('codex-again', 'codex again'));
   await waitFor(() => f.codex.calls.length === 2);
-  assert.equal(f.codex.calls[1]!.conversation.id, codexId);
-  assert.equal(f.codex.calls[1]!.conversation.nativeId, `codex-${codexId}`);
+  assert.notEqual(f.codex.calls[1]!.conversation.id, codexId);
+  assert.equal(f.codex.calls[1]!.conversation.nativeId, null);
+  assert.match(f.codex.calls[1]!.conversation.contextSeed!, /claude context/);
+  assert.match(f.codex.calls[1]!.conversation.contextSeed!, /codex context/);
   assert.equal(f.claude.calls.length, 1);
 });
 
@@ -565,22 +567,21 @@ test('忙中选择当前 Agent 不取消运行或排队任务，随后继续同�
   await waitFor(() => f.sink.replies.some(reply => reply.text.endsWith('\n\nreply:queued')));
 });
 
-test('忙中切换 Agent 取消旧任务和队列，旧结果不发到新 Agent 会话', async t => {
+test('忙中切换 Agent 等待当前轮安全结束，排队输入交给最新主控', async t => {
   const f = fixture(t, false);
   await f.manager.handle(message('old-agent-running', 'old'));
   await waitFor(() => f.codex.calls.length === 1);
-  await f.manager.handle(message('old-agent-queued', 'discard'));
-  await f.manager.handle(message('switch-busy-agent', '/agent claude'));
-  assert.equal(f.codex.calls[0]!.signal.aborted, true);
-  await f.manager.handle(message('new-agent-running', 'fresh'));
-  assert.equal(f.claude.calls.length, 0, '切换 Agent 等待旧 CLI 退出');
-  f.codex.finish(0, 'stale old agent answer');
+  await f.manager.handle(message('old-agent-queued', 'carry-forward'));
+  const switching = f.manager.handle(message('switch-busy-agent', '/agent claude'));
+  await setTimeout(0);
+  assert.equal(f.codex.calls[0]!.signal.aborted, false);
+  assert.equal(f.claude.calls.length, 0);
+  f.codex.finish(0, 'safe old answer');
+  await switching;
   await waitFor(() => f.claude.calls.length === 1);
+  assert.match(f.claude.calls[0]!.text, /carry-forward/);
   f.claude.finish(0, 'fresh Claude answer');
   await waitFor(() => f.sink.replies.some(reply => reply.text.endsWith('\n\nfresh Claude answer')));
-  assert(f.sink.replies.every(reply => !reply.text.includes('stale old agent answer')));
+  assert(f.sink.replies.some(reply => reply.text.endsWith('\n\nsafe old answer')));
   assert.equal(f.codex.calls.length, 1);
-  const reply = f.sink.replies.at(-1)!.text;
-  assert.match(reply, /^\[Claude ·/);
-  assert(!reply.includes('✅'));
 });

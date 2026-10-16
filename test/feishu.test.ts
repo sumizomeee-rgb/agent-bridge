@@ -163,3 +163,134 @@ test('飞书重启后找回自己的处理中表情，送达失败时保留处�
   failDone = true; await bridge.markReplyDelivered([{ ...source, id: prefix + '1700000000000|om_failed' }]); assert.deepEqual(deleted, ['ours']);
   assert.deepEqual(logs, ['FEISHU_RECEIPT_FAILED']); assert(!JSON.stringify(logs).includes('private-token'));
 });
+
+
+test('飞书群入口显式启用后只收白名单真人，实体提及和回复链保留原始平台身份', async t => {
+  const { config, cleanup } = setup(t); config.groupMode = true;
+  const accepted: IncomingDM[] = [], captured: IncomingDM[] = [];
+  const bridge = new FeishuTransport(config, async message => { accepted.push(message); }, { onReceive: message => { captured.push(message); } }); cleanup(() => bridge.close());
+  const group = event('om_group', { chat_type: 'group', chat_id: 'oc_raw', content: JSON.stringify({ text: '@_user_1 /group start' }),
+    mentions: [{ key: '@_user_1', name: '同名显示名', id: { open_id: 'ou_realBot' } }, { key: '@_user_2', id: { open_id: 'ou_realBot' } }, { key: '@_user_3', id: { user_id: 'unmapped' } }], parent_id: 'om_parent' });
+  await bridge.receiveEvent(group); await bridge.receiveEvent(group);
+  assert.equal(accepted.length, 1); assert.equal(captured.length, 1);
+  assert.equal(accepted[0]!.text, '/group start');
+  assert.equal(accepted[0]!.channelId, prefix + 'oc_raw');
+  assert.deepEqual(accepted[0]!.space, { kind: 'group', spaceId: 'oc_raw', mentionedUserIds: ['ou_realBot'], replyToMessageId: 'om_parent' });
+  const bot = event('om_bot', { chat_type: 'group' }); bot.event.sender.sender_type = 'app'; await bridge.receiveEvent(bot);
+  const outsider = event('om_outsider', { chat_type: 'group' }); outsider.event.sender.sender_id.open_id = 'ou_outsider'; await bridge.receiveEvent(outsider);
+  const foreign = event('om_foreign', { chat_type: 'group' }); foreign.header.app_id = 'cli_other'; await bridge.receiveEvent(foreign);
+  assert.equal(accepted.length, 1);
+  await bridge.receiveEvent(event('om_plain', { chat_type: 'group', content: '{"text":"@同名显示名 /new"}' }));
+  assert.deepEqual(accepted[1]!.space?.mentionedUserIds, []); assert.equal(accepted[1]!.text, '@同名显示名 /new');
+  await bridge.receiveEvent(event('om_p2p', { mentions: [{ key: '@_user_1', id: { open_id: 'ou_realBot' } }] }));
+  assert.equal(accepted[2]!.space, undefined, '启用群功能不改变私聊事件归属');
+});
+
+test('飞书群信息须逐应用验证is_in_chat，名称和数量不代替在群证明', async t => {
+  const { config, cleanup } = setup(t); const urls: string[] = []; let inside = false;
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any) => {
+    const url = String(input); urls.push(url);
+    if (url.includes('/auth/')) return response({ code: 0, tenant_access_token: 'private-token' });
+    if (url.endsWith('/bot/v3/info')) return response({ code: 0, data: { bot: { app_name: 'Bot', open_id: 'ou_bot' } } });
+    return response({ code: 0, data: url.endsWith('/is_in_chat') ? { is_in_chat: inside } : { chat_mode: 'group', name: '相同群名', owner_id: 'ou_owner', owner_id_type: 'open_id', user_count: '1' } });
+  }) as any }); cleanup(() => bridge.close());
+  await bridge.verifyIdentity(); assert.equal(bridge.botUser?.id, 'ou_bot');
+  assert.deepEqual(await bridge.getGroupInfo('oc_appSpecific'), { spaceId: 'oc_appSpecific', name: '相同群名', ownerId: 'ou_owner', memberCount: 1, botIsMember: false });
+  inside = true; assert.equal((await bridge.getGroupInfo('oc_appSpecific')).botIsMember, true);
+  assert(urls.some(url => url.endsWith('/members/is_in_chat')));
+  await assert.rejects(bridge.getGroupInfo('../oc_other'), /无效/);
+});
+
+test('飞书群真人成员分页使用open_id，不能把不完整结果当完整或推导机器人集合', async t => {
+  const { config, cleanup } = setup(t); const urls: string[] = []; let limited = false;
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any) => {
+    const url = new URL(String(input)); urls.push(url.toString());
+    if (url.pathname.includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    assert.equal(url.searchParams.get('member_id_type'), 'open_id');
+    return response({ code: 0, data: url.searchParams.get('page_token') === 'next&opaque'
+      ? { items: [{ member_id_type: 'open_id', member_id: 'ou_owner', name: '可改名' }], has_more: false }
+      : { items: [{ member_id_type: 'open_id', member_id: 'ou_other' }], has_more: true, page_token: 'next&opaque', trigger_security_conf_limit: limited } });
+  }) as any }); cleanup(() => bridge.close());
+  const first = await bridge.listGroupMembers('oc_chat', { limit: 1 });
+  assert.deepEqual(first, { members: [{ id: 'ou_other', idType: 'open_id', isBot: false }], hasMore: true, pageToken: 'next&opaque', verification: 'verified', scope: 'humans' });
+  assert.deepEqual(await bridge.getGroupMember('oc_chat', 'ou_owner'), { id: 'ou_owner', idType: 'open_id', isBot: false });
+  assert.equal(await bridge.getGroupMember('oc_chat', 'ou_missing'), null);
+  assert(urls.some(url => url.includes('page_token=next%26opaque')));
+  limited = true; assert.equal((await bridge.listGroupMembers('oc_chat')).verification, 'unknown');
+  await assert.rejects(bridge.getGroupMember('oc_chat', 'ou_missing'), /无法确认/);
+});
+
+test('飞书群查询拒绝权限错误、无在群字段和缺少后续游标，不泄漏原始响应', async t => {
+  const { config, cleanup } = setup(t); let mode = 'permission';
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any) => {
+    const url = String(input);
+    if (url.includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    if (mode === 'permission') return response({ code: 99991672, msg: 'private-token' }, 403);
+    if (url.endsWith('/is_in_chat')) return response({ code: 0, data: {} });
+    if (url.includes('/members?')) return response({ code: 0, data: { items: [], has_more: true } });
+    return response({ code: 0, data: { chat_mode: 'group', name: '同名群' } });
+  }) as any }); cleanup(() => bridge.close());
+  await assert.rejects(bridge.getGroupInfo('oc_chat'), error => error instanceof Error && /99991672/.test(error.message) && !/private-token/.test(error.message));
+  mode = 'partial'; await assert.rejects(bridge.getGroupInfo('oc_chat'), /无法确认/);
+  await assert.rejects(bridge.listGroupMembers('oc_chat'), /返回格式/);
+});
+
+
+test('飞书群历史恢复只返回负责人真人，保持原消息、实体提及、回复与群空间，分页边界包含Bot', async t => {
+  const { config, cleanup } = setup(t); config.groupMode = true;
+  config.externalAllowedUserIds = ['ou_owner', 'ou_other'];
+  const queries: URL[] = [], paths: string[] = [];
+  const item = (id: string, sender: Record<string, unknown>, changes: Record<string, unknown> = {}) => ({
+    message_id: id, chat_id: 'oc_chat', create_time: '1700000000123', msg_type: 'text', sender,
+    body: { content: '{"text":"@_user_1 /status"}' }, mentions: [{ key: '@_user_1', id: 'ou_bot', id_type: 'open_id', name: '可改名' }], parent_id: 'om_parent', ...changes,
+  });
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any) => {
+    const url = new URL(String(input)); paths.push(url.pathname);
+    if (url.pathname.includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    if (url.pathname.endsWith('/is_in_chat')) return response({ code: 0, data: { is_in_chat: true } });
+    if (url.pathname.endsWith('/members')) return response({ code: 0, data: { items: [{ member_id: 'ou_owner', member_id_type: 'open_id' }], has_more: false } });
+    if (url.pathname.endsWith('/messages')) {
+      queries.push(url);
+      return response({ code: 0, data: { has_more: true, page_token: 'next&opaque', items: [
+        item('om_z', { id: 'cli_other', id_type: 'app_id', sender_type: 'app' }, { body: { content: 'invalid JSON ignored' } }),
+        item('om_y', { id: 'ou_other', id_type: 'open_id', sender_type: 'user' }, { body: { content: 'invalid JSON ignored' } }),
+        item('om_x', { id: 'ou_owner', id_type: 'open_id', sender_type: 'user' }),
+        item('om_x', { id: 'ou_owner', id_type: 'open_id', sender_type: 'user' }),
+        item('om_a', { id: 'ou_owner', id_type: 'open_id', sender_type: 'user' }, { deleted: true }),
+      ] } });
+    }
+    return response({ code: 0, data: { chat_mode: 'group' } });
+  }) as any }); cleanup(() => bridge.close());
+  await assert.rejects(bridge.readGroupHistory('oc_chat'), /明确/);
+  const page = await bridge.readGroupHistory('oc_chat', { ownerUserId: 'ou_owner', since: prefix + '1700000000123|om_old', pageToken: 'previous&opaque', limit: 100 });
+  assert.equal(page.messages.length, 1); assert.equal(page.messages[0]!.id, prefix + '1700000000123|om_x');
+  assert.deepEqual(page.messages[0]!.space, { kind: 'group', spaceId: 'oc_chat', mentionedUserIds: ['ou_bot'], replyToMessageId: 'om_parent' });
+  assert.equal(page.messages[0]!.text, '/status'); assert.equal(page.messages[0]!.userId, prefix + 'ou_owner');
+  assert.equal(page.oldestId, prefix + '1700000000123|om_a'); assert.equal(page.newestId, prefix + '1700000000123|om_z');
+  assert.equal(page.pageToken, 'next&opaque'); assert.equal(page.hasMore, true);
+  assert.equal(queries[0]!.searchParams.get('start_time'), '1699999999');
+  assert.equal(queries[0]!.searchParams.get('page_token'), 'previous&opaque');
+  assert.equal(queries[0]!.searchParams.get('page_size'), '50');
+  assert(paths.every(path => !/resources|reactions/.test(path)), '恢复只取元数据，不下载非负责人附件、不做收件反馈');
+});
+
+test('飞书群历史成员撤销、群地址错配和分页损坏均拒绝，默认关闭时不发请求', async t => {
+  const { config, cleanup } = setup(t); let calls = 0, mode = 'outside';
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any) => {
+    calls++; const url = new URL(String(input));
+    if (url.pathname.includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    if (url.pathname.endsWith('/is_in_chat')) return response({ code: 0, data: { is_in_chat: mode !== 'outside' } });
+    if (url.pathname.endsWith('/members')) return response({ code: 0, data: { items: mode === 'owner-removed' ? [] : [{ member_id: 'ou_owner', member_id_type: 'open_id' }], has_more: false } });
+    if (url.pathname.endsWith('/messages')) return response({ code: 0, data: mode === 'bad-page' ? { items: [], has_more: true } : { items: [{ message_id: 'om_wrong', create_time: '1700000000000', chat_id: 'oc_other' }], has_more: false } });
+    return response({ code: 0, data: { chat_mode: 'group' } });
+  }) as any }); cleanup(() => bridge.close());
+  await assert.rejects(bridge.readGroupHistory('oc_chat'), /未启用/); assert.equal(calls, 0);
+  config.groupMode = true; await assert.rejects(bridge.readGroupHistory('oc_chat'), /失效/);
+  mode = 'owner-removed'; await assert.rejects(bridge.readGroupHistory('oc_chat'), /失效/);
+  mode = 'wrong-space'; await assert.rejects(bridge.readGroupHistory('oc_chat'), /其他群/);
+  mode = 'bad-page'; await assert.rejects(bridge.readGroupHistory('oc_chat'), /分页格式/);
+  const before = calls;
+  await assert.rejects(bridge.readGroupHistory('oc_chat', { since: 'feishu:cli_other|1700000000000|om_wrong' }), /不属于/);
+  await assert.rejects(bridge.readGroupHistory('oc_chat', { ownerUserId: 'ou_other' }), /已授权/);
+  assert.equal(calls, before);
+});

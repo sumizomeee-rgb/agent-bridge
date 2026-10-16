@@ -4,16 +4,28 @@ import { closeSync, mkdirSync, openSync, readSync, renameSync, statSync, unlinkS
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import type { AgentName } from './types.js';
+import type { AgentName, AgentTurn, Conversation } from './types.js';
 
 export interface TaskOrigin {
   conversationId: string; userId: string; channelId: string; originMessageId: string;
   nativeId: string | null; agent: AgentName; cwd: string;
   helperPath?: string; nodePath?: string;
+  groupContext?: AgentTurn['groupContext'];
+  /** Immutable original parent identities survive successive backend switches. */
+  reboundFrom?: Array<{ conversationId: string; agent: AgentName; nativeId: string | null }>;
   /** Program-created internal workspace initialization, never a user/tool parameter. */
-  purpose?: 'workspace-context' | 'schedule';
+  purpose?: 'workspace-context' | 'schedule' | 'host-event';
   scheduleKind?: 'controller' | 'worker';
 }
+/** Rebind only the parent identity. Audience, execution directory and frozen group evidence stay intact. */
+export function rebindTaskOrigin(origin: TaskOrigin, source: Conversation, target: Conversation): TaskOrigin {
+  if (origin.conversationId !== source.id) return origin;
+  if (source.id === target.id || source.userId !== target.userId || resolve(source.cwd) !== resolve(target.cwd) || !target.nativeId
+    || origin.userId !== source.userId || origin.agent !== source.agent) throw new Error('任务父会话重绑身份不匹配。');
+  return { ...origin, conversationId: target.id, agent: target.agent, nativeId: target.nativeId,
+    reboundFrom: [...(origin.reboundFrom ?? []), { conversationId: source.id, agent: source.agent, nativeId: origin.nativeId }] };
+}
+
 export interface TaskContextFile {
   version: 1; registryDir: string; contextId: string; token: string; helperPath: string; nodePath: string;
 }
@@ -117,6 +129,7 @@ export class TaskRegistry {
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS task_observation_state ON task_observations(state, created_at);
+      CREATE TABLE IF NOT EXISTS task_parent_rebindings (source_id TEXT PRIMARY KEY, target_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS task_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS task_event_state ON task_events(state, created_at);`);
     const columns = new Set(this.db.prepare('PRAGMA table_info(task_events)').all().map(row => String(row.name)));
@@ -285,6 +298,26 @@ export class TaskRegistry {
         this.db.prepare('UPDATE tasks SET wake_allowed=0 WHERE context_id=?').run(String(context.id));
       }
     }
+  }
+  /** Retried after either SQLite journal commits; original tickets, statuses and audiences never change. */
+  rebindConversation(source: Conversation, target: Conversation): void {
+    const identity = JSON.stringify({ id: target.id, userId: target.userId, agent: target.agent, nativeId: target.nativeId, cwd: target.cwd });
+    const previous = this.db.prepare('SELECT target_json FROM task_parent_rebindings WHERE source_id=?').get(source.id);
+    if (previous && previous.target_json !== identity) throw new Error('任务父会话已重绑到其他目标。');
+    // Validate even an empty partition before recording a binding.
+    rebindTaskOrigin({ conversationId: source.id, userId: source.userId, agent: source.agent, nativeId: source.nativeId, cwd: source.cwd, channelId: 'validation', originMessageId: 'validation' }, source, target);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const table of ['task_contexts', 'tasks', 'task_events', 'task_observations']) {
+        for (const row of this.db.prepare(`SELECT id,origin_json FROM ${table}`).all()) {
+          const origin = JSON.parse(String(row.origin_json)) as TaskOrigin;
+          if (origin.conversationId !== source.id) continue;
+          this.db.prepare(`UPDATE ${table} SET origin_json=? WHERE id=?`).run(JSON.stringify(rebindTaskOrigin(origin, source, target)), String(row.id));
+        }
+      }
+      this.db.prepare('INSERT OR IGNORE INTO task_parent_rebindings (source_id,target_json) VALUES (?,?)').run(source.id, identity);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   /** One-time semantic migration of existing scheduler tasks and queued events. */
   migrateScheduleTask(taskId: string, kind: 'controller' | 'worker'): void {

@@ -146,7 +146,7 @@ test('准备中消息在 Codex ready 后补入；拒绝后的后续消息只排�
   f.adapter.finish(1);
 });
 
-for (const command of ['/stop', '/new', '/agent claude', '/cwd .']) {
+for (const command of ['/stop', '/new', '/cwd .']) {
   test(`${command} 在途补充及时取消，迟到接受和旧结果不串会话`, async t => {
     const f = fixture(t);
     await f.manager.handle(f.message('a'));
@@ -277,4 +277,13 @@ test('模型完成后等待 steer 确认时停止，保留 completed 并取消�
   assert.equal(f.store.getMessage('a')?.replyState, 'cancelled');
   assert.equal(f.store.getMessage('b')?.state, 'cancelled');
   assert.equal(f.adapter.calls.length, 1);
+});
+
+test('/agent waits for an in-flight supplement to settle and preserves accepted input in the latest handoff', async t => {
+  const f = fixture(t);
+  await f.manager.handle(f.message('a', 'first goal')); await waitFor(() => f.adapter.calls.length === 1);
+  await f.manager.handle(f.message('b', 'latest correction')); await waitFor(() => f.adapter.steering.length === 1);
+  const switching = f.manager.handle(f.message('switch', '/agent claude')); await delay(0); assert.equal(f.adapter.calls[0]!.signal.aborted, false);
+  f.adapter.finish(); f.adapter.steering[0]!.resolve({ status: 'accepted' }); await switching;
+  assert.equal(f.store.getMessage('b')?.state, 'completed'); assert.equal(f.store.getActive('u')?.agent, 'claude'); assert.match(f.store.getActive('u')!.contextSeed!, /latest correction/); assert.equal(f.adapter.calls.length, 1);
 });

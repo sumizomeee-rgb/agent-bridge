@@ -24,6 +24,13 @@ export interface Conversation {
 }
 export interface AgentCommand { command: string; args: string[] }
 export interface BridgeConfig {
+  /** Runtime identity is stable across profile/display-name changes. */
+  botId?: string;
+  ownerPrincipalId?: string;
+  ownerUserId?: string;
+  contextWorkspace?: string;
+  workingCwd?: string;
+  groupMode?: boolean;
   platform?: BridgePlatform;
   profile?: string;
   applicationId?: string;
@@ -110,8 +117,14 @@ export interface AgentTurn {
   onNativeId?: (nativeId: string) => void;
   /** Only this explicit channel may publish coordinating-agent output. */
   onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string) => Promise<void>;
+  /** Frozen per-event audience and host causal identity; never inferred from last contact. */
+  groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
+  onSilent?: () => Promise<void>;
+  preparing?: boolean;
+  /** Disposable evidence-only execution: restricted filesystem tools, no inherited MCP/plugins. */
+  readOnly?: boolean;
   /** Standalone background input, never a human authorization. */
-  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context'; toolName?: string; text: string; introductionRequested?: boolean };
+  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context' | 'group-event'; toolName?: string; text: string; introductionRequested?: boolean };
   /** Optional explicit worker effort inherited from the coordinating turn. */
   effort?: string;
   onModel?: (model: string) => void;
@@ -132,6 +145,7 @@ export interface AgentAdapter {
   getModelInfo?(cwd: string): Promise<AgentModelInfo>;
 }
 export interface BridgeMessage {
+  groupContext?: AgentTurn['groupContext'];
   id: string;
   userId: string;
   channelId: string;
@@ -168,7 +182,14 @@ export interface DiscordAttachment {
   resourceKey?: string;
   messageId?: string;
 }
+export interface GroupMessageSpace {
+  kind: 'group'; spaceId: string; mentionedUserIds: string[]; replyToMessageId?: string;
+}
+export interface GroupSpaceInfo { spaceId: string; name?: string; ownerId?: string; guildId?: string; memberCount?: number; botIsMember?: boolean }
+export interface GroupMember { id: string; idType: 'open_id' | 'user_id' | 'union_id' | 'discord'; isBot?: boolean }
+export interface GroupMembersPage { members: GroupMember[]; hasMore: boolean; pageToken?: string; verification: 'verified' | 'unknown'; reason?: string; scope?: 'humans' | 'channel' }
 export interface IncomingDM {
+  space?: GroupMessageSpace;
   id: string;
   userId: string;
   channelId: string;

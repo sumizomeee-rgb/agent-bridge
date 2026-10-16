@@ -111,6 +111,9 @@ function fixture(t: TestContext, controllerMode = true) {
   }, { mergeDelayMs: 0, taskRegistry: registry,
     onInitializeWorkspace: turn => { initializations.push(turn); return runtime.initializeWorkspace(turn); },
     onInitializationError: (_conversation, error) => errors.push(error),
+    onPrepareSwitch: (source, target, channel, prompt, signal) => runtime.prepareAgentSwitch(source, target, channel, prompt, signal),
+    onRebindSwitch: (source, target) => runtime.rebindConversation(source, target),
+    onPauseSwitch: source => runtime.pauseConversation(source.id), onResumeSwitch: source => runtime.resumeConversation(source.id),
     onDetach: id => runtime.detachConversation(id), onStop: id => runtime.cancelConversation(id) });
   runtime = makeRuntime(); manager = makeManager();
   const inspect = new SessionStore(config.dataDir);
@@ -247,7 +250,7 @@ test('首条普通消息并行派只读初始化，真实任务计数且不改�
   assert.deepEqual(f.errors, []);
 });
 
-test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd 换入口、续聊去重（模拟只读子 Agent）', async t => {
+test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd 只换执行目录、续聊去重（模拟只读子 Agent）', async t => {
   const f = fixture(t);
   const other = join(f.root, 'other'); mkdirSync(other);
   writeFileSync(join(f.root, 'README.md'), '初始化入口：context-a.md\n回传要求：只返回指定文件的执行规范。');
@@ -275,8 +278,9 @@ test('用户本机初始化入口通过独立事件载入；/new 重读、/cwd �
   await f.send('new-a-again', '/new'); await until(() => f.controller.turns.length === 3);
   assert.match(f.controller.turns[2]!.event!.text, /WORKSPACE_POLICY_A_UPDATED/);
   await f.send('cwd-b', `/cwd "${other}"`); await until(() => f.controller.turns.length === 4);
-  assert.match(f.controller.turns[3]!.event!.text, /WORKSPACE_POLICY_B/);
-  assert.deepEqual(reads, [join(f.root, 'context-a.md'), join(f.root, 'context-a.md'), join(other, 'context-b.md')]);
+  assert.match(f.controller.turns[3]!.event!.text, /WORKSPACE_POLICY_A_UPDATED/);
+  assert.equal(f.inspect.getActive('user')!.cwd, other);
+  assert.deepEqual(reads, [join(f.root, 'context-a.md'), join(f.root, 'context-a.md'), join(f.root, 'context-a.md')]);
   assert.equal(f.runtime.store.workers().length, 3);
   assert.deepEqual(f.errors, []);
 });
@@ -399,20 +403,25 @@ test('/new 后相关 human 问题驱动 init 轮普通工作，其来源与回�
   assert.equal(f.initializations.length, 1); assert.equal(f.children.turns.length, 2);
 });
 
-test('/cwd 和新建 Agent 会话各派一次，恢复已有会话不重新调查', async t => {
+test('/cwd 重新调查工作区，Agent 来回切换各自提炼最新主控而不恢复旧分支', async t => {
   const f = fixture(t); const other = join(f.root, 'other'); mkdirSync(other);
   await f.send('new', '/new'); await until(() => f.children.turns.length === 1);
   f.children.finish(0); await until(() => f.controller.turns.length === 1);
   await f.send('cwd', `/cwd "${other}"`); await until(() => f.children.turns.length === 2);
-  assert.equal(f.children.turns[1]!.conversation.cwd, other);
+  assert.equal(f.children.turns[1]!.conversation.cwd, f.config.workspace);
+  assert.equal(f.inspect.getActive('user')!.cwd, other);
   f.children.finish(1); await until(() => f.controller.turns.length === 2);
-  await f.send('agent', '/agent claude'); await until(() => f.children.turns.length === 3);
+  const switching = f.send('agent', '/agent claude'); await until(() => f.children.turns.length === 3);
   assert.equal(f.children.turns[2]!.conversation.agent, 'claude');
-  assert.equal(f.children.turns[2]!.conversation.cwd, other);
-  f.children.finish(2); await until(() => f.controller.turns.length === 3);
-  await f.send('restore', '/agent codex'); await delay(30);
-  assert.equal(f.children.turns.length, 3);
-  assert.equal(f.runtime.store.workers().length, 3);
+  assert.equal(f.children.turns[2]!.conversation.cwd, f.config.workspace);
+  assert.equal(f.children.turns[2]!.readOnly, true);
+  f.children.finish(2, JSON.stringify({ workspaceContext: '只读工作区约定', continuation: '最新目标与纠正；普通助手和计划保持原样' })); await switching;
+  const claude = f.inspect.getActive('user')!; assert.equal(f.controller.turns.length, 3); assert.equal(f.controller.turns[2]!.preparing, true);
+  const switchingBack = f.send('restore', '/agent codex'); await until(() => f.children.turns.length === 4);
+  f.children.finish(3, JSON.stringify({ workspaceContext: '工作区稳定约定', continuation: '从 Claude 最新进展向前续接' })); await switchingBack;
+  assert.notEqual(f.inspect.getActive('user')!.id, claude.id);
+  assert.equal(f.controller.turns.length, 4);
+  assert.equal(f.runtime.store.workers().length, 2);
 });
 
 test('恢复无标记已有原生会话调查一次，完成标记跨重启保留不重复派发', async t => {

@@ -1,3 +1,4 @@
+import { readOnlyRuntime } from './readonly.js';
 import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, safeError, type JsonObject, type RpcTransport } from './process.js';
@@ -61,8 +62,12 @@ export class CodexAdapter implements AgentAdapter {
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Codex 会话仍在执行任务。');
 
-    const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], turn.conversation.cwd,
-      { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) });
+    if (turn.readOnly && (turn.conversation.nativeId || turn.taskContextPath)) throw new Error('只读摘要必须使用独立的新会话且不能持有任务登记权限。');
+    const readonly = turn.readOnly ? readOnlyRuntime('codex', this.env) : undefined;
+    let transport: RpcTransport;
+    try { transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://', ...(readonly?.args ?? [])], turn.conversation.cwd,
+      readonly?.env ?? { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) }); }
+    catch (error) { readonly?.cleanup(); throw error; }
     const rpc = new JsonRpcClient(transport);
     const completed = deferred<AgentResult>();
     const replies = new Map<string, { text: string; phase: unknown }>();
@@ -196,7 +201,7 @@ export class CodexAdapter implements AgentAdapter {
       try {
         thread = await rpc.request(resumeId ? 'thread/resume' : 'thread/start', {
           ...(resumeId ? { threadId: resumeId, excludeTurns: true } : {}), modelProvider,
-          cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
+          cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: turn.readOnly ? 'read-only' : 'danger-full-access',
           ...((effort ?? configured.config.model_reasoning_effort) ? { config: { model_reasoning_effort: effort ?? configured.config.model_reasoning_effort } } : {}),
           ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
         });
@@ -232,7 +237,7 @@ export class CodexAdapter implements AgentAdapter {
       if (!input.length) throw new Error('消息没有文字或图片。');
       const started = await rpc.request('turn/start', {
         threadId: nativeId, input, cwd: turn.conversation.cwd,
-        approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
+        approvalPolicy: 'never', sandboxPolicy: { type: turn.readOnly ? 'readOnly' : 'dangerFullAccess' },
         ...(turn.conversation.model ? { model: turn.conversation.model } : {}),
         ...(effort ? { effort } : {}),
       });
@@ -260,6 +265,7 @@ export class CodexAdapter implements AgentAdapter {
       removeMessage(); removeFailure(); rpc.close();
       this.supplements.delete(conversationId);
       this.active.delete(conversationId);
+      readonly?.cleanup();
     }
   }
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const readline = require('node:readline');
 const trace = (value) => fs.appendFileSync(process.env.FAKE_TRACE, JSON.stringify(value) + '\n');
 trace({ argv: process.argv.slice(2), proxy: process.env.HTTPS_PROXY, http: process.env.HTTP_PROXY,
-  all: process.env.ALL_PROXY, noProxy: process.env.NO_PROXY, cwd: process.cwd(), taskContext: process.env.BRIDGE_TASK_CONTEXT });
+  all: process.env.ALL_PROXY, noProxy: process.env.NO_PROXY, cwd: process.cwd(), taskContext: process.env.BRIDGE_TASK_CONTEXT, readonlyHome: process.env.CODEX_HOME || process.env.CLAUDE_CONFIG_DIR });
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
 const mode = process.env.FAKE_MODE;
 const codex = process.argv.includes('app-server');
@@ -119,7 +119,7 @@ async function fixture(agent: AgentName, mode = 'success') {
     throw new Error('fake turn did not start');
   };
   const cleanup = async () => { await adapter.close(); await rm(directory, { recursive: true, force: true }); };
-  return { adapter, controller, turn, progress, nativeIds, traces, waitStarted, cleanup, image };
+  return { adapter, controller, turn, progress, nativeIds, traces, waitStarted, cleanup, image, env, command };
 }
 
 for (const agent of ['codex', 'claude'] as const) {
@@ -304,3 +304,34 @@ for (const agent of ['codex', 'claude'] as const) {
     finally { await adapter.close(); await f.cleanup(); }
   });
 }
+
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent}的摘要只读模式隔离工具配置和任务票据，普通执行权限不变`, async () => {
+  const f = await fixture(agent);
+  const home = join(f.turn.conversation.cwd, 'fake-source-home'); await mkdir(home);
+  Object.assign(f.env, { USERPROFILE: f.turn.conversation.cwd, HOME: f.turn.conversation.cwd,
+    ...(agent === 'codex' ? { CODEX_HOME: home } : { CLAUDE_CONFIG_DIR: home }) });
+  if (agent === 'codex') await writeFile(join(home, 'config.toml'), '[mcp_servers.dangerous]\ncommand="never-run"\n[features]\nhooks=true\n');
+  else await writeFile(join(home, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://fake-gateway.invalid' }, hooks: { SessionStart: ['never-run'] }, enabledPlugins: { 'dangerous@plugin': true } }));
+  try {
+    await f.adapter.run({ ...f.turn, readOnly: true });
+    const traces = await f.traces(), launch = traces[0]!;
+    assert.notEqual(launch.readonlyHome, home); assert.equal(launch.taskContext, undefined);
+    await assert.rejects(readFile(join(launch.readonlyHome, agent === 'codex' ? 'config.toml' : 'settings.json')), error => (error as NodeJS.ErrnoException).code === 'ENOENT');
+    if (agent === 'codex') {
+      assert.equal(traces.find(value => value.method === 'thread/start')!.params.sandbox, 'read-only');
+      assert.deepEqual(traces.find(value => value.method === 'turn/start')!.params.sandboxPolicy, { type: 'readOnly' });
+      assert(launch.argv.includes('mcp_servers={}')); assert(launch.argv.includes('agents.enabled=false'));
+    } else {
+      const args: string[] = launch.argv;
+      assert.equal(args[args.indexOf('--tools') + 1], 'Read,Glob,Grep');
+      assert.equal(args[args.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
+      assert(args.includes('--strict-mcp-config')); assert(args.includes('--no-chrome')); assert(args.includes('--disable-slash-commands'));
+      assert.equal(args[args.indexOf('--setting-sources') + 1], '');
+      const settings = JSON.parse(args[args.indexOf('--settings') + 1]!);
+      assert.equal(settings.env.ANTHROPIC_BASE_URL, 'https://fake-gateway.invalid'); assert.equal(settings.hooks, undefined); assert.equal(settings.enabledPlugins, undefined);
+    }
+    await assert.rejects(f.adapter.run({ ...f.turn, readOnly: true, taskContextPath: 'cannot-pass-ticket' }), /任务登记权限/);
+    await assert.rejects(f.adapter.run({ ...f.turn, readOnly: true, conversation: { ...f.turn.conversation, nativeId: 'old-controller' } }), /独立的新会话/);
+  } finally { await f.cleanup(); }
+});

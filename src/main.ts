@@ -1,276 +1,84 @@
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
-import { createServer, connect } from 'node:net';
-import { createHash } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadConfig, prepareConfigPaths, projectRoot, agentEnvironment, safeError, redactText } from './config.js';
-import { CodexAdapter } from './agents/codex.js';
-import { ClaudeAdapter } from './agents/claude.js';
-import { SessionManager } from './manager.js';
-import { PlatformTransport } from './platform.js';
+import { loadHostConfig, projectRoot, safeError } from './config.js';
+import { ensureHostSemanticData } from './host-migration.js';
 import { acquireInstanceLock } from './instance-lock.js';
-import { ensureSemanticData } from './profile-migration.js';
-import { DurableIngress } from './ingress.js';
-import { NativeControllerAdapter } from './controller/native.js';
-import { ControllerRuntime } from './controller/runtime.js';
-import { TaskRegistry, TaskService } from './tasks.js';
-import { BridgeLifecycle } from './lifecycle.js';
-import { mapPresentation } from './presentation.js';
-import type { ReplyOptions, IncomingDM } from './types.js';
+import { BotRuntime } from './bot-runtime.js';
+import { HostRuntime } from './host-runtime.js';
 import { RestartService } from './restart.js';
-import { closeResources } from './shutdown.js';
-import { TargetCatalogService } from './remote/catalog.js';
-import { CapabilityHealthService } from './capabilities.js';
 
 if (process.argv.includes('--help')) {
-  console.log('启动：start.ps1 [-Profile discord/default] [-ProxyPort 7898]\n配置检查：start.ps1 -Check\n私聊：/help、new chat、/chats、/agent、/stop');
+  console.log('启动宿主：start.ps1；配置检查：start.ps1 -Check；首次升级：host-migration-cli --config 配置路径（默认dry-run）。启动集合在version:3 startupProfiles配置，私聊/help，群/group start。');
   process.exit(0);
 }
-const config = loadConfig(undefined, false);
-const secrets = [config.token, config.appSecret ?? ''];
-const log = (message: string): void => {
-  const line = `${new Date().toISOString()} ${safeError(message, secrets)}\n`;
-  appendFileSync(join(config.logsDir, 'bridge.log'), line);
-  process.stdout.write(line);
-};
-async function checkProxy(): Promise<void> {
-  if (!config.proxyUrl) return;
-  const proxy = new URL(config.proxyUrl);
-  await new Promise<void>((resolve, reject) => {
-    const socket = connect({ host: proxy.hostname, port: Number(proxy.port) });
-    socket.setTimeout(3000);
-    socket.once('connect', () => { socket.destroy(); resolve(); });
-    socket.once('timeout', () => { socket.destroy(); reject(new Error('代理端口没有响应，请先启动笔记本网络项目')); });
-    socket.once('error', reject);
-  });
-}
-await checkProxy();
+const config = loadHostConfig(undefined, false);
 if (process.argv.includes('--check')) {
-  console.log(`CONFIG_OK platform=${config.platform} profile=${config.profile} agent=${config.defaultAgent} allowedUsers=${config.allowedUserIds.length} workspace=${config.workspace}`);
+  console.log(`CONFIG_OK platform=${config.configs[0]!.platform} bots=${config.configs.length} profiles=${config.configs.map(c => c.profile).join(',')}`);
   process.exit(0);
 }
-const projectGuard = await acquireInstanceLock(projectRoot, config.dataDir);
-prepareConfigPaths(config);
-ensureSemanticData(config.dataDir);
-let manager: SessionManager;
+mkdirSync(config.rootDataDir, { recursive: true });
+const guard = await acquireInstanceLock(projectRoot, config.rootDataDir);
+const secrets = config.configs.flatMap(c => [c.token, c.appSecret ?? '']);
+const log = (text: string): void => {
+  const line = `${new Date().toISOString()} ${safeError(text, secrets)}\n`;
+  appendFileSync(join(config.rootDataDir, 'host.log'), line); process.stdout.write(line);
+};
 let restart: RestartService;
-let ingress: DurableIngress;
-let closing = false;
-const transport: PlatformTransport = new PlatformTransport(config, message => {
-  if (restart.isDraining()) {
-    if (!message.interaction) ingress.capture(message);
-    return Promise.resolve();
-  }
-  return ingress.receive(message);
-}, {
-  logger: message => log(config.platform?.toUpperCase() + ' ' + message),
-  onReceive: message => ingress.capture(message),
-  onReady: () => restart.isDraining() ? Promise.resolve() : ingress.recover((channelId, options) => transport.readDMHistory(channelId, options)),
-});
-const applicationIdentity = await transport.verifyIdentity().catch(async error => {
-  await transport.close(); projectGuard.close(); throw new Error(safeError(error, secrets));
-});
-// Project selection is exclusive; the actual bot identity is also exclusive across relocated copies.
-const guard = createServer(socket => socket.destroy());
-const identity = createHash('sha256').update(`${config.platform}:${applicationIdentity}`).digest('hex').slice(0, 24);
-const pipe = process.platform === 'win32' ? `\\\\.\\pipe\\agent-bridge-bot-${identity}` : join(config.dataDir, `bridge-${identity}.sock`);
-await new Promise<void>((resolve, reject) => { guard.once('error', reject); guard.listen(pipe, resolve); }).catch(async error => {
-  await transport.close(); projectGuard.close(); throw new Error('当前机器人已有桥实例运行。');
-});
-const pidFile = join(config.dataDir, 'bridge.pid.json');
-const stopFile = join(config.dataDir, 'stop.request');
-if (existsSync(stopFile)) unlinkSync(stopFile);
-writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), main: process.argv[1], platform: config.platform, profile: config.profile }));
-const capabilityHealth = new CapabilityHealthService(config);
-try { log(capabilityHealth.startupSummary(await capabilityHealth.refresh(config.workspace))); }
-catch (error) { log('CAPABILITY_HEALTH_FAILED ' + safeError(error, secrets)); }
-const env = agentEnvironment(config);
-const tasks = new TaskRegistry(config.dataDir);
-// Executing children retain the user's ordinary CLI, skills, approvals and provider routing.
-const executionAdapters = { codex: new CodexAdapter(config.commands.codex, env), claude: new ClaudeAdapter(config.commands.claude, env) };
-const targetCatalog = new TargetCatalogService(config, executionAdapters);
-const runtime = config.controllerMode ? new ControllerRuntime(config, executionAdapters, tasks, {
-  targetCatalog,
-  onCheckCapabilities: (workspace, args) => capabilityHealth.query(workspace, args),
-  onStall: event => {
-    if (!event.taskId) return;
-    const text = `观察时间：${event.observedAt}\n目标：${event.targetId}；workerId：${event.workerId}；jobId：${event.jobId}\n工具：${event.tool.toolName ?? '未知'}；已等待约 ${Math.floor(event.waitingMs / 1000)} 秒。任务仍在执行，未自动停止或重做。`;
-    if (tasks.observeTask(event.taskId, event.observationKey, text)) manager.completionAvailable();
-  },
-  onCompletion: () => manager.completionAvailable(),
-  onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
-  onWorkCountsChanged: counts => transport.setWorkCounts(counts),
-  onError: error => log('CONTROLLER_WORKER ' + safeError(error)),
-  isDraining: () => restart?.isDraining() ?? false,
-  onRequestRestart: origin => restart.request(origin),
-}) : undefined;
-const adapters = runtime ? {
-  codex: new NativeControllerAdapter(config.commands.codex, env, {
-    agent: 'codex', dataDir: config.dataDir, metadataAdapter: executionAdapters.codex, defaultModels: config.defaultModels,
-    invokeTool: (turn, name, args, id) => runtime.invoke(turn, name, args, id),
-  }),
-  claude: new NativeControllerAdapter(config.commands.claude, env, {
-    agent: 'claude', dataDir: config.dataDir, metadataAdapter: executionAdapters.claude, defaultModels: config.defaultModels,
-    invokeTool: (turn, name, args, id) => runtime.invoke(turn, name, args, id),
-  }),
-} : executionAdapters;
-const taskService = new TaskService(tasks, {
-  onCompletion: () => manager.completionAvailable(),
-  onCountChanged: conversationId => manager.refreshTaskCounts(conversationId),
-  onError: error => log('TASKS ' + safeError(error)),
-});
-const migrationSeeds = new Map<string, string>();
-const migrationPath = join(config.dataDir, 'controller-migration.json');
-if (config.controllerMode && existsSync(migrationPath)) {
-  try {
-    if (statSync(migrationPath).size > 2 * 1024 * 1024) throw new Error('迁移上下文文件超过上限');
-    const raw: unknown = JSON.parse(readFileSync(migrationPath, 'utf8').replace(/^\uFEFF/, ''));
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('迁移上下文文件格式无效');
-    for (const [id, text] of Object.entries(raw)) if (typeof text === 'string') migrationSeeds.set(id, text.slice(0, 64 * 1024));
-  } catch (error) { log('MIGRATION_CONTEXT_IGNORED ' + safeError(error)); }
+let host: HostRuntime;
+let closing: Promise<void> | undefined;
+let poll: ReturnType<typeof setInterval> | undefined;
+const pidFile = join(config.rootDataDir, 'bridge.pid.json'), stopFile = join(config.rootDataDir, 'stop.request');
+async function shutdown(planned = false): Promise<void> {
+  if (closing) return closing;
+  closing = (async () => {
+    if (poll) clearInterval(poll);
+    if (!planned) restart?.cancel();
+    log(planned ? 'RESTART_STOPPING' : 'STOPPING');
+    try { await host?.close(); log('STOPPED'); }
+    finally {
+      guard.close(); if (existsSync(pidFile)) unlinkSync(pidFile);
+      if (existsSync(stopFile)) unlinkSync(stopFile);
+      if (!planned) restart?.close();
+    }
+  })();
+  return closing;
 }
-let releaseStartup!: () => void;
-const startupReady = new Promise<void>(resolve => { releaseStartup = resolve; });
-const preparationEpochs = new Map<string, number>();
-const messageRevisions = new Map<string, number>();
-const isControl = (message: IncomingDM): boolean =>
-  /^(?:\/(?:stop|new|cwd)(?:\s|$)|\/agent\s+\S|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
-ingress = new DurableIngress(config.dataDir, {
-  allowedUserIds: config.allowedUserIds,
-  hasMessage: id => manager.hasMessage(id),
-  isImmediate: isControl,
-  // Stamp before queuing: a later /new cannot reclassify old, still-unprepared input.
-  onQueued: (message, replayOnly) => {
-    const revision = (preparationEpochs.get(message.userId) ?? 0) + (isControl(message) ? 1 : 0);
-    preparationEpochs.set(message.userId, revision);
-    if (!replayOnly) messageRevisions.set(message.id, revision);
-  },
-  handle: async message => {
-    try {
-      await startupReady;
-      if (closing || restart.isDraining()) return;
-      if (manager.hasMessage(message.id)) {
-        if (message.interaction) await transport.sendInteractionText(message.interaction, '这条命令已经处理，不会重复执行。');
-        return;
-      }
-      const control = isControl(message);
-      if (!control && messageRevisions.get(message.id) !== (preparationEpochs.get(message.userId) ?? 0)) {
-        manager.discard({ id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths: [] });
-        return;
-      }
-      const imagePaths = control ? [] : await transport.downloadImages(message);
-      if (closing || restart.isDraining()) return;
-      const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: message.text, imagePaths };
-      if (!control && messageRevisions.get(message.id) !== (preparationEpochs.get(message.userId) ?? 0)) {
-        manager.discard(prepared);
-        return;
-      }
-      const commandReply = message.interaction
-        ? (text: string, options?: ReplyOptions) => transport.sendInteractionText(message.interaction!, redactText(text, [...secrets, message.interaction!.token]), options?.presentation ? { ...options, presentation: mapPresentation(options.presentation, value => redactText(value, [...secrets, message.interaction!.token])) } : options)
-        : undefined;
-      await manager.handle(prepared, commandReply);
-    } finally { messageRevisions.delete(message.id); }
-  },
-  onError: (message, error) => {
-    if (closing || restart.isDraining()) return;
-    log('INGRESS_PREPARATION_FAILED ' + safeError(error));
-    void transport.sendText(message.channelId, transport.failureText(error)).catch(() => log('收件错误反馈发送失败。'));
-  },
-});
-
-manager = new SessionManager(config, adapters, {
-  markReplyDelivered: messages => transport.markReplyDelivered(messages),
-  setTaskCount: (message, count) => transport.setTaskCount(message, count),
-  sendText: (channelId, text, options) => transport.sendText(channelId, redactText(text, secrets),
-    options ? {
-      ...options,
-      ...(options.presentation ? { presentation: mapPresentation(options.presentation, value => redactText(value, secrets)) } : {}),
-      ...(options.repeatHeader ? { repeatHeader: redactText(options.repeatHeader, secrets) } : {}),
-      ...(options.images ? { images: options.images.map(image => ({ ...image,
-        ...(image.description ? { description: redactText(image.description, secrets) } : {}),
-      })) } : {}),
-      ...(options.files ? { files: options.files.map(file => ({ ...file,
-        ...(file.description ? { description: redactText(file.description, secrets) } : {}),
-      })) } : {}),
-    } : undefined),
-}, { taskRegistry: tasks, botName: () => transport.botUser?.username,
-  onListComputers: (conversation, refresh) => targetCatalog.computerOverview(conversation.cwd, refresh),
-  onListWorkers: (conversation, scope) => Promise.resolve(runtime?.queryWorkerOverview(conversation, scope) ?? []),
-  onRequestRestart: origin => restart.request(origin),
-  ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
-  ...(runtime ? { onStop: id => runtime.cancelConversation(id), onDetach: id => runtime.detachConversation(id),
-    onInitializeWorkspace: turn => runtime.initializeWorkspace(turn),
-    onInitializationError: (_conversation, error) => log('workspace initialization: ' + safeError(error)),
-    controllerSeed: conversation => migrationSeeds.get(conversation.id) ?? '' } : {}),
-});
-const lifecycle = new BridgeLifecycle(config, event => transport.onBridgeLifecycle(event), () => ingress.lastAuthorizedContact(),
-  error => log('LIFECYCLE_NOTICE_FAILED ' + safeError(error, secrets)));
-restart = new RestartService(config.dataDir, {
-  supervised: process.env.BRIDGE_SUPERVISED === '1',
-  beginDrain: () => { ingress.pause(); manager.beginDrain(); runtime?.beginDrain(); },
-  isIdle: () => manager.isIdle() && (runtime?.isIdle() ?? true) && transport.isIdle(),
-  shutdown: () => shutdown(true),
-  onShutdownComplete: exitCode => { process.exitCode = exitCode; restart.close(); },
-  onPhase: phase => { if (phase !== 'ready') void transport.onBridgeLifecycle({ phase }).catch(error => log('LIFECYCLE_FAILED ' + safeError(error, secrets))); },
-  onError: error => log('RESTART ' + safeError(error)),
-});
-restart.beginRecovery();
-for (const channel of manager.knownChannels()) if (config.allowedUserIds.includes(channel.userId)) ingress.seedChannel(channel);
-async function shutdown(plannedRestart = false): Promise<void> {
-  if (closing) return;
-  closing = true;
-  releaseStartup();
-  clearInterval(stopPoll);
-  if (!plannedRestart) restart.cancel();
-  log(plannedRestart ? 'RESTART_STOPPING' : 'STOPPING');
-  // Abort REST/backfill and stop fresh Gateway input before closing either journal.
-  try {
-    await closeResources([
-      { name: '通信平台', close: () => transport.close() },
-      { name: '收件', close: () => ingress.close() },
-      { name: '任务回执', close: () => taskService.close() },
-      { name: '主控', close: () => manager.close() },
-      { name: '执行任务', close: async () => { await runtime?.close(); } },
-      { name: '远程目录', close: () => targetCatalog.close() },
-      ...Object.entries(executionAdapters).map(([agent, adapter]) => ({ name: `${agent} 执行器`, close: () => adapter.close() })),
-      { name: '生命周期', close: () => lifecycle.close() },
-      { name: '任务数据库', close: () => tasks.close() },
-      { name: '进程标识', close: () => {
-        guard.close(); projectGuard.close();
-        if (existsSync(pidFile)) unlinkSync(pidFile);
-        if (existsSync(stopFile)) unlinkSync(stopFile);
-      } },
-    ]);
-    log('STOPPED');
-  } catch (error) {
-    log('STOP_FAILED ' + safeError(error));
-    if (plannedRestart) throw error;
-  } finally {
-    // RestartService records a planned failure before it releases the journal.
-    if (!plannedRestart) restart.close();
-  }
-}
-const stopPoll = setInterval(() => { if (existsSync(stopFile)) void shutdown(); }, 1000);
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) process.on(signal, () => void shutdown());
-process.on('uncaughtException', e => { log(`FATAL ${safeError(e)}`); restart.failed(safeError(e)); void shutdown().finally(() => { if (process.exitCode !== 76) process.exitCode = 1; }); });
-process.on('unhandledRejection', e => log(`ERROR ${safeError(e)}`));
 try {
-  await transport.start();
-  log(`READY bot=${transport.botUser?.username ?? 'unknown'} agent=${config.defaultAgent} proxy=${config.proxyUrl ?? 'inherit'}`);
-  if (config.platform === 'discord' && config.features?.nativeCommands !== false)
-    void transport.syncSlashCommands().then(() => log('SLASH_COMMANDS_SYNCED')).catch(error => log(`SLASH_COMMANDS_FAILED ${safeError(error, secrets)}`));
-  await manager.recover();
-  if (!closing) await runtime?.start();
-  if (!closing) taskService.start();
-  if (!closing && runtime) transport.setWorkCounts(runtime.getGlobalWorkCounts());
-  releaseStartup();
-  if (!closing) {
-    restart.ready();
-    await lifecycle.ready();
-    if (!closing) ingress.start();
+  const marker = ensureHostSemanticData(config);
+  host = new HostRuntime(config, marker, origin => Promise.resolve(restart.request(origin)), log);
+  restart = new RestartService(config.rootDataDir, {
+    supervised: process.env.BRIDGE_SUPERVISED === '1', beginDrain: () => host.beginDrain(), isIdle: () => host.isIdle(),
+    shutdown: () => shutdown(true), onShutdownComplete: code => { process.exitCode = code; restart.close(); },
+    onPhase: phase => { if (phase !== 'ready') for (const bot of host.bots.values()) void bot.transport.onBridgeLifecycle({ phase }).catch(error => log('LIFECYCLE_FAILED ' + safeError(error, secrets))); },
+    onError: error => log('RESTART ' + safeError(error, secrets)),
+  });
+  restart.beginRecovery(); host.beginRecovery();
+  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), main: process.argv[1],
+    platform: config.configs[0]!.platform, profiles: config.configs.map(c => c.profile), bots: config.configs.map(c => c.botId) }));
+  if (existsSync(stopFile)) unlinkSync(stopFile);
+  // Verify each actual app and reserve its own identity, while keeping a failed Bot isolated.
+  for (const selected of config.configs) {
+    try {
+      const bot = new BotRuntime(selected, host.hooks(selected)); host.attach(bot);
+      await bot.verify();
+    }
+    catch (error) { host.failures.set(selected.botId!, safeError(error, secrets)); log(`BOT_UNAVAILABLE ${selected.botId} ${safeError(error, secrets)}`); }
   }
+  await host.prepareRecoveryBots();
+  await Promise.all([...host.bots].filter(([id]) => !host.failures.has(id)).map(async ([id, bot]) => {
+    try { await bot.start(); }
+    catch (error) { host.failures.set(id, safeError(error, secrets)); log(`BOT_START_FAILED ${id} ${safeError(error, secrets)}`); }
+  }));
+  if (![...host.bots.keys()].some(id => !host.failures.has(id))) throw new Error('没有可用的 Bot，宿主未就绪。');
+  await host.recover(); restart.ready();
+  await Promise.all([...host.bots].filter(([id]) => !host.failures.has(id)).map(([, bot]) => bot.publishReadyLifecycle()));
+  log(`HOST_READY bots=${config.configs.length - host.failures.size}/${config.configs.length}`);
+  poll = setInterval(() => { if (existsSync(stopFile)) void shutdown().catch(error => { log('STOP_FAILED ' + safeError(error, secrets)); process.exitCode = 76; }); }, 1000);
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) process.on(signal, () => void shutdown().catch(error => { log('STOP_FAILED ' + safeError(error, secrets)); process.exitCode = 76; }));
+  process.on('uncaughtException', error => { log('FATAL ' + safeError(error, secrets)); restart.failed(safeError(error, secrets)); void shutdown().finally(() => { process.exitCode = 76; }); });
+  process.on('unhandledRejection', error => log('ERROR ' + safeError(error, secrets)));
 } catch (error) {
-  log(`START_FAILED ${safeError(error)}`);
-  restart.failed(safeError(error));
-  await shutdown();
-  if (process.exitCode !== 76) process.exitCode = 1;
+  log('START_FAILED ' + safeError(error, secrets));
+  try { await shutdown(); } catch (failure) { log('STOP_FAILED ' + safeError(failure, secrets)); }
+  process.exitCode = 1;
 }

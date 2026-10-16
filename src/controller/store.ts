@@ -1,6 +1,8 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { rebindTaskOrigin } from '../tasks.js';
+import type { Conversation } from '../types.js';
 import type { ControllerJob, ControllerJobStatus, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
@@ -37,6 +39,8 @@ export class ControllerStore {
       CREATE INDEX IF NOT EXISTS controller_schedule_due ON controller_schedules(status,due_at);
       CREATE TABLE IF NOT EXISTS controller_supplements (
         id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, job_id TEXT NOT NULL, value_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS controller_paused_parents (id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS controller_parent_rebindings (source_id TEXT PRIMARY KEY, target_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS controller_calls (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL);`);
     // Convert the former wake-only table once, then retire it. There is no old API or dual write path.
     if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='controller_wakes'").get()) {
@@ -54,6 +58,36 @@ export class ControllerStore {
     }
   }
   close(): void { this.db.close(); }
+  pauseConversation(id: string): void { this.db.prepare('INSERT OR IGNORE INTO controller_paused_parents (id) VALUES (?)').run(id); }
+  resumeConversation(id: string): void { this.db.prepare('DELETE FROM controller_paused_parents WHERE id=?').run(id); }
+  isConversationPaused(id: string): boolean { return this.db.prepare('SELECT 1 FROM controller_paused_parents WHERE id=?').get(id) !== undefined; }
+  /** One local transaction, replayable independently of TaskRegistry's journal. */
+  rebindConversation(source: Conversation, target: Conversation): void {
+    const identity = JSON.stringify({ id: target.id, userId: target.userId, agent: target.agent, nativeId: target.nativeId, cwd: target.cwd });
+    const previous = this.db.prepare('SELECT target_json FROM controller_parent_rebindings WHERE source_id=?').get(source.id);
+    if (previous && previous.target_json !== identity) throw new Error('执行服务父会话已重绑到其他目标。');
+    rebindTaskOrigin({ conversationId: source.id, userId: source.userId, agent: source.agent, nativeId: source.nativeId, cwd: source.cwd, channelId: 'validation', originMessageId: 'validation' }, source, target);
+    this.transaction(() => {
+      for (const worker of this.workers()) if (worker.origin.conversationId === source.id) {
+        worker.origin = rebindTaskOrigin(worker.origin, source, target);
+        this.db.prepare('UPDATE controller_workers SET parent_id=?,value_json=? WHERE id=?').run(target.id, JSON.stringify(worker), worker.id);
+      }
+      for (const value of this.jobs()) if (value.origin.conversationId === source.id) {
+        value.origin = rebindTaskOrigin(value.origin, source, target);
+        this.db.prepare('UPDATE controller_jobs SET value_json=? WHERE id=?').run(JSON.stringify(value), value.id);
+      }
+      for (const value of this.supplements()) if (value.origin.conversationId === source.id) {
+        value.origin = rebindTaskOrigin(value.origin, source, target); this.saveSupplement(value);
+      }
+      for (const value of this.schedules()) if (value.origin.conversationId === source.id) {
+        value.origin = rebindTaskOrigin(value.origin, source, target);
+        if (value.worker) value.worker.origin = rebindTaskOrigin(value.worker.origin, source, target);
+        if (value.job) value.job.origin = rebindTaskOrigin(value.job.origin, source, target);
+        this.db.prepare('UPDATE controller_schedules SET parent_id=?,value_json=? WHERE id=?').run(target.id, JSON.stringify(value), value.id);
+      }
+      this.db.prepare('INSERT OR IGNORE INTO controller_parent_rebindings (source_id,target_json) VALUES (?,?)').run(source.id, identity);
+    });
+  }
   transaction<T>(operation: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try { const value = operation(); this.db.exec('COMMIT'); return value; }

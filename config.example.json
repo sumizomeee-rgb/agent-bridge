@@ -1,13 +1,13 @@
 {
-  "version": 2,
-  "startupProfile": "discord/default",
-  "platformProfiles": {
-    "discord": "discord/default",
-    "feishu": "feishu/default"
-  },
+  "version": 3,
+  "startupProfiles": ["discord/default"],
+  "principals": [],
+  "spaces": [],
+  "groupMode": true,
   "defaultAgent": "codex",
   "controllerMode": true,
-  "workspace": "C:\\SuchProject\\AgentWorkspace",
+  "workspaceRoot": ".local/workspaces",
+  "dataDir": ".local/data",
   "maxFileBytes": 20971520,
   "commands": {
     "codex": {

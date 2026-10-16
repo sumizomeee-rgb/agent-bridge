@@ -2,14 +2,16 @@ export interface CommandOption {
   type: 'string' | 'boolean'; name: string; description: string; required?: boolean;
   min_length?: number; max_length?: number; choices?: Array<{ name: string; value: string }>;
 }
-export interface CommandDefinition { name: string; description: string; help: string; options?: CommandOption[] }
+export interface CommandDefinition { name: string; description: string; help: string; options?: CommandOption[]; contexts?: Array<'dm' | 'group'> }
+/** Group controls share this registry; adapters only render their platform menu. */
 const agents = [{ name: 'Codex CLI', value: 'codex' }, { name: 'Claude Code', value: 'claude' }];
 const agentOption: CommandOption = { type: 'string', name: 'agent', description: '选择 Agent；留空查看当前状态', choices: agents };
 
 /** 两个平台的唯一命令定义；平台菜单只做参数编码。 */
 export const COMMANDS: CommandDefinition[] = [
+  { name: 'group', contexts: ['group'], help: '/group start|stop：激活或停用当前工作群', description: '激活、刷新或停用当前工作群', options: [{ type: 'string', name: 'action', description: 'start 激活／刷新，stop 停用', required: true, choices: [{ name: 'start', value: 'start' }, { name: 'stop', value: 'stop' }] }] },
   { name: 'new', help: "/new [continue] [codex|claude]：新建会话；continue 提炼上一会话后续接。两者都会取消旧定时", description: '新建会话，可提炼上一会话后续接', options: [{ ...agentOption, description: '新会话使用的 Agent；留空沿用当前 Agent' }, { type: 'boolean', name: 'continue', description: '初始化时提炼上一会话；仍取消旧定时，不接管旧助手' }] },
-  { name: 'agent', help: "/agent [codex|claude]：查看或切换 Agent，续接该目录的上次会话", description: '切换 Agent 并自动续接该目录的上下文', options: [agentOption] },
+  { name: 'agent', help: "/agent [codex|claude]：查看或切换 Agent，交接当前主控的最新上下文", description: '切换 Agent 并交接当前最新上下文', options: [agentOption] },
   { name: 'chats', help: "/chats：只读查看当前 bot 下自己的历史会话", description: '只读查看自己的历史会话' },
   { name: 'cwd', help: "/cwd 路径：在指定目录新建会话", description: '在指定工作目录新建会话', options: [
     { type: 'string', name: 'path', description: '工作目录路径', required: true, min_length: 1, max_length: 1000 },
@@ -40,8 +42,14 @@ export const COMMANDS: CommandDefinition[] = [
 ];
 
 export function commandHelp(controllerMode = false): string {
-  return ['直接发送文字或图片即可继续当前会话。命令只在 bot 私聊中使用。', ...COMMANDS.map(command =>
+  return ['直接发送文字或图片即可继续当前会话。命令只在 bot 私聊中使用。', ...COMMANDS.filter(command => command.contexts?.includes('dm') ?? !command.contexts).map(command =>
     controllerMode && command.name === 'stop' ? '/stop：停止桥管理的执行子 Agent、清空队列并取消预约；独立远端进程需要另行核对' : command.help)].join('\n');
+}
+export function groupCommands(): CommandDefinition[] {
+  return COMMANDS.filter(c => ['group', 'status', 'workers', 'new', 'stop', 'help'].includes(c.name)).map(c => ({
+    ...c, contexts: ['group'], options: c.name === 'new' ? [] : c.name === 'workers' ? c.options?.filter(o => ['history', 'details'].includes(o.name)) : c.options,
+    help: c.name === 'new' ? '/new：重置本群全部成员，影响其私聊和其他群，取消旧定时' : c.name === 'stop' ? '/stop：停止本群成员的主控、助手与预约，影响其所有入口' : c.help,
+  }));
 }
 export function parseNewArguments(argument: string): { agent?: 'codex' | 'claude'; continue: boolean } | null {
   const parts = argument.toLowerCase().split(/\s+/).filter(Boolean);

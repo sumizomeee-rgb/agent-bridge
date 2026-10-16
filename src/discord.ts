@@ -5,8 +5,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import WebSocket from 'ws';
-import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions } from './types.js';
-import { SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
+import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
+import { SLASH_COMMANDS, GROUP_SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 import { splitOverviewMessage, type WorkCounts } from './overview.js';
 import { discordPresentationPages } from './presentation.js';
 import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
@@ -406,6 +406,82 @@ export class DiscordTransport {
     return { messages, oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: result.length === limit };
   }
 
+  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {
+    if (this.config.groupMode !== true || !snowflake(spaceId) || (options.after !== undefined && !snowflake(options.after))
+      || (options.before !== undefined && !snowflake(options.before)) || (options.after && options.before)) throw new Error('Discord 群历史未启用或游标无效。');
+    const owner = options.ownerUserId ?? (this.allowedUsers.size === 1 ? [...this.allowedUsers][0] : undefined);
+    if (!owner || !this.allowedUsers.has(owner)) throw new Error('Discord 群历史需要明确的已授权负责人账号。');
+    const limit = options.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Discord 群历史页面大小无效。');
+    const info = await this.getGroupInfo(spaceId);
+    if (info.botIsMember !== true || !await this.getGroupMember(spaceId, owner)) throw new Error('Discord 群历史访问权已失效。');
+    const query = new URLSearchParams({ limit: String(limit), ...(options.after ? { after: options.after } : {}), ...(options.before ? { before: options.before } : {}) });
+    const result = await this.rest(`/channels/${spaceId}/messages?${query}`, 'GET');
+    if (!Array.isArray(result) || result.length > limit || result.some(item => !record(item) || !snowflake(item.id) || item.channel_id !== spaceId
+      || (item.guild_id != null && item.guild_id !== info.guildId))) throw new Error('Discord 群历史返回格式或群身份无效。');
+    const ids = result.map(item => String(item.id)).sort((left, right) => BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
+    const messages = new Map<string, IncomingDM>();
+    for (const item of result) {
+      if (!record(item.author) || item.author.id !== owner) continue;
+      const message = this.parseIncoming({ ...item, guild_id: info.guildId });
+      if (message && !messages.has(message.id)) messages.set(message.id, message);
+    }
+    return { messages: [...messages.values()], oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: result.length === limit };
+  }
+
+  private async groupAccess(spaceId: string, userId: string): Promise<{ channel: RecordValue; allowed: boolean; isBot?: boolean }> {
+    if (!snowflake(spaceId) || !snowflake(userId)) throw new Error('Discord 群或账号标识无效。');
+    const channel = await this.rest(`/channels/${spaceId}`, 'GET');
+    if (!record(channel) || channel.id !== spaceId || !snowflake(channel.guild_id) || ![0, 5, 10, 11, 12].includes(Number(channel.type))) throw new Error('Discord Space 必须是文本频道或已有话题。');
+    const guildId = channel.guild_id, thread = [10, 11, 12].includes(Number(channel.type));
+    const [guild, roles, member, parent] = await Promise.all([
+      this.rest(`/guilds/${guildId}`, 'GET'), this.rest(`/guilds/${guildId}/roles`, 'GET'),
+      this.rest(`/guilds/${guildId}/members/${userId}`, 'GET'),
+      thread && snowflake(channel.parent_id) ? this.rest(`/channels/${channel.parent_id}`, 'GET') : Promise.resolve(channel),
+    ]);
+    if (!record(guild) || !Array.isArray(roles) || !record(member) || !record(member.user) || member.user.id !== userId || !Array.isArray(member.roles)
+      || !record(parent) || parent.guild_id !== guildId || !Array.isArray(parent.permission_overwrites)) throw new Error('Discord 频道权限事实不完整。');
+    const bits = (value: unknown): bigint => { if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new Error('Discord 权限位无效。'); return BigInt(value); };
+    const everyone = roles.find(role => record(role) && role.id === guildId);
+    if (!record(everyone)) throw new Error('Discord 缺少默认角色权限。');
+    let permission = bits(everyone.permissions);
+    const memberRoles = new Set(member.roles);
+    for (const role of roles) if (record(role) && memberRoles.has(role.id)) permission |= bits(role.permissions);
+    const administrator = guild.owner_id === userId || (permission & 8n) !== 0n;
+    if (administrator) permission = (1n << 63n) - 1n;
+    else {
+      const overwrites = parent.permission_overwrites;
+      for (const overwrite of overwrites) if (record(overwrite) && overwrite.type === 0 && overwrite.id === guildId) permission = (permission & ~bits(overwrite.deny)) | bits(overwrite.allow);
+      let deny = 0n, allow = 0n;
+      for (const overwrite of overwrites) if (record(overwrite) && overwrite.type === 0 && memberRoles.has(overwrite.id)) { deny |= bits(overwrite.deny); allow |= bits(overwrite.allow); }
+      permission = (permission & ~deny) | allow;
+      for (const overwrite of overwrites) if (record(overwrite) && overwrite.type === 1 && overwrite.id === userId) permission = (permission & ~bits(overwrite.deny)) | bits(overwrite.allow);
+    }
+    const required = 1024n | 65536n | (thread ? 1n << 38n : 2048n);
+    let allowed = (permission & required) === required;
+    if (member.communication_disabled_until && Date.parse(String(member.communication_disabled_until)) > Date.now()) allowed = false;
+    if (thread && record(channel.thread_metadata) && (channel.thread_metadata.archived === true || channel.thread_metadata.locked === true)) allowed = false;
+    if (allowed && channel.type === 12 && !administrator && (permission & (1n << 34n)) === 0n) {
+      const threadMember = await this.rest(`/channels/${spaceId}/thread-members/${userId}`, 'GET');
+      allowed = record(threadMember) && threadMember.user_id === userId;
+    }
+    return { channel, allowed, ...(typeof member.user.bot === 'boolean' ? { isBot: member.user.bot } : {}) };
+  }
+
+  async getGroupInfo(spaceId: string): Promise<GroupSpaceInfo> {
+    if (!this.botUser) await this.verifyIdentity();
+    const { channel, allowed } = await this.groupAccess(spaceId, this.botUser!.id);
+    return { spaceId, guildId: String(channel.guild_id), botIsMember: allowed,
+      ...(typeof channel.name === 'string' ? { name: channel.name } : {}) };
+  }
+  async getGroupMember(spaceId: string, userId: string): Promise<GroupMember | null> {
+    const access = await this.groupAccess(spaceId, userId);
+    return access.allowed ? { id: userId, idType: 'discord', ...(access.isBot == null ? {} : { isBot: access.isBot }) } : null;
+  }
+  async listGroupMembers(_spaceId: string, _options: { pageToken?: string; limit?: number } = {}): Promise<GroupMembersPage> {
+    return { members: [], hasMore: false, verification: 'unknown', scope: 'channel', reason: '服务器成员列表不能证明频道或话题的完整可见成员；请逐账号核实频道权限。' };
+  }
+
   async syncSlashCommands(): Promise<void> {
     if (this.closed) throw new Error('Discord transport 已关闭。');
     if (!this.applicationId) {
@@ -416,10 +492,20 @@ export class DiscordTransport {
     await this.rest(`/applications/${this.applicationId}/commands`, 'PUT', SLASH_COMMANDS);
   }
 
+  /** Guild-specific menus avoid global duplicate names with different DM/group arguments. */
+  async syncGroupSlashCommands(guildId: string): Promise<void> {
+    if (this.config.groupMode !== true || !snowflake(guildId)) throw new Error('Discord 群命令未启用或服务器标识无效。');
+    if (!this.applicationId) await this.verifyIdentity();
+    await this.rest(`/applications/${this.applicationId}/guilds/${guildId}/commands`, 'PUT', GROUP_SLASH_COMMANDS);
+  }
+
   async verifyIdentity(): Promise<string> {
     const application = await this.rest('/applications/@me', 'GET');
     if (!record(application) || !snowflake(application.id)) throw new Error('Discord 没有返回有效应用标识。');
     this.applicationId = application.id;
+    const user = await this.rest('/users/@me', 'GET');
+    if (!record(user) || !snowflake(user.id) || user.bot !== true || typeof user.username !== 'string') throw new Error('Discord 没有返回有效机器人账号身份。');
+    this.botUser = { id: user.id, username: user.username };
     return application.id;
   }
 
@@ -702,7 +788,7 @@ export class DiscordTransport {
         } else {
           this.lastIdentifyAt = Date.now();
           this.sendPacket(socket, 2, {
-            token: this.config.token, intents: 4096,
+            token: this.config.token, intents: this.config.groupMode === true ? 4096 | 1 | 512 | 32768 : 4096,
             properties: { os: process.platform, browser: 'discord-agent-bridge', device: 'discord-agent-bridge' },
           });
         }
@@ -782,7 +868,7 @@ export class DiscordTransport {
     const captured = this.options.onReceive?.(message);
     this.seenMessages.add(message.id);
     this.consumeRestartNotice();
-    this.knownDMChannels.add(message.channelId);
+    if (!message.space) this.knownDMChannels.add(message.channelId);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
     const receiptKey = `${data.channel_id}:${data.id}`;
     const receipt = captured === false || this.config.features?.reactions === false ? Promise.resolve() : this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
@@ -803,7 +889,7 @@ export class DiscordTransport {
 
   private parseIncoming(data: RecordValue): IncomingDM | null {
     const author = data.author;
-    if (data.guild_id != null || data.webhook_id != null || !record(author) || author.bot === true ||
+    if ((data.guild_id != null && !(this.config.groupMode === true && snowflake(data.guild_id))) || data.webhook_id != null || !record(author) || author.bot === true || author.system === true ||
         !snowflake(author.id) || !this.allowedUsers.has(author.id) || !snowflake(data.id) ||
         !snowflake(data.channel_id)) return null;
     const attachments: DiscordAttachment[] = [];
@@ -816,8 +902,15 @@ export class DiscordTransport {
         }
       }
     }
-    return { id: data.id, userId: author.id, channelId: data.channel_id,
-      text: typeof data.content === 'string' ? data.content : '', attachments };
+    const mentionedUserIds = Array.isArray(data.mentions) ? [...new Set(data.mentions.flatMap(item => record(item) && snowflake(item.id) ? [item.id] : []))] : [];
+    let text = typeof data.content === 'string' ? data.content : '';
+    if (data.guild_id != null) {
+      let match: RegExpExecArray | null;
+      while ((match = /^\s*<@!?(\d{1,20})>\s*/.exec(text)) && mentionedUserIds.includes(match[1]!)) text = text.slice(match[0].length);
+    }
+    return { id: data.id, userId: author.id, channelId: data.channel_id, text, attachments,
+      ...(data.guild_id != null ? { space: { kind: 'group' as const, spaceId: data.channel_id, mentionedUserIds,
+        ...(record(data.message_reference) && snowflake(data.message_reference.message_id) ? { replyToMessageId: data.message_reference.message_id } : {}) } } : {}) };
   }
 
   private async incomingInteraction(data: RecordValue): Promise<void> {
@@ -829,21 +922,24 @@ export class DiscordTransport {
     const endpoint = `/interactions/${data.id}/${encodeURIComponent(data.token)}/callback`;
     const reject = (content: string) => this.interactionRest(endpoint, 'POST',
       { type: 4, data: { content, flags: 64, allowed_mentions: { parse: [] } } }, true);
-    const user = data.user;
+    const guild = this.config.groupMode === true && snowflake(data.guild_id) && data.context === 0;
+    const user = guild && record(data.member) ? data.member.user : data.user;
     const channel = record(data.channel) ? data.channel : undefined;
     const channelId = snowflake(data.channel_id) ? data.channel_id : channel?.id;
     const botDM = data.context === 1 || (data.context == null && channel?.type === 1);
-    if (data.guild_id != null || !botDM || (channel?.type != null && channel.type !== 1)
-      || !record(user) || user.bot === true || !snowflake(user.id) || !this.allowedUsers.has(user.id)
+    if ((!guild && (data.guild_id != null || !botDM || (channel?.type != null && channel.type !== 1)))
+      || (guild && channel?.type != null && ![0, 5, 10, 11, 12].includes(Number(channel.type)))
+      || !record(user) || user.bot === true || user.system === true || !snowflake(user.id) || !this.allowedUsers.has(user.id)
       || !snowflake(channelId) || (this.applicationId && data.application_id !== this.applicationId)) {
-      await reject('这些命令仅供已授权用户在机器人的私聊中使用。'); return;
+      await reject(this.config.groupMode === true ? '这些命令仅供已授权真人在机器人私聊或启用的工作群中使用。' : '这些命令仅供已授权用户在机器人的私聊中使用。'); return;
     }
-    const parsed = slashText(data.data);
+    const parsed = slashText(data.data, guild ? 'group' : 'dm');
     if ('error' in parsed) { await reject(parsed.error); return; }
     this.consumeRestartNotice();
     const interaction: SlashInteraction = { id: data.id, token: data.token, applicationId: data.application_id };
     const message: IncomingDM & { interaction: SlashInteraction } = {
       id: data.id, userId: user.id, channelId, text: parsed.text, attachments: [], interaction,
+      ...(guild ? { space: { kind: 'group' as const, spaceId: channelId, mentionedUserIds: this.botUser ? [this.botUser.id] : [] } } : {}),
     };
     let acknowledged!: Promise<void>;
     // Reserve the arrival position before starting the network request, so text cannot overtake it.

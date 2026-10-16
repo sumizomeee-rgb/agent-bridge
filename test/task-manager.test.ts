@@ -162,7 +162,7 @@ test('登记和完成数量刷新不再向普通消息发送数字表情，也�
   assert.equal(f.codex.calls.length, 1, '数量刷新不会新建模型 turn');
 });
 
-for (const cmd of ['/new', '/stop', '/agent claude', '/cwd'] as const) {
+for (const cmd of ['/new', '/stop', '/cwd'] as const) {
   test(`${cmd} 后旧任务只通知来源，不唤醒当前会话也不声称杀死远端`, async t => {
     const f = fixture(t);
     await f.manager.handle(message('origin', 'delegate'));

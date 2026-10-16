@@ -12,23 +12,25 @@ interface SlashDefinition {
   type: 1;
   name: string;
   description: string;
-  contexts: [1];
+  contexts: [0] | [1];
   options?: SlashOption[];
 }
-import { COMMANDS } from './commands.js';
-export const SLASH_COMMANDS: SlashDefinition[] = COMMANDS.map(({ name, description, options }) => ({
-  type: 1, name, description, contexts: [1], ...(options ? { options: options.map(option => ({ ...option, type: option.type === 'string' ? 3 as const : 5 as const })) } : {}),
+import { COMMANDS, groupCommands, type CommandDefinition } from './commands.js';
+const render = (commands: CommandDefinition[], context: 0 | 1): SlashDefinition[] => commands.map(({ name, description, options }) => ({
+  type: 1, name, description, contexts: [context] as [0] | [1], ...(options ? { options: options.map(option => ({ ...option, type: option.type === 'string' ? 3 as const : 5 as const })) } : {}),
 }));
+export const SLASH_COMMANDS = render(COMMANDS.filter(command => !command.contexts || command.contexts.includes('dm')), 1);
+export const GROUP_SLASH_COMMANDS = render(groupCommands(), 0);
 
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** Reuse the text-command behavior; no independent session or model state lives here. */
-export function slashText(data: unknown): { text: string } | { error: string } {
+export function slashText(data: unknown, context: 'dm' | 'group' = 'dm'): { text: string } | { error: string } {
   if (!object(data) || typeof data.name !== 'string' || (data.type != null && data.type !== 1)) {
     return { error: '这个交互不是支持的斜杠命令。请使用 /help。' };
   }
-  const definition = SLASH_COMMANDS.find(command => command.name === data.name);
+  const definition = (context === 'group' ? GROUP_SLASH_COMMANDS : SLASH_COMMANDS).find(command => command.name === data.name);
   if (!definition) return { error: '这个命令已停用或不受支持，请使用 /help 查看当前菜单。' };
   if (data.options != null && !Array.isArray(data.options)) return { error: '命令参数格式不正确，请重新选择。' };
   const values = new Map<string, string | boolean>();
@@ -49,6 +51,7 @@ export function slashText(data: unknown): { text: string } | { error: string } {
     return { error: '请填写命令需要的参数，再重新发送。' };
   }
   switch (definition.name) {
+    case 'group': return { text: `/group ${values.get('action')}` };
     case 'new': return { text: `/new${values.get('continue') ? ' continue' : ''}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'agent': return { text: `/${definition.name}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };

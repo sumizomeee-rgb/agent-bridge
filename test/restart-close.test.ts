@@ -121,7 +121,7 @@ test('真实隔离supervisor收到76仅启动一次，不创建disabled并保存
   writeFileSync(join(dist, 'main.js'), `import {appendFileSync} from 'node:fs';\nappendFileSync(${JSON.stringify(countPath)}, 'started\\n');\nprocess.exitCode=76;\n`);
   const journal = new RestartJournal(dataDir); journal.request(origin); journal.mark('stopping'); journal.close();
   copyFileSync(new URL('../../scripts/paths.ps1', import.meta.url), join(scripts, 'paths.ps1'));
-  writeFileSync(join(root, '.local', 'config.json'), JSON.stringify({ version: 2, startupProfile: 'discord/default' }));
+  writeFileSync(join(root, '.local', 'config.json'), JSON.stringify({ version: 3, startupProfiles: ['discord/default'] }));
   const child = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(scripts, 'supervise.ps1')],
     { encoding: 'utf8', timeout: 8000, windowsHide: true });
   assert.equal(child.error, undefined, child.stderr); assert.equal(child.status, 0, child.stderr);
@@ -130,4 +130,16 @@ test('真实隔离supervisor收到76仅启动一次，不创建disabled并保存
   const saved = new RestartJournal(dataDir);
   try { assert.equal(saved.current()!.phase, 'failed'); assert.match(saved.current()!.error!, /退出（76）/); }
   finally { saved.close(); }
+});
+
+test('startup platform validates the configured host set and never selects a legacy platformProfiles fallback', { skip: process.platform !== 'win32' }, t => {
+  const root = rootFor(t), scripts = join(root, 'scripts'); mkdirSync(scripts); mkdirSync(join(root, '.local'));
+  copyFileSync(new URL('../../scripts/paths.ps1', import.meta.url), join(scripts, 'paths.ps1'));
+  writeFileSync(join(root, '.local', 'config.json'), JSON.stringify({ version: 3, startupProfiles: ['feishu/a', 'feishu/b'], platformProfiles: { discord: 'discord/forbidden', feishu: 'feishu/forbidden' } }));
+  const script = join(scripts, 'paths.ps1').replaceAll("'", "''");
+  const run = (profile: string, platform: string) => spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-Command', `$ErrorActionPreference='Stop'; . '${script}'; Resolve-BridgeProfile '${profile}' '${platform}'`], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+  const selected = run('', 'feishu'); assert.equal(selected.status, 0, selected.stderr); assert.equal(selected.stdout.trim(), 'feishu/a');
+  const second = run('feishu/b', 'feishu'); assert.equal(second.status, 0, second.stderr); assert.equal(second.stdout.trim(), 'feishu/b');
+  const mismatch = run('', 'discord'); assert.notEqual(mismatch.status, 0); assert.match(mismatch.stderr, /Profile and platform do not match/);
+  const outside = run('discord/forbidden', 'discord'); assert.notEqual(outside.status, 0); assert.match(outside.stderr, /not in startupProfiles/);
 });

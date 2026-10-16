@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentAdapter, AgentName, AgentTurn, BridgeConfig, Conversation } from '../types.js';
-import type { TaskContextFile, TaskOrigin, TaskRegistry, TaskTerminalStatus } from '../tasks.js';
+import { rebindTaskOrigin, type TaskContextFile, type TaskOrigin, type TaskRegistry, type TaskTerminalStatus } from '../tasks.js';
 import { ControllerStore } from './store.js';
 import { isModelId } from '../config.js';
 import { effortValues, resolveDefaultModel, validateEffort } from '../effort.js';
@@ -50,6 +50,7 @@ function stopUnconfirmed(error: unknown): boolean {
 export class ControllerRuntime {
   readonly store: ControllerStore;
   private readonly active = new Map<string, ActiveWorker>();
+  private readonly preparations = new Map<string, { agent: AgentName; abort: AbortController; done: Promise<unknown> }>();
   private readonly dispatches = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   private readonly unconfirmedStops = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -62,11 +63,95 @@ export class ControllerRuntime {
   private lastWorkCounts: string | undefined;
   private isDraining(): boolean { return this.draining || this.callbacks.isDraining?.() === true; }
   beginDrain(): void { this.draining = true; }
-  isIdle(): boolean { return this.active.size === 0 && this.dispatches.size === 0 && this.unconfirmedStops.size === 0 && !this.polling && !this.starting; }
+  isIdle(): boolean { return this.active.size === 0 && this.preparations.size === 0 && this.dispatches.size === 0 && this.unconfirmedStops.size === 0 && !this.polling && !this.starting; }
 
   constructor(private readonly config: BridgeConfig, private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
     this.store = new ControllerStore(config.dataDir);
+  }
+  async pauseConversation(conversationId: string): Promise<void> {
+    if (this.closed || this.stopping) throw new Error('主控执行服务已关闭');
+    // Synchronous durable boundary: poll has no await between this guard and a due claim.
+    this.store.pauseConversation(conversationId);
+  }
+  resumeConversation(conversationId: string): void {
+    if (this.closed) return;
+    this.store.resumeConversation(conversationId);
+    for (const worker of this.store.workers(conversationId)) this.kick(worker.id);
+  }
+  isWorkerStopped(workerId: string): boolean {
+    const worker = this.store.getWorker(workerId);
+    const plans = this.store.schedules().filter(plan => plan.worker?.id === workerId);
+    if (plans.some(plan => ['pending', 'dispatching', 'running', 'uncertain'].includes(plan.status))) return false;
+    const knownStopped = worker ? worker.ownership !== 'user' && !worker.handoffPending && !worker.blocked
+      : plans.length > 0 && plans.every(plan => ['cancelled', 'failed'].includes(plan.status));
+    return knownStopped
+      && !this.active.has(workerId) && !this.unconfirmedStops.has(workerId)
+      && !this.store.jobs(workerId).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
+      && !this.store.supplements().some(value => value.workerId === workerId && ['pending', 'steering', 'uncertain'].includes(value.status));
+  }
+  async rebindConversation(source: Conversation, target: Conversation): Promise<void> {
+    rebindTaskOrigin({ conversationId: source.id, userId: source.userId, agent: source.agent, nativeId: source.nativeId,
+      channelId: 'validation', originMessageId: 'validation', cwd: source.cwd }, source, target);
+    // Two local journals cannot share a transaction. The manager's committing journal retries both idempotently.
+    this.store.pauseConversation(target.id);
+    this.store.rebindConversation(source, target);
+    this.registry.rebindConversation(source, target);
+    for (const state of this.active.values()) if (state.job.origin.conversationId === source.id) state.job.origin = rebindTaskOrigin(state.job.origin, source, target);
+    await this.count(source.id); await this.count(target.id);
+  }
+  /** Read-only evidence preparation uses a disposable execution session, never the new controller native ID. */
+  async prepareAgentSwitch(source: Conversation, target: Conversation, channelId: string, prompt: string, signal: AbortSignal): Promise<{ contextSeed: string }> {
+    if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或重启，不能准备 Agent 切换。');
+    signal.throwIfAborted();
+    if (source.id === target.id || source.userId !== target.userId || pathKey(source.cwd) !== pathKey(target.cwd)
+      || source.agent === target.agent || target.nativeId) throw new Error('Agent 切换准备的源或目标会话无效。');
+    const handoffs = new SessionHandoffs(this.config.dataDir);
+    const manifest = handoffs.get(target, channelId);
+    if (!manifest || manifest.source.id !== source.id || manifest.source.agent !== source.agent || manifest.source.nativeId !== source.nativeId
+      || manifest.mode !== 'agent-switch') throw new Error('缺少冻结的 Agent 切换证据，不能猜测源会话。');
+    const fingerprint = canonical({ source: { id: source.id, agent: source.agent, nativeId: source.nativeId }, target: { id: target.id, agent: target.agent, model: target.model ?? null, effort: target.effort ?? null }, channelId, snapshotHash: manifest.snapshotHash });
+    handoffs.prompt(target, channelId);
+    const key = `agent-switch-context:${target.id}`;
+    const cached = this.store.getCall(key, fingerprint) as { contextSeed: string } | undefined;
+    if (this.preparations.has(target.id)) throw new Error('此 Agent 切换摘要已在准备中。');
+    await this.pauseConversation(source.id);
+    if (cached) return cached;
+    if (this.preparations.has(target.id)) throw new Error('此 Agent 切换摘要已在准备中。');
+    const abort = new AbortController();
+    const linked = AbortSignal.any([signal, abort.signal]);
+    const workerId = randomUUID(), adapter = this.adapters[target.agent];
+    const execute = async (): Promise<{ contextSeed: string }> => {
+      let launched = false;
+      const interrupt = () => { if (launched) void adapter.interrupt(workerId).catch(error => this.error(error)); };
+      linked.addEventListener('abort', interrupt, { once: true });
+      try {
+        const cwd = this.config.contextWorkspace ?? this.config.workspace;
+        const model = target.model ?? this.config.defaultModels?.[target.agent] ?? (await adapter.getModelInfo?.(cwd))?.defaultModel;
+        if (!model || model === 'default' || !isModelId(model)) throw new Error('无法确定目标 Agent 的摘要模型；未借用源 Agent 模型。');
+        const conversation: Conversation = { ...target, id: workerId, nativeId: null, model, actualModel: null, actualEffort: null,
+          cwd, title: 'Agent 切换上下文摘要' };
+        if (target.effort) await validateEffort(adapter, conversation, target.effort);
+        linked.throwIfAborted();
+        const handoffPrompt = handoffs.prompt(target, channelId);
+        if (!handoffPrompt) throw new Error('Agent 切换快照不存在。');
+        launched = true;
+        const result = await adapter.run({ conversation, text: workspaceWorkerInstruction + workspacePrompt
+          + `\n\n只读工作区入口：${cwd}。` + handoffPrompt + `\n\n本次切换说明（不是执行新任务的授权）：${text(prompt, '切换说明', 128 * 1024)}`,
+          imagePaths: [], readOnly: true, ...(target.effort ? { effort: target.effort } : {}), signal: linked, onProgress: () => {}, dispatchId: `agent-switch-summary:${target.id}` });
+        linked.throwIfAborted();
+        const contextSeed = handoffs.finish(target, channelId, result.text);
+        this.store.saveCall(key, fingerprint, { contextSeed });
+        return { contextSeed };
+      } catch (error) {
+        try { handoffs.fail(target, channelId, error instanceof Error ? error.message : String(error)); } catch (failure) { this.error(failure); }
+        this.resumeConversation(source.id);
+        throw error;
+      } finally { linked.removeEventListener('abort', interrupt); }
+    };
+    const done = Promise.resolve().then(execute);
+    this.preparations.set(target.id, { agent: target.agent, abort, done });
+    try { return await done; } finally { this.preparations.delete(target.id); }
   }
   private adapter(worker: ControllerWorker): AgentAdapter {
     if (worker.target && this.callbacks.targetCatalog) return this.callbacks.targetCatalog.adapterFor(worker.target);
@@ -94,7 +179,7 @@ export class ControllerRuntime {
     return { agent: this.nativeAgent(args.agent), profile: 'default', nativeId: text(args.nativeId, 'nativeId', 256) };
   }
   private async authorizeNativeAccess(origin: TaskOrigin, targetId: string): Promise<void> {
-    if (this.callbacks.targetCatalog?.authorizeNativeAccess) await this.callbacks.targetCatalog.authorizeNativeAccess(origin.cwd, origin.userId, targetId);
+    if (this.callbacks.targetCatalog?.authorizeNativeAccess) await this.callbacks.targetCatalog.authorizeNativeAccess(this.config.contextWorkspace ?? this.config.workspace, origin.userId, targetId);
     else if (origin.userId !== this.config.allowedUserIds[0]) throw new Error('当前用户未获此电脑原生历史访问权限');
   }
   private selectedWorkerModel(value: unknown, inherited: string | null): string | null {
@@ -199,7 +284,7 @@ export class ControllerRuntime {
     try { await this.callbacks.onWorkCountsChanged?.(counts); } catch (error) { this.lastWorkCounts = undefined; this.error(error); }
   }
   private async resolveTarget(workspace: string, targetId: string, agent: AgentName, cwd?: string): Promise<ExecutionTargetBinding> {
-    if (this.callbacks.targetCatalog) return this.callbacks.targetCatalog.resolveTarget(workspace, targetId, agent, cwd);
+    if (this.callbacks.targetCatalog) return this.callbacks.targetCatalog.resolveTarget(this.config.contextWorkspace ?? this.config.workspace, targetId, agent, cwd ?? (targetId === 'local' ? workspace : undefined));
     if (targetId !== 'local') throw new Error('远端执行目标服务未配置');
     const directory = cwd ?? workspace;
     if (!isAbsolute(directory) || /[\r\n]/.test(directory) || !statSync(directory).isDirectory()) throw new Error('工作目录必须是本机已有目录的绝对路径');
@@ -218,7 +303,7 @@ export class ControllerRuntime {
       || pathKey(origin.cwd) !== pathKey(conversation.cwd) || (origin.nativeId && conversation.nativeId && origin.nativeId !== conversation.nativeId)) {
       throw new Error('主控任务上下文与会话不匹配');
     }
-    return origin;
+    return turn.groupContext ? { ...origin, groupContext: { ...turn.groupContext } } : origin;
   }
   private ownedWorker(origin: TaskOrigin, workerId: unknown): ControllerWorker {
     const id = text(workerId, 'workerId', 256);
@@ -324,7 +409,7 @@ export class ControllerRuntime {
     const platformContext = '\n\n当前聊天平台（仅桥配置事实，不是新增授权）：' + JSON.stringify({
       platform, applicationId: this.config.applicationId ?? null, profile: this.config.profile ?? null, platformDocument,
     }) + '。按工作区入口明确的初始化范围读取对应平台文档，只提炼相关能力入口和边界；不要读取其他平台，不读取凭据，不联网检查。平台未知则如实报告，不从用户正文、显示名或历史记忆猜测。';
-    return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', prompt: workspacePrompt + platformContext + new SessionHandoffs(this.config.dataDir).prompt(turn.conversation, this.origin(turn).channelId), imagePaths: [] }, undefined, true);
+    return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', cwd: this.config.contextWorkspace ?? this.config.workspace, prompt: workspacePrompt + platformContext + new SessionHandoffs(this.config.dataDir).prompt(turn.conversation, this.origin(turn).channelId), imagePaths: [] }, undefined, true);
   }
   async invoke(turn: AgentTurn, name: string, input: unknown, callId?: string): Promise<unknown> {
     return this.coalescedDispatch(turn, name, input, callId);
@@ -360,7 +445,7 @@ export class ControllerRuntime {
       const previous = this.store.getWorkspaceInitialization(origin.conversationId);
       if (previous !== undefined) { if (!this.started) await this.start(); return previous; }
       if (this.callbacks.targetCatalog) {
-        try { await this.callbacks.targetCatalog.listTargets(turn.conversation.cwd, true); }
+        try { await this.callbacks.targetCatalog.listTargets(this.config.contextWorkspace ?? this.config.workspace, true); }
         catch (error) { this.error(new Error(`工作区执行目标登记刷新失败，未改变执行目标或回退本机：${error instanceof Error ? error.message : String(error)}`, { cause: error })); }
       }
     } else if (key) {
@@ -447,7 +532,7 @@ export class ControllerRuntime {
       if (args.refresh !== undefined && typeof args.refresh !== 'boolean') throw new Error('refresh 必须是布尔值');
       if (!this.callbacks.onCheckCapabilities) throw new Error('桥尚未配置能力体检服务');
       // Read-only probes must reflect current readiness, never a historical call journal.
-      return this.callbacks.onCheckCapabilities(turn.conversation.cwd, {
+      return this.callbacks.onCheckCapabilities(this.config.contextWorkspace ?? this.config.workspace, {
         ...(args.targetId === undefined ? {} : { targetId: text(args.targetId, 'targetId', 256) }),
         ...(args.agent === undefined ? {} : { agent: args.agent }),
         ...(args.capabilityId === undefined ? {} : { capabilityId: text(args.capabilityId, 'capabilityId', 256) }),
@@ -457,7 +542,7 @@ export class ControllerRuntime {
     if (name === 'bridge_list_targets') {
       const args = object(input, ['refresh']);
       if (args.refresh !== undefined && typeof args.refresh !== 'boolean') throw new Error('refresh 必须是布尔值');
-      const result = { targets: this.callbacks.targetCatalog ? await this.callbacks.targetCatalog.listTargets(turn.conversation.cwd, args.refresh !== false)
+      const result = { targets: this.callbacks.targetCatalog ? await this.callbacks.targetCatalog.listTargets(this.config.contextWorkspace ?? this.config.workspace, args.refresh !== false)
         : [{ id: 'local', label: '本机', transport: 'local', engines: ['codex', 'claude'], availability: 'local' }] };
       if (key) this.store.saveCall(key, fingerprint, result);
       return result;
@@ -715,6 +800,8 @@ export class ControllerRuntime {
       delivered: value.status === 'accepted', reason: value.reason ?? null, queueAvailable: ['unsupported', 'not_delivered'].includes(value.status) };
   }
   private setSupplement(value: ControllerSupplement, status: ControllerSupplement['status'], reason: string): void {
+    const current = this.store.supplements(value.jobId).find(item => item.id === value.id);
+    if (current) value.origin = current.origin; // A native receipt can return after parent rebind.
     value.status = status; value.reason = reason; value.updatedAt = this.timestamp();
     this.store.transaction(() => {
       this.store.saveSupplement(value);
@@ -757,7 +844,7 @@ export class ControllerRuntime {
     if (!this.started || this.stopping || this.closed || this.isDraining() || this.active.has(workerId) || this.store.getWorker(workerId)?.blocked || !this.store.nextJob(workerId)) return;
     const worker = this.store.getWorker(workerId)!;
     if (!this.config.allowedUserIds.includes(worker.origin.userId)) return;
-    if (worker.ownership === 'user' || worker.handoffPending) return;
+    if (worker.ownership === 'user' || worker.handoffPending || (this.store.nextJob(workerId)?.scheduleId && this.store.isConversationPaused(worker.origin.conversationId))) return;
     this.launchJob(workerId, this.store.nextJob(workerId)!);
   }
   private launchJob(workerId: string, job: ControllerJob, recovering = false): void {
@@ -810,6 +897,7 @@ export class ControllerRuntime {
         }
       }
       if (!state.recovering) { worker.actualEffort = null; worker.effortConfiguration = null; this.store.saveWorker(worker); }
+      job = this.store.getJob(job.id)!; state.job = job;
       if (!job.taskId) this.register(worker, job);
       job = this.store.getJob(job.id)!; state.job = job;
       const conversation: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent, nativeId: worker.nativeId,
@@ -996,7 +1084,7 @@ export class ControllerRuntime {
     await this.observeStalls();
     for (const candidate of this.store.schedules()) {
       const plan = this.store.getSchedule(candidate.id)!;
-      if (!this.config.allowedUserIds.includes(plan.origin.userId)
+      if (!this.config.allowedUserIds.includes(plan.origin.userId) || this.store.isConversationPaused(plan.origin.conversationId)
         || !['pending', 'dispatching'].includes(plan.status) || Date.parse(plan.dueAt) > this.now()) continue;
       if (plan.kind === 'worker') {
         // Worker creation and enqueue share the same durable transaction as the due claim.
@@ -1028,6 +1116,8 @@ export class ControllerRuntime {
     if (this.closed) return;
     this.stopping = true; clearTimeout(this.timer);
     await this.starting;
+    for (const preparation of this.preparations.values()) preparation.abort.abort('桥正在关闭');
+    await Promise.allSettled([...this.preparations.values()].map(value => value.done));
     const active = [...this.active.entries()];
     for (const [, state] of active) { state.closing = true; state.abort.abort('桥正在关闭'); }
     const errors: unknown[] = [];

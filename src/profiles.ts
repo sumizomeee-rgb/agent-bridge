@@ -5,6 +5,7 @@ import type { BridgePlatform } from './types.js';
 export interface BotProfile {
   platform: BridgePlatform; name: string; applicationId?: string; token?: string; appSecret?: string;
   network?: { proxyPort: number | null };
+  workspace?: string; workingCwd?: string; ownerPrincipalId?: string;
   allowedUserIds: string[]; features?: { reactions?: boolean; nativeCommands?: boolean; presence?: boolean };
 }
 export function readJson(path: string): Record<string, unknown> {
@@ -32,7 +33,8 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
     if (!['reactions', 'nativeCommands', 'presence'].includes(key) || typeof enabled !== 'boolean') throw new Error('未知或无效的可选功能。');
     if (platform === 'feishu' && enabled && key !== 'reactions') throw new Error(`飞书暂不支持可选功能 ${key}。`);
   }
-  return { platform, name, applicationId, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
+  for (const key of ['workspace', 'workingCwd', 'ownerPrincipalId']) if (raw[key] != null && (typeof raw[key] !== 'string' || !String(raw[key]).trim())) throw new Error(`Profile ${key} 必须是非空字符串。`);
+  return { platform, name, applicationId, workspace: raw.workspace as string | undefined, workingCwd: raw.workingCwd as string | undefined, ownerPrincipalId: raw.ownerPrincipalId as string | undefined, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
     allowedUserIds: raw.allowedUserIds.map(String), network: { proxyPort: proxyPort as number | null }, features: features as BotProfile['features'] };
 }
 /** A credential rotation or profile alias change retains the bot's actual identity. */

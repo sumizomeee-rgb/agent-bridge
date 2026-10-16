@@ -138,7 +138,7 @@ test('同Agent的/new和/cwd保留显式model，清除原生上下文和实际mo
   assert.equal(inspect(store => store.getActive('owner')!.model), 'sonnet');
   assert.equal(inspect(store => store.getActive('owner')!.actualModel), null);
   await send('/new codex');
-  assert.equal(inspect(store => store.getActive('owner')!.model), null);
+  assert.equal(inspect(store => store.getActive('owner')!.model), 'gpt-6.1-sol');
   assert.equal(inspect(store => store.getConversation(previous.id)!.model), 'gpt-6.1-sol');
   assert.equal(inspect(store => store.getConversation(previous.id)!.nativeId), previous.nativeId);
 });

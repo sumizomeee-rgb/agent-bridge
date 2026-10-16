@@ -21,8 +21,9 @@ const configFor = (root: string, scope = prefix): BridgeConfig => ({ platform: '
   commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } } });
 
 test('命令菜单和帮助来自同一注册表，两平台没有各自的业务清单', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(item => item.name), COMMANDS.map(item => item.name));
-  for (const command of COMMANDS) assert(commandHelp().includes('/' + command.name));
+  assert.deepEqual(SLASH_COMMANDS.map(item => item.name), COMMANDS.filter(item => item.contexts?.includes('dm') ?? !item.contexts).map(item => item.name));
+  for (const command of COMMANDS.filter(item => item.contexts?.includes('dm') ?? !item.contexts)) assert(commandHelp().includes('/' + command.name));
+  assert(!commandHelp().includes('/group '));
   assert.match(commandHelp(true), /停止桥管理的执行子 Agent/);
   assert(!COMMANDS.some(command => ['platform', 'bot', 'startup'].includes(command.name)));
 });

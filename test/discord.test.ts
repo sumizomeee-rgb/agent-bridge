@@ -878,3 +878,81 @@ test('fatal Gateway authentication errors stop reconnect attempts', async t => {
   assert.equal(f.sockets.length, 1);
   await assert.rejects(f.transport.sendText('222', 'closed'), /已关闭/);
 });
+
+
+test('Discord群收件只在显式启用时接收真人，频道和话题分别保留Space，提及不按文本猜测', async t => {
+  const received: IncomingDM[] = [];
+  const f = await fixture(t, async input => { received.push(input); }); f.config.groupMode = true;
+  await f.transport.start();
+  assert.equal((f.packets.find(packet => packet.op === 2)!.d as Record<string, unknown>).intents, 4096 | 1 | 512 | 32768);
+  f.dispatch({ id: '300', guild_id: '333', channel_id: '222', content: '<@999> /group start', mentions: [{ id: '999' }, { id: '999' }, { id: 'bad' }], message_reference: { message_id: '299' } });
+  f.dispatch({ id: '300', guild_id: '333', channel_id: '222' });
+  f.dispatch({ id: '301', guild_id: '333', channel_id: '224', content: '@同名 /new', mentions: [] });
+  f.dispatch({ id: '302', guild_id: '333', author: { id: '111', bot: true } });
+  f.dispatch({ id: '303', guild_id: '333', author: { id: '444', bot: false } });
+  f.dispatch({ id: '304', guild_id: '333', webhook_id: '345' });
+  f.dispatch({ id: '305', guild_id: 'malformed' });
+  await eventually(() => received.length === 2); await delay(15);
+  assert.equal(received.length, 2); assert.equal(received[0]!.text, '/group start');
+  assert.deepEqual(received[0]!.space, { kind: 'group', spaceId: '222', mentionedUserIds: ['999'], replyToMessageId: '299' });
+  assert.deepEqual(received[1]!.space, { kind: 'group', spaceId: '224', mentionedUserIds: [] });
+  assert.equal(received[1]!.text, '@同名 /new');
+  f.dispatch({ id: '306', content: 'p2p' }); await eventually(() => received.length === 3); assert.equal(received[2]!.space, undefined);
+});
+
+test('Discord群元数据可读不代表能收发，按角色覆盖及话题权限核实当前Bot和负责人', async t => {
+  let denyView = false, privateThread = false, threadMembership = false;
+  const required = (1024n | 2048n | 65536n | (1n << 38n)).toString();
+  const transport = new DiscordTransport({ token: 'fake', allowedUserIds: ['111'], maxImageBytes: 100, proxyUrl: null } as BridgeConfig, async () => {}, {
+    restBaseUrl: 'https://group.test.invalid', fetch: (async (input: any) => {
+      const path = new URL(String(input)).pathname;
+      const body = path === '/channels/222' ? { id: '222', guild_id: '333', type: privateThread ? 12 : 0, parent_id: '221', name: '频道', permission_overwrites: denyView ? [{ id: '999', type: 1, deny: '1024', allow: '0' }] : [] }
+        : path === '/channels/221' ? { id: '221', guild_id: '333', type: 0, permission_overwrites: [] }
+        : path === '/guilds/333' ? { id: '333', owner_id: '444' }
+        : path === '/guilds/333/roles' ? [{ id: '333', permissions: required }]
+        : path.startsWith('/guilds/333/members/') ? { user: { id: path.split('/').at(-1), bot: path.endsWith('999') }, roles: [] }
+        : path === '/channels/222/thread-members/999' ? threadMembership ? { user_id: '999' } : {}
+        : {};
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as any,
+  }); t.after(() => transport.close()); transport.botUser = { id: '999', username: 'Bot' };
+  assert.deepEqual(await transport.getGroupInfo('222'), { spaceId: '222', name: '频道', guildId: '333', botIsMember: true });
+  assert.deepEqual(await transport.getGroupMember('222', '111'), { id: '111', idType: 'discord', isBot: false });
+  denyView = true; assert.equal((await transport.getGroupInfo('222')).botIsMember, false);
+  privateThread = true; assert.equal((await transport.getGroupInfo('222')).botIsMember, false);
+  threadMembership = true; assert.equal((await transport.getGroupInfo('222')).botIsMember, true);
+  assert.equal((await transport.listGroupMembers('222')).verification, 'unknown', '不把guild成员冒充频道成员快照');
+});
+
+
+test('Discord群历史按频道恢复负责人真人，过滤Bot与其他白名单人，原生实体和回复保留', async t => {
+  const urls: URL[] = []; let loseAccess = false, wrongChannel = false;
+  const transport = new DiscordTransport({ groupMode: true, token: 'fake', allowedUserIds: ['111', '444'], maxImageBytes: 100, proxyUrl: null } as BridgeConfig, async () => {}, {
+    restBaseUrl: 'https://history.test.invalid', fetch: (async (input: any) => {
+      const url = new URL(String(input)); urls.push(url);
+      const body = url.pathname === '/channels/222' ? { id: '222', guild_id: '333', type: 11, parent_id: '221' }
+        : url.pathname === '/channels/221' ? { id: '221', guild_id: '333', type: 0, permission_overwrites: [] }
+        : url.pathname === '/guilds/333' ? { id: '333', owner_id: '888' }
+        : url.pathname === '/guilds/333/roles' ? [{ id: '333', permissions: loseAccess ? '1024' : (1024n | 65536n | (1n << 38n)).toString() }]
+        : url.pathname.startsWith('/guilds/333/members/') ? { user: { id: url.pathname.split('/').at(-1), bot: url.pathname.endsWith('999') }, roles: [] }
+        : url.pathname === '/channels/222/messages' ? [
+          { id: '50', channel_id: '222', author: { id: '999', bot: true }, content: 'Bot发言' },
+          { id: '49', channel_id: '222', author: { id: '444' }, content: '其他白名单' },
+          { id: '48', channel_id: wrongChannel ? '223' : '222', author: { id: '111' }, content: '<@999> /status', mentions: [{ id: '999' }], message_reference: { message_id: '47' } },
+          { id: '48', channel_id: '222', author: { id: '111' }, content: 'duplicate' },
+        ] : {};
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as any,
+  }); t.after(() => transport.close()); transport.botUser = { id: '999', username: 'Bot' };
+  await assert.rejects(transport.readGroupHistory('222'), /明确/);
+  const page = await transport.readGroupHistory('222', { ownerUserId: '111', before: '51', limit: 4 });
+  assert.equal(page.messages.length, 1); assert.equal(page.messages[0]!.text, '/status');
+  assert.deepEqual(page.messages[0]!.space, { kind: 'group', spaceId: '222', mentionedUserIds: ['999'], replyToMessageId: '47' });
+  assert.equal(page.oldestId, '48'); assert.equal(page.newestId, '50'); assert.equal(page.hasMore, true);
+  assert.equal(urls.find(url => url.pathname.endsWith('/messages'))!.searchParams.get('before'), '51');
+  assert(urls.every(url => !/reactions|resources/.test(url.pathname)));
+  loseAccess = true; const before = urls.filter(url => url.pathname.endsWith('/messages')).length;
+  await assert.rejects(transport.readGroupHistory('222', { ownerUserId: '111' }), /失效/);
+  assert.equal(urls.filter(url => url.pathname.endsWith('/messages')).length, before);
+  loseAccess = false; wrongChannel = true; await assert.rejects(transport.readGroupHistory('222', { ownerUserId: '111' }), /群身份/);
+});

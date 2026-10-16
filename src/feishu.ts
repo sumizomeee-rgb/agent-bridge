@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { WSClient, EventDispatcher, Domain, type HttpInstance } from '@larksuiteoapi/node-sdk';
-import type { BridgeConfig, IncomingDM, DiscordAttachment, ReplyOptions, BridgeMessage } from './types.js';
+import type { BridgeConfig, IncomingDM, DiscordAttachment, ReplyOptions, BridgeMessage, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import { compareMessageIds } from './routing.js';
 
@@ -19,7 +19,7 @@ export interface FeishuOptions {
   logger?: (message: string) => void;
 }
 export class FeishuTransport {
-  botUser?: { username: string };
+  botUser?: { id?: string; username: string };
   private token = ''; private expires = 0; private obtaining?: Promise<string>;
   private readonly shutdown = new AbortController();
   private readonly dispatcher?: Dispatcher;
@@ -70,7 +70,8 @@ export class FeishuTransport {
   }
   async verifyIdentity(): Promise<string> {
     const data = await this.api('/bot/v3/info');
-    this.botUser = { username: String(data.bot?.app_name ?? data.bot?.name ?? 'Feishu Bot') };
+    this.botUser = { username: String(data.bot?.app_name ?? data.bot?.name ?? 'Feishu Bot'),
+      ...(typeof data.bot?.open_id === 'string' && /^ou_[a-zA-Z0-9_-]+$/.test(data.bot.open_id) ? { id: data.bot.open_id } : {}) };
     return this.config.applicationId!;
   }
   async start(): Promise<void> {
@@ -133,16 +134,32 @@ export class FeishuTransport {
     } else attachments.push({ id: String(content.file_key ?? ''), filename: String(content.file_name ?? type ?? 'attachment'),
       url: '', size: 0, content_type: 'application/octet-stream', resourceKey: String(content.file_key ?? ''), messageId: message.message_id });
     const channel = String(message.chat_id ?? '');
-    if (!/^oc_[a-zA-Z0-9_-]+$/.test(channel)) throw new Error('飞书私聊地址无效。');
-    return { id: this.messageId(message), userId: this.config.scopePrefix + user, channelId: this.config.scopePrefix + channel, text, attachments };
+    if (!/^oc_[a-zA-Z0-9_-]+$/.test(channel)) throw new Error('飞书聊天地址无效。');
+    const mentions: Json[] = Array.isArray(message.mentions) ? message.mentions.map((item: Json) => ({ ...item,
+      id: { open_id: typeof item?.id === 'string' && item.id_type === 'open_id' ? item.id : item?.id?.open_id },
+    })).filter((item: Json) => typeof item.id.open_id === 'string' && /^ou_[a-zA-Z0-9_-]+$/.test(item.id.open_id)) : [];
+    const mentionedUserIds = [...new Set<string>(mentions.map((item: Json) => item.id.open_id))];
+    // Only platform-resolved leading tokens may precede a text command. Display names never establish identity.
+    if (message.chat_type === 'group') {
+      let previous: string;
+      do {
+        previous = text;
+        const mention = mentions.find((item: Json) => typeof item.key === 'string' && item.key && text.trimStart().startsWith(item.key));
+        if (mention) text = text.trimStart().slice(mention.key.length).trimStart();
+      } while (text !== previous);
+    }
+    return { id: this.messageId(message), userId: this.config.scopePrefix + user, channelId: this.config.scopePrefix + channel, text, attachments,
+      ...(message.chat_type === 'group' ? { space: { kind: 'group' as const, spaceId: channel, mentionedUserIds,
+        ...(typeof message.parent_id === 'string' && /^om_[a-zA-Z0-9_-]+$/.test(message.parent_id) ? { replyToMessageId: message.parent_id } : {}) } } : {}) };
   }
   async receiveEvent(event: any): Promise<void> {
     const data = event.event ?? event; const sender = data.sender, message = data.message;
-    if (this.closed || sender?.sender_type !== 'user' || message?.chat_type !== 'p2p') return;
+    if (this.closed || sender?.sender_type !== 'user' || (message?.chat_type !== 'p2p' && !(this.config.groupMode === true && message?.chat_type === 'group'))) return;
     if (event.header?.app_id && event.header.app_id !== this.config.applicationId) return;
     const user = sender.sender_id?.open_id;
     if (typeof user !== 'string' || !this.config.externalAllowedUserIds?.includes(user)) return;
     const normalized = this.normalize(message, user);
+    if (this.seenMessages.has(normalized.id)) return;
     // This must finish durable capture before SDK acknowledgement; it never waits for model work.
     const captured = this.options.onReceive?.(normalized);
     if (captured !== false && !this.seenMessages.has(normalized.id)) {
@@ -151,6 +168,83 @@ export class FeishuTransport {
       void this.markReceived(normalized);
     }
     await this.receive(normalized);
+  }
+  /** Every application must verify its own raw chat ID; names/counts do not establish cross-app identity. */
+  async getGroupInfo(spaceId: string): Promise<GroupSpaceInfo> {
+    if (!/^oc_[a-zA-Z0-9_-]+$/.test(spaceId)) throw new Error('飞书群地址无效。');
+    const [chat, membership] = await Promise.all([
+      this.api(`/im/v1/chats/${spaceId}?user_id_type=open_id`),
+      this.api(`/im/v1/chats/${spaceId}/members/is_in_chat`),
+    ]);
+    if (chat.chat_mode !== 'group' || typeof membership.is_in_chat !== 'boolean') throw new Error('飞书群身份或机器人在群状态无法确认。');
+    const count = Number(chat.user_count);
+    return { spaceId, botIsMember: membership.is_in_chat,
+      ...(typeof chat.name === 'string' ? { name: chat.name } : {}),
+      ...(chat.owner_id_type === 'open_id' && typeof chat.owner_id === 'string' ? { ownerId: chat.owner_id } : {}),
+      ...(Number.isSafeInteger(count) && count >= 0 ? { memberCount: count } : {}) };
+  }
+  /** Feishu's members API excludes bots. Its result only proves human membership. */
+  async listGroupMembers(spaceId: string, options: { pageToken?: string; limit?: number } = {}): Promise<GroupMembersPage> {
+    if (!/^oc_[a-zA-Z0-9_-]+$/.test(spaceId)) throw new Error('飞书群地址无效。');
+    const limit = options.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('飞书群成员页面大小无效。');
+    const params = new URLSearchParams({ member_id_type: 'open_id', page_size: String(limit), ...(options.pageToken ? { page_token: options.pageToken } : {}) });
+    const data = await this.api(`/im/v1/chats/${spaceId}/members?${params}`);
+    if (!Array.isArray(data.items) || data.items.some((item: Json) => item.member_id_type !== 'open_id' || typeof item.member_id !== 'string' || !/^ou_[a-zA-Z0-9_-]+$/.test(item.member_id))
+      || (data.has_more === true && (typeof data.page_token !== 'string' || !data.page_token))) throw new Error('飞书群成员返回格式无效。');
+    return { members: data.items.map((item: Json) => ({ id: item.member_id, idType: 'open_id' as const, isBot: false })),
+      hasMore: data.has_more === true, ...(data.has_more === true ? { pageToken: data.page_token } : {}),
+      verification: data.trigger_security_conf_limit === true ? 'unknown' : 'verified', scope: 'humans',
+      ...(data.trigger_security_conf_limit === true ? { reason: '群成员安全限制导致返回不完整。' } : {}) };
+  }
+  async getGroupMember(spaceId: string, userId: string): Promise<GroupMember | null> {
+    if (!/^ou_[a-zA-Z0-9_-]+$/.test(userId)) throw new Error('飞书群成员身份无效。');
+    const tokens = new Set<string>(); let pageToken: string | undefined;
+    do {
+      const page = await this.listGroupMembers(spaceId, { pageToken });
+      const member = page.members.find(item => item.id === userId); if (member) return member;
+      if (page.verification !== 'verified') throw new Error('飞书群成员访问权无法确认。');
+      pageToken = page.pageToken;
+      if (pageToken && tokens.has(pageToken)) throw new Error('飞书群成员分页游标重复。');
+      if (pageToken) tokens.add(pageToken);
+    } while (pageToken);
+    return null;
+  }
+  /** Group recovery has its own authorization and retains group space/mentions, never a synthetic DM. */
+  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {
+    if (this.config.groupMode !== true || !/^oc_[a-zA-Z0-9_-]+$/.test(spaceId)) throw new Error('飞书群历史未启用或群标识无效。');
+    const users = this.config.externalAllowedUserIds ?? [];
+    const owner = options.ownerUserId ?? (users.length === 1 ? users[0] : undefined);
+    if (!owner || !users.includes(owner)) throw new Error('飞书群历史需要明确的已授权负责人账号。');
+    const limit = Math.min(options.limit ?? 50, 50);
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('飞书群历史页面大小无效。');
+    if (options.after && options.since && options.after !== options.since) throw new Error('飞书群历史起点不一致。');
+    const seconds = (id: string): number => {
+      if (!id.startsWith(this.config.scopePrefix!)) throw new Error('飞书群历史游标不属于当前机器人。');
+      const raw = id.slice(this.config.scopePrefix!.length);
+      if (!/^\d{10,16}\|om_[a-zA-Z0-9_-]+$/.test(raw)) throw new Error('飞书群历史游标无效。');
+      return Math.floor(Number(raw.split('|')[0]) / 1000);
+    };
+    const params = new URLSearchParams({ container_id_type: 'chat', container_id: spaceId, page_size: String(limit), sort_type: 'ByCreateTimeDesc' });
+    const since = options.since ?? options.after;
+    // One-second overlap preserves opaque IDs sharing a timestamp. The host deduplicates original message IDs.
+    if (since) params.set('start_time', String(Math.max(0, seconds(since) - 1)));
+    if (options.before) params.set('end_time', String(seconds(options.before) + 1));
+    if (options.pageToken) params.set('page_token', options.pageToken);
+    const info = await this.getGroupInfo(spaceId);
+    if (info.botIsMember !== true || !await this.getGroupMember(spaceId, owner)) throw new Error('飞书群历史访问权已失效。');
+    const data = await this.api(`/im/v1/messages?${params}`);
+    if (!Array.isArray(data.items) || (data.has_more === true && (typeof data.page_token !== 'string' || !data.page_token))) throw new Error('飞书群历史分页格式无效。');
+    const ids: string[] = [], messages = new Map<string, IncomingDM>();
+    for (const item of data.items as Json[]) {
+      if (item.chat_id != null && item.chat_id !== spaceId) throw new Error('飞书群历史返回了其他群的消息。');
+      const id = this.messageId(item); ids.push(id);
+      if (item.deleted === true || item.sender?.sender_type !== 'user' || item.sender?.id_type !== 'open_id' || item.sender.id !== owner) continue;
+      if (!messages.has(id)) messages.set(id, this.normalize({ ...item, chat_id: spaceId, chat_type: 'group' }, owner));
+    }
+    ids.sort(compareMessageIds);
+    return { messages: [...messages.values()], oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: data.has_more === true,
+      ...(data.has_more === true ? { pageToken: data.page_token } : {}) };
   }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
     const params = new URLSearchParams({ container_id_type: 'chat', container_id: channelId, page_size: String(Math.min(options.limit ?? 50, 50)), sort_type: 'ByCreateTimeDesc' });

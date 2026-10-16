@@ -1,3 +1,4 @@
+import { readOnlyRuntime } from './readonly.js';
 import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
 import { claudeEffortConfiguration } from './claude-effort.js';
@@ -91,14 +92,18 @@ export class ClaudeAdapter implements AgentAdapter {
     if (this.closed) throw new Error('Claude 适配器已关闭。');
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');
 
+    if (turn.readOnly && (turn.conversation.nativeId || turn.taskContextPath)) throw new Error('只读摘要必须使用独立的新会话且不能持有任务登记权限。');
+    const readonly = turn.readOnly ? readOnlyRuntime('claude', this.env) : undefined;
     const args = ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
       '--verbose', '--include-partial-messages', '--dangerously-skip-permissions',
-      ...(turn.acceptSupplements ? ['--replay-user-messages'] : [])];
+      ...(turn.acceptSupplements ? ['--replay-user-messages'] : []), ...(readonly?.args ?? [])];
     if (effort) args.push('--effort', effort);
     if (turn.conversation.nativeId) args.push('--resume', turn.conversation.nativeId);
     if (turn.conversation.model) args.push('--model', turn.conversation.model);
-    const transport = this.createTransport(this.command, args, turn.conversation.cwd,
-      { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) });
+    let transport: ClaudeTransport;
+    try { transport = this.createTransport(this.command, args, turn.conversation.cwd,
+      readonly?.env ?? { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) }); }
+    catch (error) { readonly?.cleanup(); throw error; }
     const completed = deferred<AgentResult>();
     let nativeId = turn.conversation.nativeId;
     let cancelled = false;
@@ -260,6 +265,7 @@ export class ClaudeAdapter implements AgentAdapter {
       for (const value of pendingInputs.values()) value.done.resolve({ status: 'uncertain', reason: 'Claude 轮次已关闭，补充接收未确认；不能重发。' });
       this.supplements.delete(conversationId);
       this.active.delete(conversationId);
+      readonly?.cleanup();
     }
   }
 

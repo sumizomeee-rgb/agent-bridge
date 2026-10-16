@@ -1,20 +1,22 @@
 # Agent Bridge
 
-在 Windows 笔记本运行，启动前选择 Discord 或飞书 bot，通过机器人私聊 Codex / Claude Code。支持双向图片，也可以要求 Agent 把生成或整理的普通文件作为附件发回。文字、图片、会话绑定和原生会话 ID 都会保留；程序重启后继续当前会话。
+在 Windows 笔记本运行，一个宿主可启动同一平台的多个 Discord 或飞书 Bot。每个 Bot 只服务一个激活账号，其私聊和已激活工作群共用本 Bot 的当前主控；不同 Bot 的记忆、任务和原生会话独立。支持图片、文件回传、后台助手及预约，正常重启保留会话和未启动队列。
+
+本轮群聊与连续 Agent 交接已有离线测试；模型网关仍离线，飞书普通群消息未 @ Bot 的实时投递尚未现场验收，不能据此宣称真实链路已就绪。
 
 ## 部署与生成工作区
 
 已验证平台为 Windows x64。目标用户需要已配置 Codex CLI 和 Claude Code；供应商、认证和模型别名沿用自己的 CLI / CC Switch 设置。
 
 1. 获取代码及编译后的 `dist/`，复制同平台 `node_modules/` 和 `.local/runtime/`。
-2. 将 `config.example.json` 复制为 `.local/config.json`，填写 CLI 路径、工作区和默认启动 Profile；再把 profiles/ 下的 bot 模板复制到 .local/bots/<平台>/<名称>.json，填写该 bot 的凭据和白名单。
-3. 生成工作区，在其 `README.md` 填写自己的导航，再把桥配置中的 `workspace` 设为同一路径：
+2. 将 `config.example.json` 复制为 `.local/config.json`，使用 `version: 3`、CLI 路径和同平台的 `startupProfiles` 集合；把 `profiles/` 中模板复制到 `.local/bots/<平台>/<名称>.json`，填写各 Bot 的真实应用 ID、凭据和白名单。明确登记 `principals` 的账号映射；飞书工作群还需 `spaces` 的逐应用群地址。
+3. 为每个 Bot 生成独立上下文工作区，在其 `README.md` 填写导航。默认路径为 `<workspaceRoot>/<平台>/<应用ID>`，也可在对应 Profile 的 `workspace` 指定绝对路径：
 
 ```powershell
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-4. 运行 `.\start.ps1 -Check` 检查配置，再运行 `.\start.ps1`；代理按启动 Profile 的 `network.proxyPort` 配置（Discord 示例 7898、飞书直连），也可临时用 `.\start.ps1 -ProxyPort 7898`。
+4. 现有 v2 数据先按[宿主迁移](docs/profiles.md#现有部署迁移到-v3)预览、正常停桥并离线应用。运行 `.\start.ps1 -Check` 做离线配置和路径检查，再运行 `.\start.ps1` 启动完整集合；代理按各 Profile 的 `network.proxyPort` 配置，也可显式临时用 `.\start.ps1 -ProxyPort 7898`。
 5. 需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。
 
 生成脚本不需要 Node 或联网，只补缺失文件（包括按职责划分的子目录），已有文件原样保留。空 `remote-agents/registry.json`、`capabilities/registry.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
@@ -40,7 +42,7 @@ agent-bridge/
 └─ .local/                    运行时、配置、会话、日志与备份，不进 Git
 ```
 
-Agent 工作区独立于桥代码，可放在任意指定目录：
+每个 Bot 的上下文工作区独立于桥代码，可放在指定目录；不同 Bot 不能共用或嵌套同一上下文目录。工程执行目录另由 `workingCwd` 或私聊 `/cwd` 选择，初始化与登记仍从固定上下文工作区读取：
 
 ```text
 D:\Agent Workspace/
@@ -71,12 +73,12 @@ D:\Agent Workspace/
 
 ## 使用与维护
 
-- [Profile、bot 与语义迁移](docs/profiles.md)：启动前选平台及 bot、本地私有配置、Git 边界和完整的一次性迁移。
+- [Profile、Bot 与宿主迁移](docs/profiles.md)：v3 启动集合、独立工作区、账号及群映射、私有资料和离线迁移。
 
 - [使用说明](docs/usage.md)：主控与子 Agent、私聊指令、图片和文件、模型及强度、任务计数与安全重启。
 - [部署与迁移](docs/deployment.md)：工作区生成、配置、代理、数据迁移与跨电脑登记。
 - [能力登记与就绪检查](docs/capabilities.md)：启动体检、按需查询、验收范围和任务进度。
 - [开发与验证](docs/development.md)：构建、测试和版本升级。
-- [群聊与多个长期主控 Bot（设计，未实现）](docs/group-controller-design.md)：共享主控、单操作者、多群、命令与交接边界、反例验收及开发顺序。
+- [群聊与多个长期主控 Bot](docs/group-controller-design.md)：唯一群聊设计稿，统一当前主控、单操作者、多群、命令与交接边界及验收要求。
 
-新增或改变主控工具声明后，已有 Codex 原生会话需要 `/new` 才能加载新声明；普通重启仍续接旧会话。工作区模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化；普通模型、强度切换可以保留当前会话。
+新增或改变主控工具声明后，已有 Codex 原生会话需要 `/new` 才能加载新声明；普通重启仍续接旧会话。模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化。私聊 `/new continue` 仅提炼本 Bot 当前主控，并取消旧预约；真实 `/agent` 切换自动交接最新上下文，保留助手和计划，目标准备失败时保持旧主控。普通模型、强度切换保留当前会话。

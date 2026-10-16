@@ -2,7 +2,7 @@ import { DiscordTransport, ingressFailureText } from './discord.js';
 import { FeishuTransport } from './feishu.js';
 import type { BridgeLifecycleEvent } from './lifecycle.js';
 import { externalId } from './routing.js';
-import type { BridgeConfig, IncomingDM, ReplyOptions, BridgeMessage } from './types.js';
+import type { BridgeConfig, IncomingDM, ReplyOptions, BridgeMessage, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
 import type { WorkCounts } from './overview.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 
@@ -16,7 +16,7 @@ export class PlatformTransport {
       : new DiscordTransport({ ...config, allowedUserIds: config.externalAllowedUserIds ?? config.allowedUserIds },
         message => receive(this.scoped(message)), { ...hooks, onReceive: message => hooks.onReceive(this.scoped(message)) });
   }
-  get botUser(): { username: string } | undefined { return this.transport.botUser ?? undefined; }
+  get botUser(): { id?: string; username: string } | undefined { return this.transport.botUser ?? undefined; }
   private scoped(message: IncomingDM): IncomingDM {
     const scope = this.config.scopePrefix ?? '';
     return { ...message, id: scope + message.id, userId: scope + message.userId, channelId: scope + message.channelId };
@@ -30,6 +30,12 @@ export class PlatformTransport {
     if (applicationId !== this.config.applicationId) throw new Error('凭据对应的机器人与 Profile applicationId 不一致。');
     return applicationId;
   }
+  getGroupInfo(spaceId: string): Promise<GroupSpaceInfo> { return this.transport.getGroupInfo(spaceId); }
+  listGroupMembers(spaceId: string, options: { pageToken?: string; limit?: number } = {}): Promise<GroupMembersPage> { return this.transport.listGroupMembers(spaceId, options); }
+  getGroupMember(spaceId: string, userId: string): Promise<GroupMember | null> { return this.transport.getGroupMember(spaceId, userId); }
+  async syncGroupSlashCommands(guildId: string): Promise<void> {
+    if (this.config.features?.nativeCommands !== false && this.transport instanceof DiscordTransport) await this.transport.syncGroupSlashCommands(guildId);
+  }
   start(): Promise<void> { return this.transport.start(); }
   close(): Promise<void> { return this.transport.close(); }
   isIdle(): boolean { return this.transport.isIdle(); }
@@ -37,6 +43,15 @@ export class PlatformTransport {
   sendInteractionText(interaction: NonNullable<IncomingDM['interaction']>, text: string, options?: ReplyOptions): Promise<void> {
     if (!(this.transport instanceof DiscordTransport)) throw new Error('当前平台没有原生斜杠交互。');
     return this.transport.sendInteractionText(interaction, text, options);
+  }
+  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {
+    if (this.transport instanceof FeishuTransport) return this.transport.readGroupHistory(spaceId, options);
+    const cursor = (id: string) => this.config.scopePrefix && id.startsWith(this.config.scopePrefix) ? this.raw(id) : id;
+    const page = await this.transport.readGroupHistory(spaceId, { ...options,
+      ...(options.before ? { before: cursor(options.before) } : {}), ...(options.after ? { after: cursor(options.after) } : {}) });
+    const scope = this.config.scopePrefix ?? '';
+    return { ...page, messages: page.messages.map(message => this.scoped(message)),
+      oldestId: page.oldestId ? scope + page.oldestId : null, newestId: page.newestId ? scope + page.newestId : null };
   }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
     if (this.transport instanceof FeishuTransport) return this.transport.readDMHistory(this.raw(channelId), options);
