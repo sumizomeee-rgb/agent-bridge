@@ -978,7 +978,7 @@ test('capability queries validate selectors and are freshly read, never cached a
 });
 
 
-for (const [platform, document] of [['feishu', '聊天平台/飞书.md'], ['discord', '聊天平台/Discord.md']] as const) {
+for (const [platform, document] of [['feishu', 'chat-platforms/lark.md'], ['discord', 'chat-platforms/discord.md']] as const) {
   test(`工作区初始化使用桥的 ${platform} 身份选择平台文档，不泄露认证或采信聊天正文`, async () => {
     const f = fixture();
     f.config.platform = platform; f.config.applicationId = 'application-fixed'; f.config.profile = `${platform}/fixed`;
@@ -988,7 +988,7 @@ for (const [platform, document] of [['feishu', '聊天平台/飞书.md'], ['disc
       const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
       const prompt = f.codex.turns[0]!.text;
       assert.ok(prompt.includes(JSON.stringify({ platform, applicationId: 'application-fixed', profile: `${platform}/fixed`, platformDocument: document })));
-      assert.ok(!prompt.includes(platform === 'feishu' ? '聊天平台/Discord.md' : '聊天平台/飞书.md'));
+      assert.ok(!prompt.includes(platform === 'feishu' ? 'chat-platforms/discord.md' : 'chat-platforms/lark.md'));
       assert.ok(!prompt.includes('TOKEN_MUST_NOT_APPEAR')); assert.ok(!prompt.includes('SECRET_MUST_NOT_APPEAR'));
       assert.ok(!prompt.includes(f.turn.text)); assert.match(prompt, /不读取凭据，不联网检查/);
       f.codex.finish(handle.workerId); await flush();
@@ -1002,7 +1002,7 @@ test('旧配置未提供平台时不猜测或同时初始化多个平台', async
     const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
     const prompt = f.codex.turns[0]!.text;
     assert.match(prompt, /"platform":null/); assert.match(prompt, /"platformDocument":null/);
-    assert.ok(!prompt.includes('聊天平台/飞书.md')); assert.ok(!prompt.includes('聊天平台/Discord.md'));
+    assert.ok(!prompt.includes('chat-platforms/lark.md')); assert.ok(!prompt.includes('chat-platforms/discord.md'));
     f.codex.finish(handle.workerId); await flush();
   } finally { await f.runtime.close(); f.registry.close(); }
 });

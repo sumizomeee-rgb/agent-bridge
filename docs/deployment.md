@@ -30,7 +30,7 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-生成 `MEMORY.md`、`README.md`、`agents.json`、`capabilities.json` 和各自的 `.example.json`，以及 `聊天平台/飞书.md`、`聊天平台/Discord.md`；预建 `.local/tmp/` 和 `.local/deliveries/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
+生成 `MEMORY.md`、`README.md`、`agents.json`、`capabilities.json` 和各自的 `.example.json`，以及 `chat-platforms/lark.md`、`chat-platforms/discord.md`；预建 `.local/tmp/` 和 `.local/deliveries/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
 
 1. 在生成的 `README.md` 填写电脑用途、项目与 SSH 导航、需要初始化读取的本机入口；长工作指南只指向权威文档。
 2. `agents.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `agents.example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。

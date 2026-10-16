@@ -50,7 +50,7 @@ D:\Agent Workspace/
 ├─ agents.example.json        远端登记示例，不自动启用
 ├─ capabilities.json          能力入口与验收范围，默认空表
 ├─ capabilities.example.json  能力登记示例，不自动启用
-├─ 聊天平台/                  飞书.md、Discord.md，初始化只读当前平台
+├─ chat-platforms/            lark.md、discord.md，初始化只读当前平台
 └─ .local/                    tmp/ 临时产物、deliveries/ 正式交付
 ```
 
@@ -65,6 +65,5 @@ D:\Agent Workspace/
 - [能力登记与就绪检查](docs/capabilities.md)：启动体检、按需查询、验收范围和任务进度。
 - [开发与验证](docs/development.md)：构建、测试和版本升级。
 - [群聊与多个长期主控 Bot（设计，未实现）](docs/group-controller-design.md)：共享主控、单操作者、多群、命令与交接边界、反例验收及开发顺序。
-- [飞书适配历史调研（非群聊设计）](docs/feishu-bridge-feasibility.md)：共享核心、单平台互斥启动、能力边界与后续验收；保留最初调研证据。
 
 新增或改变主控工具声明后，已有 Codex 原生会话需要 `/new` 才能加载新声明；普通重启仍续接旧会话。工作区模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化；普通模型、强度切换可以保留当前会话。

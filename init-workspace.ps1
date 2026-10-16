@@ -37,9 +37,9 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', '聊天平台\飞书.md', '聊天平台\Discord.md')
+    $files = @('MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', 'chat-platforms\lark.md', 'chat-platforms\discord.md')
     # 先检查父目录及完整清单，避免碰撞时只生成一部分模板。
-    $directories = @('聊天平台', '.local', '.local\tmp', '.local\deliveries')
+    $directories = @('chat-platforms', '.local', '.local\tmp', '.local\deliveries')
     foreach ($name in $directories) {
         $directory = Join-Path $workspace $name
         if ([IO.File]::Exists($directory)) {
