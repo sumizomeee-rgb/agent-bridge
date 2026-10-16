@@ -10,14 +10,14 @@ import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', 'chat-platforms/lark.md', 'chat-platforms/discord.md'];
+const templates = ['MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms/lark.md', 'chat-platforms/discord.md'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 
 test('workspace capability skeleton and inactive example use the current registry schema', () => {
-  const skeleton = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities.json'), 'utf8')));
+  const skeleton = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities/registry.json'), 'utf8')));
   assert.deepEqual(skeleton, []);
-  const example = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities.example.json'), 'utf8')));
+  const example = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities/example.json'), 'utf8')));
   assert.equal(example.length, 3);
   assert.ok(example.every(item => !item.acceptance), 'An untested example must not claim an accepted capability.');
 });
@@ -49,8 +49,8 @@ test('workspace initializer generates usable templates from another working dire
     requireSuccess(run(workspace, root));
     assert.deepEqual(readdirSync(workspace).sort(), [...new Set([...templates.map(file => file.split('/')[0]!), '.local'])].sort());
     for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), readFileSync(join(project, 'workspace-template', file)));
-    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'agents.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
-    assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities.json'), 'utf8'))), []);
+    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
+    assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities/registry.json'), 'utf8'))), []);
     assert.deepEqual(readdirSync(join(workspace, '.local')).sort(), ['deliveries', 'tmp']);
     assert.deepEqual(readdirSync(join(workspace, '.local', 'tmp')), []);
     assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').trim());
@@ -66,8 +66,9 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     mkdirSync(workspace);
     const custom = Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('用户工作习惯\r\n保留原样\r\n')]);
     writeFileSync(join(workspace, 'README.md'), custom);
+    mkdirSync(join(workspace, 'capabilities'));
     const capabilities = Buffer.from('{\r\n  \"version\": 1, \"capabilities\": [], \"note\": \"用户维护\"\r\n}\r\n');
-    writeFileSync(join(workspace, 'capabilities.json'), capabilities);
+    writeFileSync(join(workspace, 'capabilities/registry.json'), capabilities);
     writeFileSync(join(workspace, 'private.txt'), 'existing unrelated context');
     mkdirSync(join(workspace, '.local', 'tmp'), { recursive: true });
     writeFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'unfinished task evidence');
@@ -77,7 +78,7 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     const before = new Map([...templates, 'private.txt'].map(file => [file, readFileSync(join(workspace, file))]));
     requireSuccess(run(workspace, root));
     assert.deepEqual(readFileSync(join(workspace, 'README.md')), custom);
-    assert.deepEqual(readFileSync(join(workspace, 'capabilities.json')), capabilities);
+    assert.deepEqual(readFileSync(join(workspace, 'capabilities/registry.json')), capabilities);
     assert.deepEqual(readFileSync(join(workspace, 'chat-platforms', 'lark.md')), custom);
     assert.equal(readFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'utf8'), 'unfinished task evidence');
     for (const [file, bytes] of before) assert.deepEqual(readFileSync(join(workspace, file)), bytes);
@@ -99,7 +100,7 @@ test('workspace initializer relocates with its templates to a project path conta
     assert.ok(!existsSync(join(relocated, 'node_modules')));
     const workspace = join(root, '目标 工作区');
     requireSuccess(run(workspace, root, join(relocated, 'init-workspace.ps1')));
-    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'agents.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
+    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
   } finally { cleanup(); }
 });
 
@@ -122,11 +123,12 @@ test('workspace initializer rejects relative paths, drive/share roots and a file
 test('workspace initializer fails before copying templates when a destination filename is already a directory', windowsOnly, () => {
   const { root, cleanup } = fixture();
   try {
-    const workspace = join(root, 'collision'); mkdirSync(join(workspace, 'agents.json'), { recursive: true });
+    const workspace = join(root, 'collision'); mkdirSync(join(workspace, 'remote-agents/registry.json'), { recursive: true });
     const result = run(workspace, root);
     assert.equal(result.error, undefined, result.error?.message);
     assert.notEqual(result.status, 0, result.stdout + result.stderr);
-    assert.deepEqual(readdirSync(workspace), ['agents.json']);
+    assert.deepEqual(readdirSync(workspace), ['remote-agents']);
+    assert.deepEqual(readdirSync(join(workspace, 'remote-agents')), ['registry.json']);
   } finally { cleanup(); }
 });
 
@@ -171,6 +173,21 @@ test('临时及交付目录路径被文件占用时提前失败，不生成部�
       assert.deepEqual(readdirSync(workspace), ['.local']);
       assert.equal(readFileSync(join(workspace, collision), 'utf8'), '用户文件');
       if (collision !== '.local') assert.deepEqual(readdirSync(join(workspace, '.local')), [collision.split('/')[1]!]);
+    } finally { cleanup(); }
+  }
+});
+
+
+test('legacy root registries require migration before any skeleton is generated', windowsOnly, () => {
+  for (const legacy of ['agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json']) {
+    const { root, cleanup } = fixture();
+    try {
+      const workspace = join(root, 'legacy'); mkdirSync(workspace);
+      writeFileSync(join(workspace, legacy), 'user registration must survive');
+      const result = run(workspace, root);
+      assert.notEqual(result.status, 0, result.stdout + result.stderr);
+      assert.deepEqual(readdirSync(workspace), [legacy]);
+      assert.equal(readFileSync(join(workspace, legacy), 'utf8'), 'user registration must survive');
     } finally { cleanup(); }
   }
 });

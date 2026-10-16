@@ -17,7 +17,7 @@ const ref: NativeSessionRef = { agent: 'codex', profile: 'default', nativeId };
 function fixture(t: TestContext, terminal = true) {
   const root = mkdtempSync(join(tmpdir(), 'bridge-native-session-'));
   const home = join(root, 'user'), cwd = join(root, 'workspace'), data = join(root, 'data'), codex = join(home, '.codex');
-  mkdirSync(join(codex, 'sessions'), { recursive: true }); mkdirSync(cwd); mkdirSync(data);
+  mkdirSync(join(codex, 'sessions'), { recursive: true }); mkdirSync(cwd); mkdirSync(join(cwd, 'remote-agents')); mkdirSync(data);
   writeFileSync(join(codex, 'config.toml'), 'model_provider="openai"\n');
   const path = join(codex, 'sessions', `rollout-${nativeId}.jsonl`);
   const records = [{ type: 'session_meta', payload: { id: nativeId, cwd, cli_version: '0.162.1' } },
@@ -218,7 +218,7 @@ test('catalog explicitly registered native-history access is distinct from the g
   const config: BridgeConfig = { token: '', allowedUserIds: ['owner', 'friend'], defaultAgent: 'codex', workspace: f.cwd,
     proxyUrl: null, commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, dataDir: f.data, attachmentsDir: f.data, logsDir: f.data, maxImageBytes: 100 };
   const adapter: AgentAdapter = { async run() { throw new Error('No model is allowed in this test.'); }, async interrupt() {}, async close() {} };
-  writeFileSync(join(f.cwd, 'agents.json'), JSON.stringify({ version: 1, targets: [{ id: 'workstation', label: 'test', expectedHostname: 'TEST', sshConfig: join(f.root, 'ssh_config'), alias: 'test', remoteRoot: f.root, nodePath: process.execPath, engines: { codex: { agentCommand: { command: process.execPath, args: [] }, defaultCwd: f.cwd } }, allowedUserIds: ['friend'] }] }));
+  writeFileSync(join(f.cwd, 'remote-agents/registry.json'), JSON.stringify({ version: 1, targets: [{ id: 'workstation', label: 'test', expectedHostname: 'TEST', sshConfig: join(f.root, 'ssh_config'), alias: 'test', remoteRoot: f.root, nodePath: process.execPath, engines: { codex: { agentCommand: { command: process.execPath, args: [] }, defaultCwd: f.cwd } }, allowedUserIds: ['friend'] }] }));
   const catalog = new TargetCatalogService(config, { codex: adapter, claude: adapter }, { nativeSessions: service });
   await catalog.authorizeNativeAccess(f.cwd, 'friend', 'workstation');
   await assert.rejects(catalog.authorizeNativeAccess(f.cwd, 'owner', 'workstation'), /权限/);
@@ -236,7 +236,7 @@ test('remote catalog forwards native list/read/adopt over the existing authentic
   f.resources.push(() => daemon.close());
   const config: BridgeConfig = { token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: f.cwd, proxyUrl: null,
     commands: { codex: command, claude: command }, dataDir: f.data, attachmentsDir: f.data, logsDir: f.data, maxImageBytes: 100 };
-  writeFileSync(join(f.cwd, 'agents.json'), JSON.stringify({ version: 1, targets: [{ id: 'workstation', label: 'test', expectedHostname: hostname(), sshConfig: join(f.root, 'ssh_config'), alias: 'test', remoteRoot: f.root, nodePath: process.execPath, engines: { codex: { agentCommand: command, defaultCwd: f.cwd } } }] }));
+  writeFileSync(join(f.cwd, 'remote-agents/registry.json'), JSON.stringify({ version: 1, targets: [{ id: 'workstation', label: 'test', expectedHostname: hostname(), sshConfig: join(f.root, 'ssh_config'), alias: 'test', remoteRoot: f.root, nodePath: process.execPath, engines: { codex: { agentCommand: command, defaultCwd: f.cwd } } }] }));
   const noop: AgentAdapter = { async run() { throw new Error('Local model execution is forbidden in this test.'); }, async interrupt() {}, async close() {} };
   const service = f.make();
   const catalog = new TargetCatalogService(config, { codex: noop, claude: noop }, { nativeSessions: service, clientFactory: () => ({ request: (method, args) => daemon.handle(method, args) as Promise<any>, async close() {} }), pollMs: 1 });

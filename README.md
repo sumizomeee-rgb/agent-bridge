@@ -17,7 +17,7 @@
 4. 运行 `.\start.ps1 -Check` 检查配置，再运行 `.\start.ps1`；代理按启动 Profile 的 `network.proxyPort` 配置（Discord 示例 7898、飞书直连），也可临时用 `.\start.ps1 -ProxyPort 7898`。
 5. 需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。
 
-生成脚本不需要 Node 或联网，只补缺失文件（包括聊天平台子目录），已有文件原样保留。空 `agents.json`、`capabilities.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
+生成脚本不需要 Node 或联网，只补缺失文件（包括按职责划分的子目录），已有文件原样保留。空 `remote-agents/registry.json`、`capabilities/registry.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
 
 ## 目录导航
 
@@ -46,15 +46,28 @@ Agent 工作区独立于桥代码，可放在任意指定目录：
 D:\Agent Workspace/
 ├─ MEMORY.md                  持续维护的偏好、纠正与已核实事实
 ├─ README.md                  稳定行为约定、初始化入口与工作导航
-├─ agents.json                实际跨电脑注册表，默认空表
-├─ agents.example.json        远端登记示例，不自动启用
-├─ capabilities.json          能力入口与验收范围，默认空表
-├─ capabilities.example.json  能力登记示例，不自动启用
+├─ remote-agents/             远程电脑及 Agent 的非秘密登记
+│  ├─ registry.json           实际登记，默认空表
+│  └─ example.json            填写示例，不自动启用
+├─ capabilities/              浏览器／应用能力及历史验收登记
+│  ├─ registry.json           实际登记，默认空表
+│  └─ example.json            填写示例，不自动启用
 ├─ chat-platforms/            lark.md、discord.md，初始化只读当前平台
 └─ .local/                    tmp/ 临时产物、deliveries/ 正式交付
 ```
 
 工作区 Markdown 骨架为 2 + 平台数：README 统一保存稳定约定与导航，MEMORY 保存持续记忆，每个平台另有一份指南。根目录不放临时产物，生成器预建 `.local/tmp/` 与 `.local/deliveries/`；收工规则见工作区 README。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
+
+
+### 工作区职责与生成原理
+
+工作区根目录保留 `README.md`、`MEMORY.md` 和按职责命名的目录。README 是初始化与规则的唯一入口，MEMORY 记录长期偏好和已核实事实；`chat-platforms/` 提供按当前平台选择的操作指南。`remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。这两类 JSON 由程序按需读取，不作为初始化全文注入；示例不会自动启用，任何登记都不包含凭据。
+
+`workspace-template/` 是随代码维护的公共骨架，`init-workspace.ps1 -Path <绝对目录>` 按固定清单复制缺失文件并预建职能目录和 `.local/tmp/`、`.local/deliveries/`。生成前先检查目录／文件碰撞；已有用户文件保持原字节，不覆盖、不自动同步模板，也不扫描任意新增目录。桥运行时不生成工作区；初始化只读 README 指定的 MEMORY 和当前平台文档，其余资料按任务和工具需要读取。更新已有 README 时需保留用户内容并定点合并，新会话重新初始化后生效。
+
+新增职能时使用英文小写、短横线目录名，一目录承担一项稳定职责。在工作区 README 写明用途、维护者、文件格式、何时读取以及权威来源；默认按需读取，不自动加入初始化。若需提供公共骨架，将无秘密的最小模板加入 `workspace-template/<职能>/`，同步生成器的目录／文件清单、程序读取路径和相应测试，再更新本节。任务产物进 `.local/tmp/<任务名>/`，保留交付进 `.local/deliveries/<任务名>/`，不占根目录或职能登记目录。
+
+旧工作区升级先停桥并备份，将根目录 `agents.json`、`agents.example.json` 分别移动至 `remote-agents/registry.json`、`remote-agents/example.json`；将 `capabilities.json`、`capabilities.example.json` 分别移动至 `capabilities/registry.json`、`capabilities/example.json`，更新已有 README 引用后再运行生成器并重启。目标已存在时先人工核对合并，禁止覆盖；生成器发现旧登记会报错，避免创建空表后静默忽略原配置。
 
 ## 使用与维护
 

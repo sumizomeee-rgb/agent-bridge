@@ -30,14 +30,20 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-生成 `MEMORY.md`、`README.md`、`agents.json`、`capabilities.json` 和各自的 `.example.json`，以及 `chat-platforms/lark.md`、`chat-platforms/discord.md`；预建 `.local/tmp/` 和 `.local/deliveries/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
+生成 `MEMORY.md`、`README.md`、`remote-agents/registry.json`、`capabilities/registry.json` 和各目录的 `example.json`，以及 `chat-platforms/lark.md`、`chat-platforms/discord.md`；预建 `.local/tmp/` 和 `.local/deliveries/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
 
 1. 在生成的 `README.md` 填写电脑用途、项目与 SSH 导航、需要初始化读取的本机入口；长工作指南只指向权威文档。
-2. `agents.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `agents.example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。
-3. `capabilities.json` 初始为空；按 `capabilities.example.json` 填写真正使用的浏览器 profile 和能力入口。验收记录注明范围，当前状态由桥按需查询，示例不会启用；见[能力登记与就绪检查](capabilities.md)。
+2. `remote-agents/registry.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `remote-agents/example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。
+3. `capabilities/registry.json` 初始为空；按 `capabilities/example.json` 填写真正使用的浏览器 profile 和能力入口。验收记录注明范围，当前状态由桥按需查询，示例不会启用；见[能力登记与就绪检查](capabilities.md)。
 4. 把 `.local/config.json` 的 `workspace` 设为该绝对路径。已运行桥需安全重启加载配置；当前用户也可用 `/cwd 完整绝对路径` 在新工作区开启会话。
 
 工作区文件属于用户资料，需要单独迁移；保留旧工作区就直接复制它，不必重新生成或覆盖。修改模板不会覆盖现有工作区。旧工作区的 AGENTS.md 如需收敛，应先把全部有效约定合并到 README，再备份并回收旧文件；生成器不会自动合并或删除用户已有文件，也不会重新生成 AGENTS.md。重复运行生成器会补齐缺失的平台文档，但已有 README 的初始化入口需要用户按模板定点更新；没有声明读取范围时，桥不会自行扫描或加载额外资料。
+
+### 旧版根目录登记迁移
+
+升级读取路径前先停桥并备份用户工作区。将根目录 `agents.json`、`agents.example.json` 移到 `remote-agents/registry.json`、`remote-agents/example.json`；将 `capabilities.json`、`capabilities.example.json` 移到 `capabilities/registry.json`、`capabilities/example.json`。保持 JSON 原字节，目标已有文件时先核对合并，不直接覆盖。更新已有 README、MEMORY 和平台指南中的路径引用后，重新运行生成器核对，再重启桥。生成器检测到旧根目录登记会提前报错，不自动迁移用户文件或创建空表代替真实登记。
+
+职责与新增职能的模板、固定清单和读取逻辑约定见 [项目 README](../README.md#工作区职责与生成原理)。
 
 ## 工作目录与数据
 
@@ -67,7 +73,7 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 
 ## 跨电脑直属 Agent
 
-在实际工作区维护 `agents.json`（`version: 1`），格式见 `workspace-template/agents.example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
+在实际工作区维护 `remote-agents/registry.json`（`version: 1`），格式见 `workspace-template/remote-agents/example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
 
 主控按需使用 `bridge_list_targets` 查询，再在 `bridge_start_worker` 指定 `targetId`。登记不等于实时在线，派发时核对目标电脑、引擎和远端目录；不会因目标失败而悄悄改在本机执行。远端执行器运行在目标电脑，在自己的 `.local/remote` 保存任务、原生会话与回执，管理接口仅监听目标机 127.0.0.1，通过 SSH 本地转发和私有认证连接；连接元数据由 SSH 内部读取，不写进登记表。断线重连和桥恢复查询同一派发编号，不重复提交原任务。续接、工作中补充、停止、任务数字表情、读图与文件回传共用既有能力；远端产物下载到桥的 `.local/data/outgoing/remote` 后回传。
 

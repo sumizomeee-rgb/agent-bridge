@@ -2,11 +2,11 @@
 
 [返回项目首页](../README.md)
 
-工作区的 `capabilities.json` 保存能力入口和验收记录，桥的 `.local/data/capability-health` 保存当前检查缓存。登记属于用户上下文；检查和任务观测由桥提供。启动、重启做轻检查，主控按需调用 `bridge_check_capabilities`；新会话以 `README.md` 为唯一入口，并只读 README 明确要求的 MEMORY 及当前平台文档；桥提供 platform、固定应用 ID 和 Profile，未知时不猜测。不会为初始化远连或探测业务页面，也不逐轮注入完整报告。
+工作区的 `capabilities/registry.json` 保存能力入口和验收记录，桥的 `.local/data/capability-health` 保存当前检查缓存。登记属于用户上下文；检查和任务观测由桥提供。启动、重启做轻检查，主控按需调用 `bridge_check_capabilities`；新会话以 `README.md` 为唯一入口，并只读 README 明确要求的 MEMORY 及当前平台文档；桥提供 platform、固定应用 ID 和 Profile，未知时不猜测。不会为初始化远连或探测业务页面，也不逐轮注入完整报告。
 
 ## 登记
 
-生成器提供有效空表和独立的 `capabilities.example.json`，示例不会自动启用。填入真实值后放到实际表；不存密码、Token、Cookie 或截图。远端 `targetId` 对应同目录 `agents.json`，本机使用保留值 `local`。
+生成器提供有效空表和独立的 `capabilities/example.json`，示例不会自动启用。填入真实值后放到实际表；不存密码、Token、Cookie 或截图。远端 `targetId` 对应工作区 `remote-agents/registry.json`，本机使用保留值 `local`。
 
 | 字段 | 内容 |
 | --- | --- |

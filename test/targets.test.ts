@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AgentAdapter, BridgeConfig } from '../src/types.js';
@@ -10,6 +10,7 @@ import type { ExecutionTargetBinding } from '../src/remote/types.js';
 
 function fixture() {
   const workspace = mkdtempSync(join(tmpdir(), 'bridge-targets-'));
+  mkdirSync(join(workspace, 'remote-agents'));
   const command = { command: process.execPath, args: [] };
   const config: BridgeConfig = { token: 'unused', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace, proxyUrl: null,
     commands: { codex: command, claude: command }, dataDir: workspace, attachmentsDir: workspace, logsDir: workspace, maxImageBytes: 20 };
@@ -18,7 +19,7 @@ function fixture() {
     remoteRoot: 'E:\\Agent Runtime', nodePath: 'D:\\Node\\node.exe', engines: { codex: { agentCommand: { command: 'D:\\Node\\node.exe', args: ['D:\\CLI\\codex.js'] }, defaultCwd: 'E:\\Work' } }, password: 'do-not-copy', token: 'do-not-copy' };
   return { workspace, config, local, entry, catalog: new TargetCatalogService(config, { codex: local, claude: local }) };
 }
-test('target catalog supplies local builtin without agents.json and makes no remote probe', async () => {
+test('target catalog supplies local builtin without remote-agents/registry.json and makes no remote probe', async () => {
   const f = fixture(); let connections = 0;
   const catalog = new TargetCatalogService(f.config, { codex: f.local, claude: f.local }, { clientFactory: () => { connections++; throw new Error('not allowed to probe'); } });
   assert.deepEqual((await catalog.listTargets(f.workspace)).map(value => value.id), ['local']);
@@ -36,7 +37,7 @@ test('target catalog supplies local builtin without agents.json and makes no rem
   await catalog.close(); await f.catalog.close();
 });
 test('remote catalog snapshots only registered fields and never stats a target cwd on the bridge computer', async () => {
-  const f = fixture(); writeFileSync(join(f.workspace, 'agents.json'), JSON.stringify({ version: 1, targets: [f.entry] }));
+  const f = fixture(); writeFileSync(join(f.workspace, 'remote-agents/registry.json'), JSON.stringify({ version: 1, targets: [f.entry] }));
   const summary = (await f.catalog.listTargets(f.workspace))[1]!; assert.equal(summary.availability, 'registered'); assert.deepEqual(summary.engines, ['codex']);
   const binding = await f.catalog.resolveTarget(f.workspace, 'station', 'codex', 'Z:\\Does-Not-Exist-On-Notebook');
   assert.equal(binding.cwd, 'Z:\\Does-Not-Exist-On-Notebook'); assert.ok(!JSON.stringify(binding).includes('do-not-copy'));
@@ -46,7 +47,7 @@ test('remote catalog snapshots only registered fields and never stats a target c
   await f.catalog.close();
 });
 test('catalog refresh is explicit and a saved worker binding is unaffected by registry edits', async () => {
-  const f = fixture(); const path = join(f.workspace, 'agents.json'); writeFileSync(path, JSON.stringify({ version: 1, targets: [f.entry] }));
+  const f = fixture(); const path = join(f.workspace, 'remote-agents/registry.json'); writeFileSync(path, JSON.stringify({ version: 1, targets: [f.entry] }));
   const old = await f.catalog.resolveTarget(f.workspace, 'station', 'codex');
   writeFileSync(path, JSON.stringify({ version: 1, targets: [{ ...f.entry, label: '新名称', engines: { codex: { ...f.entry.engines.codex, defaultCwd: 'E:\\Other' } } }] }));
   assert.equal((await f.catalog.resolveTarget(f.workspace, 'station', 'codex')).cwd, 'E:\\Work');

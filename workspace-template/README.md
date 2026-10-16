@@ -13,11 +13,20 @@
 
 ## 正式骨架与临时产物
 
-Markdown 正式骨架为 **2 + 平台数**：`README.md` 统一保存稳定行为约定、导航与初始化入口，`MEMORY.md` 保存持续维护的偏好和事实；每个平台另有一份 `chat-platforms/<平台>.md`，初始化只读当前平台。`agents.json`、`capabilities.json` 及示例属于登记资料，不计入正文数量。
+Markdown 正式骨架为 **2 + 平台数**：`README.md` 统一保存稳定行为约定、导航与初始化入口，`MEMORY.md` 保存持续维护的偏好和事实；每个平台另有一份 `chat-platforms/<平台>.md`，初始化只读当前平台。`remote-agents/registry.json`、`capabilities/registry.json` 及示例属于登记资料，不计入正文数量。
 
 生成脚本预建 `.local/tmp/` 和 `.local/deliveries/`。临时脚本、日志、截图、下载和实验放 `.local/tmp/<任务名>/`；要保留的交付放 `.local/deliveries/<任务名>/`；旧证据按需归档到 `.local/archive/`。已有工具的专用 `.local` 输出目录继续使用。根目录不放临时产物，实际工程代码回所属项目。
 
 这些目录不在默认初始化读取范围内；收工按本文件的归位规则核对和回收，不把整个临时目录视为可随意清空。
+
+
+## 职能目录与扩展约定
+
+根目录保留 README、MEMORY 和职能目录，不平铺登记表或临时文件。`chat-platforms/` 保存平台指南；`remote-agents/registry.json` 保存远程电脑及 CLI 登记；`capabilities/registry.json` 保存能力入口与历史验收。各职能的 `example.json` 只作填写参考，不自动启用。登记由桥程序按需读取，默认不全文加入初始化；凭据仍留在原电脑或部署配置中。
+
+新增稳定职能时，使用英文小写、短横线目录名，一目录一职责；在本 README 明确用途、维护者、权威来源、文件格式和读取时机，默认按任务需要读取。需要程序读取或成为公共骨架时，同步桥项目的读取路径、`workspace-template/`、生成器固定清单及对应测试；仅创建目录不会自动加载、授权或增加工具。临时产物与保留交付分别归 `.local/tmp/<任务名>/` 和 `.local/deliveries/<任务名>/`。
+
+骨架生成器只补缺失项，不覆盖已有个人说明、记忆或登记，不会扫描新目录。模板更新后，在已有工作区定点合并所需规则；初始化读取范围以本 README 的明确约定为准。
 
 ## 按任务使用的导航
 
@@ -29,18 +38,18 @@ Markdown 正式骨架为 **2 + 平台数**：`README.md` 统一保存稳定行�
 
 ## 能力登记
 
-`capabilities.json` 为有效空表，按 `capabilities.example.json` 填入真正使用的电脑、CLI 与浏览器入口，示例不会启用。主控按需调用 `bridge_check_capabilities`；当前静态前提与历史验收分开，登记不代表网站已登录或任务可完成，文件选择也不等于成功交付。检查缓存保存在桥 `.local/data/capability-health`，不逐轮注入；说明见桥 docs/capabilities.md。
+`capabilities/registry.json` 为有效空表，按 `capabilities/example.json` 填入真正使用的电脑、CLI 与浏览器入口，示例不会启用。主控按需调用 `bridge_check_capabilities`；当前静态前提与历史验收分开，登记不代表网站已登录或任务可完成，文件选择也不等于成功交付。检查缓存保存在桥 `.local/data/capability-health`，不逐轮注入；说明见桥 docs/capabilities.md。
 
 ## 跨电脑登记
 
-`agents.json` 为实际注册表，初始为空；本机 `local` 无需填写。按 `agents.example.json` 填写真实 SSH 配置、电脑和 CLI 路径，示例不会启用。主控可按需查询已登记目标；登记不代表电脑当前在线。
+`remote-agents/registry.json` 为实际注册表，初始为空；本机 `local` 无需填写。按 `remote-agents/example.json` 填写真实 SSH 配置、电脑和 CLI 路径，示例不会启用。主控可按需查询已登记目标；登记不代表电脑当前在线。
 
 | 导航 | 本机入口或说明（按需填写） |
 | --- | --- |
 | 当前电脑用途 | |
 | SSH 连接配置库 | |
 | 项目或工位工作指南 | 只记录权威文档入口 |
-| 浏览器与登录状态 | 记录职责与业务入口，具体配置及验收范围放 capabilities.json |
+| 浏览器与登录状态 | 记录职责与业务入口，具体配置及验收范围放 capabilities/registry.json |
 
 
 ## 稳定行为与执行约定

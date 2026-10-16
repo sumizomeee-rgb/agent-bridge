@@ -11,11 +11,11 @@ const extensionId = 'hehggadaopoacecdllhhajmbjkdcmajg';
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'bridge-capabilities-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const workspace = join(root, 'workspace'); mkdirSync(workspace);
+  const workspace = join(root, 'workspace'); mkdirSync(workspace); mkdirSync(join(workspace, 'capabilities'));
   writeFileSync(join(workspace, 'MEMORY.md'), 'private-work-habits'); writeFileSync(join(workspace, 'README.md'), 'private-business-navigation');
   const config: BridgeConfig = { token: 'private-bot-token', allowedUserIds: ['123456789012345678'], defaultAgent: 'codex', workspace, proxyUrl: null,
     commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), maxImageBytes: 1024 };
-  const registry = (capabilities: unknown[]) => writeFileSync(join(workspace, 'capabilities.json'), JSON.stringify({ version: 1, capabilities }));
+  const registry = (capabilities: unknown[]) => writeFileSync(join(workspace, 'capabilities/registry.json'), JSON.stringify({ version: 1, capabilities }));
   registry([]);
   const browser = (fields: Record<string, unknown> = {}, profileName = 'Default') => {
     const profilePath = join(root, profileName); mkdirSync(join(profilePath, 'Extensions', extensionId, '1.0.0'), { recursive: true });
@@ -124,7 +124,7 @@ test('cache is scoped to exact workspace, preserves checkedAt, and becomes expli
   const before = await health.query(); f.registry([{ id: 'new-app', label: 'New', targetId: 'local', kind: 'web-app' }]); now += 1500;
   const old = await health.query(); assert.equal(old.checkedAt, before.checkedAt); assert.equal(old.stale, true); assert.equal(probes, 1); assert.ok(!old.items.some(value => value.id === 'new-app'));
   const fresh = await health.query(f.workspace, { refresh: true }); assert.equal(fresh.stale, false); assert.equal(probes, 2); entry(fresh, 'new-app');
-  const second = join(f.root, 'second-workspace'); mkdirSync(second); writeFileSync(join(second, 'capabilities.json'), JSON.stringify({ version: 1, capabilities: [] }));
+  const second = join(f.root, 'second-workspace'); mkdirSync(join(second, 'capabilities'), { recursive: true }); writeFileSync(join(second, 'capabilities/registry.json'), JSON.stringify({ version: 1, capabilities: [] }));
   const separate = await health.query(second); assert.ok(!separate.items.some(value => value.id === 'new-app')); assert.equal(probes, 3);
   const saved = readdirSync(join(f.config.dataDir, 'capability-health')); assert.equal(saved.filter(value => value.endsWith('.json')).length, 2);
   for (const filename of saved) assert.ok(!readFileSync(join(f.config.dataDir, 'capability-health', filename), 'utf8').includes('private-bot-token'));
@@ -145,9 +145,9 @@ test('filtered reports have a bounded UTF-8 payload, preserve machine/agent sele
 });
 
 test('missing and malformed registries are reported without exposing rejected values, and relative workspace queries fail', async t => {
-  const f = fixture(t); rmSync(join(f.workspace, 'capabilities.json')); const health = f.service();
+  const f = fixture(t); rmSync(join(f.workspace, 'capabilities/registry.json')); const health = f.service();
   assert.equal(entry(await health.query(), 'registry').status, 'unknown');
-  writeFileSync(join(f.workspace, 'capabilities.json'), '{bad private-bot-token');
+  writeFileSync(join(f.workspace, 'capabilities/registry.json'), '{bad private-bot-token');
   const broken = await health.query(f.workspace, { refresh: true }); assert.equal(entry(broken, 'registry').status, 'missing'); assert.ok(!JSON.stringify(broken).includes('private-bot-token'));
   await assert.rejects(() => health.query('relative/workspace'), /绝对路径/); assert.match(startupSummary(broken), /缺项/);
 });

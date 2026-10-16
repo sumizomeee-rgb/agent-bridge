@@ -53,7 +53,7 @@ function absolute(value: unknown, name: string): string {
   const result = text(value, name, 4000); if (!win32.isAbsolute(result) && !posix.isAbsolute(result)) throw new Error(`${name}必须为绝对路径。`); return result;
 }
 export function parseCapabilityRegistry(raw: unknown): CapabilityRegistration[] {
-  if (!object(raw) || raw.version !== 1 || !Array.isArray(raw.capabilities) || raw.capabilities.length > 64) throw new Error('capabilities.json 需要 version:1 和最多 64 项 capabilities 数组。');
+  if (!object(raw) || raw.version !== 1 || !Array.isArray(raw.capabilities) || raw.capabilities.length > 64) throw new Error('capabilities/registry.json 需要 version:1 和最多 64 项 capabilities 数组。');
   const seen = new Set<string>();
   return raw.capabilities.map(value => {
     if (!object(value)) throw new Error('能力登记格式无效。');
@@ -173,11 +173,11 @@ export class CapabilityHealthService {
     entries.push(await this.proxy());
     let registrations: CapabilityRegistration[] = [];
     try {
-      registrations = parseCapabilityRegistry(await jsonFile(join(workspace, 'capabilities.json'), MAX_REGISTRY_BYTES));
+      registrations = parseCapabilityRegistry(await jsonFile(join(workspace, 'capabilities/registry.json'), MAX_REGISTRY_BYTES));
       if (registrations.some(value => ['workspace', 'cli-codex', 'cli-claude', 'proxy', 'registry'].includes(value.id))) throw new Error('能力 id 与内置检查名称冲突。');
     } catch (error) {
       const missing = (error as NodeJS.ErrnoException).code === 'ENOENT';
-      entries.push(item({ id: 'registry', label: '能力登记', targetId: 'local', kind: 'registry' }, [check('capabilities.json', missing ? 'unknown' : 'missing', missing ? '尚未登记应用／浏览器能力；可生成空骨架后补充。' : '能力登记无效；检查 version、必填字段与绝对路径。')]));
+      entries.push(item({ id: 'registry', label: '能力登记', targetId: 'local', kind: 'registry' }, [check('capabilities/registry.json', missing ? 'unknown' : 'missing', missing ? '尚未登记应用／浏览器能力；可生成空骨架后补充。' : '能力登记无效；检查 version、必填字段与绝对路径。')]));
     }
     const browserChecks = new Map<string, Promise<CapabilityCheck[]>>();
     for (const registration of registrations) {

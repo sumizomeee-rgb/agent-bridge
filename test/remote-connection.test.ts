@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SshRemoteClient, requestRemoteHttp } from '../src/remote/client.js';
@@ -13,6 +13,7 @@ import type { ExecutionTargetBinding, RemoteClient, RemoteJob } from '../src/rem
 
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), 'remote-connection-'));
+  mkdirSync(join(root, 'remote-agents'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const command = { command: process.execPath, args: [] };
   const config: BridgeConfig = { token: 'offline', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: root,
@@ -133,7 +134,7 @@ test('identity rejection is preserved without reconnecting or dispatching', asyn
 
 test('computer refresh recovers a stale idle connection while cached reads perform no probe', async t => {
   const f = fixture(t); let stale = false, connections = 0, probes = 0;
-  writeFileSync(join(f.root, 'agents.json'), JSON.stringify({ version: 1, targets: [{ id: 'station', label: 'station',
+  writeFileSync(join(f.root, 'remote-agents/registry.json'), JSON.stringify({ version: 1, targets: [{ id: 'station', label: 'station',
     expectedHostname: f.binding.expectedHostname, sshConfig: f.binding.sshConfig, alias: f.binding.alias,
     remoteRoot: f.root, nodePath: process.execPath, engines: { codex: { agentCommand: f.binding.agentCommand, defaultCwd: f.root } } }] }));
   const unused: AgentAdapter = { run: async () => { throw new Error('no native calls permitted'); }, interrupt: async () => {}, close: async () => {} };
