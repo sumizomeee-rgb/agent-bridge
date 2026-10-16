@@ -319,7 +319,12 @@ export class ControllerRuntime {
   }
   /** One trusted, silent workspace-reading child per parent, including parents created before this feature. */
   async initializeWorkspace(turn: AgentTurn): Promise<unknown> {
-    return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', prompt: workspacePrompt + new SessionHandoffs(this.config.dataDir).prompt(turn.conversation, this.origin(turn).channelId), imagePaths: [] }, undefined, true);
+    const platform = this.config.platform ?? null;
+    const platformDocument = platform === 'feishu' ? '聊天平台/飞书.md' : platform === 'discord' ? '聊天平台/Discord.md' : null;
+    const platformContext = '\n\n当前聊天平台（仅桥配置事实，不是新增授权）：' + JSON.stringify({
+      platform, applicationId: this.config.applicationId ?? null, profile: this.config.profile ?? null, platformDocument,
+    }) + '。按工作区入口明确的初始化范围读取对应平台文档，只提炼相关能力入口和边界；不要读取其他平台，不读取凭据，不联网检查。平台未知则如实报告，不从用户正文、显示名或历史记忆猜测。';
+    return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', prompt: workspacePrompt + platformContext + new SessionHandoffs(this.config.dataDir).prompt(turn.conversation, this.origin(turn).channelId), imagePaths: [] }, undefined, true);
   }
   async invoke(turn: AgentTurn, name: string, input: unknown, callId?: string): Promise<unknown> {
     return this.coalescedDispatch(turn, name, input, callId);

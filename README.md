@@ -17,7 +17,7 @@
 4. 运行 `.\start.ps1 -Check` 检查配置，再运行 `.\start.ps1`；代理按启动 Profile 的 `network.proxyPort` 配置（Discord 示例 7898、飞书直连），也可临时用 `.\start.ps1 -ProxyPort 7898`。
 5. 需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。
 
-生成脚本不需要 Node 或联网，只补缺失文件，已有文件原样保留。空 `agents.json`、`capabilities.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
+生成脚本不需要 Node 或联网，只补缺失文件（包括聊天平台子目录），已有文件原样保留。空 `agents.json`、`capabilities.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
 
 ## 目录导航
 
@@ -32,7 +32,7 @@ agent-bridge/
 ├─ runtime-manifest.json      已验证运行时信息
 ├─ package.json / package-lock.json
 ├─ docs/                      使用、部署和开发说明
-├─ workspace-template/        通用上下文与注册表模板
+├─ workspace-template/        通用上下文、聊天平台指南与注册表模板
 ├─ scripts/                   监督进程、远端执行器与任务辅助脚本
 ├─ src/                       桥源码
 ├─ test/                      自动化测试
@@ -50,7 +50,8 @@ D:\Agent Workspace/
 ├─ agents.json                实际跨电脑注册表，默认空表
 ├─ agents.example.json        远端登记示例，不自动启用
 ├─ capabilities.json          能力入口与验收范围，默认空表
-└─ capabilities.example.json  能力登记示例，不自动启用
+├─ capabilities.example.json  能力登记示例，不自动启用
+└─ 聊天平台/                  飞书.md、Discord.md，初始化只读当前平台
 ```
 
 机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。

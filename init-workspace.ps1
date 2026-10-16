@@ -37,8 +37,12 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('AGENTS.md', 'MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')
-    # 先检查完整清单，避免目录占用了文件名时只生成一部分模板。
+    $files = @('AGENTS.md', 'MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', '聊天平台\飞书.md', '聊天平台\Discord.md')
+    # 先检查父目录及完整清单，避免碰撞时只生成一部分模板。
+    $platformDirectory = Join-Path $workspace '聊天平台'
+    if ([IO.File]::Exists($platformDirectory)) {
+        throw "平台文档目录已被文件占用：$platformDirectory"
+    }
     foreach ($name in $files) {
         $source = Join-Path $templateRoot $name
         $destination = Join-Path $workspace $name
@@ -61,6 +65,7 @@ try {
             $preserved++
         } else {
             # overwrite=false：即使有其他程序同时创建文件，也不会覆盖。
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
             [IO.File]::Copy($source, $destination, $false)
             Write-Host "生成：$name"
             $created++

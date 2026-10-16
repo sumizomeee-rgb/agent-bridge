@@ -10,7 +10,7 @@ import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['AGENTS.md', 'MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json'];
+const templates = ['AGENTS.md', 'MEMORY.md', 'README.md', 'agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json', '聊天平台/飞书.md', '聊天平台/Discord.md'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 
@@ -47,7 +47,7 @@ test('workspace initializer generates usable templates from another working dire
   try {
     const workspace = join(root, '上下文 空间', '新工作区[原样]');
     requireSuccess(run(workspace, root));
-    assert.deepEqual(readdirSync(workspace).sort(), [...templates].sort());
+    assert.deepEqual(readdirSync(workspace).sort(), [...new Set(templates.map(file => file.split('/')[0]!))].sort());
     for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), readFileSync(join(project, 'workspace-template', file)));
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'agents.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
     assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities.json'), 'utf8'))), []);
@@ -66,11 +66,14 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     const capabilities = Buffer.from('{\r\n  \"version\": 1, \"capabilities\": [], \"note\": \"用户维护\"\r\n}\r\n');
     writeFileSync(join(workspace, 'capabilities.json'), capabilities);
     writeFileSync(join(workspace, 'private.txt'), 'existing unrelated context');
+    mkdirSync(join(workspace, '聊天平台'));
+    writeFileSync(join(workspace, '聊天平台', '飞书.md'), custom);
     requireSuccess(run(workspace, root));
-    const before = new Map(readdirSync(workspace).map(file => [file, readFileSync(join(workspace, file))]));
+    const before = new Map([...templates, 'private.txt'].map(file => [file, readFileSync(join(workspace, file))]));
     requireSuccess(run(workspace, root));
     assert.deepEqual(readFileSync(join(workspace, 'AGENTS.md')), custom);
     assert.deepEqual(readFileSync(join(workspace, 'capabilities.json')), capabilities);
+    assert.deepEqual(readFileSync(join(workspace, '聊天平台', '飞书.md')), custom);
     for (const [file, bytes] of before) assert.deepEqual(readFileSync(join(workspace, file)), bytes);
   } finally { cleanup(); }
 });
@@ -81,7 +84,11 @@ test('workspace initializer relocates with its templates to a project path conta
     const relocated = join(root, '迁移项目 空格');
     mkdirSync(join(relocated, 'workspace-template'), { recursive: true });
     copyFileSync(script, join(relocated, 'init-workspace.ps1'));
-    for (const file of templates) copyFileSync(join(project, 'workspace-template', file), join(relocated, 'workspace-template', file));
+    for (const file of templates) {
+      const destination = join(relocated, 'workspace-template', file);
+      mkdirSync(dirname(destination), { recursive: true });
+      copyFileSync(join(project, 'workspace-template', file), destination);
+    }
     assert.ok(!existsSync(join(relocated, '.local')));
     assert.ok(!existsSync(join(relocated, 'node_modules')));
     const workspace = join(root, '目标 工作区');
@@ -114,5 +121,32 @@ test('workspace initializer fails before copying templates when a destination fi
     assert.equal(result.error, undefined, result.error?.message);
     assert.notEqual(result.status, 0, result.stdout + result.stderr);
     assert.deepEqual(readdirSync(workspace), ['agents.json']);
+  } finally { cleanup(); }
+});
+
+
+test('平台文档父路径被文件占用时，在复制任何模板前失败', windowsOnly, () => {
+  const { root, cleanup } = fixture();
+  try {
+    const workspace = join(root, '平台目录碰撞'); mkdirSync(workspace);
+    writeFileSync(join(workspace, '聊天平台'), '用户已有文件');
+    const result = run(workspace, root);
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(readdirSync(workspace), ['聊天平台']);
+    assert.equal(readFileSync(join(workspace, '聊天平台'), 'utf8'), '用户已有文件');
+  } finally { cleanup(); }
+});
+
+test('平台文档目标被目录占用时，不生成其他模板', windowsOnly, () => {
+  const { root, cleanup } = fixture();
+  try {
+    const workspace = join(root, '平台文件碰撞');
+    mkdirSync(join(workspace, '聊天平台', '飞书.md'), { recursive: true });
+    const result = run(workspace, root);
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(readdirSync(workspace), ['聊天平台']);
+    assert.deepEqual(readdirSync(join(workspace, '聊天平台')), ['飞书.md']);
   } finally { cleanup(); }
 });
