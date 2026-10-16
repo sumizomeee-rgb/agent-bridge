@@ -1,4 +1,5 @@
 import test, { type TestContext } from 'node:test';
+import { ownTemporaryDirectory } from './temp-directory.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -61,7 +62,7 @@ class LocalAdapter implements AgentAdapter {
   async confirmStopped() { return this.stopProof === true; }
 }
 function setup(t: TestContext, options: { root?: string; appId?: string; controller?: boolean } = {}) {
-  const root = options.root ?? mkdtempSync(join(tmpdir(), 'bridge-bot-runtime-'));
+  const root = options.root ?? ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-bot-runtime-')), 'bridge-bot-runtime-');
   const appId = options.appId ?? String(123456789012345678n + BigInt(++serial));
   const prefix = `discord:${appId}|`;
   const config: BridgeConfig = { botId: `discord:${appId}`, applicationId: appId, platform: 'discord', profile: `discord/offline${serial}`, scopePrefix: prefix,
@@ -160,7 +161,7 @@ test('主控停止证明只接受执行适配器程序证据，没有已知会�
 });
 
 test('实际main --check完整加载v3启动集合而不访问网络、创建运行数据或争抢项目锁', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'bridge-main-check-')), configPath = join(root, 'config.json');
+  const root = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-main-check-')), 'bridge-main-check-'), configPath = join(root, 'config.json');
   const profiles = join(root, 'bots', 'feishu'); mkdirSync(profiles, { recursive: true });
   for (const name of ['a', 'b']) writeFileSync(join(profiles, `${name}.json`), JSON.stringify({ applicationId: `cli_offline${name}`, appSecret: 'fake-secret-never-output', allowedUserIds: [`ou_owner${name}`], network: { proxyPort: null } }));
   const dataDir = join(root, 'data'); writeFileSync(configPath, JSON.stringify({ version: 3, startupProfiles: ['feishu/a', 'feishu/b'], workspaceRoot: join(root, 'contexts'), dataDir,

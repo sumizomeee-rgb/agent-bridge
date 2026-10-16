@@ -1,4 +1,5 @@
 import test, { type TestContext } from 'node:test';
+import { ownTemporaryDirectory } from './temp-directory.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -29,7 +30,7 @@ class SwitchAdapter implements AgentAdapter {
 const flush = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
 
 function setup(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'bridge-controller-switch-'));
+  const root = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-controller-switch-')), 'bridge-controller-switch-');
   const contextWorkspace = join(root, 'context'), work = join(root, 'engineering'); mkdirSync(contextWorkspace); mkdirSync(work);
   const registry = new TaskRegistry(root), codex = new SwitchAdapter(), claude = new SwitchAdapter();
   const config: BridgeConfig = { token: 'fake', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: root, contextWorkspace,

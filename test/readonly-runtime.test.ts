@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { ownTemporaryDirectory } from './temp-directory.js';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -7,7 +8,7 @@ import { parse } from 'smol-toml';
 import { readOnlyRuntime } from '../src/agents/readonly.js';
 
 test('只读Codex配置只继承模型路由，移除可写MCP、hooks和插件，认证副本随临时home清理', () => {
-  const source = mkdtempSync(join(tmpdir(), 'bridge-readonly-source-'));
+  const source = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-readonly-source-')), 'bridge-readonly-source-');
   writeFileSync(join(source, 'config.toml'), 'model_provider="custom"\n[model_providers.custom]\nbase_url="https://gateway.invalid"\n[mcp_servers.write_anywhere]\ncommand="never-run"\n[features]\nhooks=true\nplugins=true\n[plugins]\nenabled=true\n');
   writeFileSync(join(source, 'auth.json'), '{"fake":"credential"}');
   const runtime = readOnlyRuntime('codex', { CODEX_HOME: source });
