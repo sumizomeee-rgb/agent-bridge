@@ -107,12 +107,16 @@ export function computerOverview(items: readonly ComputerOverview[], details = f
     footer: '✅ 表示连接与 CLI 入口就绪，模型需实际调用确认。/computers details 查看检查时间和详情。' };
 }
 export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false, view: WorkerView = 'active'): BridgePresentation {
-  if (details) return workerDetails(items, scope, now, view);
   const label = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length, queued = items.reduce((sum, item) => sum + item.queued, 0);
   const uncertain = items.filter(item => item.status === 'uncertain').length;
-  const rank = (item: WorkerOverview) => item.running ? 0 : ['uncertain', 'handoff-pending', 'failed'].includes(item.status) ? 1 : item.queued ? 2 : 3;
-  const sorted = [...items].sort((a, b) => rank(a) - rank(b));
+  const rank = (item: WorkerOverview) => item.running ? 0 : ['uncertain', 'handoff-pending'].includes(item.status) ? 1 : item.queued ? 2 : 3;
+  const endedAt = (item: WorkerOverview) => {
+    const timestamp = Date.parse(item.endedAt ?? '');
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  };
+  const sorted = [...items].sort((a, b) => rank(a) - rank(b) || endedAt(b) - endedAt(a));
+  if (details) return workerDetails(sorted, scope, now, view);
   const states = { queued: '⏳ 等待执行', running: '🔄 运行中', completed: '✅ 已完成', failed: '❌ 失败', cancelled: '⏹ 已停止', uncertain: '⚠️ 待核对', idle: '💤 空闲', 'handed-off': '👤 已交给你', 'handoff-pending': '⚠️ 交接待确认' };
   return { title: view === 'history' ? `${label}的历史助手 · 共${items.length}个` : `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`, tone: 'info', purpose: 'overview',
     blocks: sorted.length ? sorted.map((item, index) => {

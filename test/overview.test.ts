@@ -90,6 +90,29 @@ test('空列表、未知回报、完成、空闲及阻塞状态均可读，历�
   assert.equal(elapsedText('2026-10-13T06:00:00Z', NaN), '开始时间未记录');
 });
 
+test('助手按最后结束时间倒序，运行置顶，历史失败不插队，简版和详情顺序一致', () => {
+  const finished = (workerId: string, endedAt?: string, status: WorkerOverview['status'] = 'completed') =>
+    worker({ workerId, status, running: false, queued: 0, startedAt: '2026-10-13T06:00:00Z', endedAt });
+  const history = [
+    finished('missing'), finished('older', '2026-10-13T06:01:00Z'),
+    finished('failed', '2026-10-13T06:02:00Z', 'failed'), finished('invalid', 'invalid'),
+    finished('newest', '2026-10-13T06:04:00Z'), finished('tied', '2026-10-13T06:04:00Z', 'cancelled'),
+  ];
+  const original = history.map(item => item.workerId);
+  const expected = ['newest', 'tied', 'failed', 'older', 'missing', 'invalid'];
+  for (const details of [false, true]) {
+    for (const scope of ['current', 'all'] as const) {
+      for (const active of [false, true]) {
+        const items = active ? [...history, worker({ workerId: 'running' })] : history;
+        const text = renderWorkerDetails(items, scope, now, details, active ? 'active' : 'history');
+        const ids = text.split('\n').filter(line => /^\d+\. /.test(line)).map(line => line.split(' · ').at(-1));
+        assert.deepEqual(ids, active ? ['running', ...expected] : expected);
+      }
+    }
+  }
+  assert.deepEqual(history.map(item => item.workerId), original);
+});
+
 test('会话名安全截断、短 ID 碰撞扩展且完整复制信息保留', () => {
   const hostile = '长中文标题'.repeat(100) + '\n```ansi\n\u001b[31m@everyone\u202e';
   const workers = [worker({ workerId: '12345678-a', title: hostile, nativeId: 'native-long-123456789', effort: 'xhigh' }),
