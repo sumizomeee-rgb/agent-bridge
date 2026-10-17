@@ -49,6 +49,13 @@ test('Feishu evidence history contains outsider humans and app bots with author,
   assert.equal(queries[0]!.searchParams.get('page_token'), 'opaque&previous'); assert(methods.slice(1).every(m => m === 'GET')); assert(queries.every(u => !/resources|reactions/.test(u.pathname)));
 });
 
+test('Feishu card history explicitly describes API projection and compatibility fallback limits', async t => {
+  const { bridge } = feishu([item('om_card', { id: 'cli_bot', sender_type: 'app' }, { msg_type: 'interactive', body: { content: JSON.stringify({ title: '卡片消息', elements: [{ tag: 'div', text: '请升级客户端以查看此消息' }] }) } })]); t.after(() => bridge.close());
+  const page = await bridge.readConversationHistory('oc_group');
+  assert(page.messages[0]!.text.includes('请升级客户端'));
+  assert(page.coverage.notes.some(note => note.includes('接口可见投影') && note.includes('不得') && note.includes('不保证原卡完整')));
+});
+
 test('Feishu evidence refuses wrong group, broken pagination, revoked membership and filters subsecond bounds', async t => {
   const wrong = feishu([item('om_x', {}, { chat_id: 'oc_other' })]); t.after(() => wrong.bridge.close());
   await assert.rejects(wrong.bridge.readConversationHistory('oc_group'), /其他群/);

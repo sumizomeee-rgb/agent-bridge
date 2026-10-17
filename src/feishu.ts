@@ -331,7 +331,7 @@ export class FeishuTransport {
         ...(typeof item.parent_id === 'string' && /^om_[a-zA-Z0-9_-]+$/.test(item.parent_id) ? { replyToMessageId: item.parent_id } : {}), ...(truncated ? { truncated: true } : {}) };
       messages.set(message.id, message);
     }
-    return historyPage(spaceId, options, [...messages.values()], data.has_more, data.page_token, ['飞书接口实际可见记录；ID 仅属于当前应用命名空间，不可跨应用互换。', '按创建时间倒序；删除、权限或接口保留范围可能造成缺口，不声称完整历史。']);
+    return historyPage(spaceId, options, [...messages.values()], data.has_more, data.page_token, ['飞书接口实际可见记录；ID 仅属于当前应用命名空间，不可跨应用互换。', '按创建时间倒序；删除、权限或接口保留范围可能造成缺口，不声称完整历史。', ...(data.items.some((item: Json) => (item.msg_type ?? item.message_type) === 'interactive') ? ['卡片正文仅为飞书接口可见投影，可能是兼容提示，不保证原卡完整；不得根据提示编造原文。'] : [])]);
   }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
     const params = new URLSearchParams({ container_id_type: 'chat', container_id: channelId, page_size: String(Math.min(options.limit ?? 50, 50)), sort_type: 'ByCreateTimeDesc' });
