@@ -47,7 +47,7 @@ export function commandHelp(controllerMode = false): string {
 }
 export function groupCommands(): CommandDefinition[] {
   return COMMANDS.filter(c => ['group', 'status', 'workers', 'new', 'stop', 'help'].includes(c.name)).map(c => ({
-    ...c, contexts: ['group'], options: c.name === 'new' ? [] : c.name === 'workers' ? c.options?.filter(o => ['history', 'details'].includes(o.name)) : c.options,
+    ...c, contexts: ['group'], options: c.name === 'new' ? [] : c.options,
     help: c.name === 'new' ? '/new：重置本群全部成员，影响其私聊和其他群，取消旧定时' : c.name === 'stop' ? '/stop：停止本群成员的主控、助手与预约，影响其所有入口' : c.help,
   }));
 }

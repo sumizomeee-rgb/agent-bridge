@@ -474,7 +474,7 @@ test('群原生菜单来自唯一命令表，限定参数并独立注册在明�
   assert.deepEqual(slashText({ name: 'group', options: [option('action', 'start')] }, 'group'), { text: '/group start' });
   assert.deepEqual(slashText({ name: 'new' }, 'group'), { text: '/new' });
   assert('error' in slashText({ name: 'new', options: [option('continue', true)] }, 'group'));
-  assert('error' in slashText({ name: 'workers', options: [option('scope', 'all')] }, 'group'));
+  assert.deepEqual(slashText({ name: 'workers', options: [option('scope', 'all')] }, 'group'), { text: '/workers all' });
   assert('error' in slashText({ name: 'agent' }, 'group'));
   assert('error' in slashText({ name: 'group', options: [option('action', 'start')] }));
   const f = await fixture(t, true, ['111'], true); await f.transport.syncGroupSlashCommands('333');

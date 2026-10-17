@@ -14,6 +14,7 @@ import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } 
 import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
 import { historyPage, type ConversationHistoryOptions, type ConversationHistoryPage } from '../src/group-history.js';
 import { groupMessagePayloadHash, type GroupMentionView } from '../src/group-mentions.js';
+import type { WorkerOverview } from '../src/overview.js';
 
 test('current group envelope reports real broadcast recipients, internal speaker and non-authorizing compact evidence', async t => {
   const f = fixture(t); await f.activate();
@@ -91,14 +92,14 @@ async function eventual(check: () => boolean, label: string): Promise<void> {
   for (let tick = 0; tick < 3000; tick++) { if (check()) return; await nextImmediate(); }
   assert.fail(`No progress: ${label}`);
 }
-function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHandler; platform?: 'feishu' | 'discord' } = {}) {
+function fixture(t: TestContext, options: { initialized?: string[]; unowned?: string[]; run?: TurnHandler; platform?: 'feishu' | 'discord' } = {}) {
   const path = mkdtempSync(join(tmpdir(), 'bridge-host-runtime-test-'));
   const platform = options.platform ?? 'feishu', ids = platform === 'feishu' ? [A, B] : [D1, D2], primary = ids[0]!;
   const ownerId = (index: number) => platform === 'feishu' ? `owner-${index}` : '333333333333333333';
   const otherId = (index: number) => platform === 'feishu' ? `other-${index}` : '444444444444444444';
   const configs = ids.map((botId, index): BridgeConfig => ({
     botId, platform, applicationId: botId.slice(platform.length + 1), scopePrefix: `${botId}|`,
-    ownerPrincipalId: P, ownerUserId: `${botId}|${ownerId(index)}`, profile: `test-${index}`,
+    ...(options.unowned?.includes(botId) ? {} : { ownerPrincipalId: P }), ownerUserId: `${botId}|${ownerId(index)}`, profile: `test-${index}`,
     token: '', allowedUserIds: [`${botId}|${ownerId(index)}`, `${botId}|${otherId(index)}`], defaultAgent: 'codex',
     workspace: join(path, `workspace-${index}`), dataDir: join(path, `data-${index}`),
     attachmentsDir: join(path, `images-${index}`), logsDir: join(path, `logs-${index}`), proxyUrl: null,
@@ -118,6 +119,9 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
   const managers = new Map<string, SessionManager>(), sessions = new Map<string, SessionStore>();
   const hooks = new Map(configs.map(c => [c.botId!, host.hooks(c)]));
   const workerStopped = new Map<string, boolean>();
+  const workerLists = new Map<string, WorkerOverview[]>();
+  const workerQueries: Array<{ botId: string; conversationId: string; scope: string }> = [];
+  const workerReads = new Map<string, () => Promise<void>>();
   const groupChecks = new Map<string, () => Promise<boolean>>();
   const downloads = new Map<string, () => Promise<string[]>>();
   const conversationHistories = new Map<string, (raw: string, options: ConversationHistoryOptions) => Promise<ConversationHistoryPage>>();
@@ -142,7 +146,12 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
     };
     const manager = new SessionManager(c, { codex: adapter, claude: adapter }, {
       async sendText(channel, text, replyOptions) { replies.push({ botId, channel, text, options: replyOptions }); },
-    }, { ...hook.manager, authorizeUser: user => hook.authorize(user, ''), mergeDelayMs: 0 } as SessionManagerOptions);
+    }, { ...hook.manager, authorizeUser: user => hook.authorize(user, ''), mergeDelayMs: 0,
+      onListWorkers: async (conversation, scope) => {
+        workerQueries.push({ botId, conversationId: conversation.id, scope });
+        await workerReads.get(botId)?.(); return workerLists.get(botId) ?? [];
+      },
+    } as SessionManagerOptions);
     managers.set(botId, manager);
     const inspect = new SessionStore(c.dataDir); sessions.set(botId, inspect);
     const transport = {
@@ -161,7 +170,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
           mentions: original.space!.mentionedUserIds.map((id, index) => ({ key: `@_user_${index + 1}`, id })) };
       },
       async sendText(channel: string, text: string, replyOptions?: ReplyOptions) { replies.push({ botId, channel, text, options: replyOptions }); },
-      async sendInteractionText(_interaction: unknown, text: string) { replies.push({ botId, channel: 'interaction', text }); },
+      async sendInteractionText(_interaction: unknown, text: string, options?: ReplyOptions) { replies.push({ botId, channel: 'interaction', text, options }); },
       async syncGroupSlashCommands() {}, async readGroupHistory(raw: string, historyOptions: DMHistoryOptions) {
         return histories.get(botId)?.(raw, historyOptions) ?? { messages: [], hasMore: false, oldestId: null, newestId: null };
       },
@@ -211,7 +220,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
     await eventual(() => host.isIdle() && !host.store.listEvents().some(e => ['queued', 'reserved', 'running'].includes(e.state)), 'host and all managed native turns idle');
     await nextImmediate();
   };
-  return { path, host, config, configs, managers, sessions, hooks, replies, calls, reports, workerStopped, groupChecks, downloads, histories, conversationHistories, stoppedProofs, ids,
+  return { path, host, config, configs, managers, sessions, hooks, replies, calls, reports, workerStopped, workerLists, workerQueries, workerReads, groupChecks, downloads, histories, conversationHistories, stoppedProofs, ids,
     message, activate, drain, close, mentionViews, humanMentions, mentionReads, originals, run: (next: TurnHandler) => { handler = next; },
     gate: () => { const wait = gate(); ownedGates.push(wait); return wait; } };
 }
@@ -229,6 +238,128 @@ function crossAppMention(f: ReturnType<typeof fixture>, source: IncomingDM, repe
   f.mentionViews.set(A, async () => scopedView(f, A, source, keys.map(key => ({ key, id: 'ou_b_in_receiver_namespace' }))));
   f.mentionViews.set(B, async () => scopedView(f, B, source, keys.map(key => ({ key, id: `platform-${B}` }))));
 }
+
+function overviewWorker(id: string, title: string): WorkerOverview {
+  return { workerId: id, conversationId: 'fixture-conversation', conversationTitle: 'private controller title', targetId: 'local', targetLabel: '桥电脑',
+    agent: 'codex', title, model: 'gpt-6.1-sol', effort: 'medium', nativeId: `native-${id}`,
+    status: 'running', running: true, queued: 0, startedAt: null };
+}
+
+test('group workers reuses each Bot private current overview and presentation without host task aggregation or ANSI', async t => {
+  const f = fixture(t); await f.activate();
+  f.workerLists.set(A, [overviewWorker('worker-a', 'A normal private-origin worker')]);
+  f.workerLists.set(B, [overviewWorker('worker-b', 'B own worker')]);
+  const privateViews = new Map<string, ReplyOptions['presentation']>();
+  for (const [index, botId] of [A, B].entries()) {
+    await f.managers.get(botId)!.handle({ id: 'dm-overview-' + botId, userId: f.configs[index]!.ownerUserId!,
+      channelId: `${botId}|oc_private_overview`, text: '/workers', imagePaths: [] });
+    privateViews.set(botId, f.replies.at(-1)!.options?.presentation);
+  }
+  const start = f.replies.length;
+  await f.host.receive(A, f.message(A, 'group-overview', '/workers')); await f.drain();
+  const replies = f.replies.slice(start);
+  assert.deepEqual(replies.map(value => value.botId).sort(), [A, B]);
+  for (const reply of replies) {
+    assert.deepEqual(reply.options?.presentation, privateViews.get(reply.botId));
+    assert.match(reply.options!.presentation!.title, /^当前对话的直属助手/);
+    assert.doesNotMatch(reply.text, /群协作任务|\u001b|```ansi|private controller title/);
+    assert.ok(reply.channel.includes('_group_1'));
+  }
+  assert.equal(f.workerQueries.every(query => query.scope === 'current'), true);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.host.store.listEvents().length, 0);
+});
+
+test('group workers real mention selects only that Bot and uses private history all details options', async t => {
+  const f = fixture(t); await f.activate();
+  f.workerLists.set(A, [{ ...overviewWorker('ended-a', 'A finished worker'), running: false, status: 'completed', endedAt: '2026-10-17T12:00:00Z' }]);
+  const start = f.replies.length;
+  await f.host.receive(A, f.message(A, 'group-history-options', '/workers history all details', G1, [A])); await f.drain();
+  const replies = f.replies.slice(start);
+  assert.equal(replies.length, 1); assert.equal(replies[0]!.botId, A);
+  assert.match(replies[0]!.options!.presentation!.title, /历史助手 · 共1个/);
+  assert.match(replies[0]!.text, /workerId：ended-a/);
+  assert.doesNotMatch(replies[0]!.text, /private controller title/);
+  assert.equal(f.workerQueries.at(-1)!.scope, 'all'); assert.equal(f.calls.length, 0);
+});
+
+test('group workers revalidates the binding after querying and does not publish across a concurrent group stop', async t => {
+  const f = fixture(t); await f.activate(); const wait = f.gate();
+  f.workerLists.set(A, [overviewWorker('blocked-a', 'must not publish after group stop')]);
+  f.workerReads.set(A, async () => { await wait.promise; });
+  const start = f.replies.length;
+  const query = f.host.receive(A, f.message(A, 'group-workers-stop-race', '/workers', G1, [A]));
+  await eventual(() => f.workerQueries.length === 1, 'worker lookup started');
+  f.host.store.stopGroup(G1, P, 'stop while querying'); wait.release(); await query; await f.drain();
+  assert.equal(f.replies.slice(start).some(reply => reply.text.includes('must not publish after group stop')), false);
+  assert.equal(f.calls.length, 0);
+});
+
+test('group workers does not initialize an uninitialized member or query a different Bot owner', async t => {
+  const f = fixture(t, { initialized: [A], unowned: [B] }); await f.activate();
+  const initial = f.host.store.getController(A)!.conversationId, start = f.replies.length;
+  await f.host.receive(A, f.message(A, 'group-workers-uninitialized', '/workers')); await f.drain();
+  assert.equal(f.host.store.getController(A)!.conversationId, initial);
+  assert.equal(f.host.store.getController(B), null);
+  assert.equal(f.host.store.getBot(B)!.ownerPrincipalId, null);
+  assert.deepEqual(f.workerQueries.map(query => query.botId), [A]);
+  assert.equal(f.replies.slice(start).some(reply => reply.botId === B && reply.text.includes('未初始化')), true);
+  assert.equal(f.calls.length, 0);
+});
+
+test('Discord group workers completes the selected app interaction with the shared structured overview', async t => {
+  const f = fixture(t, { platform: 'discord' }); await f.activate();
+  f.workerLists.set(D1, [overviewWorker('discord-worker', 'Discord own worker')]);
+  const message = f.message(D1, 'native-workers', '/workers', G1, [D1]);
+  message.interaction = { id: 'workers-interaction', token: 'fake-token', applicationId: '111111111111111111' };
+  const start = f.replies.length;
+  await f.host.receive(D1, message); await f.drain();
+  const replies = f.replies.slice(start);
+  assert.equal(replies.length, 1); assert.equal(replies[0]!.botId, D1); assert.equal(replies[0]!.channel, 'interaction');
+  assert.equal(replies[0]!.options?.presentation?.purpose, 'overview');
+  assert.match(replies[0]!.text, /Discord own worker/); assert.equal(f.calls.length, 0);
+});
+
+test('group workers rechecks platform membership after the asynchronous lookup before exposing data', async t => {
+  const f = fixture(t); await f.activate();
+  f.workerLists.set(A, [overviewWorker('revoked-worker', 'must not expose after owner left')]);
+  f.workerReads.set(A, async () => { f.groupChecks.set(A, async () => false); });
+  const start = f.replies.length;
+  await f.host.receive(A, f.message(A, 'workers-membership-revoked', '/workers', G1, [A])); await f.drain();
+  assert.equal(f.replies.slice(start).some(reply => reply.text.includes('must not expose after owner left')), false);
+  assert.equal(f.host.store.getGroup(G1)!.enabled, false); assert.equal(f.calls.length, 0);
+});
+
+test('group workers hides internal consultations and their worker-result descendants within an ordinary public root', async t => {
+  const f = fixture(t); await f.activate(); let internal: NonNullable<AgentTurn['groupContext']> | undefined;
+  let descendant: NonNullable<AgentTurn['groupContext']> | undefined;
+  f.run(async (botId, turn) => {
+    if (botId === A && !turn.event) await f.host.invoke(A, turn, 'bridge_send_bot', { targetBotId: B, text: 'internal worker question' }, 'internal-worker-question');
+    if (botId === B && turn.text === 'internal worker question') internal = turn.groupContext;
+    if (botId === B && turn.text === 'internal worker result') {
+      descendant = turn.groupContext;
+      assert.equal(JSON.parse(turn.chatScene!).currentMessage.visibility, 'internal');
+      assert.equal(JSON.parse(turn.chatScene!).currentMessage.defaultDelivery.area, 'internal');
+    }
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'owner-internal-work', 'discuss this')); await f.drain();
+  assert.ok(internal); assert.equal(f.host.store.getRoot(internal.rootId)!.replyTo.collaborationMode, undefined);
+  f.host.store.enqueueEvent({ id: 'internal-worker-result', rootId: internal.rootId, botId: B, generation: internal.generation,
+    kind: 'assistant-result', causeEventId: internal.eventId, payload: { text: 'internal worker result', eventKind: 'worker-result' } });
+  await f.host.pump(); await f.drain(); assert.ok(descendant);
+  f.workerLists.set(B, [overviewWorker('internal-child', 'private internal title'), overviewWorker('public-child', 'visible normal worker')]);
+  (f.host.bots.get(B)!.controller!.store as unknown as { workers: () => unknown[] }).workers = () => [
+    { id: 'internal-child', origin: { groupContext: descendant } }, { id: 'public-child', origin: {} },
+  ];
+  const start = f.replies.length;
+  await f.host.receive(A, f.message(A, 'workers-public-root-internal-child', '/workers all details')); await f.drain();
+  const reply = f.replies.slice(start).find(value => value.botId === B)!;
+  assert.match(reply.text, /visible normal worker/); assert.doesNotMatch(reply.text, /private internal title|internal-child/);
+  const c = f.configs.find(config => config.botId === B)!;
+  await f.managers.get(B)!.handle({ id: 'internal-worker-private-overview', userId: c.ownerUserId!, channelId: `${B}|oc_private_worker`, text: '/workers all details', imagePaths: [] });
+  assert.match(f.replies.at(-1)!.text, /private internal title/);
+});
 
 test('Feishu receiver broadcasts ordinary scoped mentions once to all ready members without app-view reads', async t => {
   const f = fixture(t); await f.activate();
@@ -1250,6 +1381,12 @@ test('internal task titles stay out of later public scenes and group worker list
   assert.equal(f.host.store.listTasks(G1).length, 1);
   await f.host.receive(A, f.message(A, 'later-public-scene', '正常群消息', G1, [A])); await f.drain();
   assert.equal(publicScene.tasks.length, 0);
+  const internalTurn = f.calls.find(call => call.botId === B && call.turn.groupContext && JSON.parse(call.turn.groupContext.scene).collaboration?.mode === 'internal')!.turn;
+  f.workerLists.set(B, [overviewWorker('private-worker', '静默协作助手不可公开')]);
+  (f.host.bots.get(B)!.controller!.store as unknown as { workers: () => unknown[] }).workers = () => [{ id: 'private-worker', origin: { groupContext: internalTurn.groupContext } }];
   await f.host.receive(A, f.message(A, 'public-worker-status', '/workers', G1, [A])); await f.drain();
   assert.equal(f.replies.some(reply => reply.channel === `${A}|oc_a_group_1` && reply.text.includes('不应出现在群里的任务标题')), false);
+  const start = f.replies.length;
+  await f.host.receive(A, f.message(A, 'public-worker-status-all', '/workers all details')); await f.drain();
+  assert.equal(f.replies.slice(start).some(reply => /静默协作助手不可公开|private-worker|private controller title/.test(reply.text)), false);
 });

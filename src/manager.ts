@@ -96,6 +96,28 @@ export class SessionManager {
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
 
+  async replyWorkers(userId: string, argument: string, reply: (text: string, options?: ReplyOptions) => Promise<void>,
+    filter?: (items: WorkerOverview[]) => WorkerOverview[], createIfMissing = true): Promise<void> {
+    const args = argument.split(/\s+/).filter(Boolean);
+    if (args.some(value => !['current', 'all', 'history', 'details'].includes(value)) || new Set(args).size !== args.length || args.includes('current') && args.includes('all')) {
+      await reply('用法：/workers [history] [all] [details]；默认只看未结束助手，history 看历史。'); return;
+    }
+    if (!this.options.onListWorkers) { await reply('桥尚未配置直属 Agent 查询。'); return; }
+    const target = this.store.getActive(userId) ?? (createIfMissing ? this.ensureActive(userId) : null);
+    if (!target) {
+      const view: BridgePresentation = { title: '直属助手', tone: 'info', blocks: [{ kind: 'entry', text: '尚未初始化主控；请先在此 Bot 私聊初始化。' }] };
+      await reply(presentationText(view), { presentation: view }); return;
+    }
+    const scope = args.includes('all') ? 'all' : 'current';
+    let items: WorkerOverview[];
+    try { items = await this.options.onListWorkers(target, scope); }
+    catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
+    const history = args.includes('history');
+    const selected = (filter ? filter(items) : items).filter(item => isActiveWorker(item) !== history);
+    const view = workerOverview(selected, scope, Date.now(), args.includes('details'), history ? 'history' : 'active');
+    await reply(presentationText(view), { presentation: view });
+  }
+
   currentConversation(userId: string): Conversation | null { return this.store.getActive(userId); }
   conversationById(id: string): Conversation | null { return this.store.getConversation(id); }
   private authorizedUsers(): string[] { return this.config.allowedUserIds.filter(user => this.options.authorizeUser?.(user) !== false); }
@@ -823,21 +845,7 @@ export class SessionManager {
         catch { throw new Error('电脑清单检查失败，请稍后重试。'); }
         const view = computerOverview(items, args.includes('details')); await reply(presentationText(view), { presentation: view }); return;
       }
-      case 'workers': {
-        const args = argument.split(/\s+/).filter(Boolean);
-        if (args.some(value => !['current', 'all', 'history', 'details'].includes(value)) || new Set(args).size !== args.length || args.includes('current') && args.includes('all')) {
-          await reply('用法：/workers [history] [all] [details]；默认只看未结束助手，history 看历史。'); return;
-        }
-        if (!this.options.onListWorkers) { await reply('桥尚未配置直属 Agent 查询。'); return; }
-        const target = current ?? this.ensureActive(message.userId);
-        const scope = args.includes('all') ? 'all' : 'current';
-        let items: WorkerOverview[];
-        try { items = await this.options.onListWorkers(target, scope); }
-        catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
-        const history = args.includes('history');
-        const selected = items.filter(item => isActiveWorker(item) !== history);
-        const view = workerOverview(selected, scope, Date.now(), args.includes('details'), history ? 'history' : 'active'); await reply(presentationText(view), { presentation: view }); return;
-      }
+      case 'workers': { await this.replyWorkers(message.userId, argument, reply); return; }
       case 'status': {
         const running = current && this.running.get(message.userId)?.conversationId === current.id;
         const blocks: BridgePresentation['blocks'] = [{ kind: 'entry', text:
