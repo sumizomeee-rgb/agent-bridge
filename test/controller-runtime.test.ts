@@ -442,6 +442,12 @@ test('workspace initialization uses one durable child with the parent backend/mo
     assert.equal(child.conversation.model, 'gpt-6.1-sol'); assert.equal(child.effort, 'high'); assert.deepEqual(child.imagePaths, []);
     assert.match(child.text, /README\.md 为用户入口/); assert.match(child.text, /遵循其中定义的初始化入口、只读范围和回传要求/);
     assert.match(child.text, /不要扫描未指定的目录或技能目录/); assert.match(child.text, /不连接远程电脑/);
+    assert.match(child.text, /普通初始化概括目标800–1500个Unicode字符/);
+    assert.match(child.text, /完整平台指南、接口参数、命令示例、技能步骤和工具清单留给执行子 Agent 按任务读取/);
+    assert.match(child.text, /用户偏好与授权边界/); assert.match(child.text, /相关机器别名和权威入口/);
+    assert.match(child.text, /执行者应读取的文档路径、未核实或不可用项/);
+    assert.match(child.text, /不靠截断省略关键约束/);
+    assert.match(child.text, /workspaceContext仍只放简要工作区能力概括，continuation另放用户纠正和未完成事项/);
     assert(!child.text.includes('用户职责和偏好、当前电脑用途'));
     assert.match(child.text, /不自行登记桥后台任务、向聊天平台发消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
     assert.equal(child.taskContextPath, undefined); assert.equal(child.onPublicMessage, undefined); assert.equal(f.registry.activeCount('parent-A'), 1);
