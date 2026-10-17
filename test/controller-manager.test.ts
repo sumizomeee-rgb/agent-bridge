@@ -80,7 +80,25 @@ test('an ordinary absolute file citation stays prose; only explicit paths attach
   assert.equal(f.replies[1]!.options?.files?.[0]?.filename, 'report.txt');
 });
 
-test('same native public tool delivery key cannot publish twice', async t => {
+test('controller prose paths and image Markdown do not upload; explicit images render as images', async t => {
+  let path = '';
+  const f = fixture(t, async turn => {
+    await turn.onPublicMessage!(`截图在 ${path}，![截图](<${path}>)`, [], 'prose');
+    await turn.onPublicMessage!('当前页面如下。', [path], 'image');
+    return { nativeId: 'controller-native', text: '', controlledOutput: true };
+  });
+  path = join(f.root, 'page.png');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aU1kAAAAASUVORK5CYII=', 'base64');
+  writeFileSync(path, png);
+  await f.send('one', '展示页面'); await until(() => f.inspect.getMessage('one')?.state === 'completed');
+  assert.equal(f.replies.length, 2);
+  assert.equal(f.replies[0]!.options?.images, undefined); assert.equal(f.replies[0]!.options?.files, undefined);
+  assert.equal(f.replies[1]!.options?.files, undefined);
+  assert.equal(f.replies[1]!.options?.images?.[0]?.contentType, 'image/png');
+  assert.deepEqual(Buffer.from(f.replies[1]!.options!.images![0]!.data), png);
+});
+
+test('same native public tool delivery key cannot publish twice' , async t => {
   const f = fixture(t, async turn => {
     await turn.onPublicMessage!('只发一次', [], 'same-key');
     await turn.onPublicMessage!('只发一次', [], 'same-key');

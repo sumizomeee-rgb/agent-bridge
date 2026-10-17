@@ -204,14 +204,14 @@ function fileType(path: string): string {
 
 /** Only explicitly declared final-reply attachments are read; unrelated files are never enumerated. */
 async function collect(finalText: string, _rootDirectory: string | string[], maxImageBytes: number,
-  signal?: AbortSignal, maxFileBytes?: number): Promise<CollectedAttachments> {
+  signal?: AbortSignal, maxFileBytes?: number, declarations?: ImageMarker[]): Promise<CollectedAttachments> {
   if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes <= 0) throw failed('图片大小上限配置无效。');
   if (maxFileBytes !== undefined && (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0 || maxFileBytes > MAX_FILE_BYTES)) {
     throw failed('文件大小上限必须是 1–25165824 的整数。');
   }
   signal?.throwIfAborted();
-  const declared = markers(finalText, maxFileBytes !== undefined).map(marker => ({ marker,
-    path: localPath(marker.destination, marker.image) })).filter(item => item.path !== null);
+  const declared = (declarations ?? markers(finalText, maxFileBytes !== undefined)).map(marker => ({ marker,
+    path: declarations ? resolve(marker.destination) : localPath(marker.destination, marker.image) })).filter(item => item.path !== null);
   if (!declared.length) return { text: finalText, images: [], files: [] };
   signal?.throwIfAborted();
   const images: OutgoingImage[] = [];
@@ -295,6 +295,18 @@ function attachmentFailure(error: unknown, signal: AbortSignal | undefined, labe
   if (error instanceof ArtifactReadError) throw new Error(`${label}：${error.message}`);
   const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '未知文件错误';
   throw new Error(`${label}：无法读取明确声明的附件（${code}），未上传任何附件。请确认绝对路径指向本机可读取的物理文件。`);
+}
+
+/** Controller attachments are explicit tool arguments, never inferred from message prose. */
+export async function collectOutgoingPaths(paths: string[], rootDirectory: string | string[], maxImageBytes: number,
+  maxFileBytes = DEFAULT_FILE_BYTES, signal?: AbortSignal): Promise<CollectedAttachments> {
+  try {
+    if (!Array.isArray(paths) || paths.length > MAX_IMAGES || paths.some(path => typeof path !== 'string'
+      || !isAbsolute(path) || path.length > 4096 || /[\x00-\x1f\x7f]/.test(path))) throw failed('附件必须是明确指定的本机绝对文件路径，最多 10 个。');
+    const declarations = paths.map(destination => ({ start: 0, end: 0, destination, description: '',
+      image: ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(extname(destination).toLowerCase()) }));
+    return await collect('', rootDirectory, maxImageBytes, signal, maxFileBytes, declarations);
+  } catch (error) { return attachmentFailure(error, signal, '附件回传失败'); }
 }
 
 export async function collectOutgoingAttachments(finalText: string, rootDirectory: string | string[], maxImageBytes: number,

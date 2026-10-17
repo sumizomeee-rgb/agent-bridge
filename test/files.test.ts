@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import test, { type TestContext } from 'node:test';
-import { collectOutgoingAttachments } from '../src/artifacts.js';
+import { collectOutgoingAttachments, collectOutgoingPaths } from '../src/artifacts.js';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, ReplyOptions, ReplySink } from '../src/types.js';
@@ -39,7 +39,38 @@ async function fixture(t: TestContext) {
   return { root, workspace, links, after };
 }
 
-test('PDF, Office, ZIP, unknown binaries and empty files preserve exact bytes and names', async t => {
+test('explicit controller paths classify verified images and files without Markdown parsing', async t => {
+  const f = await fixture(t);
+  const image = join(f.workspace, '图 [一] (`截图`).PNG'), report = join(f.workspace, '报告.txt');
+  await writeFile(image, PNG); await writeFile(report, 'result');
+  const result = await collectOutgoingPaths([image, report, image], f.workspace, 100);
+  assert.equal(result.text, ''); assert.equal(result.images.length, 1); assert.equal(result.files.length, 1);
+  assert.equal(result.images[0]!.contentType, 'image/png');
+  assert.deepEqual(Buffer.from(result.images[0]!.data), PNG);
+  assert.equal(result.files[0]!.filename, '报告.txt');
+  // Direct mode retains its explicit file-vs-image Markdown contract.
+  const direct = await collectOutgoingAttachments(fileMarker(image), f.workspace, 100);
+  assert.equal(direct.images.length, 0); assert.equal(direct.files.length, 1);
+});
+
+test('explicit controller paths reject missing, relative, non-image bytes and oversized images', async t => {
+  const f = await fixture(t), valid = join(f.workspace, 'valid.png'), bad = join(f.workspace, 'bad.jpg');
+  await writeFile(valid, PNG); await writeFile(bad, 'not an image');
+  await assert.rejects(collectOutgoingPaths([valid, join(f.workspace, 'missing.png')], f.workspace, 100), /ENOENT/);
+  await assert.rejects(collectOutgoingPaths(['relative.png'], f.workspace, 100), /绝对文件路径/);
+  await assert.rejects(collectOutgoingPaths([bad], f.workspace, 100), /文件内容不是/);
+  await assert.rejects(collectOutgoingPaths([valid], f.workspace, PNG.length - 1), /图片大小上限/);
+  assert.deepEqual(await collectOutgoingPaths([], join(f.root, 'missing-root'), 100), { text: '', images: [], files: [] });
+});
+
+test('explicit controller paths retain physical-file and directory-link checks', async t => {
+  const f = await fixture(t), image = join(f.workspace, 'shot.png'); await writeFile(image, PNG);
+  const alias = join(f.workspace, 'alias'); await symlink(f.workspace, alias, 'junction'); f.links.push(alias);
+  await assert.rejects(collectOutgoingPaths([join(alias, 'shot.png')], f.workspace, 100), /目录包含链接/);
+  await assert.rejects(collectOutgoingPaths([f.workspace], f.workspace, 100), /普通文件/);
+});
+
+test('PDF, Office, ZIP, unknown binaries and empty files preserve exact bytes and names' , async t => {
   const f = await fixture(t);
   const entries = [
     { name: '报告 (最终).pdf', data: Buffer.from('%PDF-1.7\nexample'), type: 'application/pdf' },

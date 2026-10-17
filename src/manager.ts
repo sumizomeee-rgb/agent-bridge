@@ -8,7 +8,7 @@ import { agentDisplayName, replyHeader } from './reply.js';
 import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview, type WorkerOverview } from './overview.js';
 import { commandHelp, parseCommand as command, parseNewArguments } from './commands.js';
 import { presentationText, type BridgePresentation } from './presentation.js';
-import { collectOutgoingAttachments } from './artifacts.js';
+import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
@@ -981,7 +981,7 @@ export class SessionManager {
     if (claim === 'delivered') return;
     if (claim === 'uncertain') throw new Error('这条回复的投递状态未知，已保留，未重复发送');
     try {
-      const outgoing = await collectOutgoingAttachments(paths.map(path => `[附件](<${path}>)`).join('\n'),
+      const outgoing = await collectOutgoingPaths(paths,
         [target.cwd, join(this.config.dataDir, 'outgoing')], this.config.maxImageBytes, this.config.maxFileBytes, signal);
       if (!current()) throw new Error('主控轮次在附件准备期间停止');
       const identity = { conversationId: target.id, agent: target.agent, nativeId };

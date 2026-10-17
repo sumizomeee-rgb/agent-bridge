@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { collectOutgoingAttachments } from './artifacts.js';
+import { collectOutgoingPaths } from './artifacts.js';
 import { formatWorkerOverview } from './overview.js';
 import type { HostConfig } from './config.js';
 import type { HostSemanticMarker } from './host-migration.js';
@@ -925,7 +925,7 @@ export class HostRuntime {
       if (!route) throw new Error('此 Bot 还没有经真实私聊登记的负责人地址，请先在该 Bot 私聊发消息。');
       const text = bounded(args.text, 'text'), paths = args.attachmentPaths ?? [];
       if (!Array.isArray(paths) || paths.length > 10 || paths.some(p => typeof p !== 'string')) throw new Error('附件路径清单格式无效。');
-      const outgoing = await collectOutgoingAttachments((paths as string[]).map(path => `[附件](<${path}>)`).join('\n'),
+      const outgoing = await collectOutgoingPaths(paths as string[],
         [turn.conversation.cwd, join(bot.config.dataDir, 'outgoing')], bot.config.maxImageBytes, bot.config.maxFileBytes, turn.signal);
       this.assertContext(context);
       const id = key(context.eventId, callId ?? key(context.principalId, text), 'private');
