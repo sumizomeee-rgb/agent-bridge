@@ -305,19 +305,45 @@ test('prepared automatic dispatch is visible before its worker receipt and force
   held.release(); await f.drain();
 });
 
-test('new non-owner group messages enter refreshed evidence without granting execution authorization', { timeout: 10000 }, async t => {
+test('non-owner observer messages stay readable without advancing scene or consuming reassessment', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'nonowner-scene-owner'), turn = held.turns.get(B)!;
+  const beforeEvents = f.host.store.listEvents().length, beforeCursor = f.host.store.sceneCursor(G1, B);
   const guest = f.message(A, 'scene-guest-update', '群友补充的现场事实'); guest.userId = `${A}|outside-whitelist`;
   await f.host.receive(A, guest);
-  const before = f.host.store.listEvents().length;
-  const refresh = await turn.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'guest-refresh' });
-  assert.equal(refresh.refreshRequired, true); const scene = JSON.parse(refresh.scene!);
-  assert.equal(scene.originalRootId, turn.groupContext!.rootId); assert.equal(scene.originalPrincipalId, P); assert.equal(scene.newAuthorization, false);
-  assert.ok(scene.updates.some((update: any) => update.text === '群友补充的现场事实' && update.canAuthorize === false));
-  assert.equal(f.host.store.listEvents().length, before);
+  assert.equal(f.host.store.sceneCursor(G1, B), beforeCursor);
+  assert.equal((await turn.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'guest-refresh' })).refreshRequired, false);
   const guest2 = f.message(A, 'scene-guest-more', '第二条事实'); guest2.userId = `${A}|outside-whitelist`; await f.host.receive(A, guest2);
+  assert.equal(f.host.store.sceneCursor(G1, B), beforeCursor);
   assert.equal((await turn.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'guest-second-refresh' })).refreshRequired, false);
+  assert.equal(f.host.store.listEvents().length, beforeEvents, 'observer facts do not enqueue controller turns');
+  const context: any = await f.host.invoke(B, turn, 'bridge_group_context', {});
+  for (const text of ['群友补充的现场事实', '第二条事实']) {
+    assert.ok(context.conversationEvidence.recent.some((record: any) => record.text === text && record.canAuthorize === false));
+    assert.ok(f.host.store.readContext(G1, B).recent.some(record => record.text === text && record.canAuthorize === false));
+  }
+  const a = held.turns.get(A)!;
+  await f.host.invoke(A, a, 'bridge_start_worker', { title: '登记 Bot 的真实执行进展', prompt: '只读检查' }, 'known-bot-after-guests', async () =>
+    f.registerExecution(A, a, 'known-bot-after-guests', 'known-bot-scene-worker'));
+  const refresh = await turn.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'known-bot-refresh' });
+  assert.equal(refresh.refreshRequired, true, 'observer messages must leave the one refresh available for registered Bot progress');
+  const scene = JSON.parse(refresh.scene!);
+  assert.equal(scene.originalRootId, turn.groupContext!.rootId); assert.equal(scene.originalPrincipalId, P); assert.equal(scene.newAuthorization, false);
+  assert.ok(scene.updates.some((update: any) => update.kind === 'dispatch' && update.sourceBotId === A));
+  assert.ok(scene.updates.every((update: any) => update.canAuthorize === false));
+  assert.equal(scene.updates.some((update: any) => update.text === '群友补充的现场事实' || update.text === '第二条事实'), false);
+  const reopened = new HostStore(f.config.rootDataDir);
+  try { assert.equal(reopened.consumeSceneRefresh(turn.groupContext!.rootId, B), false); }
+  finally { reopened.close(); }
   held.release(); await f.drain();
+
+  const next = await holdSceneTurns(f, 'next-owner-scene-request'), nextB = next.turns.get(B)!;
+  assert.notEqual(nextB.groupContext!.rootId, turn.groupContext!.rootId);
+  assert.equal((await nextB.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'next-initial-check' })).refreshRequired, false,
+    'previous request progress is initial context rather than a new stale-scene signal');
+  await next.turns.get(A)!.onPublicMessage!('新一条主人请求下的 Bot 公开进展', [], 'next-known-bot-public', undefined, false);
+  assert.equal((await nextB.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'next-public-refresh' })).refreshRequired, true,
+    'a new owner request receives its own once-only reassessment budget');
+  next.release(); await f.drain();
 });
 
 test('legacy claimed work uses automatic dispatch reconciliation and cannot reopen a user-owned worker', { timeout: 10000 }, async t => {

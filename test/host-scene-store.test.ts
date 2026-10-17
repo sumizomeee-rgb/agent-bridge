@@ -55,18 +55,58 @@ test('an own public message advances the shared cursor without creating a reason
   assert.deepEqual(result.updates, []); assert.equal(result.total, 0); assert(result.cursor > 0); assert.equal(result.truncated, false);
 });
 
-test('non-owner context is visible evidence with preserved attribution and cannot authorize work or enqueue turns', async t => {
+test('bystander context stays readable without advancing the reassessment version, authorizing work or enqueueing turns', async t => {
   const { store } = await setup(t), binding = store.getGroup(SPACE)!;
   const input = { id: 'bystander', spaceId: SPACE, epoch: binding.epoch, revision: binding.revision,
     principalId: P, receiverBotId: A,
     source: { botId: A, messageId: 'message-1', userId: 'non-owner', channelId: 'group-native', authorType: 'user',
       authorName: 'Another group member', mentionedUserIds: [] }, text: 'Additional evidence, not an instruction', attachments: [], canAuthorize: false };
-  store.appendContext(input); const cursor = store.sceneCursor(SPACE, A);
+  const cursor = store.sceneCursor(SPACE, A); store.appendContext(input);
   store.appendContext(input); assert.equal(store.sceneCursor(SPACE, A), cursor);
-  const [change] = store.readSceneUpdates(SPACE, A, 0).updates;
-  assert(change); assert.equal(change.sourceBotId, null); assert.equal(change.source.type, 'group-evidence');
-  assert.equal(change.source.userId, 'non-owner'); assert.equal(change.canAuthorize, false);
+  const [record] = store.readContext(SPACE, A).recent;
+  assert(record); assert.equal(record.source.userId, 'non-owner'); assert.equal(record.canAuthorize, false);
+  assert.equal(record.text, input.text); assert.deepEqual(store.readSceneUpdates(SPACE, A, 0).updates, []);
+  store.appendContext({ ...input, id: 'external-bot', source: { ...input.source, userId: 'external-bot', authorType: 'bot' } });
+  assert.equal(store.sceneCursor(SPACE, A), cursor); assert.equal(store.readContext(SPACE, A).recent.length, 2);
   assert.deepEqual(store.listEvents(), []); assert.equal(store.listTasks().length, 0);
+});
+
+test('verified owner context advances reassessment while another member remains read-only history', async t => {
+  const { store } = await setup(t), binding = store.getGroup(SPACE)!;
+  const input = { id: 'owner-update', spaceId: SPACE, epoch: binding.epoch, revision: binding.revision,
+    principalId: P, receiverBotId: A, source: { botId: A, messageId: 'owner-message-2', userId: 'user-' + A,
+      channelId: 'native-' + A, authorType: 'user', mentionedUserIds: [] }, text: 'Owner follow-up', attachments: [], canAuthorize: true };
+  store.appendContext(input); const cursor = store.sceneCursor(SPACE, B); assert(cursor > 0);
+  store.appendContext({ ...input, id: 'guest-update', canAuthorize: false, text: 'Unrelated conversation',
+    source: { ...input.source, userId: 'guest' } });
+  assert.equal(store.sceneCursor(SPACE, B), cursor);
+  const updates = store.readSceneUpdates(SPACE, B, 0);
+  assert.deepEqual(updates.updates.map(value => value.text), ['Owner follow-up']);
+  assert.equal(updates.total, 1); assert.equal(updates.truncated, false);
+  assert.equal(updates.updates[0]!.canAuthorize, false); // Refresh evidence is never fresh authorization.
+  assert.equal(store.readContext(SPACE, B).recent.length, 2);
+});
+
+test('legacy bystander scene rows remain stored but cannot advance the version or occupy refresh deltas after reopen', async t => {
+  const { store, open } = await setup(t), binding = store.getGroup(SPACE)!;
+  store.appendPublic({ id: 'bot-before-guest', rootId: 'root', authorBotId: A, principalId: P, text: 'Confirmed Bot reply' });
+  const cursor = store.sceneCursor(SPACE, B);
+  const input = { id: 'legacy-guest', spaceId: SPACE, epoch: binding.epoch, revision: binding.revision,
+    principalId: P, receiverBotId: A, source: { botId: A, messageId: 'legacy-guest-message', userId: 'guest',
+      channelId: 'native-' + A, authorType: 'user', mentionedUserIds: [] }, text: 'Legacy bystander text', attachments: [], canAuthorize: false };
+  store.appendContext(input);
+  const db = new DatabaseSync(store.path);
+  db.prepare('INSERT INTO host_scene_log(id,space_id,epoch,kind,source_bot_id,text,source_json) VALUES(?,?,?,?,?,?,?)')
+    .run('context:' + input.id, SPACE, binding.epoch, 'context', null, input.text, JSON.stringify({ type: 'group-evidence' }));
+  db.prepare('INSERT INTO host_scene_log(id,space_id,epoch,kind,source_bot_id,text,source_json) VALUES(?,?,?,?,?,?,?)')
+    .run('context:missing-record', SPACE, binding.epoch, 'context', null, 'Unprovable old source', JSON.stringify({ type: 'group-evidence' }));
+  db.close(); store.close(); const reopened = open();
+  assert.equal(reopened.sceneCursor(SPACE, B), cursor);
+  assert.deepEqual(reopened.readSceneUpdates(SPACE, B, cursor), { cursor, updates: [], total: 0, truncated: false });
+  assert.deepEqual(reopened.readSceneUpdates(SPACE, B, 0, 1).updates.map(value => value.text), ['Confirmed Bot reply']);
+  assert.equal(reopened.readContext(SPACE, B).recent[0]!.text, input.text);
+  const retained = new DatabaseSync(reopened.path);
+  assert.equal(retained.prepare("SELECT COUNT(*) n FROM host_scene_log WHERE kind='context'").get()!.n, 2); retained.close();
 });
 
 test('scene refresh is once per original owner request and Bot, persists across restart and shares derived roots', async t => {

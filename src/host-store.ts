@@ -4,6 +4,10 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import type { AgentName, BridgePlatform } from './types.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
+// Readable bystander history, including legacy scene rows, does not trigger reassessment.
+const sceneRefreshEligible = `(kind<>'context' OR EXISTS (SELECT 1 FROM host_context_records c
+  WHERE host_scene_log.id='context:'||c.id AND c.space_id=host_scene_log.space_id
+    AND c.epoch=host_scene_log.epoch AND c.can_authorize=1))`;
 export type HostReplyAddress = Readonly<Record<string, string>>;
 export class HostStateError extends Error {
   constructor(readonly code: 'not-found' | 'conflict' | 'forbidden' | 'stale' | 'blocked' | 'public-reply-limit', message: string) {
@@ -885,7 +889,7 @@ export class HostStore {
           throw new HostStateError('conflict', 'Context message identity reused');
       } else this.run('INSERT INTO host_context_records(id,space_id,epoch,source_json,text,attachments_json,can_authorize,received_at) VALUES(?,?,?,?,?,?,?,?)',
         input.id, input.spaceId, input.epoch, JSON.stringify(value.source), input.text, JSON.stringify(value.attachments), Number(value.canAuthorize), new Date().toISOString());
-      this.appendSceneInner({ id: 'context:' + input.id, spaceId: input.spaceId, epoch: input.epoch,
+      if (input.canAuthorize) this.appendSceneInner({ id: 'context:' + input.id, spaceId: input.spaceId, epoch: input.epoch,
         kind: 'context', sourceBotId: null, text: input.text,
         source: { type: 'group-evidence', messageId: input.source.messageId, authorType: input.source.authorType,
           userId: input.source.userId, ...(input.source.authorName ? { authorName: input.source.authorName } : {}) } });
@@ -956,7 +960,7 @@ export class HostStore {
     });
   }
   private sceneCursorInner(spaceId: string, epoch: number): number {
-    return Number(this.one('SELECT MAX(sequence) AS cursor FROM host_scene_log WHERE space_id=? AND epoch=?', spaceId, epoch)?.cursor ?? 0);
+    return Number(this.one(`SELECT MAX(sequence) AS cursor FROM host_scene_log WHERE space_id=? AND epoch=? AND ${sceneRefreshEligible}`, spaceId, epoch)?.cursor ?? 0);
   }
   sceneCursor(spaceId: string, botId: string): number {
     const group = this.getGroup(spaceId); if (!group) throw new HostStateError('not-found', 'Unknown group');
@@ -971,7 +975,7 @@ export class HostStore {
         throw new HostStateError('conflict', 'Scene cursor must be nonnegative and limit must be 1..100');
       const cursor = this.sceneCursorInner(spaceId, group.epoch);
       // Own synchronous effects were already known to this controller. An asynchronous completion was not.
-      const where = "space_id=? AND epoch=? AND sequence>? AND NOT (source_bot_id IS ? AND kind IN ('public','dispatch'))";
+      const where = `space_id=? AND epoch=? AND sequence>? AND ${sceneRefreshEligible} AND NOT (source_bot_id IS ? AND kind IN ('public','dispatch'))`;
       const args: SQLInputValue[] = [spaceId, group.epoch, after, botId];
       const total = Number(this.one(`SELECT COUNT(*) AS n FROM host_scene_log WHERE ${where}`, ...args)!.n);
       const updates = this.rows(`SELECT * FROM (SELECT * FROM host_scene_log WHERE ${where} ORDER BY sequence DESC LIMIT ?) ORDER BY sequence`,
