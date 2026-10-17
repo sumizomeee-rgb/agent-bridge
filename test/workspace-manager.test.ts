@@ -450,7 +450,7 @@ test('初始化子任务失败保存事实并交回原父，桥只提示一次�
   assert.match(result.event!.text, /failed/); assert.match(result.event!.text, /workspace read denied/);
   assert.equal(f.runtime.store.jobs()[0]!.status, 'failed');
   await until(() => f.inspect.workspaceNotice(result.conversation.id)?.state === 'delivered');
-  assert.equal(f.replies.length, 2); assert.match(f.replies[1]!.text, /读取失败/);
+  assert.equal(f.replies.length, 2); assert.match(f.replies[1]!.text, /初始化未完成/);
   assert.equal(f.registry.activeCount(result.conversation.id), 0);
   await f.send('ask', '上下文查完了吗'); await until(() => f.controller.turns.length === 2);
   assert.equal(f.controller.turns[1]!.conversation.nativeId, f.inspect.getActive('user')!.nativeId);
@@ -817,6 +817,10 @@ test('/new continue without a prior controller does not switch, and malformed ha
   await f.send('continue', '/new continue'); await until(() => f.children.turns.length === 2);
   const target = f.inspect.getActive('user')!;
   f.children.finish(1, 'INVALID_NOT_JSON');
+  await until(() => f.children.turns.length === 3);
+  assert.equal(f.children.turns[2]!.conversation.id, f.children.turns[1]!.conversation.id);
+  assert.equal(f.children.turns[2]!.conversation.nativeId, `child-native-${f.children.turns[1]!.conversation.id}`);
+  f.children.finish(2, 'INVALID_NOT_JSON');
   await until(() => f.manager.isIdle() && f.inspect.workspaceNotice(target.id)!.state === 'delivered');
   assert.equal(f.runtime.store.jobs().at(-1)!.status, 'failed');
   const manifest = JSON.parse(readFileSync(join(f.config.dataDir, 'session-handoffs', target.id, 'manifest.json'), 'utf8'));

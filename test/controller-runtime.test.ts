@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ownTemporaryDirectory } from './temp-directory.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
+import { SessionHandoffs } from '../src/controller/handoff.js';
 import { ControllerStore } from '../src/controller/store.js';
 import type { ControllerStallEvent } from '../src/controller/runtime-types.js';
 import { TaskRegistry, type TaskCompletionEvent, type TaskContextFile } from '../src/tasks.js';
@@ -1028,4 +1029,137 @@ test('worker canonical effort evidence persists and reaches the ordinary worker 
     assert.deepEqual(overview.find(item => item.workerId === handle.workerId)!.effortMetadata, metadata);
     f.codex.finish(handle.workerId); await flush();
   } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+function prepareContinuation(f: ReturnType<typeof fixture>): SessionHandoffs {
+  const handoffs = new SessionHandoffs(f.dir);
+  handoffs.prepare({ ...f.turn.conversation, id: 'previous-parent' }, f.turn.conversation, 'dm-A',
+    [{ role: 'user', text: '不得连接远程，也不得修改 MEMORY', at: '2026-10-01' }], []);
+  return handoffs;
+}
+const validHandoff = JSON.stringify({ workspaceContext: '本地只读，完整平台工具由执行者按需读取。', continuation: '保留用户纠正：不得连接远程，也不得修改 MEMORY；旧任务不重做。' });
+const oversizedHandoff = JSON.stringify({ workspaceContext: '字'.repeat(1010), continuation: '不得连接远程，也不得修改 MEMORY。' });
+
+test('handoff 1010-character receipt is repaired once in the same native worker/job without new execution scope', async () => {
+  const f = fixture(); const handoffs = prepareContinuation(f);
+  try {
+    const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
+    f.codex.finish(handle.workerId, oversizedHandoff); await flush();
+    assert.equal(f.codex.turns.length, 2);
+    const repair = f.codex.turns[1]!;
+    assert.equal(repair.conversation.id, handle.workerId); assert.equal(repair.conversation.nativeId, `native-${handle.workerId}`);
+    assert.equal(repair.dispatchId, handle.jobId + ':summary-repair'); assert.equal(repair.acceptSupplements, false);
+    assert.equal(f.runtime.store.jobs().length, 1); assert.equal(f.runtime.store.workers().length, 1);
+    assert.match(repair.text, /workspaceContext 1010>1000/); assert.match(repair.text, /不重新执行调查/);
+    assert.match(repair.text, /目标600–800/); assert.match(repair.text, /目标1200–1800/);
+    assert.equal(handoffs.get(f.turn.conversation, 'dm-A')!.repairJobId, handle.jobId);
+    assert.equal(f.events.length, 0);
+    f.codex.finish(handle.workerId, validHandoff); await flush();
+    assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'completed'); assert.equal(f.events.length, 1);
+    assert.match(f.events[0]!.text, /不得连接远程/); assert.equal(handoffs.get(f.turn.conversation, 'dm-A')!.status, 'ready');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('a second oversized handoff receipt fails precisely and never creates another repair', async () => {
+  const f = fixture(); prepareContinuation(f);
+  try {
+    const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
+    f.codex.finish(handle.workerId, oversizedHandoff); await flush(); f.codex.finish(handle.workerId, oversizedHandoff); await flush();
+    assert.equal(f.codex.turns.length, 2); assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'failed');
+    assert.match(f.runtime.store.getJob(handle.jobId)!.result!, /workspaceContext 1010>1000/);
+    await f.runtime.initializeWorkspace(f.turn); await flush(); assert.equal(f.codex.turns.length, 2);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+for (const corruption of ['hash', 'owner'] as const) test(`handoff ${corruption} mismatch is never repaired`, async () => {
+  const f = fixture(); prepareContinuation(f);
+  try {
+    const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
+    const base = join(f.dir, 'session-handoffs', 'parent-A');
+    if (corruption === 'hash') writeFileSync(join(base, 'source.json'), '{}');
+    else { const path = join(base, 'manifest.json'); const value = JSON.parse(readFileSync(path, 'utf8')); value.userId = 'other'; writeFileSync(path, JSON.stringify(value)); }
+    f.codex.finish(handle.workerId, oversizedHandoff); await flush();
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'failed');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('reset before receipt prevents repair and rejects the old initialization', async () => {
+  const f = fixture(); prepareContinuation(f);
+  try {
+    const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
+    await f.runtime.detachConversation('parent-A'); f.codex.finish(handle.workerId, oversizedHandoff); await flush();
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'cancelled');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('cancellation during the sole repair never triggers another run or accepts its result', async () => {
+  const f = fixture(); prepareContinuation(f);
+  try {
+    const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
+    f.codex.finish(handle.workerId, oversizedHandoff); await flush(); await f.runtime.cancelConversation('parent-A'); await flush();
+    assert.equal(f.codex.turns.length, 2); assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'cancelled');
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('interrupted repair remains uncertain across restart with no replay', async () => {
+  const f = fixture(); prepareContinuation(f); let second: ControllerRuntime | undefined;
+  try {
+    const handle = await f.runtime.initializeWorkspace(f.turn) as Handle; await flush();
+    f.codex.finish(handle.workerId, oversizedHandoff); await flush(); await f.runtime.close();
+    const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
+    await second.start(); await second.initializeWorkspace(f.turn); await flush();
+    assert.equal(adapter.turns.length, 0); assert.equal(second.store.getJob(handle.jobId)!.status, 'uncertain');
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('ordinary workers never parse or repair handoff-shaped results', async () => {
+  const f = fixture(); prepareContinuation(f);
+  try {
+    const handle = await launch(f.runtime, f.turn); await flush(); f.codex.finish(handle.workerId, oversizedHandoff); await flush();
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'completed');
+    assert.equal(f.runtime.store.getJob(handle.jobId)!.result, oversizedHandoff);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('durably claimed repair on a running remote dispatch never replays the original or repair after crash', async () => {
+  const f = fixture(); const handoffs = prepareContinuation(f); let second: ControllerRuntime | undefined;
+  try {
+    await f.runtime.close(); const store = new ControllerStore(f.dir);
+    const context = JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile;
+    const origin = { ...f.registry.getContextOrigin(context), purpose: 'workspace-context' as const };
+    const jobId = randomUUID(); const taskId = f.registry.register(context, '初始化摘要', jobId).taskId;
+    const target = { id: 'station', label: '工位', transport: 'ssh' as const, agent: 'codex' as const, agentCommand: f.config.commands.codex, cwd: f.dir };
+    store.addWorker({ id: 'remote-worker', origin, agent: 'codex', model: null, actualModel: null, effort: null, cwd: f.dir, target,
+      title: 'remote', nativeId: 'native-remote-worker', imagePaths: [], wakeAllowed: true, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+    store.addJob({ id: jobId, workerId: 'remote-worker', origin, prompt: '只读初始化', imagePaths: [], status: 'running', taskId,
+      result: null, cancelReason: null, createdAt: '2026-10-09', updatedAt: '2026-10-09' }); store.close();
+    handoffs.claimRepair(f.turn.conversation, 'dm-A', jobId);
+    const adapter = new FakeAdapter();
+    second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, { ...f.callbacks, targetCatalog: {
+      listTargets: async () => [], resolveTarget: async () => target, adapterFor: () => adapter, handoff: async () => { throw new Error('unused'); } } });
+    await second.start(); await flush();
+    assert.equal(adapter.turns.length, 0); assert.equal(second.store.getJob(jobId)!.status, 'uncertain');
+    assert.match(second.store.getJob(jobId)!.result!, /唯一一次摘要修复期间重启/);
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('damaged handoff ownership at restart isolates the uncertain job without blocking other workers', async () => {
+  const f = fixture(); prepareContinuation(f); let second: ControllerRuntime | undefined;
+  try {
+    await f.runtime.close(); const store = new ControllerStore(f.dir);
+    const context = JSON.parse(readFileSync(f.turn.taskContextPath!, 'utf8')) as TaskContextFile;
+    const origin = { ...f.registry.getContextOrigin(context), purpose: 'workspace-context' as const };
+    const jobId = randomUUID(); const taskId = f.registry.register(context, '初始化摘要', jobId).taskId;
+    store.addWorker({ id: 'damaged-worker', origin, agent: 'codex', model: null, actualModel: null, effort: null, cwd: f.dir,
+      title: 'damaged', nativeId: 'native-damaged-worker', imagePaths: [], wakeAllowed: true, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
+    store.addJob({ id: jobId, workerId: 'damaged-worker', origin, prompt: '只读初始化', imagePaths: [], status: 'running', taskId,
+      result: null, cancelReason: null, createdAt: '2026-10-09', updatedAt: '2026-10-09' }); store.close();
+    const path = join(f.dir, 'session-handoffs', 'parent-A', 'manifest.json');
+    const manifest = JSON.parse(readFileSync(path, 'utf8')); manifest.userId = 'other'; writeFileSync(path, JSON.stringify(manifest));
+    const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
+    await second.start(); await flush();
+    assert.equal(adapter.turns.length, 0); assert.equal(second.store.getJob(jobId)!.status, 'uncertain');
+    const ordinary = await launch(second, f.turn); await flush(); assert.equal(adapter.turns.length, 1);
+    adapter.finish(ordinary.workerId); await flush(); assert.equal(second.store.getJob(ordinary.jobId)!.status, 'completed');
+  } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });

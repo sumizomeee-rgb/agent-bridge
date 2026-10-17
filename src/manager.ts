@@ -1196,7 +1196,7 @@ export class SessionManager {
     const outcome = notice.outcome;
     if (outcome === 'ready') return; // 成功介绍只由主控公开通道发送。
     const bodies: Record<Exclude<WorkspaceNoticeOutcome, 'ready'>, string> = {
-      'read-failed': '⚠️ 工作区上下文读取失败，结果已交给主控。',
+      'read-failed': '⚠️ 工作区初始化未完成，具体失败原因已交给主控。',
       'read-cancelled': '⚠️ 工作区上下文读取已取消，结果已交给主控。',
       'load-failed': '⚠️ 初始化结果未能载入主控，结果已保存。',
       'request-failed': '⚠️ 工作区初始化请求未确认完成，请核对状态。',

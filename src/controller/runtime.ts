@@ -10,7 +10,7 @@ import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
-import { SessionHandoffs } from './handoff.js';
+import { HandoffResultError, SessionHandoffs } from './handoff.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '你是桥已登记并管理的执行子 Agent。执行下面的任务，使用你需要的电脑工具或 SSH 技能；等待你启动的远端任务结束并核对结果后再返回。不要自行登记桥后台任务、发 Discord 消息或伪造完成回执。若涉及截图或文件，返回文件绝对路径供主控决定发送。\n\n';
@@ -371,7 +371,16 @@ export class ControllerRuntime {
     for (const job of this.store.jobs().filter(job => job.status === 'running')) {
       if (!this.config.allowedUserIds.includes(job.origin.userId)) continue;
       const worker = this.store.getWorker(job.workerId)!;
-      if (worker.target?.transport === 'ssh' && worker.ownership !== 'user' && !worker.handoffPending) this.launchJob(worker.id, job, true);
+      let repair = false;
+      try {
+        repair = job.origin.purpose === 'workspace-context' && new SessionHandoffs(this.config.dataDir).get(
+          { id: job.origin.conversationId, userId: job.origin.userId, cwd: job.origin.cwd }, job.origin.channelId)?.repairJobId === job.id;
+      } catch (error) {
+        await this.finish(worker, job, 'uncertain', '交接登记无法验证；未恢复执行：' + (error instanceof Error ? error.message : String(error)));
+        continue;
+      }
+      if (repair) await this.finish(worker, job, 'uncertain', '桥在唯一一次摘要修复期间重启；结果未知，未自动重做。');
+      else if (worker.target?.transport === 'ssh' && worker.ownership !== 'user' && !worker.handoffPending) this.launchJob(worker.id, job, true);
       else await this.finish(worker, job, 'uncertain', '桥在执行期间重启；该轮结果未知，未自动重做。请检查已发生的操作。');
     }
     // Completing the two SQLite journals cannot share a transaction. Reconcile a saved terminal
@@ -923,11 +932,44 @@ export class ControllerRuntime {
       const prepared = await resolveDefaultModel(adapter, turn);
       const running = adapter.run(prepared);
       void this.count(job.origin.conversationId);
-      const result = await running;
+      let result = await running;
       await this.settleSupplements(state);
       this.nativeId(worker, result.nativeId);
+      if (job.origin.purpose === 'workspace-context') {
+        const handoffs = new SessionHandoffs(this.config.dataDir);
+        const owner = { id: job.origin.conversationId, userId: job.origin.userId, cwd: job.origin.cwd };
+        const canRepair = (): boolean => {
+          const current = this.store.getJob(job.id), currentWorker = this.store.getWorker(worker.id);
+          return !state.recovering && !this.stopping && !state.closing && !state.abort.signal.aborted && !state.cancelReason
+            && !this.store.isConversationPaused(job.origin.conversationId)
+            && current?.status === 'running' && !current.cancelReason && (current.wakeAllowed ?? currentWorker?.wakeAllowed) !== false
+            && !!currentWorker && !currentWorker.blocked && !currentWorker.handoffPending && currentWorker.ownership !== 'user';
+        };
+        if (canRepair()) {
+          try { handoffs.validate(owner, job.origin.channelId, result.text); }
+          catch (error) {
+            if (!(error instanceof HandoffResultError)) throw error;
+            handoffs.claimRepair(owner, job.origin.channelId, job.id);
+            // Same registered worker, native session, model and job; only rewrite its completed receipt.
+            // The durable claim above prevents restart/recovery from replaying an unknown repair.
+            const repair: AgentTurn = { ...prepared, conversation: { ...prepared.conversation, nativeId: result.nativeId },
+              recovering: false, acceptSupplements: false, imagePaths: [], dispatchId: job.id + ':summary-repair',
+              text: workspaceWorkerInstruction + '上一轮只读初始化已经正常返回，但回执校验失败：' + error.message
+                + '这是唯一一次回执修复；仅据上轮已读工作区及同一冻结源改写摘要，不扩展读取范围，不重新执行调查，不联网、不连接远程、不改文件、不发消息、不启动任务。保持原只读范围、用户纠正、禁止事项和冻结源不变；先合并重复与操作细节，禁止硬截断丢失约束。'
+                + handoffs.prompt(owner, job.origin.channelId) };
+            if (canRepair()) {
+              state.ready = false;
+              result = await adapter.run(repair);
+              this.nativeId(worker, result.nativeId);
+              await this.settleSupplements(state);
+            }
+          }
+        }
+      }
       const current = this.store.getJob(job.id)!;
-      if (state.closing) await this.finish(worker, current, 'uncertain', '桥关闭时停止了执行子 Agent；本轮结果未知，未自动重做。');
+      if (job.origin.purpose === 'workspace-context' && (current.wakeAllowed ?? worker.wakeAllowed) === false
+        && new SessionHandoffs(this.config.dataDir).get({ id: job.origin.conversationId, userId: job.origin.userId, cwd: job.origin.cwd }, job.origin.channelId)) await this.finish(worker, current, 'cancelled', '父会话已切换或重置；未接受旧初始化回执。');
+      else if (state.closing) await this.finish(worker, current, 'uncertain', '桥关闭时停止了执行子 Agent；本轮结果未知，未自动重做。');
       else if (state.cancelReason || current.cancelReason) await this.finish(worker, current, 'cancelled', `${state.cancelReason ?? current.cancelReason}\n本桥管理的 CLI 进程已结束；远端自行启动的后台进程及已发生的改动需另行核对。`);
       else await this.finish(worker, current, 'completed', result.text);
     } catch (error) {
@@ -962,7 +1004,7 @@ export class ControllerRuntime {
         if (status === 'completed') result = handoffs.finish(owner, job.origin.channelId, result);
         else handoffs.fail(owner, job.origin.channelId, result);
       } catch (error) {
-        status = 'failed'; result = `会话交接未完成：${error instanceof Error ? error.message : String(error)}`;
+        if (status !== 'uncertain') status = 'failed'; result = `会话交接未完成：${error instanceof Error ? error.message : String(error)}`;
         try { handoffs.fail(owner, job.origin.channelId, result); } catch (failure) { this.error(failure); }
       }
     }
