@@ -53,6 +53,7 @@ Profile 还可设置 `defaultAgent: "codex"` 或 `defaultAgent: "claude"`；未�
   "startupProfiles": ["feishu/bot1", "feishu/bot2"],
   "workspaceRoot": ".local/workspaces",
   "groupMode": true,
+  "internalBotCommunicationEnabled": false,
   "principals": [{
     "id": "me",
     "accounts": {
@@ -75,6 +76,10 @@ Profile 还可设置 `defaultAgent: "codex"` 或 `defaultAgent: "claude"`；未�
 `groupMode` 只有显式 `true` 才接收群输入，还需机器人和负责人在群、权限可验证、成员账号属于同一操作者等检查。机器人、Webhook、未知账号和未授权真人消息不启动执行。提及使用平台实体 ID 解析，正文中的 Bot 昵称不算点名。群启用及命令见[使用说明](usage.md#工作群与当前主控)。
 
 ## 网络与可选功能
+
+公共配置的 `internalBotCommunicationEnabled` 是独立布尔开关，与群内 `bridge_silent` 无关。省略时为 `true`，保持既有部署；`config.example.json` 显式为 `false`，新部署先使用群公开协作。它在宿主启动时加载，修改后需安全重启桥，不支持聊天命令修改，也不要求 `/new`。
+
+设置 `false` 时，关闭跨 Bot 的 `bridge_send_bot`、`bridge_start_collaboration` 的 `internal` 模式及当前依赖内部通知的 `bridge_propose_handoff`／`bridge_accept_handoff`；不会把原本内部的正文自动改发群里。新工具声明隐藏内部入口，已有原生会话可能缓存旧工具清单，但桥端仍拒绝相关调用。此前尚未派送的内部定向事件不再投递，尚未接受的 `proposed` 交接提议同步取消，防止旧提议阻塞原负责人继续派工；再次开启不会复活旧提议。这只取消交接提议，不取消任务或正在执行的直属助手，原任务负责人和资源归属保持。已经进入对方原生上下文的内容不能撤回；内部助手结果或唤醒失败仍遵守内部可见边界，不向群公开错误正文、结果或任务标题。公开 `start_collaboration`、群消息广播、群静默不回复、本人私聊、各自的直属助手及其结果交付保持可用。是否重新开放由宿主配置决定，不以模型重试绕过。
 
 网络配置属于各 Profile 的 `network.proxyPort`。Discord 示例为 `7898`，飞书示例为 `null`；平台链路缺省直连，公共配置不接受旧 `proxyPort`。`-ProxyPort` 仅显式覆盖本次宿主启动。没有指定 Agent 代理时沿用本机自己的默认环境和 CLI 配置。不会修改飞连、系统代理、隧道或它们的自启设置。
 

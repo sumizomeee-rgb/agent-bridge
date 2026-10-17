@@ -26,11 +26,11 @@ class GroupProtocol implements RpcTransport {
   async stop() { this.stopped = true; }
 }
 async function until(check: () => boolean) { for (let n = 0; n < 2000; n++) { if (check()) return; await new Promise<void>(resolve => setImmediate(resolve)); } assert.fail('原生群协议没有达到预期'); }
-function setup(t: TestContext) {
+function setup(t: TestContext, internalBotCommunicationEnabled?: boolean) {
   const root = mkdtempSync(join(tmpdir(), 'bridge-group-native-')); mkdirSync(join(root, '.codex')); writeFileSync(join(root, '.codex', 'config.toml'), 'model_provider="fixture"\n');
   const protocol = new GroupProtocol(), invoked: string[] = []; let silent = 0, published = 0;
   let manage: () => Promise<unknown> = async () => ({});
-  const adapter = new NativeControllerAdapter({ command: 'offline', args: [] }, {}, { agent: 'codex', dataDir: join(root, 'data'), userHome: root,
+  const adapter = new NativeControllerAdapter({ command: 'offline', args: [] }, {}, { agent: 'codex', dataDir: join(root, 'data'), userHome: root, internalBotCommunicationEnabled,
     createTransport: () => protocol, invokeTool: async (_turn, name) => { invoked.push(name); return manage(); } });
   t.after(() => adapter.close());
   const turn: AgentTurn = { conversation: { id: 'group-parent', userId: 'owner', agent: 'codex', nativeId: null, title: '', cwd: root, createdAt: '', updatedAt: '' },
@@ -40,6 +40,40 @@ function setup(t: TestContext) {
 }
 const reply = (protocol: GroupProtocol, id: number) => protocol.written.find(item => item.id === id && !item.method)?.result as JsonObject | undefined;
 
+
+test('关闭后台 Bot 互通后原生工具清单只允许公开协作，缓存旧调用不能穿透守卫，群静默仍可用', async t => {
+  const f = setup(t, false);
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+  const start = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
+  const tools = start.dynamicTools as Array<{ name: string; inputSchema: JsonObject }>;
+  for (const name of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff']) assert.equal(tools.some(tool => tool.name === name), false);
+  const collaboration = tools.find(tool => tool.name === 'bridge_start_collaboration')!;
+  assert.deepEqual(((collaboration.inputSchema.properties as JsonObject).mode as JsonObject).enum, ['public']);
+  for (const name of ['bridge_silent', 'bridge_start_worker', 'bridge_claim_work', 'bridge_send_message']) assert.equal(tools.some(tool => tool.name === name), true);
+  for (const [index, name] of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff', 'bridge_start_collaboration'].entries()) {
+    const id = 300 + index;
+    f.protocol.emit({ id, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'cached-' + name,
+      tool: name, arguments: JSON.stringify({ targetBotId: 'another-bot', text: 'must stay unsent', mode: 'internal' }) } });
+    await until(() => !!reply(f.protocol, id)); assert.equal(reply(f.protocol, id)!.success, false, name);
+  }
+  assert.deepEqual(f.invoked, []);
+  f.protocol.emit({ id: 310, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'public-allowed',
+    tool: 'bridge_start_collaboration', arguments: JSON.stringify({ targetBotId: 'another-bot', targetId: 'group-target', text: 'discuss openly', mode: 'public' }) } });
+  await until(() => !!reply(f.protocol, 310)); assert.equal(reply(f.protocol, 310)!.success, true);
+  assert.deepEqual(f.invoked, ['bridge_start_collaboration']);
+  f.protocol.tool(311, 'bridge_silent'); await until(() => !!reply(f.protocol, 311));
+  f.protocol.complete(); assert.equal((await running).controlledOutput, true); assert.equal(f.silent, 1); assert.equal(f.published, 0);
+});
+
+test('缺省后台 Bot 互通保留原有工具及两种协作模式', async t => {
+  const f = setup(t); const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+  const start = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
+  const tools = start.dynamicTools as Array<{ name: string; inputSchema: JsonObject }>;
+  for (const name of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff']) assert.equal(tools.some(tool => tool.name === name), true);
+  const collaboration = tools.find(tool => tool.name === 'bridge_start_collaboration')!;
+  assert.deepEqual(((collaboration.inputSchema.properties as JsonObject).mode as JsonObject).enum, ['internal', 'public']);
+  f.protocol.tool(320, 'bridge_silent'); await until(() => !!reply(f.protocol, 320)); f.protocol.complete(); await running;
+});
 
 test('统一发送工具保留显式目标与补充语义，重复调用只发一次，最后发送才封闭本轮', async t => {
   const f = setup(t), sent: Array<{ target: string | undefined; finish: boolean | undefined }> = [];

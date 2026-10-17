@@ -68,6 +68,23 @@ test('v3 host loads one complete same-platform set with stable identity paths an
   assert.throws(() => loadConfig(['--config', f.config], false), /语义迁移/);
 });
 
+test('host internal Bot communication flag defaults on, accepts explicit booleans and reaches every Bot config', t => {
+  const f = fixture(t);
+  const initial = loadHostConfig(['--config', f.config], false);
+  assert.equal(initial.internalBotCommunicationEnabled, true);
+  assert.equal(initial.configs.every(config => config.internalBotCommunicationEnabled === true), true);
+  for (const enabled of [false, true]) {
+    writeConfig(f, { internalBotCommunicationEnabled: enabled });
+    const host = loadHostConfig(['--config', f.config], false);
+    assert.equal(host.internalBotCommunicationEnabled, enabled);
+    assert.equal(host.configs.every(config => config.internalBotCommunicationEnabled === enabled), true);
+  }
+  for (const invalid of ['false', 0, 1, null, {}, []]) {
+    writeConfig(f, { internalBotCommunicationEnabled: invalid });
+    assert.throws(() => loadHostConfig(['--config', f.config], false), /internalBotCommunicationEnabled/);
+  }
+});
+
 test('host rejects old semantics, duplicate real bots, mixed platforms, shared workspace and ambiguous principals', t => {
   const f = fixture(t); writeConfig(f, { version: 2 }); assert.throws(() => loadHostConfig(['--config', f.config], false), /离线宿主迁移/);
   const a = join(f.local, 'bots', 'feishu', 'a.json'), b = join(f.local, 'bots', 'feishu', 'b.json'), rawA = JSON.parse(readFileSync(a, 'utf8')), rawB = JSON.parse(readFileSync(b, 'utf8'));

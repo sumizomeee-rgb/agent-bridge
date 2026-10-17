@@ -33,6 +33,8 @@ export interface BridgeConfig {
   contextWorkspace?: string;
   workingCwd?: string;
   groupMode?: boolean;
+  /** 跨 Bot 后台互通开关；缺省保留旧部署行为，false 时仅允许公开协作。 */
+  internalBotCommunicationEnabled?: boolean;
   platform?: BridgePlatform;
   profile?: string;
   applicationId?: string;

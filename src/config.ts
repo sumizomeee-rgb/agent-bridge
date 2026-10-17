@@ -83,6 +83,7 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
     throw new Error('maxFileBytes 必须是 1–25165824 的整数（单个回传文件大小上限）。');
   }
   if (raw.controllerMode != null && typeof raw.controllerMode !== 'boolean') throw new Error('controllerMode 必须是布尔值');
+  if (raw.internalBotCommunicationEnabled !== undefined && typeof raw.internalBotCommunicationEnabled !== 'boolean') throw new Error('internalBotCommunicationEnabled 必须是布尔值');
   const dataDir = localPath(raw.dataDir, '.local/data');
   const scopePrefix = profileScope(profile);
   const config: BridgeConfig = {
@@ -96,12 +97,13 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
     logsDir: localPath(raw.logsDir, `.local/logs/${profile.name}`), maxImageBytes: 20 * 1024 * 1024,
     defaultModels, modelOptions, maxFileBytes: maxFileBytes as number,
     controllerMode: raw.controllerMode === true,
+    internalBotCommunicationEnabled: raw.internalBotCommunicationEnabled !== false,
   };
   return config;
 }
 export interface PrincipalMapping { id: string; accounts: Record<string, string> }
 export interface SpaceMapping { id: string; accounts: Record<string, string> }
-export interface HostConfig { version: 3; rootDataDir: string; configs: BridgeConfig[]; principals: PrincipalMapping[]; spaces: SpaceMapping[] }
+export interface HostConfig { version: 3; rootDataDir: string; internalBotCommunicationEnabled?: boolean; configs: BridgeConfig[]; principals: PrincipalMapping[]; spaces: SpaceMapping[] }
 /** Runtime entry point. Version 2 must be migrated offline; it is never reinterpreted here. */
 export function loadHostConfig(argv = process.argv.slice(2), createDirectories = true): HostConfig {
   let configPath = resolve(projectRoot, '.local', 'config.json');
@@ -201,7 +203,7 @@ export function loadHostConfig(argv = process.argv.slice(2), createDirectories =
       spaces.push({ id: record.id, accounts });
     }
   }
-  const host: HostConfig = { version: 3, rootDataDir, configs, principals, spaces };
+  const host: HostConfig = { version: 3, rootDataDir, configs, principals, spaces, internalBotCommunicationEnabled: raw.internalBotCommunicationEnabled !== false };
   if (createDirectories) { mkdirSync(rootDataDir, { recursive: true }); configs.forEach(prepareConfigPaths); }
   return host;
 }export function prepareConfigPaths(config: BridgeConfig): void {

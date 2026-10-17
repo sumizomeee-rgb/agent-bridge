@@ -4,6 +4,7 @@
   "principals": [],
   "spaces": [],
   "groupMode": true,
+  "internalBotCommunicationEnabled": false,
   "defaultAgent": "codex",
   "controllerMode": true,
   "workspaceRoot": ".local/workspaces",

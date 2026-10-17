@@ -92,7 +92,7 @@ async function eventual(check: () => boolean, label: string): Promise<void> {
   for (let tick = 0; tick < 3000; tick++) { if (check()) return; await nextImmediate(); }
   assert.fail(`No progress: ${label}`);
 }
-function fixture(t: TestContext, options: { initialized?: string[]; unowned?: string[]; run?: TurnHandler; platform?: 'feishu' | 'discord' } = {}) {
+function fixture(t: TestContext, options: { initialized?: string[]; unowned?: string[]; run?: TurnHandler; platform?: 'feishu' | 'discord'; internalBotCommunicationEnabled?: boolean } = {}) {
   const path = mkdtempSync(join(tmpdir(), 'bridge-host-runtime-test-'));
   const platform = options.platform ?? 'feishu', ids = platform === 'feishu' ? [A, B] : [D1, D2], primary = ids[0]!;
   const ownerId = (index: number) => platform === 'feishu' ? `owner-${index}` : '333333333333333333';
@@ -103,10 +103,10 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
     token: '', allowedUserIds: [`${botId}|${ownerId(index)}`, `${botId}|${otherId(index)}`], defaultAgent: 'codex',
     workspace: join(path, `workspace-${index}`), dataDir: join(path, `data-${index}`),
     attachmentsDir: join(path, `images-${index}`), logsDir: join(path, `logs-${index}`), proxyUrl: null,
-    maxImageBytes: 1024, maxFileBytes: 4096, controllerMode: true, groupMode: true,
+    maxImageBytes: 1024, maxFileBytes: 4096, controllerMode: true, groupMode: true, internalBotCommunicationEnabled: options.internalBotCommunicationEnabled,
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } },
   }));
-  const config: HostConfig = { version: 3, rootDataDir: join(path, 'host'), configs,
+  const config: HostConfig = { version: 3, rootDataDir: join(path, 'host'), configs, internalBotCommunicationEnabled: options.internalBotCommunicationEnabled,
     principals: [{ id: P, accounts: Object.fromEntries(ids.map((id, index) => [id, ownerId(index)])) },
       { id: Q, accounts: Object.fromEntries(ids.map((id, index) => [id, otherId(index)])) }],
     spaces: [{ id: G1, accounts: Object.fromEntries(ids.map((id, index) => [id, platform === 'feishu' ? `oc_${index ? 'b' : 'a'}_group_1` : '555555555555555555'])) },
@@ -1235,6 +1235,133 @@ test('controller roster is queried on demand with activity, aliases and snapshot
   });
   await f.managers.get(A)!.handle({ id: 'roster-dm', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_roster_dm`, text: '查主控', imagePaths: [] });
   await f.drain(); assert.equal(f.calls.length, 1); assert.ok(roster.checkedAt); assert.equal(f.host.store.listEvents().length, 0);
+});
+
+test('disabled internal Bot communication rejects cached tools before writes while broadcast, silence and owned worker dispatch remain available', async t => {
+  const f = fixture(t, { internalBotCommunicationEnabled: false }); await f.activate(); let dispatched = 0;
+  const beforeControllers = [A, B].map(id => f.host.store.getController(id));
+  f.run(async (id, turn) => {
+    assert.equal(JSON.parse(turn.chatScene!).internalBotCommunicationEnabled, false);
+    if (id === A) {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      const before = { events: f.host.store.listEvents().map(event => event.id), outbox: f.host.store.listOutbox(),
+        requests: f.host.store.listCollaborationRequests(), handoffs: f.host.store.listHandoffs(), tasks: f.host.store.listTasks(G1) };
+      for (const [name, args] of [
+        ['bridge_send_bot', { targetBotId: B, text: 'must stay unsent' }],
+        ['bridge_start_collaboration', { targetId: targets.defaultTargetId, targetBotId: B, mode: 'internal', text: 'must not create a root' }],
+        ['bridge_propose_handoff', { taskId: 'missing-task', targetBotId: B, summary: 'must not create a proposal' }],
+        ['bridge_accept_handoff', { handoffId: 'missing-handoff' }],
+      ] as const) await assert.rejects(f.host.invoke(A, turn, name, args), /后台.*关闭|内部.*关闭|internal.*disabled/i);
+      assert.deepEqual({ events: f.host.store.listEvents().map(event => event.id), outbox: f.host.store.listOutbox(),
+        requests: f.host.store.listCollaborationRequests(), handoffs: f.host.store.listHandoffs(), tasks: f.host.store.listTasks(G1) }, before);
+      await f.host.invoke(A, turn, 'bridge_claim_work', { taskId: 'ordinary-work', title: 'work without a private Bot channel' });
+      await f.host.invoke(A, turn, 'bridge_start_worker', { workId: 'ordinary-work', title: 'worker', prompt: 'authorized task' }, 'worker', async () => {
+        dispatched++; return { workerId: 'ordinary-worker' };
+      });
+    }
+    await turn.onSilent!();
+  });
+  await f.host.receive(A, f.message(A, 'internal-disabled-owner', 'Both Bots receive this even with @A', G1, [A])); await f.drain();
+  assert.deepEqual(f.calls.map(call => call.botId).sort(), [A, B]);
+  assert.equal(dispatched, 1); assert.equal(f.host.store.getTask('ordinary-work')?.ownerBotId, A);
+  assert.deepEqual(f.host.store.taskWorkers('ordinary-work'), [{ botId: A, workerId: 'ordinary-worker' }]);
+  assert.equal(f.host.store.listEvents().every(event => event.state === 'silent'), true);
+  assert.deepEqual([A, B].map(id => f.host.store.getController(id)), beforeControllers);
+});
+
+test('disabled internal Bot communication retains public collaboration and its same-group completion receipt', async t => {
+  const f = fixture(t, { internalBotCommunicationEnabled: false }); await f.activate(); let receipt: any;
+  f.run(async (id, turn) => {
+    if (id === A && !turn.event) {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      receipt = await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetBotId: B,
+        targetId: targets.defaultTargetId, mode: 'public', text: 'Discuss this openly' }, 'public-with-internal-disabled');
+      assert.equal(receipt.completion.publicDeliveryComplete, true); await turn.onPublicDeliveryComplete!();
+    } else await turn.onSilent!();
+  });
+  await f.host.receive(A, f.message(A, 'public-while-internal-disabled', 'Please discuss this in the group')); await f.drain();
+  assert.equal(f.host.store.getCollaborationRequest(receipt.requestId)?.mode, 'public');
+  assert.equal(f.calls.filter(call => call.botId === B && call.turn.text === 'Discuss this openly').length, 1);
+  assert.equal(f.replies.filter(reply => reply.text.includes('Discuss this openly')).length, 1);
+});
+
+test('disabled internal Bot communication cancels old direct and handoff queues but preserves public consultation, worker result and wake', async t => {
+  const f = fixture(t, { internalBotCommunicationEnabled: false }); await f.activate();
+  await f.host.receive(A, f.message(A, 'old-channel-root', 'previously authorized group work')); await f.drain();
+  const origin = f.calls.find(call => call.botId === A)!.turn.groupContext!;
+  const root = f.host.store.getRoot(origin.rootId)!;
+  const internal = f.host.store.enqueueEvent({ id: 'old-direct-consultation', rootId: root.id, botId: B, generation: 1,
+    kind: 'consultation', sourceBotId: A, causeEventId: origin.eventId, payload: { text: 'do not deliver private question', audience: 'internal named Bot only' } });
+  assert.equal(f.host.store.claimNextEvent(B)?.id, internal.id); // A prior bridge may already have reserved this input.
+  f.host.store.enqueueEvent({ id: 'old-handoff', rootId: root.id, botId: B, generation: 1,
+    kind: 'handoff', sourceBotId: A, causeEventId: origin.eventId, payload: { text: 'do not deliver private handoff' } });
+  f.host.store.acceptRoot({ id: 'old-internal-root', spaceId: G1, principalId: P, sourceEventId: 'old-private-owner-input', targetBotIds: [B],
+    replyTo: { ...root.replyTo, collaborationMode: 'internal', initiatorBotId: A } });
+  f.host.store.enqueueEvent({ id: 'old-internal-root-question', rootId: 'old-internal-root', botId: B, generation: 1,
+    kind: 'consultation', sourceBotId: A, payload: { text: 'do not deliver internal root question' } });
+  f.host.store.acceptRoot({ id: 'old-public-root', spaceId: G1, principalId: P, sourceEventId: 'old-public-owner-input', targetBotIds: [B],
+    replyTo: { ...root.replyTo, collaborationMode: 'public', initiatorBotId: A } });
+  f.host.store.enqueueEvent({ id: 'old-public-consultation', rootId: 'old-public-root', botId: B, generation: 1,
+    kind: 'consultation', sourceBotId: A, payload: { text: 'keep public discussion', audience: 'public' } });
+  f.host.store.enqueueEvent({ id: 'old-worker-result', rootId: root.id, botId: B, generation: 1,
+    kind: 'assistant-result', causeEventId: internal.id, payload: { text: 'keep existing worker result', eventKind: 'worker-result' } });
+  f.host.store.enqueueEvent({ id: 'old-wake', rootId: root.id, botId: B, generation: 1,
+    kind: 'wake', payload: { text: 'keep existing wake', eventKind: 'wake' } });
+  const before = f.calls.length;
+  await f.host.pump(); await f.drain();
+  for (const id of ['old-direct-consultation', 'old-handoff', 'old-internal-root-question']) assert.equal(f.host.store.getEvent(id)?.state, 'cancelled', id);
+  assert.deepEqual(f.calls.slice(before).map(call => call.turn.text), ['keep public discussion', 'keep existing worker result', 'keep existing wake']);
+  for (const id of ['old-public-consultation', 'old-worker-result', 'old-wake']) assert.equal(f.host.store.getEvent(id)?.state, 'silent', id);
+});
+
+test('disabling internal Bot communication cancels a pending handoff without cancelling its task or leaving the original owner unable to dispatch', async t => {
+  const f = fixture(t, { internalBotCommunicationEnabled: false }); await f.activate();
+  await f.host.receive(A, f.message(A, 'pending-handoff-root', 'authorized continuing work')); await f.drain();
+  const rootId = f.calls.find(call => call.botId === A)!.turn.groupContext!.rootId;
+  const task = f.host.store.claimTask({ id: 'handoff-retained-task', rootId, botId: A, generation: 1,
+    title: 'continue after disabling private handoff', resources: ['browser:retained-profile'] }).task;
+  f.host.store.confirmTaskExecutionStopped(task.id, A, 'previous execution confirmed stopped');
+  f.host.store.proposeHandoff({ id: 'pending-before-switch-off', taskId: task.id, fromBotId: A, toBotId: B, summary: 'unaccepted old proposal' });
+  assert.throws(() => f.host.store.markTaskExecutionActive(task.id, A), /pending handoff/);
+  assert.throws(() => f.host.store.registerTaskWorker(task.id, A, 'replacement-worker'), /pending handoff/);
+  await f.host.pump(); await f.drain();
+  assert.equal(f.host.store.getHandoff('pending-before-switch-off')?.state, 'cancelled');
+  const retained = f.host.store.getTask(task.id)!;
+  assert.equal(retained.state, 'active'); assert.equal(retained.ownerBotId, A);
+  assert.deepEqual(retained.resources, task.resources); assert.deepEqual(retained.replyTo, task.replyTo);
+  assert.throws(() => f.host.store.claimTask({ id: 'other-task-cannot-take-resource', rootId, botId: B, generation: 1,
+    title: 'resource remains owned', resources: ['browser:retained-profile'] }), /Resource .* is owned/);
+  assert.doesNotThrow(() => f.host.store.markTaskExecutionActive(task.id, A));
+  assert.doesNotThrow(() => f.host.store.registerTaskWorker(task.id, A, 'replacement-worker'));
+  assert.deepEqual(f.host.store.taskWorkers(task.id), [{ botId: A, workerId: 'replacement-worker' }]);
+  assert.equal(f.host.store.getTask(task.id)?.executionStoppedProof, null);
+});
+
+test('disabled internal Bot communication handles failed internal worker results and wakes without a public error or a new private consultation', async t => {
+  const f = fixture(t, { internalBotCommunicationEnabled: false }); await f.activate();
+  await f.host.receive(A, f.message(A, 'internal-error-root', 'previous authorization')); await f.drain();
+  const origin = f.calls.find(call => call.botId === A)!.turn.groupContext!, root = f.host.store.getRoot(origin.rootId)!;
+  f.host.store.acceptRoot({ id: 'failed-internal-root', spaceId: G1, principalId: P, sourceEventId: 'old-private-source', targetBotIds: [B],
+    replyTo: { ...root.replyTo, collaborationMode: 'internal', initiatorBotId: A } });
+  f.host.store.enqueueEvent({ id: 'internal-error-parent', rootId: root.id, botId: B, generation: 1,
+    kind: 'consultation', sourceBotId: A, causeEventId: origin.eventId, payload: { text: 'old private consultation', audience: 'internal' } });
+  f.host.store.enqueueEvent({ id: 'failed-internal-worker-result', rootId: 'failed-internal-root', botId: B, generation: 1,
+    kind: 'assistant-result', payload: { text: 'internal worker result', eventKind: 'worker-result' } });
+  f.host.store.enqueueEvent({ id: 'failed-internal-descendant-wake', rootId: root.id, botId: B, generation: 1,
+    kind: 'wake', causeEventId: 'internal-error-parent', payload: { text: 'internal descendant wake', eventKind: 'wake' } });
+  const handled: boolean[] = [], beforeReplies = f.replies.length, beforeCalls = f.calls.length;
+  const consultations = f.host.store.listEvents().filter(event => event.kind === 'consultation').map(event => event.id);
+  const errorHook = (f.hooks.get(B)!.manager as SessionManagerOptions).onGroupTurnError!;
+  f.run(async (id, turn) => {
+    assert.equal(id, B); handled.push(await errorHook(turn.groupContext!));
+    throw new Error('PRIVATE_INTERNAL_FAILURE_MARKER: ' + turn.text);
+  });
+  await f.host.pump(); await f.drain();
+  assert.deepEqual(handled, [true, true]);
+  assert.deepEqual(f.calls.slice(beforeCalls).map(call => call.turn.text), ['internal worker result', 'internal descendant wake']);
+  for (const id of ['failed-internal-worker-result', 'failed-internal-descendant-wake']) assert.equal(f.host.store.getEvent(id)?.state, 'failed', id);
+  assert.equal(f.replies.slice(beforeReplies).some(reply => reply.text.includes('PRIVATE_INTERNAL_FAILURE_MARKER')), false);
+  assert.deepEqual(f.host.store.listEvents().filter(event => event.kind === 'consultation').map(event => event.id), consultations);
 });
 
 test('private internal collaboration wakes the current target and returns internally, with no group leak or duplicate wake', async t => {

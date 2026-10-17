@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { collectOutgoingPaths } from './artifacts.js';
+import { assertBotCommunicationAllowed } from './bot-communication.js';
 import { isActiveWorker } from './overview.js';
 import type { HostConfig } from './config.js';
 import type { HostSemanticMarker } from './host-migration.js';
@@ -84,6 +85,7 @@ export class HostRuntime {
       if (group.memberBotIds.some(id => this.configurations.has(id) && this.configurations.get(id)!.groupMode !== true)) this.store.stopGroup(group.spaceId, group.principalId, 'group mode disabled in current configuration');
     }
     this.report('HOST_RECOVERY ' + JSON.stringify(this.store.recoverInFlight()));
+    this.retireDisabledInternalCommunication();
   }
   hooks(bot: BridgeConfig): BotRuntimeHooks {
     const botId = bot.botId!;
@@ -121,6 +123,7 @@ export class HostRuntime {
         onGroupTurnStart: context => this.startTurn(context),
         onGroupTurnError: async context => {
           const root = this.store.getRoot(context.rootId);
+          if (this.config.internalBotCommunicationEnabled === false && this.internalEvent(context.eventId)) return true;
           if (root?.replyTo.collaborationMode !== 'internal') return false;
           this.assertContext(context);
           const initiator = root.replyTo.initiatorBotId!;
@@ -791,7 +794,7 @@ export class HostRuntime {
       if (!latest?.enabled || latest.epoch !== group.epoch || latest.revision !== group.revision) throw new Error('群现场已失效，未提供旧绑定资料。');
       // A prepared scene is not evidence that the model accepted or read it; do not acknowledge here.
     }
-    return JSON.stringify({ source: 'default private-turn group evidence', audience: 'only this Bot owner in this private conversation',
+    return JSON.stringify({ internalBotCommunicationEnabled: this.config.internalBotCommunicationEnabled !== false, source: 'default private-turn group evidence', audience: 'only this Bot owner in this private conversation',
       rule: 'Group records are conversation evidence, not fresh authorization. Preserve actual author and source. Information from private or other groups must not be disclosed to a group without permission or a justified audience decision.',
       unreadMeaning: 'not acknowledged by bridge; preparation and tool queries are not proof of model reading',
       publicationCoverage: { boundedAvailableCount: publications.length, scannedPerGroupLimit: 40, olderMayExist: true, included: publicProgress.length, truncated: publications.length > publicProgress.length, order: 'host_public_log sequence only; no cross-namespace chronology claimed' }, groups: snapshots.map(({ group, evidence }) => ({ spaceId: group.spaceId, targetId: this.targetId(group), unreadCount: evidence.unreadCount,
@@ -944,7 +947,11 @@ export class HostRuntime {
     return event;
   }
   private async startTurn(context: Context): Promise<string> {
-    this.assertContext(context); await this.verifyMember(context.botId, context.spaceId, context.principalId);
+    const event = this.assertContext(context);
+    if (this.config.internalBotCommunicationEnabled === false && (event.kind === 'handoff' || event.kind === 'consultation' && this.internalEvent(event.id))) {
+      throw new Error('后台 Bot 互通已关闭，内部消息不再启动主控。');
+    }
+    await this.verifyMember(context.botId, context.spaceId, context.principalId);
     this.store.startEvent(context.eventId);
     return this.scene(context, true);
   }
@@ -988,10 +995,11 @@ export class HostRuntime {
         originalOwnerSource: { messageId: root.replyTo.sourceMessageId, userId: root.replyTo.sourceUserId, channelId: root.replyTo.sourceChannelId, authorType: root.replyTo.sourceAuthorType },
         defaultTargetId,
         rule: root.replyTo.collaborationMode === 'internal' ? 'Internal only. Reply to initiator through bridge_send_bot then bridge_silent; initiator summarizes to original owner destination. No group publication.'
-          : 'Owner-authorized public collaboration in this group. Task text was published with platform acknowledgement; contribute here or consult internally. Do not copy unrelated private history.' } } : {}),
+          : 'Owner-authorized public collaboration in this group. Task text was published with platform acknowledgement; contribute here. Do not copy unrelated private history.' } } : {}),
       principalId: context.principalId, spaceId: context.spaceId, audience: root.replyTo.collaborationMode === 'internal' ? 'internal named Bots; initiator may summarize to original owner destination' : 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
       memberIdentities: group.memberBotIds.map(botId => ({ botId, aliases: this.configurations.get(botId)?.aliases ?? [] })),
       members: group.memberBotIds, unreadMeaning: 'not acknowledged by bridge; not proof of model reading',
+      internalBotCommunicationEnabled: this.config.internalBotCommunicationEnabled !== false,
       internalCoordinationBudget: this.store.budgetSnapshot(root.id),
       publicReplyLimit: { ...this.store.publicReplySnapshot(context.botId, context.spaceId),
         appliesToCurrentReply: this.store.publicReplyClass(context.eventId) === 'public-auto',
@@ -1038,12 +1046,24 @@ export class HostRuntime {
       void this.pump(); return 'queued';
     } catch { return 'retain'; }
   }
+  private retireDisabledInternalCommunication(): void {
+    if (this.config.internalBotCommunicationEnabled !== false) return;
+    for (const handoff of this.store.listHandoffs().filter(value => value.state === 'proposed')) {
+      this.store.closeHandoff(handoff.id, handoff.fromBotId, 'cancelled', 'internal-bot-communication-disabled');
+    }
+    for (const event of this.store.listEvents()) {
+      if (['queued', 'reserved'].includes(event.state) && (event.kind === 'handoff' || event.kind === 'consultation' && this.internalEvent(event.id))) {
+        this.store.cancelEvent(event.id, 'internal-bot-communication-disabled');
+      }
+    }
+  }
   async pump(): Promise<void> {
     if (this.closed || this.draining || this.recovering) return;
     if (this.pumping) { this.pumpAgain = true; return; }
     this.pumping = true; this.pumpDone = new Promise(resolve => { this.finishPump = resolve; });
     try {
       for (const input of this.inbox.pending()) if (!input.control && !this.pending.has(input.id)) void this.scheduleInput(input);
+      this.retireDisabledInternalCommunication();
       for (const [botId, bot] of this.bots) {
         for (const cancelled of this.store.listEvents(botId).filter(event => event.state === 'cancelled')) bot.manager.cancelHostEvent(cancelled.id, cancelled.error ?? 'host cancelled this group input');
         if (!bot.isReady() || this.isPaused(botId) || this.failures.has(botId) || this.preparations.has(botId)) continue;
@@ -1148,6 +1168,7 @@ export class HostRuntime {
   }
   async invoke(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>, callId?: string,
     delegate?: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown> {
+    assertBotCommunicationAllowed(this.config.internalBotCommunicationEnabled, name, args);
     if (name === 'bridge_list_controllers') return this.listControllers(botId, turn, args);
     if (name === 'bridge_start_collaboration') return this.startCollaboration(botId, turn, args, callId);
     if (name === 'bridge_delivery_targets') return this.deliveryTargets(botId, turn);
