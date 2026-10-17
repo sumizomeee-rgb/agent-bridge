@@ -1,0 +1,102 @@
+import test, { type TestContext } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { NativeControllerAdapter } from '../src/controller/native.js';
+import type { AgentName, AgentTurn } from '../src/types.js';
+import type { JsonObject, RpcTransport } from '../src/agents/process.js';
+
+const TARGET = 'group:verified-test-group:1:1';
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!check()) { assert.ok(Date.now() < deadline, '原生投递协议没有达到预期状态'); await new Promise<void>(resolve => setImmediate(resolve)); }
+}
+function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
+class DeliveryProtocol implements RpcTransport {
+  listeners = new Set<(message: JsonObject) => void>(); failures = new Set<(error: Error) => void>(); written: JsonObject[] = [];
+  started = false; stopped = false; mcpUrl = ''; private sequence = 100;
+  constructor(readonly agent: AgentName) {}
+  onMessage(callback: (message: JsonObject) => void) { this.listeners.add(callback); return () => this.listeners.delete(callback); }
+  onFailure(callback: (error: Error) => void) { this.failures.add(callback); return () => this.failures.delete(callback); }
+  emit(message: JsonObject) { queueMicrotask(() => this.listeners.forEach(callback => callback(message))); }
+  write(message: JsonObject) {
+    this.written.push(message);
+    if (message.method === 'initialize') this.emit({ id: message.id, result: {} });
+    if (message.method === 'config/read') this.emit({ id: message.id, result: { config: { model_provider: 'fixture' } } });
+    if (message.method === 'thread/start' || message.method === 'thread/resume') this.emit({ id: message.id, result: { thread: { id: 'continued-native' }, modelProvider: 'fixture', model: 'fixture-model', reasoningEffort: null } });
+    if (message.method === 'turn/start') { this.started = true; this.emit({ id: message.id, result: { turn: { id: 'delivery-turn' } } }); this.emit({ method: 'turn/started', params: { threadId: 'continued-native', turn: { id: 'delivery-turn' } } }); }
+    if (message.type === 'user') { this.started = true; this.emit({ type: 'system', subtype: 'init', session_id: 'continued-native', tools: ['mcp__bridge_controller__bridge_delivery_targets', 'mcp__bridge_controller__bridge_send_message', 'mcp__bridge_controller__bridge_list_workers'] }); }
+  }
+  async call(name: string, args: JsonObject): Promise<{ ok: boolean; value: unknown }> {
+    const id = ++this.sequence, callId = 'delivery-call-' + id;
+    if (this.agent === 'codex') {
+      this.emit({ id, method: 'item/tool/call', params: { threadId: 'continued-native', turnId: 'delivery-turn', callId, tool: name, arguments: JSON.stringify(args) } });
+      await until(() => this.written.some(message => message.id === id && !message.method));
+      const result = this.written.find(message => message.id === id && !message.method)!.result as { success: boolean; contentItems: Array<{ text: string }> };
+      return { ok: result.success, value: result.contentItems[0]?.text };
+    }
+    this.emit({ type: 'assistant', session_id: 'continued-native', message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__bridge_controller__' + name, input: args }] } });
+    try {
+      const response = await fetch(this.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) });
+      return { ok: response.status === 200, value: await response.json() };
+    } catch (error) { if (this.stopped) return { ok: false, value: String(error) }; throw error; }
+  }
+  complete() {
+    if (this.agent === 'codex') this.emit({ method: 'turn/completed', params: { threadId: 'continued-native', turn: { id: 'delivery-turn', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'DONE' }] } } });
+    else this.emit({ type: 'result', subtype: 'success', session_id: 'continued-native', result: 'DONE' });
+  }
+  async stop() { this.stopped = true; }
+}
+function fixture(t: TestContext, agent: AgentName) {
+  const root = mkdtempSync(join(tmpdir(), 'controller-native-delivery-')); mkdirSync(join(root, '.codex')); mkdirSync(join(root, '.claude')); writeFileSync(join(root, '.codex', 'config.toml'), 'model_provider="fixture"\n'); writeFileSync(join(root, '.claude', 'settings.json'), '{}');
+  const protocol = new DeliveryProtocol(agent), invoked: string[] = [], sends: Array<{ target: string | undefined; finish: boolean | undefined; text: string }> = [];
+  const adapter = new NativeControllerAdapter({ command: 'offline-fixture', args: [] }, {}, { agent, dataDir: join(root, 'data'), userHome: root,
+    invokeTool: async (_turn, name) => { invoked.push(name); return { defaultTargetId: 'private', targets: [{ targetId: TARGET, audience: 'all group members' }] }; },
+    createTransport: (_command, args) => { if (agent === 'claude') protocol.mcpUrl = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url; return protocol; } });
+  const turn: AgentTurn = { conversation: { id: 'existing-controller', userId: 'owner', agent, nativeId: 'continued-native', title: '', cwd: root, createdAt: '', updatedAt: '' },
+    source: { messageId: 'real-private-request', userId: 'owner', channelId: 'original-private-channel' }, text: '查询区域后只向测试群发一句，不在本私聊重复', imagePaths: [], signal: new AbortController().signal, onProgress() {},
+    onPublicMessage: async (text, _paths, _id, target, finish) => { sends.push({ text, target, finish }); } };
+  t.after(async () => { await adapter.close(); rmSync(root, { recursive: true, force: true }); });
+  return { adapter, protocol, turn, invoked, sends };
+}
+
+for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent} 原私聊查询后省略finish只投递测试群，DONE成功且无需补发私聊`, { timeout: 10000 }, async t => {
+    const f = fixture(t, agent), entered = gate(), acknowledged = gate(); let settled = false;
+    f.turn.onPublicMessage = async (text, _paths, _id, target, finish) => { f.sends.push({ text, target, finish }); entered.release(); await acknowledged.promise; };
+    const running = f.adapter.run(f.turn); void running.then(() => { settled = true; }, () => { settled = true; }); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_delivery_targets', {})).ok, true);
+    const publication = f.protocol.call('bridge_send_message', { targetId: TARGET, text: '只发给测试群的一句话' }); await entered.promise;
+    f.protocol.complete(); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(settled, false);
+    acknowledged.release(); assert.equal((await publication).ok, true); const result = await running;
+    assert.equal(result.controlledOutput, true); assert.equal(result.nativeId, 'continued-native'); assert.deepEqual(f.invoked, ['bridge_delivery_targets']);
+    assert.deepEqual(f.sends, [{ text: '只发给测试群的一句话', target: TARGET, finish: true }]);
+  });
+
+  test(`${agent} 统一发送默认final后拒绝新管理调用并保留已确认的一次投递`, { timeout: 10000 }, async t => {
+    const f = fixture(t, agent), running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_send_message', { targetId: TARGET, text: '最终发送' })).ok, true);
+    assert.equal((await f.protocol.call('bridge_list_workers', {})).ok, false);
+    const result = await running; assert.equal(result.controlledOutput, true); assert.equal(f.protocol.stopped, true); assert.deepEqual(f.invoked, []); assert.equal(f.sends.length, 1);
+  });
+
+  test(`${agent} 显式finish:false保留后续管理能力，再由统一发送最终结束`, { timeout: 10000 }, async t => {
+    const f = fixture(t, agent), running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_send_message', { targetId: TARGET, text: '补充进度', finish: false })).ok, true);
+    assert.equal((await f.protocol.call('bridge_list_workers', {})).ok, true);
+    assert.equal((await f.protocol.call('bridge_send_message', { targetId: TARGET, text: '最终结果' })).ok, true);
+    f.protocol.complete(); assert.equal((await running).controlledOutput, true); assert.deepEqual(f.invoked, ['bridge_list_workers']);
+    assert.deepEqual(f.sends, [{ text: '补充进度', target: TARGET, finish: false }, { text: '最终结果', target: TARGET, finish: true }]);
+  });
+
+  test(`${agent} 统一发送拒绝无效finish类型或目标，不产生投递，显式true仍正常结束`, { timeout: 10000 }, async t => {
+    const f = fixture(t, agent), running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    for (const finish of ['false', 0, null, {}]) assert.equal((await f.protocol.call('bridge_send_message', { targetId: TARGET, text: 'invalid finish', finish })).ok, false);
+    for (const targetId of ['', null, 1]) assert.equal((await f.protocol.call('bridge_send_message', { targetId, text: 'invalid target' })).ok, false);
+    assert.deepEqual(f.sends, []);
+    assert.equal((await f.protocol.call('bridge_send_message', { targetId: TARGET, text: '有效最终发送', finish: true })).ok, true);
+    f.protocol.complete(); assert.equal((await running).controlledOutput, true); assert.deepEqual(f.sends, [{ text: '有效最终发送', target: TARGET, finish: true }]);
+  });
+}

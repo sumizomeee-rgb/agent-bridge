@@ -122,7 +122,9 @@ test('image upload keeps input order; declared remote files are downloaded and u
   try {
     const image = join(f.root, 'incoming.png'); writeFileSync(image, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2]));
     const turn = f.turn(); turn.imagePaths = [image]; turn.input = [{ type: 'text', text: '先看' }, { type: 'localImage', path: image }, { type: 'text', text: '然后回答' }];
-    const pending = f.adapter.run(turn); await tick(); await new Promise<void>(resolve => setTimeout(resolve, 30));
+    let nativeReady = false; turn.onReady = () => { nativeReady = true; };
+    const pending = f.adapter.run(turn), readyDeadline = Date.now() + 5000;
+    while (!nativeReady) { assert.ok(Date.now() < readyDeadline, '远端原生适配器未在期限内就绪'); await tick(); }
     const native = f.natives[0]!; assert.ok(native); assert.deepEqual(native.turn!.input!.map(item => item.type), ['text', 'localImage', 'text']);
     const remotePath = native.turn!.imagePaths[0]!; assert.notEqual(remotePath, image); assert.deepEqual(readFileSync(remotePath), readFileSync(image));
     const report = join(f.root, 'report.csv'); writeFileSync(report, 'item,count\nCPU,2\n');

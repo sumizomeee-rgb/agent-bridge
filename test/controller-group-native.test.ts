@@ -46,8 +46,8 @@ test('统一发送工具保留显式目标与补充语义，重复调用只发�
   f.turn.onPublicMessage = async (_text, _paths, _id, target, finish) => { sent.push({ target, finish }); };
   const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
   const send = (id: number, name: string, callId: string, args: JsonObject) => f.protocol.emit({ id, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId, tool: name, arguments: JSON.stringify(args) } });
-  send(81, 'bridge_send_message', 'supplement', { text: 'owner-only', targetId: 'private' }); await until(() => !!reply(f.protocol, 81));
-  send(82, 'bridge_send_message', 'supplement', { text: 'owner-only', targetId: 'private' }); await until(() => !!reply(f.protocol, 82));
+  send(81, 'bridge_send_message', 'supplement', { text: 'owner-only', targetId: 'private', finish: false }); await until(() => !!reply(f.protocol, 81));
+  send(82, 'bridge_send_message', 'supplement', { text: 'owner-only', targetId: 'private', finish: false }); await until(() => !!reply(f.protocol, 82));
   f.protocol.tool(83, 'bridge_delivery_targets'); await until(() => !!reply(f.protocol, 83)); assert.deepEqual(f.invoked, ['bridge_delivery_targets']);
   send(84, 'bridge_send_user', 'final', { text: 'selected final', targetId: 'group:verified:1:1' }); await until(() => !!reply(f.protocol, 84));
   f.protocol.complete(); assert.equal((await running).controlledOutput, true);
@@ -57,7 +57,7 @@ test('统一发送工具保留显式目标与补充语义，重复调用只发�
 test('统一补充私聊后可以群静默结束，补充消息不冒充最终群公开回复', async t => {
   const f = setup(t), sent: boolean[] = []; f.turn.onPublicMessage = async (_text, _paths, _id, _target, finish) => { sent.push(finish === true); };
   const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
-  f.protocol.emit({ id: 91, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'supplement', tool: 'bridge_send_message', arguments: JSON.stringify({ text: 'private only', targetId: 'private' }) } });
+  f.protocol.emit({ id: 91, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'supplement', tool: 'bridge_send_message', arguments: JSON.stringify({ text: 'private only', targetId: 'private', finish: false }) } });
   await until(() => !!reply(f.protocol, 91)); f.protocol.tool(92, 'bridge_silent'); await until(() => !!reply(f.protocol, 92));
   f.protocol.complete(); assert.equal((await running).controlledOutput, true); assert.deepEqual(sent, [false]); assert.equal(f.silent, 1);
 });
@@ -66,7 +66,7 @@ test('补充投递结果未知立即封闭原生轮次，不能换调用ID盲目
   const f = setup(t); let attempts = 0;
   f.turn.onPublicMessage = async () => { attempts++; throw Object.assign(new Error('platform send uncertain'), { deliveryUncertain: true }); };
   const running = f.adapter.run(f.turn), checked = assert.rejects(running, /platform send uncertain/); await until(() => f.protocol.turns === 1);
-  f.protocol.emit({ id: 101, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'uncertain-supplement', tool: 'bridge_send_message', arguments: JSON.stringify({ text: 'private only', targetId: 'private' }) } });
+  f.protocol.emit({ id: 101, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'uncertain-supplement', tool: 'bridge_send_message', arguments: JSON.stringify({ text: 'private only', targetId: 'private', finish: false }) } });
   await checked; assert.equal(attempts, 1); assert.equal(f.protocol.stopped, true); assert.deepEqual(f.invoked, []);
 });
 

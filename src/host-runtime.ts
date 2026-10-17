@@ -481,7 +481,7 @@ export class HostRuntime {
     this.deliverySource(botId, turn);
     return { botId, aliases: this.configurations.get(botId)?.aliases ?? [], source: { messageId: source.messageId, kind: source.spaceId ? 'group' : 'private', spaceId: source.spaceId },
       defaultTargetId: source.spaceId ? this.targetId(this.store.getGroup(source.spaceId)!) : 'private', targets, unavailable,
-      rule: 'Omitting targetId replies to the original input. Explicit delivery is supplementary and never changes task ownership or future delivery. Cross-group sends do not create new human inputs or automatic Bot participation.' };
+      rule: 'Omitting targetId replies to the original input. Explicit delivery never changes task ownership or future delivery. bridge_send_message finishes by default; finish:false is supplementary. Cross-group sends do not create new human inputs or automatic Bot participation.' };
   }
   private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
     text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>): Promise<void> {
