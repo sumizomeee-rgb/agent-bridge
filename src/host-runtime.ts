@@ -697,7 +697,7 @@ export class HostRuntime {
         sourceChannelId: source.channelId, sourceAuthorType: 'user', returnTargetId, channelId: source.channelId } });
     const id = key('collaboration-request', rootId, callId ?? key(targetBotId, mode, text));
     const request = this.store.registerCollaborationRequest({ id, rootId, sourceBotId: botId, targetBotId, mode, text });
-    if (request.state === 'queued') return { registered: true, queued: true, requestId: id, eventId: request.eventId, consumed: false, acceptedWork: false };
+    if (request.state === 'queued') return { registered: true, queued: true, requestId: id, eventId: request.eventId, consumed: false, acceptedWork: false, rule: 'Finish this owner-input turn with a FINAL acknowledgement (finish:true), then DONE. The target reply arrives in a separate turn; finish:false alone does not complete this turn.' };
     if (mode === 'public') {
       const bot = this.bots.get(botId)!;
       await this.routePublication(botId, { ...turn, finish: false }, text, [], target.id, 'collaboration:' + id,
@@ -707,7 +707,7 @@ export class HostRuntime {
     const queued = this.store.queueCollaborationRequest(id);
     void this.pump();
     return { registered: true, queued: true, requestId: id, eventId: queued.event.id, mode, targetBotId, consumed: false, acceptedWork: false,
-      rule: 'Durably queued, not proof of read/acceptance/completion. Target keeps its current controller context. Wait for its real event; do not poll or promise a reply before success.' };
+      rule: 'Durably queued, not proof of read/acceptance/completion. Target keeps its current controller context. Finish this owner-input turn with a brief FINAL acknowledgement (bridge_send_message finish:true or bridge_send_user), then DONE. The target reply arrives in a separate turn. Do not leave this turn open with finish:false, poll, or claim the target has read/accepted.' };
   }
 
   private async conversationScene(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'signal'>): Promise<string> {
