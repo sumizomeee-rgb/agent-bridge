@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { collectOutgoingPaths } from './artifacts.js';
-import { formatWorkerOverview } from './overview.js';
+import { formatWorkerOverview, isActiveWorker } from './overview.js';
 import type { HostConfig } from './config.js';
 import type { HostSemanticMarker } from './host-migration.js';
 import { HostStore, type HostController, type HostEvent, type HostGroup, type RoutedDeliverySource, type RoutedDeliveryTarget } from './host-store.js';
@@ -118,6 +118,21 @@ export class HostRuntime {
         },
         onConversationScene: (conversation, source, signal) => this.conversationScene(botId, { conversation, source, signal }),
         onGroupTurnStart: context => this.startTurn(context),
+        onGroupTurnError: async context => {
+          const root = this.store.getRoot(context.rootId);
+          if (root?.replyTo.collaborationMode !== 'internal') return false;
+          this.assertContext(context);
+          const initiator = root.replyTo.initiatorBotId!;
+          if (initiator !== botId) {
+            this.store.enqueueEvent({ id: key('collaboration-failure', context.eventId), rootId: root.id, botId: initiator,
+              generation: root.generations[initiator]!, kind: 'consultation', sourceBotId: botId, causeEventId: context.eventId,
+              payload: { text: '指定主控本次内部协作执行或回复失败，未完成任务。请如实向原负责人说明，按需查询状态；不要宣称仍在等待成功回复或自动重试未知执行。', audience: 'internal' } });
+            void this.pump();
+          } else {
+            await this.notifyCollaborationOwner(root.id, '内部协作未完成，请查询当前主控状态；未自动重复执行。');
+          }
+          return true;
+        },
         onGroupTurnFinished: async (context, outcome) => {
           const event = this.store.getEvent(context.eventId);
           if (event && ['running', 'uncertain'].includes(event.state)) this.store.finishEvent(event.id, outcome);
@@ -619,10 +634,82 @@ export class HostRuntime {
       } catch (error) { unavailable.push({ targetId: this.targetId(group), reason: String(error) }); }
     }
     this.deliverySource(botId, turn);
+    const collaboration = source.rootId ? this.store.getRoot(source.rootId)?.replyTo : undefined;
+    const visibleTargets = collaboration?.collaborationMode === 'internal'
+      ? collaboration.initiatorBotId === botId ? targets.filter(target => target.targetId === collaboration.returnTargetId) : [] : targets;
     return { botId, aliases: this.configurations.get(botId)?.aliases ?? [], source: { messageId: source.messageId, kind: source.spaceId ? 'group' : 'private', spaceId: source.spaceId },
-      defaultTargetId: source.spaceId ? this.targetId(this.store.getGroup(source.spaceId)!) : 'private', targets, unavailable,
+      defaultTargetId: collaboration?.collaborationMode === 'internal' ? collaboration.initiatorBotId === botId ? collaboration.returnTargetId : null : source.spaceId ? this.targetId(this.store.getGroup(source.spaceId)!) : 'private', targets: visibleTargets, unavailable,
       rule: 'Omitting targetId replies to the original input. Explicit delivery never changes task ownership or future delivery. bridge_send_message finishes by default; finish:false is supplementary. Cross-group sends do not create new human inputs or automatic Bot participation.' };
   }
+  private listControllers(botId: string, turn: AgentTurn, args: Record<string, unknown>): unknown {
+    const source = this.deliverySource(botId, turn), limit = args.limit ?? 20, offset = args.offset ?? 0;
+    if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 50 || !Number.isInteger(offset) || (offset as number) < 0) throw new Error('主控查询分页参数无效。');
+    if (args.botId !== undefined) bounded(args.botId, 'botId', 200);
+    const owned = this.store.listBots().filter(bot => bot.ownerPrincipalId === source.principalId && this.principalAllowed(bot.botId, source.principalId)
+      && (args.botId === undefined || bot.botId === args.botId));
+    const controllers = owned.slice(offset as number, (offset as number) + (limit as number)).map(stored => {
+      const bot = this.bots.get(stored.botId), current = stored.controller;
+      const activity = current && bot ? bot.manager.controllerActivity(current.conversationId) : null;
+      const events = this.store.listEvents(stored.botId), failure = this.failures.has(stored.botId);
+      const blocked = failure || this.isPaused(stored.botId) || events.some(event => event.state === 'uncertain');
+      const pendingEvents = events.filter(event => event.state === 'queued').length;
+      const conversation = current && bot?.manager.conversationById(current.conversationId);
+      const children = conversation && bot?.controller?.queryWorkerOverview ? bot.controller.queryWorkerOverview(conversation).filter(isActiveWorker).length : null;
+      return { botId: stored.botId, aliases: this.configurations.get(stored.botId)?.aliases ?? [], initialized: !!current,
+        ready: stored.ready && !!bot?.isReady() && !blocked, controllerState: !current ? 'uninitialized' : blocked ? 'blocked'
+          : !stored.ready ? 'initialization-incomplete' : !bot?.isReady() ? 'connection-unavailable' : activity?.stopped ? 'stopped'
+          : activity?.running ? 'processing' : activity?.initializing ? 'initializing' : 'idle',
+        queuedInputs: { manager: activity?.pending ?? null, host: pendingEvents }, activeWorkers: children,
+        groups: this.store.listGroups(stored.botId).filter(group => group.enabled && group.principalId === source.principalId)
+          .map(group => ({ targetId: this.targetId(group), spaceId: group.spaceId })),
+        gatewayAvailability: 'not probed', ...(current ? { agent: current.agent } : {}) };
+    });
+    return { checkedAt: new Date().toISOString(), controllers, hasMore: (offset as number) + controllers.length < owned.length,
+      rule: 'Host snapshot, not proof of model gateway availability or acceptance. Busy controllers queue collaboration; start revalidates ownership, readiness and membership.' };
+  }
+
+  private async startCollaboration(botId: string, turn: AgentTurn, args: Record<string, unknown>, callId?: string): Promise<unknown> {
+    const source = this.deliverySource(botId, turn);
+    if (turn.event || (turn.groupContext ? this.store.getEvent(turn.groupContext.eventId)?.kind !== 'human'
+      : turn.source?.original?.authorType !== 'user')) throw new Error('新协作需要当前真实负责人的输入；后台结果只能沿原协作使用 bridge_send_bot。');
+    if (turn.groupContext && !this.store.canProduceEffects(turn.groupContext.eventId)) throw new Error('原授权轮次已结束。');
+    const targetBotId = bounded(args.targetBotId, 'targetBotId', 200), text = bounded(args.text, 'text');
+    if (targetBotId === botId || !['internal', 'public'].includes(String(args.mode))) throw new Error('请选择其他主控及 internal/public 模式。');
+    const mode = args.mode as 'internal' | 'public';
+    const group = this.store.listGroups(botId).find(group => this.targetId(group) === args.targetId);
+    if (!group) throw new Error('请选择 bridge_delivery_targets 返回的已激活群 targetId。');
+    const target = this.groupTarget(source, group), member = this.store.getBot(targetBotId);
+    if (!group.memberBotIds.includes(targetBotId) || member?.ownerPrincipalId !== source.principalId || !member.ready || !member.controller
+      || !this.bots.get(targetBotId)?.isReady() || this.failures.has(targetBotId) || this.isPaused(targetBotId)) throw new Error('指定主控非当前同负责人群成员、未就绪或受阻；未发起协作。');
+    const assertCurrent = () => {
+      const now = this.deliverySource(botId, turn), binding = this.store.getGroup(group.spaceId), current = this.store.getController(targetBotId);
+      if (now.generation !== source.generation || !binding?.enabled || binding.epoch !== group.epoch || binding.revision !== group.revision
+        || current?.generation !== member.controller!.generation || !this.store.getBot(targetBotId)?.ready
+        || this.failures.has(targetBotId) || this.isPaused(targetBotId)) throw new Error('查询期间群权限或主控代次已变化，未唤醒目标。');
+    };
+    await this.verifyMember(botId, group.spaceId, source.principalId);
+    await this.verifyMember(targetBotId, group.spaceId, source.principalId); assertCurrent();
+    const returnTargetId = source.spaceId ? this.targetId(this.store.getGroup(source.spaceId)!) : 'private';
+    const rootId = key('collaboration-root', botId, source.conversationId, source.messageId, group.spaceId, mode);
+    this.store.acceptRoot({ id: rootId, spaceId: group.spaceId, principalId: source.principalId,
+      sourceEventId: key('collaboration-source', botId, source.conversationId, source.messageId), targetBotIds: [botId],
+      replyTo: { collaborationMode: mode, collaborationBudgetKey: key('collaboration-budget', botId, source.conversationId, source.messageId), initiatorBotId: botId, sourceMessageId: source.messageId, sourceUserId: source.userId,
+        sourceChannelId: source.channelId, sourceAuthorType: 'user', returnTargetId, channelId: source.channelId } });
+    const id = key('collaboration-request', rootId, callId ?? key(targetBotId, mode, text));
+    const request = this.store.registerCollaborationRequest({ id, rootId, sourceBotId: botId, targetBotId, mode, text });
+    if (request.state === 'queued') return { registered: true, queued: true, requestId: id, eventId: request.eventId, consumed: false, acceptedWork: false };
+    if (mode === 'public') {
+      const bot = this.bots.get(botId)!;
+      await this.routePublication(botId, { ...turn, finish: false }, text, [], target.id, 'collaboration:' + id,
+        channel => bot.send(channel!, text, { signal: turn.signal }), false);
+    }
+    assertCurrent();
+    const queued = this.store.queueCollaborationRequest(id);
+    void this.pump();
+    return { registered: true, queued: true, requestId: id, eventId: queued.event.id, mode, targetBotId, consumed: false, acceptedWork: false,
+      rule: 'Durably queued, not proof of read/acceptance/completion. Target keeps its current controller context. Wait for its real event; do not poll or promise a reply before success.' };
+  }
+
   private async conversationScene(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'signal'>): Promise<string> {
     const source = this.deliverySource(botId, turn);
     const snapshots: Array<{ group: HostGroup; evidence: ReturnType<HostStore['readContext']> }> = [];
@@ -710,12 +797,27 @@ export class HostRuntime {
   }
 
   private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
-    text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>): Promise<void> {
+    text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>, observe = true): Promise<void> {
     const source = this.deliverySource(botId, turn);
+    const collaboration = source.rootId ? this.store.getRoot(source.rootId)?.replyTo : undefined;
+    if (collaboration?.collaborationMode === 'internal') {
+      if (botId !== collaboration.initiatorBotId) throw new Error('静默协作不能向聊天软件发消息；请 bridge_send_bot 回传发起主控，再 bridge_silent。');
+      targetId ??= collaboration.returnTargetId;
+      if (targetId !== collaboration.returnTargetId) throw new Error('静默协作只允许发起主控回到原交付区域总结。');
+    } else if (collaboration?.collaborationMode === 'public' && targetId && targetId !== 'private'
+      && targetId !== this.targetId(this.store.getGroup(source.spaceId!)!)) throw new Error('公开协作只允许当前指定群或负责人私聊。');
     let target: RoutedDeliveryTarget;
     if (!targetId || targetId === 'private') {
       if (!targetId && source.spaceId) target = this.groupTarget(source, this.store.getGroup(source.spaceId)!);
-      else { const privateTarget = this.privateTarget(source); if (!privateTarget) throw new Error('此 Bot 尚无负责人真实私聊地址，请先在 Bot 私聊发消息。'); target = privateTarget; }
+      else {
+        const originalPrivate = collaboration?.collaborationMode === 'internal' && collaboration.returnTargetId === 'private'
+          && collaboration.initiatorBotId === botId && collaboration.sourceUserId === source.userId
+          && collaboration.sourceChannelId?.startsWith(this.bots.get(botId)!.config.scopePrefix!)
+          && !this.hooks(this.bots.get(botId)!.config).isGroupChannel?.(collaboration.sourceChannelId);
+        const privateTarget = originalPrivate ? { id: 'private', kind: 'private' as const, botId, principalId: source.principalId,
+          userId: this.ownerAccount(botId, source.principalId)!, channelId: collaboration.sourceChannelId! } : this.privateTarget(source);
+        if (!privateTarget) throw new Error('此 Bot 尚无负责人真实私聊地址，请先在 Bot 私聊发消息。'); target = privateTarget;
+      }
     } else {
       const group = this.store.listGroups(botId).find(group => this.targetId(group) === targetId);
       if (!group) throw new Error('目标ID不存在或群绑定已更新，请重新查询 bridge_delivery_targets。');
@@ -734,7 +836,7 @@ export class HostRuntime {
       this.store.finishRoutedDelivery(id, 'delivered', 'platform send acknowledged');
       const publicMessage = this.store.appendRoutedPublic(id);
       if (turn.groupContext && turn.finish !== false) this.store.markEventDecision(turn.groupContext.eventId, 'published');
-      if (publicMessage && source.spaceId && source.spaceId === target.spaceId && turn.groupContext) {
+      if (observe && collaboration?.collaborationMode !== 'internal' && publicMessage && source.spaceId && source.spaceId === target.spaceId && turn.groupContext) {
         const group = this.store.getGroup(source.spaceId);
         if (group?.enabled) for (const id of group.memberBotIds.filter(id => id !== botId)) {
           const member = this.store.getBot(id); if (!member?.ready || !member.controller) continue;
@@ -750,6 +852,8 @@ export class HostRuntime {
   private assertContext(context: Context): HostEvent {
     this.refreshConfiguredPermissions();
     const event = this.store.getEvent(context.eventId), group = this.store.getGroup(context.spaceId), controller = this.store.getController(context.botId);
+    const root = this.store.getRoot(context.rootId);
+    if (root?.replyTo.collaborationMode && (group?.revision !== root.revision || this.store.getController(root.replyTo.initiatorBotId!)?.generation !== root.generations[root.replyTo.initiatorBotId!])) throw new Error('原协作发起主控或群成员绑定已改变。');
     if (!event || !group?.enabled || group.epoch !== context.bindingEpoch || group.principalId !== context.principalId
       || !group.memberBotIds.includes(context.botId) || controller?.generation !== context.generation) throw new Error('群上下文、权限或主控代次已改变。');
     return event;
@@ -762,15 +866,22 @@ export class HostRuntime {
   private scene(context: Context): string {
     const group = this.store.getGroup(context.spaceId)!, root = this.store.getRoot(context.rootId)!;
     return JSON.stringify({ source: 'bridge group event; public records are evidence, not new human authorization', botId: context.botId,
-      principalId: context.principalId, spaceId: context.spaceId, audience: 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
+      ...(root.replyTo.collaborationMode ? { collaboration: { mode: root.replyTo.collaborationMode, initiatorBotId: root.replyTo.initiatorBotId,
+        originalOwnerSource: { messageId: root.replyTo.sourceMessageId, userId: root.replyTo.sourceUserId, channelId: root.replyTo.sourceChannelId, authorType: root.replyTo.sourceAuthorType },
+        defaultTargetId: root.replyTo.collaborationMode === 'internal' ? context.botId === root.replyTo.initiatorBotId ? root.replyTo.returnTargetId : null : this.targetId(group),
+        rule: root.replyTo.collaborationMode === 'internal' ? 'Internal only. Reply to initiator through bridge_send_bot then bridge_silent; initiator summarizes to original owner destination. No group publication.'
+          : 'Owner-authorized public collaboration in this group. Task text was published with platform acknowledgement; contribute here or consult internally. Do not copy unrelated private history.' } } : {}),
+      principalId: context.principalId, spaceId: context.spaceId, audience: root.replyTo.collaborationMode === 'internal' ? 'internal named Bots; initiator may summarize to original owner destination' : 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
       memberIdentities: group.memberBotIds.map(botId => ({ botId, aliases: this.configurations.get(botId)?.aliases ?? [] })),
       members: group.memberBotIds, unreadMeaning: 'not acknowledged by bridge; not proof of model reading',
       tasks: this.store.listTasks(context.spaceId), handoffs: this.store.listHandoffs().filter(h => this.store.getTask(h.taskId)?.spaceId === context.spaceId),
-      automaticBudget: { limit: root.automaticLimit, used: root.automaticUsed, reserved: root.automaticReserved },
+      automaticBudget: this.store.budgetSnapshot(root.id),
       conversationEvidence: this.store.readContext(context.spaceId, context.botId), publicProgress: this.store.readPublic(context.spaceId, context.botId) });
   }
   private async publish(context: Context, text: string, paths: string[], deliver: () => Promise<void>): Promise<void> {
-    this.assertContext(context); await this.verifyMember(context.botId, context.spaceId, context.principalId);
+    this.assertContext(context);
+    if (this.store.getRoot(context.rootId)?.replyTo.collaborationMode === 'internal') throw new Error('静默协作禁止旧群公开发送入口。');
+    await this.verifyMember(context.botId, context.spaceId, context.principalId);
     const id = key(context.eventId, 'public');
     this.store.registerOutbox({ id, eventId: context.eventId, audience: 'group', payload: { text, paths } });
     const sending = this.store.beginOutboxSend(id); if (!sending) throw new Error('这次发送已登记或结果未知，不自动重复。');
@@ -822,10 +933,46 @@ export class HostRuntime {
       if (this.pumpAgain && !this.closed) { this.pumpAgain = false; queueMicrotask(() => { void this.pump(); }); }
     }
   }
+  private async notifyCollaborationOwner(rootId: string, text: string): Promise<void> {
+    this.refreshConfiguredPermissions();
+    const root = this.store.getRoot(rootId); if (!root?.replyTo.collaborationMode) throw new Error('未知协作来源。');
+    const initiator = root.replyTo.initiatorBotId!, bot = this.bots.get(initiator), group = this.store.getGroup(root.spaceId);
+    const assertCurrent = () => {
+      const binding = this.store.getGroup(root.spaceId);
+      if (!bot?.isReady() || !binding?.enabled || binding.epoch !== root.epoch || binding.revision !== root.revision
+        || this.store.getController(initiator)?.generation !== root.generations[initiator]
+        || !this.principalAllowed(initiator, root.principalId) || this.store.getBot(initiator)?.ownerPrincipalId !== root.principalId)
+        throw new Error('协作原授权或发起主控已失效，未改投。');
+    };
+    assertCurrent(); if (!group) throw new Error('协作群已失效。');
+    await this.verifyMember(initiator, root.spaceId, root.principalId);
+    const channel = root.replyTo.sourceChannelId!;
+    if (root.replyTo.returnTargetId === 'private') {
+      if (!channel.startsWith(bot!.config.scopePrefix!) || root.replyTo.sourceUserId !== bot!.config.ownerUserId
+        || this.hooks(bot!.config).isGroupChannel?.(channel)) throw new Error('原私聊返回地址无效，未改投。');
+    } else {
+      const returning = this.store.listGroups(initiator).find(value => this.targetId(value) === root.replyTo.returnTargetId);
+      if (!returning?.enabled || returning.principalId !== root.principalId
+        || channel !== bot!.config.scopePrefix! + this.rawSpace(initiator, returning.spaceId)) throw new Error('原返回群已停用或重绑，未改投。');
+      await this.verifyMember(initiator, returning.spaceId, root.principalId);
+      if (this.targetId(this.store.getGroup(returning.spaceId)!) !== root.replyTo.returnTargetId || !this.store.getGroup(returning.spaceId)?.enabled) throw new Error('返回群已变化，未改投。');
+    }
+    assertCurrent(); await bot!.send(channel, text);
+  }
+
   private notifyBudgetExhaustion(botId: string): void {
     const roots = new Set(this.store.listEvents(botId).filter(event => event.error === 'root-budget-exhausted').map(event => event.rootId));
     for (const rootId of roots) {
       const root = this.store.getRoot(rootId)!, group = this.store.getGroup(root.spaceId);
+      if (root.replyTo.collaborationMode === 'internal') {
+        const initiator = root.replyTo.initiatorBotId!, sender = this.bots.get(initiator);
+        if (!group?.enabled || group.epoch !== root.epoch || group.revision !== root.revision
+          || this.store.getController(initiator)?.generation !== root.generations[initiator] || !sender?.isReady()
+          || !this.store.claimBudgetExhaustionNotice(rootId)) continue;
+        const work = this.notifyCollaborationOwner(root.id, '本轮内部协作已达到自动交流上限，已停止新增互唤；已有执行任务继续。')
+          .catch(() => this.report('INTERNAL_BUDGET_NOTICE_UNCERTAIN')).finally(() => this.budgetNotices.delete(work));
+        this.budgetNotices.add(work); continue;
+      }
       const raw = group && this.rawSpace(group.receiverBotId, root.spaceId);
       const receiver = group && this.bots.get(group.receiverBotId);
       if (!group?.enabled || group.epoch !== root.epoch || !raw || !receiver?.isReady() || !this.store.claimBudgetExhaustionNotice(rootId)) continue;
@@ -872,6 +1019,8 @@ export class HostRuntime {
   }
   async invoke(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>, callId?: string,
     delegate?: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown> {
+    if (name === 'bridge_list_controllers') return this.listControllers(botId, turn, args);
+    if (name === 'bridge_start_collaboration') return this.startCollaboration(botId, turn, args, callId);
     if (name === 'bridge_delivery_targets') return this.deliveryTargets(botId, turn);
     if (name === 'bridge_read_group_history') return this.readGroupHistory(botId, turn, args);
     const context = turn.groupContext;

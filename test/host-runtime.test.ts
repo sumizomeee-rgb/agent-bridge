@@ -108,7 +108,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
       isIdle() { return true; },
     };
     const bot = { config: c, manager, transport,
-      controller: { isWorkerStopped: (workerId: string) => workerStopped.get(`${botId}/${workerId}`) === true,
+      controller: { queryWorkerOverview: () => [], isWorkerStopped: (workerId: string) => workerStopped.get(`${botId}/${workerId}`) === true,
         store: { workers: () => [] } },
       beginDrain() { manager.beginDrain(); }, isIdle() { return manager.isIdle(); }, isReady() { return true; },
       async confirmControllerStopped() { return stoppedProofs.get(botId) ?? true; },
@@ -968,4 +968,186 @@ test('owner input remains conversation evidence when mention routing cannot be v
   const evidence = f.host.store.readContext(G1, A).recent;
   assert.equal(evidence.at(-1)!.text, source.text); assert.equal(evidence.at(-1)!.source.userId, source.userId);
   assert.equal(evidence.at(-1)!.source.mentionedUserIds[0], 'unverified-outside-app-id');
+});
+
+
+test('controller roster is queried on demand with activity, aliases and snapshot limits, without waking any Bot', async t => {
+  const f = fixture(t); await f.activate(); f.configs[1]!.aliases = ['Miku'];
+  let roster: any;
+  f.run(async (id, turn) => {
+    assert.equal(id, A); assert.ok(!turn.chatScene?.includes('controllerState'));
+    roster = await f.host.invoke(A, turn, 'bridge_list_controllers', {});
+    assert.equal(roster.controllers.find((c: any) => c.botId === A).controllerState, 'processing');
+    assert.equal(roster.controllers.find((c: any) => c.botId === B).controllerState, 'idle');
+    assert.deepEqual(roster.controllers.find((c: any) => c.botId === B).aliases, ['Miku']);
+    assert.equal(roster.controllers.find((c: any) => c.botId === B).activeWorkers, 0);
+    assert.equal(roster.controllers[0].gatewayAvailability, 'not probed');
+    const page = await f.host.invoke(A, turn, 'bridge_list_controllers', { limit: 1 }) as any;
+    assert.equal(page.controllers.length, 1); assert.equal(page.hasMore, true);
+    await assert.rejects(f.host.invoke(A, turn, 'bridge_list_controllers', { limit: 51 }));
+    await turn.onPublicMessage!('查询完成。');
+  });
+  await f.managers.get(A)!.handle({ id: 'roster-dm', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_roster_dm`, text: '查主控', imagePaths: [] });
+  await f.drain(); assert.equal(f.calls.length, 1); assert.ok(roster.checkedAt); assert.equal(f.host.store.listEvents().length, 0);
+});
+
+test('private internal collaboration wakes the current target and returns internally, with no group leak or duplicate wake', async t => {
+  const f = fixture(t); await f.activate(); const before = f.host.store.getController(B), dm = `${A}|oc_internal_dm`;
+  const initialReplies = f.replies.length; let accepted: any;
+  f.run(async (id, turn) => {
+    if (id === A && !turn.groupContext) {
+      const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      const args = { targetId: regions.targets.find((r: any) => r.spaceId === G1).targetId, targetBotId: B, mode: 'internal', text: '仅内部核对这个任务' };
+      accepted = await f.host.invoke(A, turn, 'bridge_start_collaboration', args, 'internal-once');
+      const duplicate = await f.host.invoke(A, turn, 'bridge_start_collaboration', args, 'internal-once') as any;
+      assert.equal(duplicate.eventId, accepted.eventId); assert.equal(accepted.acceptedWork, false);
+      await turn.onPublicMessage!('已登记内部核对。');
+    } else if (id === B) {
+      const scene = JSON.parse(turn.groupContext!.scene); assert.equal(scene.collaboration.mode, 'internal');
+      assert.equal(turn.source?.original?.authorType, 'system');
+      await assert.rejects(turn.onPublicMessage!('不得泄漏到群的内容'), /静默协作/);
+      const regions = await f.host.invoke(B, turn, 'bridge_delivery_targets', {}) as any;
+      await assert.rejects(turn.onPublicMessage!('不得通过显式群目标泄漏', [], 'leak', `group:${G1}:${f.host.store.getGroup(G1)!.epoch}:${f.host.store.getGroup(G1)!.revision}`), /静默协作/);
+      await assert.rejects(f.host.invoke(B, turn, 'bridge_start_collaboration', { targetBotId: A, mode: 'public', text: '不能伪造新授权' }), /真实负责人/);
+      await f.host.invoke(B, turn, 'bridge_send_bot', { targetBotId: A, text: '核对结果：可以继续' }, 'internal-answer');
+      await turn.onSilent!();
+    } else { await turn.onPublicMessage!('核对结果已汇总。'); }
+  });
+  await f.managers.get(A)!.handle({ id: 'start-internal', userId: f.configs[0]!.ownerUserId!, channelId: dm, text: '让另一个主控后台核对', imagePaths: [] });
+  await f.drain();
+  assert.deepEqual(f.host.store.getController(B), before);
+  assert.equal(f.calls.filter(c => c.botId === B).length, 1);
+  assert.equal(f.replies.slice(initialReplies).every(r => r.channel === dm), true, JSON.stringify(f.replies.slice(initialReplies)));
+  assert.equal(f.host.store.readPublic(G1, A).length, 0);
+  assert.equal(f.host.store.listCollaborationRequests().length, 1);
+  assert.equal(f.host.store.getRoot(f.host.store.listEvents()[0]!.rootId)!.replyTo.sourceMessageId, 'start-internal');
+});
+
+test('private public collaboration announces before target execution and retains current controllers', async t => {
+  const f = fixture(t); await f.activate(); const before = f.host.store.getController(B); let queued: any;
+  f.run(async (id, turn) => {
+    if (id === A && !turn.groupContext) {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      queued = await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: targets.targets.find((r: any) => r.spaceId === G1).targetId,
+        targetBotId: B, mode: 'public', text: '请在这个群核对，私聊其他内容不公开' }, 'public-once');
+      await turn.onPublicMessage!('已发出讨论并排队。');
+    } else if (id === B) {
+      assert.equal(f.replies.some(r => r.botId === A && r.text === '请在这个群核对，私聊其他内容不公开'), true);
+      assert.equal(JSON.parse(turn.groupContext!.scene).collaboration.mode, 'public');
+      await turn.onPublicMessage!('群内核对答复。');
+    } else await turn.onSilent?.();
+  });
+  await f.managers.get(A)!.handle({ id: 'start-public', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_public_dm`, text: '去群里讨论', imagePaths: [] });
+  await f.drain(); assert.equal(queued.queued, true);
+  assert.equal(f.replies.find(r => r.text.includes('群内核对答复'))!.channel, `${B}|oc_b_group_1`);
+  assert.equal(f.calls.filter(c => c.botId === B).length, 1); assert.deepEqual(f.host.store.getController(B), before);
+  assert.equal(f.host.store.listEvents().every(event => event.kind !== 'human'), true);
+});
+
+test('uncertain public announcement never wakes target or retries its platform send', async t => {
+  const f = fixture(t); await f.activate(); let sends = 0;
+  f.host.bots.get(A)!.send = async () => { sends++; throw new Error('platform acknowledgement unavailable'); };
+  f.run(async (id, turn) => {
+    assert.equal(id, A);
+    const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+    const args = { targetId: regions.targets.find((r: any) => r.spaceId === G1).targetId, targetBotId: B, mode: 'public', text: '可能发送但未确认' };
+    await assert.rejects(f.host.invoke(A, turn, 'bridge_start_collaboration', args, 'uncertain'), /acknowledgement/);
+    await assert.rejects(f.host.invoke(A, turn, 'bridge_start_collaboration', args, 'uncertain'), /未知/);
+    await turn.onPublicMessage!('发起未确认，不能保证对方被唤醒。');
+  });
+  await f.managers.get(A)!.handle({ id: 'uncertain-start', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_failed_dm`, text: '发起讨论', imagePaths: [] });
+  await f.drain(); assert.equal(sends, 1); assert.equal(f.host.store.listEvents().length, 0);
+  assert.equal(f.host.store.listCollaborationRequests()[0]!.state, 'registered');
+});
+
+test('busy target collaboration is queued without interrupting or resetting its controller', async t => {
+  const f = fixture(t); await f.activate(); const wait = f.gate(); let registered = false;
+  f.run(async (id, turn) => {
+    if (id === B && turn.text === '已有任务') { await wait.promise; await turn.onSilent!(); }
+    else if (id === A && !turn.groupContext) {
+      const roster = await f.host.invoke(A, turn, 'bridge_list_controllers', { botId: B }) as any;
+      assert.equal(roster.controllers[0].controllerState, 'processing');
+      const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: regions.targets.find((r: any) => r.spaceId === G1).targetId,
+        targetBotId: B, mode: 'internal', text: '排队的新咨询' }); registered = true;
+      await turn.onPublicMessage!('对方忙，咨询已排队。');
+    } else await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'busy-existing', '已有任务', G1, [B]));
+  await eventual(() => f.calls.some(c => c.botId === B), 'target starts existing task');
+  const before = f.host.store.getController(B);
+  await f.managers.get(A)!.handle({ id: 'busy-private', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_busy_dm`, text: '内部咨询', imagePaths: [] });
+  await eventual(() => registered, 'consultation registered');
+  assert.equal(f.calls.filter(c => c.botId === B).length, 1);
+  wait.release(); await f.drain(); assert.equal(f.calls.filter(c => c.botId === B).length, 2);
+  assert.deepEqual(f.host.store.getController(B), before);
+});
+
+test('controller unavailable and stale group destinations reject before announcement or wake', async t => {
+  const f = fixture(t); await f.activate();
+  f.run(async (_id, turn) => {
+    const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+    const targetId = regions.targets.find((r: any) => r.spaceId === G1).targetId;
+    f.host.store.setControllerReady(B, 1, false);
+    await assert.rejects(f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId, targetBotId: B, mode: 'public', text: '不应发送' }), /未就绪/);
+    f.host.store.setControllerReady(B, 1, true); f.host.store.stopGroup(G1, P);
+    await assert.rejects(f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId, targetBotId: B, mode: 'public', text: '不应发送' }), /未激活/);
+    await turn.onPublicMessage!('协作尚未发起。');
+  });
+  await f.managers.get(A)!.handle({ id: 'reject-start', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_reject_dm`, text: '讨论', imagePaths: [] });
+  await f.drain(); assert.equal(f.host.store.listCollaborationRequests().length, 0); assert.equal(f.host.store.listEvents().length, 0);
+});
+
+
+test('internal target failure returns an honest failure to initiator without a public error message', async t => {
+  const f = fixture(t); await f.activate(); const start = f.replies.length, dm = `${A}|oc_failure_private`;
+  f.run(async (id, turn) => {
+    if (id === B) throw new Error('private execution detail must not appear publicly');
+    if (!turn.groupContext) {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: targets.targets.find((x: any) => x.spaceId === G1).targetId,
+        targetBotId: B, mode: 'internal', text: '后台验证' });
+      await turn.onPublicMessage!('已排队。');
+    } else {
+      assert.match(turn.text, /失败/); await turn.onPublicMessage!('协作没有完成。');
+    }
+  });
+  await f.managers.get(A)!.handle({ id: 'private-failure', userId: f.configs[0]!.ownerUserId!, channelId: dm, text: '内部核对', imagePaths: [] });
+  await f.drain(); assert.equal(f.replies.slice(start).every(reply => reply.channel === dm), true);
+  assert.equal(f.replies.some(reply => reply.text.includes('协作没有完成')), true);
+  assert.equal(f.host.store.readPublic(G1, A).length, 0);
+});
+
+test('internal failure cannot send back to an origin group stopped during cross-group collaboration', async t => {
+  const f = fixture(t); await f.activate(); await f.activate(G2); const start = f.replies.length;
+  f.run(async (id, turn) => {
+    if (id === A && turn.text === '从群一发起群二后台核对') {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: targets.targets.find((x: any) => x.spaceId === G2).targetId,
+        targetBotId: B, mode: 'internal', text: '跨群后台核对' });
+      await turn.onSilent!(); f.host.store.stopGroup(G1, P);
+    } else if (id === B) throw new Error('target error');
+    else throw new Error('initiator summary also failed');
+  });
+  await f.host.receive(A, f.message(A, 'cross-group-internal', '从群一发起群二后台核对', G1, [A]));
+  await f.drain(); assert.equal(f.replies.slice(start).length, 0, JSON.stringify(f.replies.slice(start)));
+});
+
+test('internal mutual consultation stops at eight automatic turns and only notifies the original owner', async t => {
+  const f = fixture(t); await f.activate(); const start = f.replies.length, dm = `${A}|oc_budget_private`;
+  f.run(async (id, turn) => {
+    if (!turn.groupContext) {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: targets.targets.find((x: any) => x.spaceId === G1).targetId,
+        targetBotId: B, mode: 'internal', text: '有界内部讨论' }); await turn.onPublicMessage!('已登记。');
+    } else {
+      await f.host.invoke(id, turn, 'bridge_send_bot', { targetBotId: id === A ? B : A, text: '继续内部交流' });
+      await turn.onSilent!();
+    }
+  });
+  await f.managers.get(A)!.handle({ id: 'private-budget', userId: f.configs[0]!.ownerUserId!, channelId: dm, text: '后台讨论', imagePaths: [] });
+  await f.drain(); assert.equal(f.calls.length, 9);
+  assert.equal(f.replies.slice(start).every(reply => reply.channel === dm), true);
+  assert.equal(f.replies.filter(reply => reply.text.includes('内部协作已达到')).length, 1);
+  assert.equal(f.host.store.readPublic(G1, A).length, 0);
 });

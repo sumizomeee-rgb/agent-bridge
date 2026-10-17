@@ -36,6 +36,12 @@ export interface HostEvent {
   initial: boolean; automatic: boolean; decision: 'published' | 'silent' | null; nativeEnded: boolean;
   causeEventId: string | null; sourceBotId: string | null; error: string | null;
 }
+export interface HostCollaborationRequest {
+  id: string; rootId: string; sourceBotId: string; targetBotId: string; text: string;
+  mode: 'internal' | 'public'; state: 'registered' | 'queued'; eventId: string;
+}
+type EnqueueEventInput = { id: string; logicalId?: string; rootId: string; botId: string; generation: number; kind: HostEventKind;
+  payload: unknown; publicCursor?: number; causeEventId?: string; sourceBotId?: string; coalesce?: boolean };
 export interface HostContextRecord {
   sequence: number; id: string; spaceId: string; epoch: number; receivedAt: string;
   source: { botId: string; messageId: string; userId: string; channelId: string; authorType: string; textTruncated?: true; authorName?: string; time?: string; mentionedUserIds: string[]; replyToMessageId?: string };
@@ -182,6 +188,9 @@ export class HostStore {
         generation INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', payload_json TEXT NOT NULL,
         public_cursor INTEGER NOT NULL DEFAULT 0, initial INTEGER NOT NULL, automatic INTEGER NOT NULL,
         decision TEXT, native_ended INTEGER NOT NULL DEFAULT 0, cause_event_id TEXT, source_bot_id TEXT, error TEXT);
+      CREATE TABLE IF NOT EXISTS host_collaboration_requests(
+        id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES host_roots(id), payload_json TEXT NOT NULL,
+        state TEXT NOT NULL, event_id TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS host_event_queue ON host_events(bot_id,state,sequence);
       CREATE UNIQUE INDEX IF NOT EXISTS host_event_slot ON host_events(bot_id) WHERE state IN ('reserved','running','uncertain');
       CREATE TABLE IF NOT EXISTS host_deliveries(
@@ -281,8 +290,24 @@ export class HostStore {
     if (!value.controller || value.controller.generation !== generation) throw new HostStateError('stale', 'Controller generation changed');
     return value;
   }
+  private assertCollaborationRoot(source: HostRoot, sourceBotId?: string): void {
+    const mode = source.replyTo.collaborationMode;
+    if (mode === undefined) return;
+    if (mode !== 'internal' && mode !== 'public') throw new HostStateError('conflict', 'Unknown collaboration mode');
+    const initiator = source.replyTo.initiatorBotId;
+    if (!initiator) throw new HostStateError('conflict', 'Collaboration initiator is missing');
+    const binding = this.assertMember(source.spaceId, initiator, source.principalId, source.epoch);
+    if (binding.revision !== source.revision) throw new HostStateError('stale', 'Collaboration group revision changed');
+    for (const id of new Set([initiator, ...(sourceBotId ? [sourceBotId] : [])])) {
+      this.assertMember(source.spaceId, id, source.principalId, source.epoch);
+      const current = this.assertCurrent(id, source.generations[id] ?? 0);
+      if (current.ownerPrincipalId !== source.principalId) throw new HostStateError('forbidden', 'Collaboration bot owner changed');
+      if (!current.ready) throw new HostStateError('blocked', 'Collaboration controller initialization is incomplete');
+    }
+  }
   private validateEvent(value: HostEvent): HostRoot {
     const source = this.mustRoot(value.rootId);
+    this.assertCollaborationRoot(source, value.sourceBotId ?? undefined);
     this.assertMember(source.spaceId, value.botId, source.principalId, source.epoch);
     const current = this.assertCurrent(value.botId, value.generation);
     if (!current.ready) throw new HostStateError('blocked', 'Controller initialization is incomplete');
@@ -520,50 +545,120 @@ export class HostStore {
     });
   }
   getRoot(id: string): HostRoot | null { const row = this.one('SELECT * FROM host_roots WHERE id=?', id); return row ? root(row) : null; }
-  claimBudgetExhaustionNotice(rootId: string): boolean {
-    return this.atomic(() => this.run('UPDATE host_roots SET exhaustion_notified=1 WHERE id=? AND exhaustion_notified=0 AND auto_used+auto_reserved>=auto_limit', rootId) === 1);
+  getCollaborationRequest(id: string): HostCollaborationRequest | null {
+    const row = this.one('SELECT * FROM host_collaboration_requests WHERE id=?', id);
+    return row ? { ...parse<Omit<HostCollaborationRequest, 'state' | 'eventId'>>(row.payload_json),
+      state: String(row.state) as HostCollaborationRequest['state'], eventId: String(row.event_id) } : null;
   }
-  enqueueEvent(input: { id: string; logicalId?: string; rootId: string; botId: string; generation: number; kind: HostEventKind;
-    payload: unknown; publicCursor?: number; causeEventId?: string; sourceBotId?: string; coalesce?: boolean }): HostEvent {
+  listCollaborationRequests(rootId?: string): HostCollaborationRequest[] {
+    return this.rows(`SELECT id FROM host_collaboration_requests ${rootId === undefined ? '' : 'WHERE root_id=?'} ORDER BY rowid`,
+      ...(rootId === undefined ? [] : [rootId])).map(row => this.getCollaborationRequest(String(row.id))!);
+  }
+  registerCollaborationRequest(input: Omit<HostCollaborationRequest, 'state' | 'eventId'>): HostCollaborationRequest {
     return this.atomic(() => {
-      const logicalId = input.logicalId ?? input.id;
-      const prior = this.one('SELECT event_id FROM host_deliveries WHERE logical_id=? AND bot_id=? AND generation=?', logicalId, input.botId, input.generation);
-      if (prior) {
-        const old = this.mustEvent(String(prior.event_id));
-        if (old.rootId !== input.rootId) throw new HostStateError('conflict', 'Logical delivery reused across roots');
-        return old;
-      }
-      const existing = this.getEvent(input.id);
-      if (existing) throw new HostStateError('conflict', 'Event ID reused for another delivery');
+      required(input.id, 'collaboration id'); required(input.text, 'collaboration text');
+      if (input.mode !== 'internal' && input.mode !== 'public') throw new HostStateError('conflict', 'Unknown collaboration mode');
+      if (input.sourceBotId === input.targetBotId) throw new HostStateError('forbidden', 'Bots cannot collaborate with themselves');
+      const previous = this.getCollaborationRequest(input.id);
+      const payload = { id: input.id, rootId: input.rootId, sourceBotId: input.sourceBotId, targetBotId: input.targetBotId, text: input.text, mode: input.mode };
+      if (previous && !same({ id: previous.id, rootId: previous.rootId, sourceBotId: previous.sourceBotId,
+        targetBotId: previous.targetBotId, text: previous.text, mode: previous.mode }, payload)) throw new HostStateError('conflict', 'Collaboration ID reused with changed parameters');
       const source = this.mustRoot(input.rootId);
-      this.assertMember(source.spaceId, input.botId, source.principalId, source.epoch);
-      this.assertCurrent(input.botId, input.generation);
-      if (source.generations[input.botId] !== input.generation) throw new HostStateError('stale', 'Old human root cannot wake a new controller or newly added member');
-      if (input.sourceBotId) {
-        this.assertMember(source.spaceId, input.sourceBotId, source.principalId, source.epoch);
-        if (input.sourceBotId === input.botId) throw new HostStateError('forbidden', 'Bots cannot wake themselves through collaboration');
+      if (source.replyTo.collaborationMode !== input.mode || source.replyTo.initiatorBotId !== input.sourceBotId)
+        throw new HostStateError('forbidden', 'Collaboration metadata differs from authorization root');
+      this.assertCollaborationRoot(source, input.sourceBotId);
+      for (const id of [input.sourceBotId, input.targetBotId]) {
+        this.assertMember(source.spaceId, id, source.principalId, source.epoch);
+        const current = this.assertCurrent(id, source.generations[id] ?? 0);
+        if (current.ownerPrincipalId !== source.principalId) throw new HostStateError('forbidden', 'Collaboration requires the same owner');
+        if (!current.ready) throw new HostStateError('blocked', 'Collaboration controller initialization is incomplete');
       }
-      const initial = input.kind === 'human';
-      const automatic = !initial && input.kind !== 'assistant-result';
-      if (initial && !source.targetBotIds.includes(input.botId)) throw new HostStateError('forbidden', 'Bot is not a first-participation target');
-      if (initial && this.one('SELECT 1 FROM host_initial_participation WHERE root_id=? AND bot_id=?', source.id, input.botId)) throw new HostStateError('conflict', 'Human root already has this bot participation');
-      // Observation is replaceable; consultation/handoff bodies are independent obligations.
-      const queued = input.coalesce !== false && input.kind === 'observation'
-        ? this.one("SELECT * FROM host_events WHERE root_id=? AND bot_id=? AND generation=? AND kind='observation' AND state='queued' ORDER BY sequence LIMIT 1", source.id, input.botId, input.generation) : undefined;
-      const id = queued ? String(queued.id) : input.id;
-      if (queued) {
-        const oldPayload = parse<unknown>(queued.payload_json);
-        this.run('UPDATE host_events SET payload_json=?,public_cursor=MAX(public_cursor,?) WHERE id=?',
-          JSON.stringify({ updates: [...(typeof oldPayload === 'object' && oldPayload !== null && 'updates' in oldPayload && Array.isArray(oldPayload.updates) ? oldPayload.updates : [oldPayload]), input.payload].slice(-40) }), input.publicCursor ?? 0, id);
-      } else {
-        this.run(`INSERT INTO host_events(id,logical_id,root_id,bot_id,generation,kind,payload_json,public_cursor,initial,automatic,cause_event_id,source_bot_id)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, id, logicalId, source.id, input.botId, input.generation, input.kind,
-        JSON.stringify(input.payload), input.publicCursor ?? 0, Number(initial), Number(automatic), input.causeEventId ?? null, input.sourceBotId ?? null);
-        if (initial) this.run('INSERT INTO host_initial_participation(root_id,bot_id,event_id) VALUES (?,?,?)', source.id, input.botId, id);
-      }
-      this.run('INSERT INTO host_deliveries(logical_id,bot_id,generation,event_id) VALUES (?,?,?,?)', logicalId, input.botId, input.generation, id);
-      return this.mustEvent(id);
+      if (previous) return previous;
+      this.run("INSERT INTO host_collaboration_requests(id,root_id,payload_json,state,event_id) VALUES (?,?,?,'registered',?)",
+        input.id, input.rootId, JSON.stringify(payload), 'collaboration:' + input.id);
+      return this.getCollaborationRequest(input.id)!;
     });
+  }
+  queueCollaborationRequest(id: string): { request: HostCollaborationRequest; event: HostEvent } {
+    return this.atomic(() => {
+      const request = this.getCollaborationRequest(id);
+      if (!request) throw new HostStateError('not-found', 'Unknown collaboration request');
+      if (request.state === 'queued') return { request, event: this.mustEvent(request.eventId) };
+      const source = this.mustRoot(request.rootId);
+      this.assertCollaborationRoot(source, request.sourceBotId);
+      const target = this.assertCurrent(request.targetBotId, source.generations[request.targetBotId] ?? 0);
+      if (!target.ready) throw new HostStateError('blocked', 'Collaboration target initialization is incomplete');
+      const event = this.enqueueEventInner({ id: request.eventId, rootId: request.rootId, botId: request.targetBotId,
+        generation: source.generations[request.targetBotId]!, kind: 'consultation', sourceBotId: request.sourceBotId,
+        causeEventId: source.sourceEventId, payload: { text: request.text, audience: request.mode } });
+      this.run("UPDATE host_collaboration_requests SET state='queued' WHERE id=?", id);
+      return { request: this.getCollaborationRequest(id)!, event };
+    });
+  }
+  private budgetRoots(source: HostRoot): HostRoot[] {
+    const key = source.replyTo.collaborationBudgetKey;
+    if (!key) return [source];
+    // The runtime derives this key from the real owner input, independently of mode and destination group.
+    return this.rows("SELECT * FROM host_roots WHERE principal_id=? AND json_extract(reply_json,'$.collaborationBudgetKey')=?",
+      source.principalId, key).map(root);
+  }
+  budgetSnapshot(rootId: string): { limit: number; used: number; reserved: number } {
+    const values = this.budgetRoots(this.mustRoot(rootId));
+    return { limit: Math.min(...values.map(value => value.automaticLimit)),
+      used: values.reduce((sum, value) => sum + value.automaticUsed, 0),
+      reserved: values.reduce((sum, value) => sum + value.automaticReserved, 0) };
+  }
+  claimBudgetExhaustionNotice(rootId: string): boolean {
+    return this.atomic(() => {
+      const source = this.mustRoot(rootId), values = this.budgetRoots(source);
+      const budget = this.budgetSnapshot(rootId);
+      if (budget.used + budget.reserved < budget.limit || values.some(value => value.exhaustionNotified)) return false;
+      for (const value of values) this.run('UPDATE host_roots SET exhaustion_notified=1 WHERE id=?', value.id);
+      return true;
+    });
+  }
+  enqueueEvent(input: EnqueueEventInput): HostEvent {
+    return this.atomic(() => this.enqueueEventInner(input));
+  }
+  private enqueueEventInner(input: EnqueueEventInput): HostEvent {
+    const logicalId = input.logicalId ?? input.id;
+    const prior = this.one('SELECT event_id FROM host_deliveries WHERE logical_id=? AND bot_id=? AND generation=?', logicalId, input.botId, input.generation);
+    if (prior) {
+      const old = this.mustEvent(String(prior.event_id));
+      if (old.rootId !== input.rootId) throw new HostStateError('conflict', 'Logical delivery reused across roots');
+      return old;
+    }
+    const existing = this.getEvent(input.id);
+    if (existing) throw new HostStateError('conflict', 'Event ID reused for another delivery');
+    const source = this.mustRoot(input.rootId);
+    this.assertCollaborationRoot(source, input.sourceBotId);
+    this.assertMember(source.spaceId, input.botId, source.principalId, source.epoch);
+    this.assertCurrent(input.botId, input.generation);
+    if (source.generations[input.botId] !== input.generation) throw new HostStateError('stale', 'Old human root cannot wake a new controller or newly added member');
+    if (input.sourceBotId) {
+      this.assertMember(source.spaceId, input.sourceBotId, source.principalId, source.epoch);
+      if (input.sourceBotId === input.botId) throw new HostStateError('forbidden', 'Bots cannot wake themselves through collaboration');
+    }
+    const initial = input.kind === 'human';
+    const automatic = !initial && input.kind !== 'assistant-result';
+    if (initial && !source.targetBotIds.includes(input.botId)) throw new HostStateError('forbidden', 'Bot is not a first-participation target');
+    if (initial && this.one('SELECT 1 FROM host_initial_participation WHERE root_id=? AND bot_id=?', source.id, input.botId)) throw new HostStateError('conflict', 'Human root already has this bot participation');
+    // Observation is replaceable; consultation/handoff bodies are independent obligations.
+    const queued = input.coalesce !== false && input.kind === 'observation'
+      ? this.one("SELECT * FROM host_events WHERE root_id=? AND bot_id=? AND generation=? AND kind='observation' AND state='queued' ORDER BY sequence LIMIT 1", source.id, input.botId, input.generation) : undefined;
+    const id = queued ? String(queued.id) : input.id;
+    if (queued) {
+      const oldPayload = parse<unknown>(queued.payload_json);
+      this.run('UPDATE host_events SET payload_json=?,public_cursor=MAX(public_cursor,?) WHERE id=?',
+        JSON.stringify({ updates: [...(typeof oldPayload === 'object' && oldPayload !== null && 'updates' in oldPayload && Array.isArray(oldPayload.updates) ? oldPayload.updates : [oldPayload]), input.payload].slice(-40) }), input.publicCursor ?? 0, id);
+    } else {
+      this.run(`INSERT INTO host_events(id,logical_id,root_id,bot_id,generation,kind,payload_json,public_cursor,initial,automatic,cause_event_id,source_bot_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, id, logicalId, source.id, input.botId, input.generation, input.kind,
+      JSON.stringify(input.payload), input.publicCursor ?? 0, Number(initial), Number(automatic), input.causeEventId ?? null, input.sourceBotId ?? null);
+      if (initial) this.run('INSERT INTO host_initial_participation(root_id,bot_id,event_id) VALUES (?,?,?)', source.id, input.botId, id);
+    }
+    this.run('INSERT INTO host_deliveries(logical_id,bot_id,generation,event_id) VALUES (?,?,?,?)', logicalId, input.botId, input.generation, id);
+    return this.mustEvent(id);
   }
   getEvent(id: string): HostEvent | null { const row = this.one('SELECT * FROM host_events WHERE id=?', id); return row ? event(row) : null; }
   listEvents(botId?: string): HostEvent[] { return this.rows(`SELECT * FROM host_events ${botId ? 'WHERE bot_id=?' : ''} ORDER BY sequence`, ...(botId ? [botId] : [])).map(event); }
@@ -581,7 +676,8 @@ export class HostStore {
           if (!(error instanceof HostStateError)) throw error;
           this.cancelEventInner(value.id, error.message); continue;
         }
-        if (value.automatic && source.automaticUsed + source.automaticReserved >= source.automaticLimit) {
+        const budget = this.budgetSnapshot(source.id);
+        if (value.automatic && budget.used + budget.reserved >= budget.limit) {
           this.cancelEventInner(value.id, 'root-budget-exhausted'); continue;
         }
         if (value.automatic) this.run('UPDATE host_roots SET auto_reserved=auto_reserved+1 WHERE id=?', source.id);

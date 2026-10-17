@@ -37,6 +37,7 @@ export type GroupTurnContext = NonNullable<AgentTurn['groupContext']>;
 export interface SessionManagerOptions {
   onConversationScene?: (conversation: Conversation, source: NonNullable<AgentTurn['source']>, signal: AbortSignal) => Promise<string>;
   binding?: ControllerBinding; authorizeUser?: (userId: string) => boolean;
+  onGroupTurnError?: (context: GroupTurnContext) => Promise<boolean>;
   onGroupTurnStart?: (context: GroupTurnContext) => Promise<string>;
   onGroupTurnFinished?: (context: GroupTurnContext, outcome: 'completed' | 'silent' | 'failed') => Promise<void>;
   onGroupSilent?: (context: GroupTurnContext) => Promise<void>;
@@ -213,6 +214,14 @@ export class SessionManager {
   isIdle(): boolean {
     return this.workers.size === 0 && this.userWorkers.size === 0 && this.running.size === 0
       && this.initializations.size === 0 && this.initializationRecoveries.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.detachPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
+  }
+
+  /** Current controller activity, separate from execution-child activity. */
+  controllerActivity(conversationId: string): { running: boolean; pending: number; initializing: boolean; stopped: boolean } {
+    const conversation = this.store.getConversation(conversationId);
+    return { running: !!conversation && this.running.get(conversation.userId)?.conversationId === conversationId,
+      pending: this.store.pendingCount(conversationId), initializing: this.initializations.has(conversationId),
+      stopped: this.closed || this.draining };
   }
 
   discard(message: BridgeMessage): void {
@@ -1144,7 +1153,9 @@ export class SessionManager {
           // A completed model turn is never retried merely because reply delivery failed.
           for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') this.store.setState(id, 'failed', String(error));
           this.store.setReplyState(turn.messageIds, 'failed');
-          await this.sink.sendText(item.channelId,
+          const handled = groupContext && this.options.onGroupTurnError
+            ? await this.options.onGroupTurnError(groupContext).catch(() => true) : false;
+          if (!handled) await this.sink.sendText(item.channelId,
             `执行或回复失败：${error instanceof Error ? error.message : String(error)}`)
             .catch(() => undefined);
         }
