@@ -668,7 +668,10 @@ test('Codex receives automatic private active-group scene, true group source and
     assert.match(privateWire, /private-message/); assert.match(privateWire, /actual-owner/); assert.match(privateWire, /讨论预算 73/);
     const groupWire = JSON.stringify(starts[1]!.input);
     assert.match(groupWire, /actual-member/); assert.match(groupWire, /owner-route/); assert.match(groupWire, /replyToMessageId/); assert.match(groupWire, /earlier/); assert.match(groupWire, /bot-M/); assert.match(groupWire, /讨论预算 73/);
+    const currentRuntime = (starts[1]!.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
+    assert.equal(JSON.parse(currentRuntime.split('\n')[0]!.split('] ')[1]!).requesterPrincipalId, 'owner');
     const evidence = (starts[2]!.toolOutput as JsonObject).output as string;
+    assert.equal(JSON.parse(evidence.split('\n')[0]!.split('] ')[1]!).requesterPrincipalId, null);
     assert.deepEqual(starts[2]!.input, []); assert.match(evidence, /background-evidence/); assert.match(evidence, /讨论预算 73/); assert.match(evidence, /not fresh authorization/);
     const thread = s.transports[0]!.written.find(item => item.method === 'thread/start')!.params as JsonObject;
     const tools = thread.dynamicTools as JsonObject[];
