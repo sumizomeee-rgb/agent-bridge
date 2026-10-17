@@ -74,7 +74,7 @@ test('same-group public collaboration completes the original delivery without a 
   const request = f.host.store.getCollaborationRequest(receipt.requestId)!;
   assert.equal(f.host.store.getRoot(request.rootId)!.replyTo.collaborationBudgetKey, original.rootId);
   assert.deepEqual(f.host.store.budgetSnapshot(original.rootId), f.host.store.budgetSnapshot(request.rootId));
-  assert.equal(f.host.store.budgetSnapshot(original.rootId).used, 1);
+  assert.equal(f.host.store.budgetSnapshot(original.rootId).used, 0);
   assert.equal(f.calls.filter(value => value.botId === B && value.turn.text === 'A meaningful public question').length, 1);
 });
 
@@ -610,15 +610,58 @@ test('shared controller fixes each group reply address despite another group and
   assert.equal(new Set(aGroupTurns.map(c => c.turn.conversation.id)).size, 1);
 });
 
-test('automatic public discussion consumes the shared eight-turn budget and terminates without extra gateway calls', { timeout: 10000 }, async t => {
+test('public discussion gives each Bot eight acknowledged non-owner replies without cancelling received events', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate();
-  f.run(async (_botId, turn) => { await turn.onPublicMessage!(`public ${f.calls.length}`); });
+  f.run(async (_botId, turn) => {
+    try { await turn.onPublicMessage!(`public ${f.calls.length}`); }
+    catch (error) {
+      if (error && typeof error === 'object' && 'groupReplyPaused' in error) await turn.onSilent!();
+      else throw error;
+    }
+  });
   await f.host.receive(A, f.message(A, 'discussion', 'independent opinions please')); await f.drain();
-  assert.equal(f.calls.length, 10); // Two free first turns plus eight automatic rounds.
   const event = f.host.store.listEvents()[0]!, root = f.host.store.getRoot(event.rootId)!;
-  assert.equal(root.automaticUsed, 8); assert.equal(root.automaticReserved, 0);
-  assert.equal(f.calls.filter(c => c.turn.groupContext?.eventKind === 'group-event').length, 8);
-  assert.equal(f.replies.filter(reply => reply.text.includes('自动协作已达到')).length, 1);
+  assert.equal(root.automaticUsed, 0); assert.equal(root.automaticReserved, 0);
+  for (const botId of [A, B]) assert.equal(f.host.store.publicReplySnapshot(botId, G1).count, 8);
+  assert.equal(f.host.store.listEvents().some(value => value.error === 'root-budget-exhausted'), false);
+  assert.ok(f.replies.filter(reply => reply.text.includes('连续回复非主人消息的可用次数已用完')).length >= 1);
+  assert.ok(f.calls.length > 10);
+});
+
+test('public reply count ignores silence and duplicate owner delivery; only a new owner message in this group resets it', async t => {
+  const f = fixture(t); await f.activate(); await f.activate(G2);
+  const ownerMessage = f.message(A, 'reply-limit-owner', 'owner source');
+  await f.host.receive(A, ownerMessage); await f.drain();
+  const original = f.host.store.listEvents(A).find(value => value.kind === 'human')!;
+  f.run(async (botId, turn) => {
+    if (!turn.groupContext) { await turn.onPublicMessage!('private answer'); return; }
+    if (botId === A && turn.text.startsWith('counted reply')) {
+      await Promise.all([
+        turn.onPublicMessage!('first paragraph', [], 'part-one:' + turn.groupContext.eventId, undefined, false),
+        turn.onPublicMessage!('second paragraph', [], 'part-two:' + turn.groupContext.eventId, undefined, false),
+      ]);
+      await turn.onPublicMessage!('last paragraph', [], 'part-three:' + turn.groupContext.eventId, undefined, true);
+    } else await turn.onSilent?.();
+  });
+  for (let i = 0; i < 2; i++) {
+    f.host.store.enqueueEvent({ id: `counted-reply-${i}`, rootId: original.rootId, botId: A, generation: original.generation,
+      kind: 'observation', sourceBotId: B, causeEventId: original.id, payload: { text: 'counted reply ' + i } });
+    await f.host.pump(); await f.drain();
+  }
+  assert.equal(f.host.store.publicReplySnapshot(A, G1).count, 2);
+  assert.equal(f.host.store.publicReplySnapshot(B, G1).count, 0);
+  await f.host.receive(A, ownerMessage); await f.drain();
+  assert.equal(f.host.store.publicReplySnapshot(A, G1).count, 2);
+  await f.managers.get(A)!.handle({ id: 'private-no-public-reset', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_private_limit`, text: 'private owner input', imagePaths: [] }); await f.drain();
+  assert.equal(f.host.store.publicReplySnapshot(A, G1).count, 2);
+  await f.host.receive(A, f.message(A, 'other-group-owner-no-reset', 'other group owner input', G2)); await f.drain();
+  assert.equal(f.host.store.publicReplySnapshot(A, G1).count, 2);
+  const guest = f.message(A, 'guest-no-public-reset', 'guest'); guest.userId = `${A}|outside-whitelist`;
+  await f.host.receive(A, guest); await f.drain();
+  assert.equal(f.host.store.publicReplySnapshot(A, G1).count, 2);
+  await f.host.receive(A, f.message(A, 'new-owner-public-reset', 'new owner message in same group')); await f.drain();
+  assert.equal(f.host.store.publicReplySnapshot(A, G1).count, 0);
+  assert.equal(f.host.store.publicReplySnapshot(B, G1).count, 0);
 });
 
 test('paused ordinary group input is durably captured but cancelled after a controller reset', { timeout: 10000 }, async t => {

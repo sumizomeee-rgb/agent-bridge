@@ -226,6 +226,118 @@ test('broadcast human root and both Bot-derived collaboration roots share reserv
   assert.equal(store.listEvents().filter(event => event.kind === 'human').length, 2);
 });
 
+function publicTurn(store: HostStore, id: string, botId = A, rootId = 'root-1'): void {
+  store.enqueueEvent({ id, rootId, botId, generation: store.getController(botId)!.generation, kind: 'observation', payload: { text: id } });
+  assert.equal(start(store, botId), id);
+}
+
+test('public reply streak counts confirmed turns once, permits silent intake at eight and resets only on a unique owner receipt', async t => {
+  const store = open(t, await directory(t)); seed(store); root(store);
+  for (let i = 0; i < 8; i++) {
+    publicTurn(store, `public-${i}`);
+    const reservation = store.reservePublicReply(`public-${i}`, SPACE);
+    assert.equal(reservation.applicable, true); assert.equal(reservation.alreadyCounted, false);
+    assert.equal(store.publicReplySnapshot(A, SPACE).count, i);
+    store.finishPublicReply(reservation.reservationId!, 'confirmed');
+    assert.equal(store.reservePublicReply(`public-${i}`, SPACE).alreadyCounted, true);
+    store.finishPublicReply(reservation.reservationId!, 'confirmed');
+    store.finishEvent(`public-${i}`, 'completed');
+  }
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 8);
+  assert.equal(store.getRoot('root-1')!.automaticUsed, 0);
+  publicTurn(store, 'ninth-still-received');
+  assert.throws(() => store.reservePublicReply('ninth-still-received', SPACE), error => error instanceof HostStateError && error.code === 'public-reply-limit');
+  assert.equal(store.getEvent('ninth-still-received')!.state, 'running');
+  assert.equal(store.claimPublicReplyLimitNotice(A, SPACE), true); assert.equal(store.claimPublicReplyLimitNotice(A, SPACE), false);
+  store.markEventDecision('ninth-still-received', 'silent'); store.finishEvent('ninth-still-received', 'silent');
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 8);
+  assert.equal(store.resetPublicReplies(SPACE, P, 'unique-owner-message', 1), true);
+  assert.equal(store.resetPublicReplies(SPACE, P, 'unique-owner-message', 1), false);
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 0); assert.equal(store.publicReplySnapshot(B, SPACE).count, 0);
+  assert.equal(store.claimPublicReplyLimitNotice(A, SPACE), false);
+});
+
+test('independent SQLite clients cannot reserve or confirm the same public reply twice', async t => {
+  const path = await directory(t); const first = open(t, path); seed(first); root(first); const second = open(t, path);
+  publicTurn(first, 'shared-public-reply');
+  const reservation = first.reservePublicReply('shared-public-reply', SPACE);
+  assert.equal(second.publicReplySnapshot(A, SPACE).reserved, 1);
+  assert.throws(() => second.reservePublicReply('shared-public-reply', SPACE), /already reserved/);
+  first.finishPublicReply(reservation.reservationId!, 'confirmed'); second.finishPublicReply(reservation.reservationId!, 'confirmed');
+  assert.equal(second.publicReplySnapshot(A, SPACE).count, 1);
+  assert.equal(second.reservePublicReply('shared-public-reply', SPACE).alreadyCounted, true);
+  first.finishEvent('shared-public-reply', 'completed');
+});
+
+test('public reply reservations release definite failures, retain uncertainty across restart and do not count silence', async t => {
+  const path = await directory(t); let store = open(t, path); seed(store); root(store);
+  publicTurn(store, 'silent-no-reservation'); store.finishEvent('silent-no-reservation', 'silent');
+  publicTurn(store, 'definite-failure'); const first = store.reservePublicReply('definite-failure', SPACE);
+  store.finishPublicReply(first.reservationId!, 'released'); store.finishEvent('definite-failure', 'failed');
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 0); assert.equal(store.publicReplySnapshot(A, SPACE).reserved, 0);
+  publicTurn(store, 'unknown-send'); const unknown = store.reservePublicReply('unknown-send', SPACE);
+  store.finishPublicReply(unknown.reservationId!, 'uncertain');
+  assert.throws(() => store.reservePublicReply('unknown-send', SPACE), /unknown/);
+  assert.throws(() => store.finishPublicReply(unknown.reservationId!, 'released'), /without proof/);
+  store.close(); store = open(t, path); store.recoverInFlight();
+  assert.equal(store.publicReplySnapshot(A, SPACE).reserved, 1); assert.equal(store.publicReplySnapshot(A, SPACE).count, 0);
+  store.finishPublicReply(unknown.reservationId!, 'confirmed');
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 1); assert.equal(store.publicReplySnapshot(A, SPACE).reserved, 0);
+});
+
+test('owner reset isolates old in-flight confirmation and old receipt replay cannot reset a later streak', async t => {
+  const store = open(t, await directory(t)); seed(store); root(store);
+  store.resetPublicReplies(SPACE, P, 'owner-first', 1);
+  publicTurn(store, 'old-in-flight'); const old = store.reservePublicReply('old-in-flight', SPACE);
+  store.resetPublicReplies(SPACE, P, 'owner-second', 1);
+  store.finishPublicReply(old.reservationId!, 'confirmed'); store.finishEvent('old-in-flight', 'completed');
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 0);
+  publicTurn(store, 'new-window'); const current = store.reservePublicReply('new-window', SPACE);
+  store.finishPublicReply(current.reservationId!, 'confirmed'); store.finishEvent('new-window', 'completed');
+  assert.equal(store.resetPublicReplies(SPACE, P, 'owner-first', 1), false);
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 1);
+  assert.throws(() => store.resetPublicReplies(SPACE, Q, 'wrong-owner', 1), /changed/);
+  assert.throws(() => store.resetPublicReplies(SPACE, P, 'wrong-epoch', 2), /changed/);
+});
+
+test('public reply counters are independent by Bot and actual group and survive process restart and controller changes', async t => {
+  const path = await directory(t); let store = open(t, path); seed(store); root(store);
+  const other = SPACE + '-other';
+  for (const id of [A, B]) store.mapSpace({ botId: id, platformSpaceId: `other-${id}`, spaceId: other, proof: 'test explicit mapping' });
+  store.startGroup({ spaceId: other, principalId: P, receiverBotId: A, memberBotIds: [A, B] });
+  publicTurn(store, 'same-turn-two-groups');
+  for (const space of [SPACE, other]) store.finishPublicReply(store.reservePublicReply('same-turn-two-groups', space).reservationId!, 'confirmed');
+  store.finishEvent('same-turn-two-groups', 'completed');
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 1); assert.equal(store.publicReplySnapshot(A, other).count, 1);
+  assert.equal(store.publicReplySnapshot(B, SPACE).count, 0);
+  store.resetPublicReplies(SPACE, P, 'owner-local-only', 1);
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 0); assert.equal(store.publicReplySnapshot(A, other).count, 1);
+  store.replaceControllerForAgentSwitch(A, P, { ...controller(A, 2), agent: 'claude' }, 1);
+  store.setController(A, P, controller(A, 3), 2);
+  store.close(); store = open(t, path);
+  assert.equal(store.publicReplySnapshot(A, other).count, 1);
+  store.stopGroup(other, P); store.startGroup({ spaceId: other, principalId: P, receiverBotId: A, memberBotIds: [A, B] });
+  assert.equal(store.publicReplySnapshot(A, other).count, 0);
+});
+
+test('public observations avoid root budgets but internal consultations, their descendants and wakes retain causal limits', async t => {
+  const store = open(t, await directory(t)); seed(store); root(store, 'root-1', [A, B], 2);
+  publicTurn(store, 'public-free'); assert.equal(store.publicReplyClass('public-free'), 'public-auto'); store.finishEvent('public-free', 'silent');
+  enqueue(store, 'internal-parent', A, 'consultation'); start(store); assert.equal(store.publicReplyClass('internal-parent'), 'internal');
+  assert.equal(store.reservePublicReply('internal-parent', SPACE).applicable, false); store.finishEvent('internal-parent', 'silent');
+  store.enqueueEvent({ id: 'public-child', rootId: 'root-1', botId: B, generation: 1, kind: 'observation', causeEventId: 'internal-parent', payload: { text: 'published evidence' } });
+  assert.equal(store.publicReplyClass('public-child'), 'public-auto'); store.finishEvent(start(store, B), 'silent');
+  store.enqueueEvent({ id: 'internal-child', rootId: 'root-1', botId: B, generation: 1, kind: 'wake', causeEventId: 'internal-parent', payload: { text: 'internal descendant' } });
+  assert.equal(store.publicReplyClass('internal-child'), 'internal'); store.finishEvent(start(store, B), 'silent');
+  store.enqueueEvent({ id: 'timer-cannot-escape', rootId: 'root-1', botId: A, generation: 1, kind: 'wake', payload: {} });
+  assert.equal(store.publicReplyClass('timer-cannot-escape'), 'wake'); assert.equal(store.claimNextEvent(A), null);
+  store.enqueueEvent({ id: 'public-consultation-after-root-limit', rootId: 'root-1', botId: A, generation: 1, kind: 'consultation', payload: { text: 'public question', audience: 'public' } });
+  assert.equal(start(store), 'public-consultation-after-root-limit'); assert.equal(store.publicReplyClass('public-consultation-after-root-limit'), 'public-auto');
+  store.finishEvent('public-consultation-after-root-limit', 'silent'); assert.equal(store.getRoot('root-1')!.automaticUsed, 2);
+  enqueue(store, 'worker-free', A, 'assistant-result'); start(store); assert.equal(store.publicReplyClass('worker-free'), 'worker-result');
+  assert.equal(store.reservePublicReply('worker-free', SPACE).applicable, false); store.finishEvent('worker-free', 'completed');
+});
+
 test('same-root observations coalesce while independent human roots take priority and retain addresses', async t => {
   const store = open(t, await directory(t)); seed(store); root(store);
   enqueue(store, 'observer-1', B, 'observation'); enqueue(store, 'observer-2', B, 'observation');

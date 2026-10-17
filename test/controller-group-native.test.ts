@@ -177,3 +177,59 @@ test('在途协作无完成收据时并行final正常交付，不把队列成功
   f.protocol.complete(); assert.equal((await running).controlledOutput, true);
   assert.equal(reply(f.protocol, 151)!.success, true); assert.equal(f.published, 1); assert.equal(finalized, 0);
 });
+
+test('群公开响应限额把final和补充发送转为正常静默，DONE等待管理与发送守卫', async t => {
+  for (const finish of [true, false]) {
+    const f = setup(t); let releaseManagement!: () => void, releaseSend!: () => void, attempts = 0;
+    const management = new Promise<void>(resolve => { releaseManagement = resolve; });
+    const send = new Promise<void>(resolve => { releaseSend = resolve; });
+    f.manage = async () => { await management; return {}; };
+    f.turn.onPublicMessage = async () => { attempts++; await send; throw Object.assign(new Error('group public responses paused'), { groupReplyPaused: true }); };
+    let finished = false;
+    const running = f.adapter.run(f.turn).then(value => { finished = true; return value; });
+    await until(() => f.protocol.turns === 1);
+    f.protocol.tool(201, 'bridge_list_workers'); await until(() => f.invoked.length === 1);
+    f.protocol.emit({ id: 202, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'public-at-limit',
+      tool: finish ? 'bridge_send_user' : 'bridge_send_message', arguments: JSON.stringify({ text: '群响应', ...(finish ? {} : { targetId: 'group-current', finish: false }) }) } });
+    f.protocol.complete(); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(finished, false);
+    if (!finish) { releaseSend(); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(f.silent, 0); assert.equal(finished, false); }
+    releaseManagement(); await until(() => attempts === 1); releaseSend();
+    assert.equal((await running).controlledOutput, true); await until(() => !!reply(f.protocol, 202));
+    assert.equal(reply(f.protocol, 202)!.success, true);
+    const value = JSON.parse((reply(f.protocol, 202)!.contentItems as JsonObject[])[0]!.text as string);
+    assert.deepEqual(value, { delivered: false, silent: true, reason: 'group-public-reply-limit' });
+    assert.equal(f.silent, 1); assert.equal(f.published, 0); assert.equal(f.protocol.stopped, false);
+  }
+});
+
+test('补充限额与并行final不互等死锁，也不重复登记静默或继续发送', async t => {
+  const f = setup(t); let release!: () => void, attempts = 0;
+  const guard = new Promise<void>(resolve => { release = resolve; });
+  f.turn.onPublicMessage = async () => { attempts++; await guard; throw Object.assign(new Error('public cap'), { groupReplyPaused: true }); };
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+  f.protocol.emit({ id: 211, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'supplement-at-limit', tool: 'bridge_send_message', arguments: JSON.stringify({ text: 'supplement', targetId: 'group-current', finish: false }) } });
+  await until(() => attempts === 1); f.protocol.tool(212, 'bridge_send_user');
+  f.protocol.complete(); release(); assert.equal((await running).controlledOutput, true);
+  await until(() => !!reply(f.protocol, 211) && !!reply(f.protocol, 212));
+  assert.equal(reply(f.protocol, 211)!.success, true); assert.equal(reply(f.protocol, 212)!.success, true);
+  assert.equal(attempts, 1); assert.equal(f.silent, 1); assert.equal(f.published, 0);
+});
+
+test('私聊和非真值限额错误不能借群静默伪装完成', async t => {
+  for (const privateInput of [true, false]) {
+    const f = setup(t); if (privateInput) f.turn.groupContext = undefined;
+    f.turn.onPublicMessage = async () => { throw Object.assign(new Error('real publication error'), { groupReplyPaused: privateInput ? true : false }); };
+    const running = f.adapter.run(f.turn), checked = assert.rejects(running, /real publication error/);
+    await until(() => f.protocol.turns === 1); f.protocol.tool(221, 'bridge_send_user');
+    await checked; assert.equal(f.silent, 0); assert.equal(f.published, 0);
+  }
+});
+
+test('群轮次向私聊交付也不能吞掉伪造的群限额错误', async t => {
+  const f = setup(t);
+  f.turn.onPublicMessage = async () => { throw Object.assign(new Error('private publication error'), { groupReplyPaused: true }); };
+  const running = f.adapter.run(f.turn), checked = assert.rejects(running, /private publication error/);
+  await until(() => f.protocol.turns === 1);
+  f.protocol.emit({ id: 231, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'private-destination', tool: 'bridge_send_message', arguments: JSON.stringify({ text: 'private result', targetId: 'private' }) } });
+  await checked; assert.equal(f.silent, 0); assert.equal(f.published, 0);
+});

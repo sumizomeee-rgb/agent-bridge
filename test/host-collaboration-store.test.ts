@@ -120,7 +120,7 @@ test('request update failure rolls back the inserted event and its logical deliv
   } finally { database.close(); }
 });
 
-test('internal and public roots share eight automatic turns and one durable exhaustion notice', async t => {
+test('internal coordination keeps its shared budget while public replies use their independent Bot group counter', async t => {
   const { store, open, input } = await setup(t, 'internal', 'real-owner-input-hash');
   const addRoot = (id: string, limit = 64) => store.acceptRoot({ id, sourceEventId: 'source-' + id, spaceId: SPACE,
     principalId: P, targetBotIds: [B], automaticLimit: limit,
@@ -128,26 +128,33 @@ test('internal and public roots share eight automatic turns and one durable exha
   addRoot('public');
   assert.deepEqual(store.budgetSnapshot('public'), { limit: 8, used: 0, reserved: 0 });
   assert.equal(store.claimBudgetExhaustionNotice('root'), false);
-  for (let index = 0; index < 8; index++) {
+  for (let index = 0; index < 16; index++) {
     const publicMode = index % 2 === 1, rootId = publicMode ? 'public' : 'root';
     const request = store.registerCollaborationRequest({ ...input, id: 'request-' + index, rootId, mode: publicMode ? 'public' : 'internal' });
     store.queueCollaborationRequest(request.id);
     const next = store.claimNextEvent(B); assert(next);
-    assert.deepEqual(store.budgetSnapshot(rootId), { limit: 8, used: index, reserved: 1 });
-    store.startEvent(next.id); store.finishEvent(next.id, 'completed');
+    assert.deepEqual(store.budgetSnapshot(rootId), { limit: 8, used: Math.floor((index + 1) / 2), reserved: publicMode ? 0 : 1 });
+    store.startEvent(next.id);
+    if (publicMode) { const permit = store.reservePublicReply(next.id, SPACE); store.finishPublicReply(permit.reservationId!, 'confirmed'); }
+    store.finishEvent(next.id, 'completed');
   }
   assert.deepEqual(store.budgetSnapshot('root'), { limit: 8, used: 8, reserved: 0 });
+  assert.equal(store.publicReplySnapshot(B, SPACE).count, 8);
   addRoot('late-public');
   const late = store.registerCollaborationRequest({ ...input, id: 'late-request', rootId: 'late-public', mode: 'public' });
   store.queueCollaborationRequest(late.id);
-  assert.equal(store.claimNextEvent(B), null); assert.equal(store.getEvent(late.eventId)?.state, 'cancelled');
+  const next = store.claimNextEvent(B); assert(next); store.startEvent(next.id);
+  assert.throws(() => store.reservePublicReply(next.id, SPACE), /limit reached/);
+  store.finishEvent(next.id, 'silent');
+  const internal = store.registerCollaborationRequest({ ...input, id: 'late-internal', rootId: 'root', mode: 'internal' });
+  store.queueCollaborationRequest(internal.id);
+  assert.equal(store.claimNextEvent(B), null); assert.equal(store.getEvent(internal.eventId)?.state, 'cancelled');
   assert.equal(store.claimBudgetExhaustionNotice('public'), true);
   assert.equal(store.claimBudgetExhaustionNotice('root'), false);
-  assert.equal(store.getRoot('root')?.exhaustionNotified, true); assert.equal(store.getRoot('late-public')?.exhaustionNotified, true);
   addRoot('after-notice');
-  assert.equal(store.claimBudgetExhaustionNotice('after-notice'), false);
   store.close(); const restored = open();
   assert.deepEqual(restored.budgetSnapshot('after-notice'), { limit: 8, used: 8, reserved: 0 });
+  assert.equal(restored.publicReplySnapshot(B, SPACE).count, 8);
   assert.equal(restored.claimBudgetExhaustionNotice('after-notice'), false);
 });
 

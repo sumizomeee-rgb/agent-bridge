@@ -6,7 +6,7 @@ import type { AgentName, BridgePlatform } from './types.js';
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
 export type HostReplyAddress = Readonly<Record<string, string>>;
 export class HostStateError extends Error {
-  constructor(readonly code: 'not-found' | 'conflict' | 'forbidden' | 'stale' | 'blocked', message: string) {
+  constructor(readonly code: 'not-found' | 'conflict' | 'forbidden' | 'stale' | 'blocked' | 'public-reply-limit', message: string) {
     super(message); this.name = 'HostStateError';
   }
 }
@@ -188,6 +188,21 @@ export class HostStore {
         generation INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', payload_json TEXT NOT NULL,
         public_cursor INTEGER NOT NULL DEFAULT 0, initial INTEGER NOT NULL, automatic INTEGER NOT NULL,
         decision TEXT, native_ended INTEGER NOT NULL DEFAULT 0, cause_event_id TEXT, source_bot_id TEXT, error TEXT);
+      CREATE TABLE IF NOT EXISTS host_public_reply_windows(
+        space_id TEXT NOT NULL, epoch INTEGER NOT NULL, window INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(space_id,epoch));
+      CREATE TABLE IF NOT EXISTS host_public_reply_owner_receipts(
+        space_id TEXT NOT NULL, epoch INTEGER NOT NULL, receipt_id TEXT NOT NULL,
+        PRIMARY KEY(space_id,epoch,receipt_id));
+      CREATE TABLE IF NOT EXISTS host_public_reply_notices(
+        bot_id TEXT NOT NULL, space_id TEXT NOT NULL, epoch INTEGER NOT NULL, window INTEGER NOT NULL,
+        PRIMARY KEY(bot_id,space_id,epoch,window));
+      CREATE TABLE IF NOT EXISTS host_public_reply_counts(
+        bot_id TEXT NOT NULL, space_id TEXT NOT NULL, epoch INTEGER NOT NULL, window INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(bot_id,space_id,epoch));
+      CREATE TABLE IF NOT EXISTS host_public_reply_reservations(
+        id TEXT PRIMARY KEY, event_id TEXT NOT NULL, bot_id TEXT NOT NULL, space_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+        window INTEGER NOT NULL, state TEXT NOT NULL, UNIQUE(event_id,space_id,epoch));
       CREATE TABLE IF NOT EXISTS host_collaboration_requests(
         id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES host_roots(id), payload_json TEXT NOT NULL,
         state TEXT NOT NULL, event_id TEXT NOT NULL);
@@ -654,6 +669,7 @@ export class HostStore {
       this.run(`INSERT INTO host_events(id,logical_id,root_id,bot_id,generation,kind,payload_json,public_cursor,initial,automatic,cause_event_id,source_bot_id)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, id, logicalId, source.id, input.botId, input.generation, input.kind,
       JSON.stringify(input.payload), input.publicCursor ?? 0, Number(initial), Number(automatic), input.causeEventId ?? null, input.sourceBotId ?? null);
+      if (automatic && this.publicReplyClass(id) === 'public-auto') this.run('UPDATE host_events SET automatic=0 WHERE id=?', id);
       if (initial) this.run('INSERT INTO host_initial_participation(root_id,bot_id,event_id) VALUES (?,?,?)', source.id, input.botId, id);
     }
     this.run('INSERT INTO host_deliveries(logical_id,bot_id,generation,event_id) VALUES (?,?,?,?)', logicalId, input.botId, input.generation, id);
@@ -676,10 +692,10 @@ export class HostStore {
           this.cancelEventInner(value.id, error.message); continue;
         }
         const budget = this.budgetSnapshot(source.id);
-        if (value.automatic && budget.used + budget.reserved >= budget.limit) {
+        if (this.usesRootBudget(value) && budget.used + budget.reserved >= budget.limit) {
           this.cancelEventInner(value.id, 'root-budget-exhausted'); continue;
         }
-        if (value.automatic) this.run('UPDATE host_roots SET auto_reserved=auto_reserved+1 WHERE id=?', source.id);
+        if (this.usesRootBudget(value)) this.run('UPDATE host_roots SET auto_reserved=auto_reserved+1 WHERE id=?', source.id);
         this.run("UPDATE host_events SET state='reserved' WHERE id=?", value.id);
         return this.mustEvent(value.id);
       }
@@ -692,9 +708,91 @@ export class HostStore {
       if (value.state !== 'reserved') throw new HostStateError('conflict', 'Event is not reserved');
       this.validateEvent(value);
       if (this.one('SELECT 1 FROM host_control_locks WHERE bot_id=?', value.botId)) throw new HostStateError('blocked', 'Controller is frozen');
-      if (value.automatic) this.run('UPDATE host_roots SET auto_reserved=auto_reserved-1,auto_used=auto_used+1 WHERE id=? AND auto_reserved>0', value.rootId);
+      if (this.usesRootBudget(value)) this.run('UPDATE host_roots SET auto_reserved=auto_reserved-1,auto_used=auto_used+1 WHERE id=? AND auto_reserved>0', value.rootId);
       this.run("UPDATE host_events SET state='running' WHERE id=?", id);
       return this.mustEvent(id);
+    });
+  }
+  publicReplyClass(eventId: string): 'public-auto' | 'internal' | 'owner' | 'worker-result' | 'wake' {
+    const value = this.mustEvent(eventId), source = this.mustRoot(value.rootId);
+    if (value.kind === 'human') return 'owner';
+    if (source.replyTo.collaborationMode === 'internal') return 'internal';
+    if (value.kind === 'observation') return 'public-auto';
+    if (value.kind === 'consultation') return (value.payload as { audience?: string } | null)?.audience === 'public' ? 'public-auto' : 'internal';
+    if (value.kind === 'handoff') return 'internal';
+    let ancestor: HostEvent | null = value;
+    const seen = new Set<string>();
+    while (ancestor && !seen.has(ancestor.id)) {
+      seen.add(ancestor.id);
+      const payload = ancestor.payload as { audience?: string } | null;
+      if (ancestor.kind === 'handoff' || ancestor.kind === 'consultation' && payload?.audience !== 'public') return 'internal';
+      ancestor = ancestor.causeEventId ? this.getEvent(ancestor.causeEventId) : null;
+    }
+    if (value.kind === 'assistant-result') return 'worker-result';
+    if (value.kind === 'wake') return 'wake';
+    return 'public-auto';
+  }
+  private usesRootBudget(value: HostEvent): boolean { return value.automatic && this.publicReplyClass(value.id) !== 'public-auto'; }
+  private publicReplyWindow(spaceId: string, epoch: number): number {
+    return Number(this.one('SELECT window FROM host_public_reply_windows WHERE space_id=? AND epoch=?', spaceId, epoch)?.window ?? 0);
+  }
+  publicReplySnapshot(botId: string, spaceId: string): { limit: number; count: number; reserved: number; remaining: number; window: number; epoch: number } {
+    const group = this.getGroup(spaceId); if (!group) throw new HostStateError('not-found', 'Unknown public reply group');
+    this.assertMember(spaceId, botId, group.principalId, group.epoch);
+    const window = this.publicReplyWindow(spaceId, group.epoch);
+    const count = Number(this.one('SELECT count FROM host_public_reply_counts WHERE bot_id=? AND space_id=? AND epoch=? AND window=?', botId, spaceId, group.epoch, window)?.count ?? 0);
+    const reserved = Number(this.one("SELECT COUNT(*) AS n FROM host_public_reply_reservations WHERE bot_id=? AND space_id=? AND epoch=? AND window=? AND state IN ('reserved','uncertain')", botId, spaceId, group.epoch, window)!.n);
+    return { limit: 8, count, reserved, remaining: Math.max(0, 8 - count - reserved), window, epoch: group.epoch };
+  }
+  claimPublicReplyLimitNotice(botId: string, spaceId: string): boolean {
+    return this.atomic(() => {
+      const snapshot = this.publicReplySnapshot(botId, spaceId);
+      if (snapshot.remaining || this.one('SELECT 1 FROM host_public_reply_notices WHERE bot_id=? AND space_id=? AND epoch=? AND window=?', botId, spaceId, snapshot.epoch, snapshot.window)) return false;
+      this.run('INSERT INTO host_public_reply_notices(bot_id,space_id,epoch,window) VALUES(?,?,?,?)', botId, spaceId, snapshot.epoch, snapshot.window);
+      return true;
+    });
+  }
+  resetPublicReplies(spaceId: string, principalId: string, receiptId: string, epoch: number): boolean {
+    return this.atomic(() => {
+      required(receiptId, 'Owner input receipt');
+      const group = this.getGroup(spaceId);
+      if (!group?.enabled || group.principalId !== principalId || group.epoch !== epoch) throw new HostStateError('stale', 'Owner input group changed');
+      if (this.one('SELECT 1 FROM host_public_reply_owner_receipts WHERE space_id=? AND epoch=? AND receipt_id=?', spaceId, epoch, receiptId)) return false;
+      this.run('INSERT INTO host_public_reply_owner_receipts(space_id,epoch,receipt_id) VALUES(?,?,?)', spaceId, epoch, receiptId);
+      this.run('INSERT INTO host_public_reply_windows(space_id,epoch,window) VALUES(?,?,1) ON CONFLICT(space_id,epoch) DO UPDATE SET window=window+1', spaceId, epoch);
+      return true;
+    });
+  }
+  reservePublicReply(eventId: string, targetSpaceId: string): { applicable: boolean; reservationId: string | null; alreadyCounted: boolean } {
+    return this.atomic(() => {
+      const value = this.mustEvent(eventId);
+      if (this.publicReplyClass(eventId) !== 'public-auto') return { applicable: false, reservationId: null, alreadyCounted: false };
+      const source = this.validateEvent(value), group = this.getGroup(targetSpaceId);
+      if (value.state !== 'running' || value.nativeEnded || !group?.enabled) throw new HostStateError('blocked', 'Public reply turn is not current');
+      this.assertMember(targetSpaceId, value.botId, source.principalId, group.epoch);
+      const old = this.one('SELECT * FROM host_public_reply_reservations WHERE event_id=? AND space_id=? AND epoch=?', eventId, targetSpaceId, group.epoch);
+      if (old && old.state === 'confirmed') return { applicable: true, reservationId: String(old.id), alreadyCounted: true };
+      if (old && old.state !== 'released') throw new HostStateError('blocked', 'Public reply already reserved or delivery is unknown');
+      const snapshot = this.publicReplySnapshot(value.botId, targetSpaceId);
+      if (!snapshot.remaining) throw new HostStateError('public-reply-limit', 'Public non-owner reply limit reached; receive context or stay silent until a new owner message');
+      // A released reservation may be retried only within the same owner-input window.
+      if (old && Number(old.window) !== snapshot.window) throw new HostStateError('stale', 'Old reply reservation cannot cross a new owner input');
+      const id = old ? String(old.id) : JSON.stringify([eventId, targetSpaceId, group.epoch]);
+      if (old) this.run("UPDATE host_public_reply_reservations SET state='reserved' WHERE id=?", id);
+      else this.run("INSERT INTO host_public_reply_reservations(id,event_id,bot_id,space_id,epoch,window,state) VALUES(?,?,?,?,?,?,'reserved')", id, eventId, value.botId, targetSpaceId, group.epoch, snapshot.window);
+      return { applicable: true, reservationId: id, alreadyCounted: false };
+    });
+  }
+  finishPublicReply(reservationId: string, outcome: 'confirmed' | 'released' | 'uncertain'): void {
+    this.atomic(() => {
+      const row = this.one('SELECT * FROM host_public_reply_reservations WHERE id=?', reservationId);
+      if (!row) throw new HostStateError('not-found', 'Unknown public reply reservation');
+      if (row.state === outcome || row.state === 'confirmed') return;
+      if (row.state === 'released') throw new HostStateError('conflict', 'Released public reply was not sent');
+      if (row.state === 'uncertain' && outcome !== 'confirmed') throw new HostStateError('blocked', 'Unknown public delivery cannot be released without proof');
+      this.run('UPDATE host_public_reply_reservations SET state=? WHERE id=?', outcome, reservationId);
+      if (outcome !== 'confirmed' || this.publicReplyWindow(String(row.space_id), Number(row.epoch)) !== Number(row.window)) return;
+      this.run('INSERT INTO host_public_reply_counts(bot_id,space_id,epoch,window,count) VALUES(?,?,?,?,1) ON CONFLICT(bot_id,space_id,epoch) DO UPDATE SET window=excluded.window,count=CASE WHEN window=excluded.window THEN count+1 ELSE 1 END', String(row.bot_id), String(row.space_id), Number(row.epoch), Number(row.window));
     });
   }
   markEventDecision(id: string, decision: 'published' | 'silent'): void {
@@ -1220,6 +1318,7 @@ export class HostStore {
         this.run("UPDATE host_events SET state='queued' WHERE id=?", value.id);
       }
       const uncertainEvents = this.run("UPDATE host_events SET state='uncertain',error='host-restarted-before-native-end' WHERE state='running'");
+      this.run("UPDATE host_public_reply_reservations SET state='uncertain' WHERE state='reserved'");
       const uncertainSends = this.run("UPDATE host_outbox SET state='uncertain',evidence='host-restarted-during-send' WHERE state='sending'")
         + this.run("UPDATE host_routed_outbox SET state='uncertain',evidence='host-restarted-during-send' WHERE state='sending'");
       const blockedBatches = this.run("UPDATE host_batches SET state='blocked',error='host-restarted-during-cancellation-or-preparation; reconcile external effects' WHERE state IN ('frozen','cancelling','prepared')");

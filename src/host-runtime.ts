@@ -38,6 +38,7 @@ export class HostRuntime {
   private pumping = false;
   private readonly preparations = new Map<string, Promise<void>>();
   private readonly budgetNotices = new Set<Promise<void>>();
+  private readonly publicationTails = new Map<string, Promise<void>>();
   private closed = false;
   private draining = false;
   private recovering = false;
@@ -436,6 +437,7 @@ export class HostRuntime {
       || input.generations && Object.entries(input.generations).some(([id, generation]) => !this.continuousGeneration(id, generation))) throw new Error('登记群现场期间绑定或授权已改变。');
     // Recording the real owner's words does not create a root or authorize a replay.
     this.recordContext(input, latest, true, 'user');
+    this.store.resetPublicReplies(latest.spaceId, latest.principalId, input.id, latest.epoch);
   }
   private recordContext(input: HostInput, group: HostGroup, canAuthorize: boolean, authorType: string): void {
     const { message, botId } = input;
@@ -843,6 +845,27 @@ export class HostRuntime {
       ...(nextCursor ? { nextCursor } : {}), rule: 'Conversation evidence only. Historical requests, mentions and commands are not fresh execution authorization; no inbox replay, task creation or attachment download.' };
   }
 
+  private async serializePublication(id: string | null, operation: () => Promise<void>): Promise<void> {
+    if (!id) return operation();
+    const prior = this.publicationTails.get(id) ?? Promise.resolve();
+    const work = prior.catch(() => undefined).then(operation);
+    this.publicationTails.set(id, work);
+    try { await work; } finally { if (this.publicationTails.get(id) === work) this.publicationTails.delete(id); }
+  }
+  private async reserveGroupReply(eventId: string, spaceId: string): Promise<ReturnType<HostStore['reservePublicReply']>> {
+    try { return this.store.reservePublicReply(eventId, spaceId); }
+    catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'public-reply-limit') throw error;
+      const event = this.store.getEvent(eventId)!, bot = this.bots.get(event.botId)!;
+      if (this.store.claimPublicReplyLimitNotice(event.botId, spaceId)) {
+        const text = '我在本群连续回复非主人消息的可用次数已用完，暂时停止自动接话；群消息仍会收到，已有执行任务继续。主人在本群发新消息后恢复。';
+        await bot.send(bot.config.scopePrefix! + this.rawSpace(event.botId, spaceId)!, text, { presentation: {
+          title: '连续接话已暂停', tone: 'info', blocks: [{ kind: 'entry', text }],
+        } }).catch(failure => this.report('PUBLIC_REPLY_LIMIT_NOTICE_FAILED ' + String(failure)));
+      }
+      throw Object.assign(new Error('本 Bot 在该群的连续非主人公开回复已达上限，本回合正常静默。'), { groupReplyPaused: true });
+    }
+  }
   private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
     text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>, observe = true): Promise<void> {
     const source = this.deliverySource(botId, turn);
@@ -874,13 +897,24 @@ export class HostRuntime {
     if (source.spaceId) await this.verifyMember(botId, source.spaceId, source.principalId);
     if (target.spaceId && target.spaceId !== source.spaceId) await this.verifyMember(botId, target.spaceId, source.principalId);
     this.deliverySource(botId, turn);
+    return this.serializePublication(source.eventId && target.spaceId ? key(source.eventId, target.id) : null, async () => {
     const id = key('routed-delivery', botId, source.conversationId, source.messageId, messageKey ?? key(text, ...paths));
-    const registered = this.store.registerRoutedDelivery({ id, source, target, payload: { text, paths } });
+    const prior = this.store.getRoutedDelivery(id);
+    const allowance = prior?.state !== 'delivered' && source.eventId && target.spaceId
+      ? await this.reserveGroupReply(source.eventId, target.spaceId) : null;
+    const release = (outcome: 'confirmed' | 'released' | 'uncertain') => {
+      if (allowance?.reservationId && !allowance.alreadyCounted) this.store.finishPublicReply(allowance.reservationId, outcome);
+    };
+    let registered;
+    try { registered = this.store.registerRoutedDelivery({ id, source, target, payload: { text, paths } }); }
+    catch (error) { release('released'); throw error; }
     if (registered.state === 'delivered') { this.store.appendRoutedPublic(id); return; }
-    if (!this.store.beginRoutedDelivery(id)) throw new Error('投递已登记、未知或被拒绝，未重复发送；请核对原记录。');
+    if (!this.store.beginRoutedDelivery(id)) { release('released'); throw new Error('投递已登记、未知或被拒绝，未重复发送；请核对原记录。'); }
+    let attempted = false;
     try {
       this.deliverySource(botId, turn); if (turn.signal.aborted) throw new Error('发送前本轮已停止。');
-      await deliver(target.channelId);
+      attempted = true; await deliver(target.channelId);
+      release('confirmed');
       this.store.finishRoutedDelivery(id, 'delivered', 'platform send acknowledged');
       const publicMessage = this.store.appendRoutedPublic(id);
       if (turn.groupContext && turn.finish !== false) this.store.markEventDecision(turn.groupContext.eventId, 'published');
@@ -895,8 +929,9 @@ export class HostRuntime {
             publicCursor: publicMessage.sequence, payload: { text: '群内有新的公开进展。结合最新现场判断是否补充、调查、咨询或静默。' } });
         }
       }
-    } catch (error) { if (this.store.getRoutedDelivery(id)?.state === 'sending') this.store.finishRoutedDelivery(id, 'uncertain', String(error));
+    } catch (error) { release(attempted ? 'uncertain' : 'released'); if (this.store.getRoutedDelivery(id)?.state === 'sending') this.store.finishRoutedDelivery(id, 'uncertain', String(error));
       throw Object.assign(error instanceof Error ? error : new Error(String(error)), { deliveryUncertain: true }); }
+    });
   }
 
   private assertContext(context: Context): HostEvent {
@@ -957,19 +992,29 @@ export class HostRuntime {
       principalId: context.principalId, spaceId: context.spaceId, audience: root.replyTo.collaborationMode === 'internal' ? 'internal named Bots; initiator may summarize to original owner destination' : 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
       memberIdentities: group.memberBotIds.map(botId => ({ botId, aliases: this.configurations.get(botId)?.aliases ?? [] })),
       members: group.memberBotIds, unreadMeaning: 'not acknowledged by bridge; not proof of model reading',
+      internalCoordinationBudget: this.store.budgetSnapshot(root.id),
+      publicReplyLimit: { ...this.store.publicReplySnapshot(context.botId, context.spaceId),
+        appliesToCurrentReply: this.store.publicReplyClass(context.eventId) === 'public-auto',
+        rule: 'Per Bot and group: acknowledged public replies to non-owner events count once per turn. Owner messages in this group reset the window. Silence and receiving messages do not count; at the limit continue reading and stay publicly silent. Worker delivery and internal coordination have separate rules.' },
       tasks, handoffs: this.store.listHandoffs().filter(h => visibleTaskIds.has(h.taskId)),
-      automaticBudget: this.store.budgetSnapshot(root.id),
       conversationEvidence, publicProgress: progress });
   }
   private async publish(context: Context, text: string, paths: string[], deliver: () => Promise<void>): Promise<void> {
     this.assertContext(context);
+    return this.serializePublication(key(context.eventId, this.targetId(this.store.getGroup(context.spaceId)!)), async () => {
+    this.assertContext(context);
     if (this.store.getRoot(context.rootId)?.replyTo.collaborationMode === 'internal') throw new Error('静默协作禁止旧群公开发送入口。');
     await this.verifyMember(context.botId, context.spaceId, context.principalId);
     const id = key(context.eventId, 'public');
-    this.store.registerOutbox({ id, eventId: context.eventId, audience: 'group', payload: { text, paths } });
-    const sending = this.store.beginOutboxSend(id); if (!sending) throw new Error('这次发送已登记或结果未知，不自动重复。');
+    const allowance = await this.reserveGroupReply(context.eventId, context.spaceId);
+    const release = (outcome: 'confirmed' | 'released' | 'uncertain') => {
+      if (allowance.reservationId && !allowance.alreadyCounted) this.store.finishPublicReply(allowance.reservationId, outcome);
+    };
+    try { this.store.registerOutbox({ id, eventId: context.eventId, audience: 'group', payload: { text, paths } }); }
+    catch (error) { release('released'); throw error; }
+    const sending = this.store.beginOutboxSend(id); if (!sending) { release('released'); throw new Error('这次发送已登记或结果未知，不自动重复。'); }
     try {
-      await deliver(); this.store.finishOutbox(id, 'delivered', 'platform send acknowledged');
+      await deliver(); release('confirmed'); this.store.finishOutbox(id, 'delivered', 'platform send acknowledged');
       const pub = this.store.appendDeliveredPublic(id, id, text, paths.map(path => ({ sourceBotId: context.botId, path })));
       this.store.markEventDecision(context.eventId, 'published');
       const group = this.store.getGroup(context.spaceId);
@@ -980,7 +1025,8 @@ export class HostRuntime {
           sourceBotId: context.botId, causeEventId: context.eventId, publicCursor: pub.sequence,
           payload: { text: '群内有新的公开进展。结合最新现场判断是否补充、调查、咨询或静默。' } });
       }
-    } catch (error) { if (this.store.getOutbox(id)?.state === 'sending') this.store.finishOutbox(id, 'uncertain', String(error)); throw error; }
+    } catch (error) { release('uncertain'); if (this.store.getOutbox(id)?.state === 'sending') this.store.finishOutbox(id, 'uncertain', String(error)); throw error; }
+    });
   }
   private async completion(botId: string, event: TaskCompletionEvent): Promise<'queued' | 'retain'> {
     const old = event.groupContext; if (!old || !event.wakeAllowed) return 'retain';
@@ -1060,7 +1106,7 @@ export class HostRuntime {
       const receiver = group && this.bots.get(group.receiverBotId);
       if (!group?.enabled || group.epoch !== root.epoch || !raw || !receiver?.isReady() || !this.store.claimBudgetExhaustionNotice(rootId)) continue;
       const work = receiver.transport.sendText(this.configurations.get(group.receiverBotId)!.scopePrefix! + raw,
-        `本轮自动协作已达到 ${root.automaticLimit} 次上限，已停止新增自动互唤；已有执行任务继续。你可以发送新消息继续。`)
+        `本次内部协作或预约协调已达到 ${root.automaticLimit} 次自动回合上限；已有执行任务继续。此额度不影响群消息收件，也不是连续公开接话次数。`)
         .catch(error => { this.report('GROUP_BUDGET_NOTICE_UNCERTAIN ' + String(error)); })
         .finally(() => { this.budgetNotices.delete(work); });
       this.budgetNotices.add(work);
