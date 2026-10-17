@@ -701,9 +701,8 @@ export class HostRuntime {
     const request = this.store.registerCollaborationRequest({ id, rootId, sourceBotId: botId, targetBotId, mode, text });
     if (request.state === 'queued') return { registered: true, queued: true, requestId: id, eventId: request.eventId, consumed: false, acceptedWork: false, rule: 'Finish this owner-input turn with a FINAL acknowledgement (finish:true), then DONE. The target reply arrives in a separate turn; finish:false alone does not complete this turn.' };
     if (mode === 'public') {
-      const bot = this.bots.get(botId)!;
-      await this.routePublication(botId, { ...turn, finish: false }, text, [], target.id, 'collaboration:' + id,
-        channel => bot.send(channel!, text, { signal: turn.signal }), false);
+      if (!turn.onPublicMessage) throw new Error('主控投递通道不可用，未发送协作消息。');
+      await turn.onPublicMessage(text, [], 'collaboration:' + id, target.id, false);
     }
     assertCurrent();
     const queued = this.store.queueCollaborationRequest(id);
@@ -838,7 +837,9 @@ export class HostRuntime {
       this.store.finishRoutedDelivery(id, 'delivered', 'platform send acknowledged');
       const publicMessage = this.store.appendRoutedPublic(id);
       if (turn.groupContext && turn.finish !== false) this.store.markEventDecision(turn.groupContext.eventId, 'published');
-      if (observe && collaboration?.collaborationMode !== 'internal' && publicMessage && source.spaceId && source.spaceId === target.spaceId && turn.groupContext) {
+      const announcement = messageKey?.startsWith('collaboration:')
+        ? this.store.getCollaborationRequest(messageKey.slice('collaboration:'.length)) : null;
+      if (observe && !announcement && collaboration?.collaborationMode !== 'internal' && publicMessage && source.spaceId && source.spaceId === target.spaceId && turn.groupContext) {
         const group = this.store.getGroup(source.spaceId);
         if (group?.enabled) for (const id of group.memberBotIds.filter(id => id !== botId)) {
           const member = this.store.getBot(id); if (!member?.ready || !member.controller) continue;

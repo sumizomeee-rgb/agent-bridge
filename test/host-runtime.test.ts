@@ -1032,7 +1032,9 @@ test('private public collaboration announces before target execution and retains
         targetBotId: B, mode: 'public', text: '请在这个群核对，私聊其他内容不公开' }, 'public-once');
       await turn.onPublicMessage!('已发出讨论并排队。');
     } else if (id === B) {
-      assert.equal(f.replies.some(r => r.botId === A && r.text === '请在这个群核对，私聊其他内容不公开'), true);
+      const announcement = f.replies.find(r => r.botId === A && r.text.endsWith('\n\n请在这个群核对，私聊其他内容不公开'));
+      assert.ok(announcement); assert.match(announcement.options!.repeatHeader!, /^\[Codex ·/);
+      assert.equal(f.host.store.listRoutedDeliveries().find(delivery => delivery.target.kind === 'group')!.payload.text, '请在这个群核对，私聊其他内容不公开');
       assert.equal(JSON.parse(turn.groupContext!.scene).collaboration.mode, 'public');
       await turn.onPublicMessage!('群内核对答复。');
     } else await turn.onSilent?.();
@@ -1046,7 +1048,12 @@ test('private public collaboration announces before target execution and retains
 
 test('uncertain public announcement never wakes target or retries its platform send', async t => {
   const f = fixture(t); await f.activate(); let sends = 0;
-  f.host.bots.get(A)!.send = async () => { sends++; throw new Error('platform acknowledgement unavailable'); };
+  const manager = f.managers.get(A)!;
+  const originalPublish = (manager as any).sink.sendText;
+  (manager as any).sink.sendText = async (channel: string, ...rest: unknown[]) => {
+    if (channel === `${A}|oc_a_group_1`) { sends++; throw new Error('platform acknowledgement unavailable'); }
+    return originalPublish(channel, ...rest);
+  };
   f.run(async (id, turn) => {
     assert.equal(id, A);
     const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
