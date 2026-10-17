@@ -37,6 +37,8 @@ profiles/discord.example.json               # Git：Discord Bot 模板
 
 公共配置使用 `workspaceRoot` 指定默认上下文根目录、`workingCwd` 指定默认工程执行目录；Profile 可用 `workspace`、`workingCwd` 分别覆盖。初始化、长期记忆、远程电脑和能力登记始终从该 Bot 固定的上下文工作区读取，执行任务在所选工程目录工作。`/cwd` 改工程目录并新建主控，不会把其他工程目录当成新的长期记忆入口。不同 Bot 的上下文目录不能相同或互相嵌套。
 
+Profile 还可设置 `defaultAgent: "codex"` 或 `defaultAgent: "claude"`；未设置时继承公共 `defaultAgent`，公共配置也未设置时使用 Codex。例如 Bot1 保持 Codex、Bot2 初始使用 Claude，只需在 Bot2 的 Profile 写入 `"defaultAgent": "claude"`。这个默认值只用于尚无当前主控的初始化，不会切换已有会话、清除原生上下文或覆盖该 Bot 已保存的模型与推理力度偏好；模型默认仍使用公共 `defaultModels`。
+
 凭据、白名单、实际路径、聊天、任务、认证副本和备份均不提交 Git。模板、校验、启动代码和说明提交 Git。新增 Bot 时复制相应模板，填入真实应用身份、凭据与白名单，生成它独立的工作区，再把 Profile 加进启动集合。飞书白名单使用该应用下的用户 Open ID，不同应用的 Open ID 不能互换。
 
 ## 操作者与群地址登记

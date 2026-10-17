@@ -57,7 +57,7 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
   };
   const proxyPort = portOverride ?? profile.network?.proxyPort ?? null;
   const proxyUrl = proxyPort == null ? null : `http://127.0.0.1:${proxyPort}`;
-  const defaultAgent = raw.defaultAgent ?? 'codex';
+  const defaultAgent = profile.defaultAgent ?? raw.defaultAgent ?? 'codex';
   if (defaultAgent !== 'codex' && defaultAgent !== 'claude') throw new Error('defaultAgent 只能是 codex 或 claude');
   const defaultModels: Partial<Record<AgentName, string>> = {};
   const modelOptions: Partial<Record<AgentName, string[]>> = {};

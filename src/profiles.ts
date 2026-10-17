@@ -1,11 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import type { BridgePlatform } from './types.js';
+import type { AgentName, BridgePlatform } from './types.js';
 
 export interface BotProfile {
   platform: BridgePlatform; name: string; applicationId?: string; token?: string; appSecret?: string;
   network?: { proxyPort: number | null };
-  workspace?: string; workingCwd?: string; ownerPrincipalId?: string;
+  workspace?: string; workingCwd?: string; ownerPrincipalId?: string; defaultAgent?: AgentName;
   allowedUserIds: string[]; features?: { reactions?: boolean; nativeCommands?: boolean; presence?: boolean };
 }
 export function readJson(path: string): Record<string, unknown> {
@@ -27,6 +27,7 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
   if (network != null && (typeof network !== 'object' || Array.isArray(network) || Object.keys(network).some(key => key !== 'proxyPort'))) throw new Error('network 仅支持 proxyPort。');
   const proxyPort = network?.proxyPort ?? null;
   if (proxyPort !== null && (typeof proxyPort !== 'number' || !Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535)) throw new Error('Profile 代理端口需要是 1–65535 的整数或 null。');
+  if (raw.defaultAgent !== undefined && raw.defaultAgent !== 'codex' && raw.defaultAgent !== 'claude') throw new Error('Profile defaultAgent 只能是 codex 或 claude。');
   const features = raw.features;
   if (features != null && (typeof features !== 'object' || Array.isArray(features))) throw new Error('features 必须是对象。');
   for (const [key, enabled] of Object.entries(features ?? {})) {
@@ -34,7 +35,7 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
     if (platform === 'feishu' && enabled && key !== 'reactions') throw new Error(`飞书暂不支持可选功能 ${key}。`);
   }
   for (const key of ['workspace', 'workingCwd', 'ownerPrincipalId']) if (raw[key] != null && (typeof raw[key] !== 'string' || !String(raw[key]).trim())) throw new Error(`Profile ${key} 必须是非空字符串。`);
-  return { platform, name, applicationId, workspace: raw.workspace as string | undefined, workingCwd: raw.workingCwd as string | undefined, ownerPrincipalId: raw.ownerPrincipalId as string | undefined, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
+  return { platform, name, applicationId, defaultAgent: raw.defaultAgent as AgentName | undefined, workspace: raw.workspace as string | undefined, workingCwd: raw.workingCwd as string | undefined, ownerPrincipalId: raw.ownerPrincipalId as string | undefined, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
     allowedUserIds: raw.allowedUserIds.map(String), network: { proxyPort: proxyPort as number | null }, features: features as BotProfile['features'] };
 }
 /** A credential rotation or profile alias change retains the bot's actual identity. */

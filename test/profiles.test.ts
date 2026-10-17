@@ -119,3 +119,11 @@ test('inactive bot running messages and task receipts stay pending during anothe
     assert.equal(registry.recoverProcessingEvents([a]).length, 1); assert.equal(registry.eventState(events.find(event => event.userId === b)!.id), 'processing');
   } finally { registry.close(); store.close(); }
 });
+
+test('bot default Agent accepts only supported names and takes precedence over the common default', t => {
+  const root = directory(t), path = join(root, 'config.json'); writeFileSync(path, JSON.stringify({ ...common(root), defaultAgent: 'claude' }));
+  const bot = { applicationId: app, token: 'private', allowedUserIds: [user] };
+  writeProfile(root, 'discord/default', bot); assert.equal(loadConfig(['--config', path], false).defaultAgent, 'claude');
+  for (const defaultAgent of ['codex', 'claude']) { writeProfile(root, 'discord/default', { ...bot, defaultAgent }); assert.equal(loadConfig(['--config', path], false).defaultAgent, defaultAgent); }
+  for (const defaultAgent of [null, '', 'CODEX', 'gemini', 1, false, ['claude'], {}]) { writeProfile(root, 'discord/default', { ...bot, defaultAgent }); assert.throws(() => loadConfig(['--config', path], false), /Profile defaultAgent/); }
+});

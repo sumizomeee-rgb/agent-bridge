@@ -7,6 +7,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { loadConfig, loadHostConfig } from '../src/config.js';
 import { ensureHostSemanticData, migrateHostConfig, restoreHostMigration, relocateHostValue } from '../src/host-migration.js';
 import { SessionStore } from '../src/store.js';
+import { SessionManager } from '../src/manager.js';
+import type { AgentAdapter, AgentTurn } from '../src/types.js';
 import { SessionHandoffs } from '../src/controller/handoff.js';
 import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 
@@ -153,4 +155,28 @@ test('migration explicitly includes inactive other-platform history while starti
   const marker = ensureHostSemanticData(host); assert.equal(marker.bots.length, 3); const discord = marker.bots.find(bot => bot.botId === discordBot)!; assert.equal(discord.contextWorkspace, discordWorkspace);
   const inactive = new SessionStore(discord.dataDir); assert.equal(inactive.getConversation(nativeIds.get(discordBot)!)?.nativeId, 'native-' + discordBot); assert.equal(inactive.getConversation(nativeIds.get(botA)!), null); inactive.close();
   const raw = JSON.parse(readFileSync(f.config, 'utf8')); writeFileSync(f.config, JSON.stringify({ ...raw, startupProfiles: ['discord/legacy'] })); const later = loadHostConfig(['--config', f.config], false); assert.equal(later.configs.length, 1); assert.equal(later.configs[0]?.botId, discordBot); assert.equal(later.configs[0]?.workspace, discordWorkspace); assert.equal(later.configs[0]?.dataDir, discord.dataDir);
+});
+test('host resolves each bot default Agent independently with profile, common and Codex fallbacks', t => {
+  const f = fixture(t), b = join(f.local, 'bots', 'feishu', 'b.json'), rawB = JSON.parse(readFileSync(b, 'utf8'));
+  writeFileSync(b, JSON.stringify({ ...rawB, defaultAgent: 'claude' })); writeConfig(f, { defaultModels: { codex: 'config-sol', claude: 'config-haiku' } });
+  const host = loadHostConfig(['--config', f.config], false); assert.deepEqual(host.configs.map(config => config.defaultAgent), ['codex', 'claude']);
+  for (const config of host.configs) assert.deepEqual(config.defaultModels, { codex: 'config-sol', claude: 'config-haiku' });
+  writeFileSync(b, JSON.stringify(rawB)); writeConfig(f, { defaultAgent: 'claude' }); assert.deepEqual(loadHostConfig(['--config', f.config], false).configs.map(config => config.defaultAgent), ['claude', 'claude']);
+  writeConfig(f, { defaultAgent: undefined }); assert.deepEqual(loadHostConfig(['--config', f.config], false).configs.map(config => config.defaultAgent), ['codex', 'codex']);
+});
+
+test('changing a bot initialization default preserves its active controller and saved backend preferences', async t => {
+  const f = fixture(t), a = join(f.local, 'bots', 'feishu', 'a.json'), rawA = JSON.parse(readFileSync(a, 'utf8'));
+  const initial = loadHostConfig(['--config', f.config], false).configs[0]!, user = initial.allowedUserIds[0]!, local = new SessionStore(initial.dataDir);
+  const active = local.createConversation(user, 'codex', initial.workspace, { controllerMode: true }); local.saveNativeId(active.id, 'preserved-native-sol'); local.setModel(active.id, 'saved-sol'); local.setEffort(active.id, 'high'); local.savePreferences(local.getConversation(active.id)!); local.setActive(user, active.id); local.close();
+  writeFileSync(a, JSON.stringify({ ...rawA, defaultAgent: 'claude' })); const config = loadHostConfig(['--config', f.config], false).configs[0]!; assert.equal(config.defaultAgent, 'claude');
+  const turns: AgentTurn[] = [], adapter: AgentAdapter = { async run(turn) { turns.push(turn); return { nativeId: turn.conversation.nativeId!, text: '', controlledOutput: true }; }, async interrupt() {}, async close() {} };
+  const manager = new SessionManager(config, { codex: adapter, claude: adapter }, { async sendText() {} }, { mergeDelayMs: 0 });
+  try {
+    await manager.handle({ id: initial.scopePrefix + 'first-after-reload', userId: user, channelId: initial.scopePrefix + 'private', text: 'continue', imagePaths: [] });
+    const deadline = Date.now() + 3000; while (!manager.isIdle()) { assert(Date.now() < deadline, 'manager must settle'); await new Promise<void>(resolve => setTimeout(resolve, 5)); }
+    assert.equal(turns.length, 1); assert.equal(turns[0]?.conversation.id, active.id); assert.equal(turns[0]?.conversation.agent, 'codex'); assert.equal(turns[0]?.conversation.nativeId, 'preserved-native-sol'); assert.equal(turns[0]?.conversation.model, 'saved-sol'); assert.equal(turns[0]?.conversation.effort, 'high');
+    assert.equal(manager.currentConversation(user)?.id, active.id);
+  } finally { await manager.close(); }
+  const after = new SessionStore(config.dataDir); try { assert.deepEqual(after.preferences('codex'), { model: 'saved-sol', effort: 'high' }); } finally { after.close(); }
 });
