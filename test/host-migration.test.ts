@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { loadConfig, loadHostConfig } from '../src/config.js';
 import { ensureHostSemanticData, migrateHostConfig, restoreHostMigration, relocateHostValue } from '../src/host-migration.js';
 import { SessionStore } from '../src/store.js';
+import { ControllerStore } from '../src/controller/store.js';
 import { SessionManager } from '../src/manager.js';
 import type { AgentAdapter, AgentTurn } from '../src/types.js';
 import { SessionHandoffs } from '../src/controller/handoff.js';
@@ -24,6 +25,35 @@ function fixture(t: TestContext, version = 3) {
   writeFileSync(config, JSON.stringify(raw)); return { root, local, data, config, raw };
 }
 function writeConfig(f: ReturnType<typeof fixture>, updates: Record<string, unknown>) { writeFileSync(f.config, JSON.stringify({ ...f.raw, ...updates })); }
+
+test('migration partitions completed workers and jobs with real local path arrays without decoding their strings again', async t => {
+  const f = fixture(t, 2); writeFileSync(join(f.data, 'disabled'), '');
+  const sessions = new SessionStore(f.data), controller = new ControllerStore(f.data), cases: Array<{ botId: string; userId: string; workerId: string; jobId: string; image: string }> = [];
+  for (const [botId, userId] of [[botA, userA], [botB, userB]] as const) {
+    const conversation = sessions.createConversation(botId + '|' + userId, 'codex', f.root); sessions.setActive(conversation.userId, conversation.id);
+    const image = join(f.data, 'attachments', botId === botA ? 'a.png' : 'b.png'); mkdirSync(join(f.data, 'attachments'), { recursive: true }); writeFileSync(image, botId);
+    const origin = { conversationId: conversation.id, userId: conversation.userId, channelId: botId + '|oc_private', originMessageId: botId + '|om_origin', nativeId: null, agent: 'codex' as const, cwd: f.root };
+    const workerId = 'worker-' + userId, jobId = 'job-' + userId, at = '2020-01-01T00:00:00.000Z';
+    const imagePaths = [image, String.raw`C:\SuchProject\AgentWorkspace\external.png`];
+    controller.addWorker({ id: workerId, origin, agent: 'codex', model: null, actualModel: null, effort: null, cwd: f.root, title: userId, nativeId: 'native-' + userId, imagePaths, wakeAllowed: false, createdAt: at, updatedAt: at });
+    controller.addJob({ id: jobId, workerId, origin, prompt: 'done', imagePaths, status: 'completed', taskId: null, result: 'preserved', cancelReason: null, wakeAllowed: false, createdAt: at, updatedAt: at });
+    cases.push({ botId, userId, workerId, jobId, image });
+  }
+  controller.close(); sessions.close();
+  const result = await migrateHostConfig(f.config, { dryRun: false, startupProfiles: ['feishu/a', 'feishu/b'] });
+  for (const own of cases) {
+    const bot = result.bots.find(bot => bot.botId === own.botId)!, migrated = new ControllerStore(bot.dataDir);
+    try {
+      const relocated = join(bot.dataDir, 'attachments', own.botId === botA ? 'a.png' : 'b.png');
+      assert.deepEqual(migrated.workers().map(worker => worker.id), [own.workerId]); assert.deepEqual(migrated.jobs().map(job => job.id), [own.jobId]);
+      assert.deepEqual(migrated.getJob(own.jobId)?.imagePaths, [relocated, String.raw`C:\SuchProject\AgentWorkspace\external.png`]);
+      assert.deepEqual(migrated.getWorker(own.workerId)?.imagePaths, [relocated, String.raw`C:\SuchProject\AgentWorkspace\external.png`]);
+      assert.equal(readFileSync(relocated, 'utf8'), own.botId); assert.equal(migrated.getJob(own.jobId)?.status, 'completed'); assert.equal(migrated.getJob(own.jobId)?.result, 'preserved');
+    } finally { migrated.close(); }
+  }
+  const source = new ControllerStore(f.data); try { assert.equal(source.jobs().length, 2); assert.equal(source.getJob(cases[0]!.jobId)?.imagePaths[0], cases[0]!.image); } finally { source.close(); }
+});
+
 
 test('v3 host loads one complete same-platform set with stable identity paths and separate context/cwd', t => {
   const f = fixture(t); writeConfig(f, { workingCwd: join(f.root, 'execution'), principals: [{ id: 'me', accounts: { [botA]: userA, [botB]: userB } }] });

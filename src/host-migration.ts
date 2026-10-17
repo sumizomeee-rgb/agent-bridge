@@ -86,9 +86,12 @@ function legacy(configPath: string, options: HostMigrationOptions): Legacy {
 }
 function jsonOwner(value: unknown, scope: string, exact = false): boolean {
   const object = typeof value === 'string' ? JSON.parse(value) : value;
-  if (!object || typeof object !== 'object') return false;
-  if (Array.isArray(object)) return object.some(item => jsonOwner(item, scope, exact));
-  return Object.entries(object).some(([key, item]) => key === 'userId' && typeof item === 'string' && (exact ? item === scope : item.startsWith(scope)) || item && typeof item === 'object' && jsonOwner(item, scope, exact));
+  function owns(item: unknown): boolean {
+    if (!item || typeof item !== 'object') return false;
+    if (Array.isArray(item)) return item.some(owns);
+    return Object.entries(item).some(([key, value]) => key === 'userId' && typeof value === 'string' && (exact ? value === scope : value.startsWith(scope)) || owns(value));
+  }
+  return owns(object);
 }
 function quiescenceBlockers(source: Legacy, stoppedJobIds = new Set<string>()): string[] {
   const blockers: string[] = [];
