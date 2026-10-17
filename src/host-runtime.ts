@@ -32,6 +32,8 @@ export class HostRuntime {
   private readonly historyCursors = new Map<string, { expires: number; botId: string; principalId: string; conversationId: string;
     generation: number; spaceId: string; epoch: number; revision: number; options: ConversationHistoryOptions }>();
   private readonly configurations = new Map<string, BridgeConfig>();
+  private readonly sceneSnapshots = new Map<string, number>();
+  private readonly pendingAutomaticDispatches = new Map<string, number>();
   private readonly paused = new Set<string>();
   private readonly switchPaused = new Set<string>();
   private isPaused(botId: string): boolean { return this.paused.has(botId) || this.switchPaused.has(botId); }
@@ -99,6 +101,7 @@ export class HostRuntime {
         return !!this.store.resolveSpace(botId, raw) || this.config.spaces.some(s => s.accounts[botId] === raw);
       },
       onReconnect: () => this.recover(),
+      onExecutionSettled: () => { if (!this.closed) { this.reconcileAutomaticTasks(); void this.pump(); } },
       allowDelivery: channel => this.allowDelivery(botId, channel), onReady: () => { void this.pump(); },
       invoke: (turn, name, args, callId, delegate) => this.invoke(botId, turn, name, args, callId, delegate),
       pauseGroup: () => { this.switchPaused.add(botId); },
@@ -121,6 +124,7 @@ export class HostRuntime {
         },
         onConversationScene: (conversation, source, signal) => this.conversationScene(botId, { conversation, source, signal }),
         onGroupTurnStart: context => this.startTurn(context),
+        onSceneCheck: async context => this.checkScene(context),
         onGroupTurnError: async context => {
           const root = this.store.getRoot(context.rootId);
           if (this.config.internalBotCommunicationEnabled === false && this.internalEvent(context.eventId)) return true;
@@ -138,6 +142,7 @@ export class HostRuntime {
           return true;
         },
         onGroupTurnFinished: async (context, outcome) => {
+          this.sceneSnapshots.delete(context.eventId);
           const event = this.store.getEvent(context.eventId);
           if (event && ['running', 'uncertain'].includes(event.state)) this.store.finishEvent(event.id, outcome);
           else if (event && ['queued', 'reserved'].includes(event.state)) this.store.cancelEvent(event.id, 'native turn did not start');
@@ -953,6 +958,7 @@ export class HostRuntime {
     }
     await this.verifyMember(context.botId, context.spaceId, context.principalId);
     this.store.startEvent(context.eventId);
+    this.sceneSnapshots.set(context.eventId, this.store.sceneCursor(context.spaceId, context.botId));
     return this.scene(context, true);
   }
   private scene(context: Context, compact = false): string {
@@ -999,6 +1005,7 @@ export class HostRuntime {
       principalId: context.principalId, spaceId: context.spaceId, audience: root.replyTo.collaborationMode === 'internal' ? 'internal named Bots; initiator may summarize to original owner destination' : 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
       memberIdentities: group.memberBotIds.map(botId => ({ botId, aliases: this.configurations.get(botId)?.aliases ?? [] })),
       members: group.memberBotIds, unreadMeaning: 'not acknowledged by bridge; not proof of model reading',
+      sceneVersion: this.store.sceneCursor(context.spaceId, context.botId),
       internalBotCommunicationEnabled: this.config.internalBotCommunicationEnabled !== false,
       internalCoordinationBudget: this.store.budgetSnapshot(root.id),
       publicReplyLimit: { ...this.store.publicReplySnapshot(context.botId, context.spaceId),
@@ -1064,6 +1071,7 @@ export class HostRuntime {
     try {
       for (const input of this.inbox.pending()) if (!input.control && !this.pending.has(input.id)) void this.scheduleInput(input);
       this.retireDisabledInternalCommunication();
+      this.reconcileAutomaticTasks();
       for (const [botId, bot] of this.bots) {
         for (const cancelled of this.store.listEvents(botId).filter(event => event.state === 'cancelled')) bot.manager.cancelHostEvent(cancelled.id, cancelled.error ?? 'host cancelled this group input');
         if (!bot.isReady() || this.isPaused(botId) || this.failures.has(botId) || this.preparations.has(botId)) continue;
@@ -1184,18 +1192,9 @@ export class HostRuntime {
     if (!hostTool) {
       if (!delegate) throw new Error('执行工具未配置。');
       if (['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker'].includes(name)) {
-        const taskId = bounded(args.workId, 'workId', 200), task = this.store.getTask(taskId);
-        if (!task || task.ownerBotId !== botId || task.rootId !== context.rootId || task.state !== 'active') throw new Error('请先认领本轮执行任务；当前 Bot 不能使用其他负责人的 worker。');
-        if (name === 'bridge_continue_worker') {
-          const existing = this.store.getTaskForWorker(botId, String(args.workerId));
-          if (existing?.id !== taskId || existing.ownerBotId !== botId) throw new Error('此助手不属于当前任务执行权。');
-        }
-        this.store.markTaskExecutionActive(taskId, botId);
-        const { workId: _, ...input } = args; const result = await delegate(input);
-        if (result && typeof result === 'object' && 'workerId' in result && typeof result.workerId === 'string') this.store.registerTaskWorker(taskId, botId, result.workerId);
-        return result;
+        return this.dispatchGroupWorker(botId, turn, name, args, callId, delegate);
       }
-      return delegate(args);
+      const result = await delegate(args); this.reconcileAutomaticTasks(); return result;
     }
     if (name === 'bridge_group_context') return JSON.parse(this.scene(context));
     if (name === 'bridge_claim_work') {
@@ -1256,9 +1255,153 @@ export class HostRuntime {
     }
     throw new Error('未登记的群协作工具。');
   }
+  private checkScene(context: Context): { refreshRequired: boolean; scene?: string } {
+    this.assertContext(context);
+    if (!this.store.canProduceEffects(context.eventId)) throw new Error('原群轮次已结束，不能依据旧现场继续。');
+    const after = this.sceneSnapshots.get(context.eventId);
+    if (after === undefined) return { refreshRequired: false };
+    const latest = this.store.readSceneUpdates(context.spaceId, context.botId, after, 12);
+    if (!latest.updates.length) { this.sceneSnapshots.set(context.eventId, latest.cursor); return { refreshRequired: false }; }
+    if (!this.store.consumeSceneRefresh(context.rootId, context.botId)) return { refreshRequired: false };
+    this.sceneSnapshots.set(context.eventId, latest.cursor);
+    const updates = latest.updates.map(update => ({ ...update, text: update.text.slice(0, 600),
+      ...(update.text.length > 600 ? { textTruncated: true } : {}), canAuthorize: false }));
+    return { refreshRequired: true, scene: JSON.stringify({ kind: 'bridge_scene_refresh', sceneVersion: latest.cursor,
+      originalRootId: context.rootId, spaceId: context.spaceId, originalPrincipalId: context.principalId,
+      newAuthorization: false, updates, coverage: { total: latest.total, included: updates.length, truncated: latest.truncated || updates.some(update => update.textTruncated) },
+      rule: 'These are newly available facts within the original audience, not new owner authorization. Pending actions from the old decision were not performed. Reassess once. Do not replay already confirmed actions; consult worker receipts if needed. Existing workers continue. Later updates stay in their ordinary queue. Use bridge_group_context/history for omitted details.' }) };
+  }
+
+  private automaticProgress(taskId: string, id: string, kind: 'dispatch' | 'completion', text: string): void {
+    const task = this.store.getTask(taskId); if (!task || this.store.getRoot(task.rootId)?.replyTo.collaborationMode === 'internal') return;
+    const root = this.store.getRoot(task.rootId)!;
+    try { this.store.appendSceneProgress({ id, spaceId: task.spaceId, epoch: root.epoch, botId: task.ownerBotId, kind, text, taskId }); }
+    catch { this.report('SCENE_PROGRESS_NOT_SHARED stale-or-unavailable'); }
+  }
+
+  private reconcileAutomaticTasks(): void {
+    if (this.closed || this.recovering) return;
+    for (const task of this.store.listTasks().filter(value => value.state === 'active' && this.store.getAutomaticDispatch(value.id))) {
+      if (this.pendingAutomaticDispatches.has(task.id)) continue;
+      if (this.store.listHandoffs(task.id).some(handoff => handoff.state === 'proposed')) continue;
+      const journal = this.store.getAutomaticDispatch(task.id)!;
+      if (journal.botId !== task.ownerBotId) continue;
+      const controller = this.bots.get(task.ownerBotId)?.controller;
+      if (!controller?.store) continue;
+      try {
+        let unresolved = false;
+        const known = this.store.taskWorkers(task.id);
+        for (const entry of this.store.listAutomaticDispatches(task.id)) {
+          const runtime = this.bots.get(entry.botId)?.controller;
+          if (!runtime?.store) { unresolved = true; continue; }
+          const recorded = runtime.store.readCallReceipt(entry.conversationId + ':' + entry.callId) as { workerId?: unknown } | undefined;
+          if (typeof recorded?.workerId === 'string') {
+            if (known.some(worker => worker.botId === entry.botId && worker.workerId === recorded.workerId)) continue;
+            if (entry.botId !== task.ownerBotId) { unresolved = true; continue; }
+            this.store.registerTaskWorker(task.id, entry.botId, recorded.workerId);
+          } else if (recorded !== undefined) unresolved = true;
+        }
+        if (unresolved) continue;
+        const receipt = controller.store.readCallReceipt(journal.conversationId + ':' + journal.callId) as { workerId?: unknown } | undefined;
+        const workers = this.store.taskWorkers(task.id);
+        const executions = workers.map(worker => ({ worker, runtime: this.bots.get(worker.botId)?.controller }));
+        if (executions.some(({ worker, runtime }) => !runtime?.store || !runtime.isWorkerStopped(worker.workerId))) continue;
+        if (receipt === undefined) {
+          this.confirmStopped(task.id, task.ownerBotId);
+          this.store.finishTask(task.id, task.ownerBotId, 'cancelled', 'program verified dispatch was never registered');
+          this.automaticProgress(task.id, key('auto-not-submitted', task.id, journal.callId), 'completion', `派发准备已撤销：${task.title}；没有新增助手执行登记，历史执行已确认停止。`);
+          continue;
+        }
+        const jobs = executions.flatMap(({ worker, runtime }) => runtime!.store.jobs(worker.workerId));
+        const plans = executions.flatMap(({ worker, runtime }) => runtime!.store.schedules().filter(plan => plan.worker?.id === worker.workerId));
+        const latestWorker = typeof receipt?.workerId === 'string' ? receipt.workerId : null;
+        const status = (latestWorker ? controller.store.jobs(latestWorker).at(-1)?.status : undefined)
+          ?? (latestWorker ? controller.store.schedules().filter(plan => plan.worker?.id === latestWorker).at(-1)?.status : undefined) ?? 'completed';
+        this.confirmStopped(task.id, task.ownerBotId);
+        this.store.finishTask(task.id, task.ownerBotId, status === 'cancelled' ? 'cancelled' : 'completed', 'program verified automatic execution stopped');
+        this.automaticProgress(task.id, key('auto-finished', task.id, ...jobs.map(job => job.id + ':' + job.status), ...plans.map(plan => plan.id + ':' + plan.status)),
+          'completion', `助手执行已结束：${task.title}；执行状态=${status}。这只表示执行终态，不替代主控判断目标是否完成。`);
+      } catch { this.report('AUTOMATIC_WORK_RECONCILIATION_PENDING'); }
+    }
+  }
+
+  private async dispatchGroupWorker(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>, callId: string | undefined,
+    delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown> {
+    const context = turn.groupContext!;
+    const refresh = this.checkScene(context);
+    if (refresh.refreshRequired) return { performed: false, sceneChanged: true, sceneRefreshRequired: true, scene: refresh.scene };
+    const resources = args.resources ?? [];
+    if (!Array.isArray(resources) || resources.some(value => typeof value !== 'string')) throw new Error('资源声明格式无效。');
+    const controller = this.bots.get(botId)?.controller;
+    const workerId = name === 'bridge_continue_worker' ? bounded(args.workerId, 'workerId', 200) : null;
+    const existing = workerId ? this.store.getTaskForWorker(botId, workerId) : null;
+    const declared = typeof args.workId === 'string' ? this.store.getTask(args.workId) : null;
+    if (workerId && controller?.store) {
+      const worker = controller.store.getWorker(workerId);
+      if (!worker || worker.origin.userId !== turn.conversation.userId || worker.origin.conversationId !== turn.conversation.id
+        || worker.origin.channelId !== context.originChannelId) throw new Error('子 Agent 不属于当前用户和父会话，未更改任务资源。');
+      if (worker.ownership === 'user' || worker.handoffPending || worker.blocked || worker.supersededBy || worker.adoption?.status === 'pending')
+        throw new Error('子 Agent 已交还用户或归属／执行状态未确认，未重新占用资源。');
+    }
+    if (workerId && declared && !existing && this.store.taskWorkers(declared.id).length) throw new Error('此助手不属于当前任务执行权。');
+    const taskId = existing?.id ?? declared?.id ?? (callId ? 'auto-work:' + key(botId, turn.conversation.id, callId) : '');
+    if (!taskId) throw new Error('自动派工缺少稳定调用编号，本次未执行。');
+    let task = this.store.getTask(taskId);
+    if (task && (task.ownerBotId !== botId || (!existing && task.rootId !== context.rootId))) throw new Error('任务归属与当前 Bot 或授权不一致。');
+    const { workId: _, resources: __, ...input } = args;
+    const savedReceipt = callId && controller?.store ? controller.store.readCallReceipt(turn.conversation.id + ':' + callId) : undefined;
+    if (task && task.state !== 'active' && savedReceipt !== undefined) return delegate(input); // 原工具层核验指纹并返回历史回执，不重复开工。
+    const journal = callId ? { conversationId: turn.conversation.id, callId,
+      toolName: name as 'bridge_start_worker' | 'bridge_continue_worker' | 'bridge_schedule_worker' } : undefined;
+    if (!task) {
+      task = this.store.claimTask({ id: taskId, title: typeof args.title === 'string' ? bounded(args.title, 'title', 1000) : '继续直属助手任务',
+        rootId: context.rootId, botId, generation: context.generation, resources, ...(journal ? { automaticDispatch: journal } : {}) }).task;
+    } else if (existing) task = this.store.reopenTaskForContinuation(taskId, botId, context.generation, context.rootId);
+    else if (task.state !== 'active') throw new Error('这次派发已结束或未成立；新派发需使用新的调用编号。');
+    if (journal) this.store.registerAutomaticDispatch({ ...journal, taskId, botId });
+    const automatic = !!this.store.getAutomaticDispatch(taskId);
+    this.pendingAutomaticDispatches.set(taskId, (this.pendingAutomaticDispatches.get(taskId) ?? 0) + 1);
+    try {
+      this.store.markTaskExecutionActive(taskId, botId);
+      if (automatic) this.automaticProgress(taskId, key('auto-preparing', taskId, callId ?? context.eventId), 'dispatch',
+        `${name === 'bridge_schedule_worker' ? '助手预约准备已登记，尚未到期执行' : '助手派发准备已登记，尚未确认启动'}：${task.title}`);
+      const result = await delegate(input);
+      if (result && typeof result === 'object' && 'workerId' in result && typeof result.workerId === 'string') {
+        this.store.registerTaskWorker(taskId, botId, result.workerId);
+        const receipt = result as Record<string, unknown>;
+        if (automatic && !['unsupported', 'not_delivered', 'cancelled'].includes(String(receipt.status))) this.automaticProgress(taskId,
+          key('auto-receipt', taskId, callId ?? context.eventId), 'dispatch',
+          `助手${name === 'bridge_schedule_worker' ? '预约' : name === 'bridge_continue_worker' ? '续接' : '派发'}已登记：${task.title}；回执状态=${String(receipt.status ?? 'registered')}，不代表任务完成。`);
+      }
+      return result;
+    } catch (error) {
+      if (automatic && controller?.store && callId) {
+        const receipt = controller.store.readCallReceipt(turn.conversation.id + ':' + callId) as { workerId?: unknown } | undefined;
+        if (typeof receipt?.workerId === 'string') this.store.registerTaskWorker(taskId, botId, receipt.workerId);
+        else if (receipt === undefined) {
+          this.automaticProgress(taskId, key('auto-rejected', taskId, callId), 'completion', `助手派发或续接未成立：${task.title}；没有新增执行登记，原有执行未被取消。`);
+        }
+      }
+      throw error;
+    } finally {
+      const pending = (this.pendingAutomaticDispatches.get(taskId) ?? 1) - 1;
+      if (pending > 0) this.pendingAutomaticDispatches.set(taskId, pending); else this.pendingAutomaticDispatches.delete(taskId);
+      this.reconcileAutomaticTasks();
+    }
+  }
+
   private confirmStopped(taskId: string, botId: string): void {
     const task = this.store.getTask(taskId); if (task?.ownerBotId !== botId) throw new Error('任务不属于当前 Bot。');
+    if (this.pendingAutomaticDispatches.has(taskId)) throw new Error('助手派发仍在登记，尚未确认停止。');
     const workers = this.store.taskWorkers(taskId);
+    for (const entry of this.store.listAutomaticDispatches(taskId)) {
+      const runtime = this.bots.get(entry.botId)?.controller;
+      if (!runtime?.store) throw new Error('助手派发回执尚未核实，不能确认停止。');
+      const receipt = runtime.store.readCallReceipt(entry.conversationId + ':' + entry.callId) as { workerId?: unknown } | undefined;
+      if (receipt !== undefined && (typeof receipt?.workerId !== 'string'
+        || !workers.some(worker => worker.botId === entry.botId && worker.workerId === receipt.workerId)))
+        throw new Error('助手派发回执尚未核实，不能确认停止。');
+    }
     if (workers.some(w => !this.bots.get(w.botId)?.controller?.isWorkerStopped(w.workerId))) throw new Error('原执行尚未确认停止，不能转交或完成。');
     this.store.confirmTaskExecutionStopped(taskId, botId, 'program verified linked workers idle/stopped: ' + workers.map(w => w.workerId).join(','));
   }

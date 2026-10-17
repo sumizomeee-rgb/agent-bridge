@@ -862,7 +862,7 @@ export class ControllerRuntime {
     const state: ActiveWorker = { job, abort: new AbortController(), done: Promise.resolve(), supplements: Promise.resolve(), ready: false, executing: true, closing: false, recovering };
     this.active.set(workerId, state);
     state.done = Promise.resolve().then(() => this.execute(workerId, state)).catch(error => this.error(error)).finally(() => {
-      this.active.delete(workerId); this.kick(workerId);
+      this.active.delete(workerId); this.kick(workerId); this.callbacks.onExecutionSettled?.();
     });
   }
   private register(worker: ControllerWorker, job: ControllerJob): string {

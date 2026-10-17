@@ -67,6 +67,8 @@ export interface ControllerRuntimeCallbacks {
   onCountChanged?: (conversationId: string, count: number) => void | Promise<void>;
   onWorkCountsChanged?: (counts: WorkCounts) => void | Promise<void>;
   onError?: (error: unknown) => void;
+  /** 在执行占用真正释放后通知宿主对账，不产生模型回合。 */
+  onExecutionSettled?: () => void;
   /** Test clock; production uses real UTC timestamps. */
   now?: () => number;
   pollIntervalMs?: number;

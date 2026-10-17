@@ -49,7 +49,7 @@ test('关闭后台 Bot 互通后原生工具清单只允许公开协作，缓存
   for (const name of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff']) assert.equal(tools.some(tool => tool.name === name), false);
   const collaboration = tools.find(tool => tool.name === 'bridge_start_collaboration')!;
   assert.deepEqual(((collaboration.inputSchema.properties as JsonObject).mode as JsonObject).enum, ['public']);
-  for (const name of ['bridge_silent', 'bridge_start_worker', 'bridge_claim_work', 'bridge_send_message']) assert.equal(tools.some(tool => tool.name === name), true);
+  for (const name of ['bridge_silent', 'bridge_start_worker', 'bridge_send_message']) assert.equal(tools.some(tool => tool.name === name), true);
   for (const [index, name] of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff', 'bridge_start_collaboration'].entries()) {
     const id = 300 + index;
     f.protocol.emit({ id, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'cached-' + name,

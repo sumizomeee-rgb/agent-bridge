@@ -51,6 +51,16 @@ export interface HostPublicMessage {
   sequence: number; id: string; rootId: string; spaceId: string; epoch: number;
   authorBotId: string | null; principalId: string; text: string; attachments: unknown[];
 }
+export interface HostSceneUpdate {
+  sequence: number; id: string; spaceId: string; epoch: number;
+  kind: 'public' | 'context' | 'dispatch' | 'completion'; sourceBotId: string | null;
+  text: string; taskId?: string; canAuthorize: false; textTruncated?: true;
+  source: { type: 'bot-public' | 'human-public' | 'group-evidence' | 'bridge-execution';
+    messageId?: string; authorType?: string; userId?: string; authorName?: string };
+}
+export interface HostSceneUpdates {
+  cursor: number; updates: HostSceneUpdate[]; total: number; truncated: boolean;
+}
 export interface HostOutbox {
   id: string; eventId: string; botId: string; generation: number; rootId: string;
   audience: 'group' | 'direct' | 'private'; targetBotIds: string[]; replyTo: HostReplyAddress;
@@ -74,6 +84,10 @@ export interface HostTask {
   id: string; rootId: string; spaceId: string; ownerBotId: string; generation: number;
   title: string; resources: string[]; replyTo: HostReplyAddress;
   state: 'active' | 'completed' | 'cancelled'; executionStoppedProof: string | null;
+}
+export interface HostAutomaticDispatch {
+  taskId: string; botId: string; conversationId: string; callId: string;
+  toolName: 'bridge_start_worker' | 'bridge_continue_worker' | 'bridge_schedule_worker';
 }
 export interface HostHandoff {
   id: string; taskId: string; fromBotId: string; toBotId: string; fromGeneration: number; toGeneration: number;
@@ -223,6 +237,13 @@ export class HostStore {
         source_json TEXT NOT NULL,text TEXT NOT NULL,attachments_json TEXT NOT NULL,can_authorize INTEGER NOT NULL,received_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS host_context_cursors(
         bot_id TEXT NOT NULL,space_id TEXT NOT NULL,epoch INTEGER NOT NULL,cursor INTEGER NOT NULL,PRIMARY KEY(bot_id,space_id,epoch));
+      CREATE TABLE IF NOT EXISTS host_scene_log(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,space_id TEXT NOT NULL,epoch INTEGER NOT NULL,
+        kind TEXT NOT NULL,source_bot_id TEXT,text TEXT NOT NULL,task_id TEXT,source_json TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS host_scene_space ON host_scene_log(space_id,epoch,sequence);
+      CREATE TABLE IF NOT EXISTS host_scene_refreshes(
+        causal_key TEXT NOT NULL,bot_id TEXT NOT NULL,principal_id TEXT NOT NULL,space_id TEXT NOT NULL,epoch INTEGER NOT NULL,
+        PRIMARY KEY(causal_key,bot_id));
       CREATE TABLE IF NOT EXISTS host_public_cursors(
         bot_id TEXT NOT NULL, space_id TEXT NOT NULL, epoch INTEGER NOT NULL, cursor INTEGER NOT NULL,
         PRIMARY KEY(bot_id,space_id,epoch));
@@ -241,6 +262,11 @@ export class HostStore {
       CREATE TABLE IF NOT EXISTS host_task_workers(
         bot_id TEXT NOT NULL REFERENCES host_bots(bot_id), worker_id TEXT NOT NULL,
         task_id TEXT NOT NULL REFERENCES host_tasks(id), PRIMARY KEY(bot_id,worker_id));
+      CREATE TABLE IF NOT EXISTS host_automatic_dispatches(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES host_tasks(id),
+        bot_id TEXT NOT NULL,conversation_id TEXT NOT NULL,call_id TEXT NOT NULL,tool_name TEXT NOT NULL,
+        UNIQUE(task_id,conversation_id,call_id));
+      CREATE UNIQUE INDEX IF NOT EXISTS host_automatic_dispatch_call ON host_automatic_dispatches(bot_id,conversation_id,call_id);
       CREATE TABLE IF NOT EXISTS host_handoffs(
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES host_tasks(id), from_bot_id TEXT NOT NULL, to_bot_id TEXT NOT NULL,
         from_generation INTEGER NOT NULL, to_generation INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'proposed',
@@ -859,6 +885,10 @@ export class HostStore {
           throw new HostStateError('conflict', 'Context message identity reused');
       } else this.run('INSERT INTO host_context_records(id,space_id,epoch,source_json,text,attachments_json,can_authorize,received_at) VALUES(?,?,?,?,?,?,?,?)',
         input.id, input.spaceId, input.epoch, JSON.stringify(value.source), input.text, JSON.stringify(value.attachments), Number(value.canAuthorize), new Date().toISOString());
+      this.appendSceneInner({ id: 'context:' + input.id, spaceId: input.spaceId, epoch: input.epoch,
+        kind: 'context', sourceBotId: null, text: input.text,
+        source: { type: 'group-evidence', messageId: input.source.messageId, authorType: input.source.authorType,
+          userId: input.source.userId, ...(input.source.authorName ? { authorName: input.source.authorName } : {}) } });
       return this.contextRecord(this.one('SELECT * FROM host_context_records WHERE id=?', input.id)!);
     });
   }
@@ -882,6 +912,92 @@ export class HostStore {
     this.run('INSERT INTO host_context_cursors(bot_id,space_id,epoch,cursor) VALUES(?,?,?,?) ON CONFLICT(bot_id,space_id,epoch) DO UPDATE SET cursor=MAX(cursor,excluded.cursor)', botId, spaceId, epoch, cursor);
   }
 
+  private appendSceneInner(input: Omit<HostSceneUpdate, 'sequence' | 'canAuthorize' | 'textTruncated'>): HostSceneUpdate {
+    const previous = this.one('SELECT * FROM host_scene_log WHERE id=?', input.id);
+    if (previous) {
+      if (previous.space_id !== input.spaceId || Number(previous.epoch) !== input.epoch || previous.kind !== input.kind
+        || previous.source_bot_id !== input.sourceBotId || previous.text !== input.text || previous.task_id !== (input.taskId ?? null)
+        || !same(parse<unknown>(previous.source_json), input.source)) throw new HostStateError('conflict', 'Scene change identity reused');
+      return this.sceneUpdate(previous);
+    }
+    this.run('INSERT INTO host_scene_log(id,space_id,epoch,kind,source_bot_id,text,task_id,source_json) VALUES(?,?,?,?,?,?,?,?)',
+      input.id, input.spaceId, input.epoch, input.kind, input.sourceBotId, input.text, input.taskId ?? null, JSON.stringify(input.source));
+    return this.sceneUpdate(this.one('SELECT * FROM host_scene_log WHERE id=?', input.id)!);
+  }
+  private appendPublicSceneInner(id: string, spaceId: string, epoch: number, sourceBotId: string | null, text: string): void {
+    this.appendSceneInner({ id: 'public:' + id, spaceId, epoch, kind: 'public', sourceBotId, text,
+      source: { type: sourceBotId === null ? 'human-public' : 'bot-public', messageId: id } });
+  }
+  private sceneUpdate(row: Row): HostSceneUpdate {
+    const text = String(row.text), bounded = text.slice(0, 1600);
+    return { sequence: Number(row.sequence), id: String(row.id), spaceId: String(row.space_id), epoch: Number(row.epoch),
+      kind: String(row.kind) as HostSceneUpdate['kind'], sourceBotId: row.source_bot_id === null ? null : String(row.source_bot_id),
+      text: bounded, ...(text.length > bounded.length ? { textTruncated: true as const } : {}),
+      ...(row.task_id === null ? {} : { taskId: String(row.task_id) }),
+      source: parse<HostSceneUpdate['source']>(row.source_json), canAuthorize: false };
+  }
+  /** Only public execution facts belong here; private consultations never become group evidence. */
+  appendSceneProgress(input: { id: string; spaceId: string; epoch: number; botId: string;
+    kind: 'dispatch' | 'completion'; text: string; taskId?: string }): HostSceneUpdate {
+    return this.atomic(() => {
+      required(input.id, 'Scene progress id');
+      if (input.kind !== 'dispatch' && input.kind !== 'completion') throw new HostStateError('conflict', 'Unknown execution scene change');
+      const group = this.getGroup(input.spaceId); if (!group) throw new HostStateError('not-found', 'Unknown group');
+      this.assertMember(input.spaceId, input.botId, group.principalId, input.epoch);
+      if (input.taskId) {
+        const value = this.getTask(input.taskId); if (!value) throw new HostStateError('not-found', 'Unknown scene task');
+        const source = this.mustRoot(value.rootId);
+        if (value.ownerBotId !== input.botId || value.spaceId !== input.spaceId || source.epoch !== input.epoch)
+          throw new HostStateError('forbidden', 'Execution scene change belongs to another task owner or group');
+        if (source.replyTo.collaborationMode === 'internal') throw new HostStateError('forbidden', 'Private task cannot enter the public scene');
+      }
+      return this.appendSceneInner({ id: 'progress:' + input.id, spaceId: input.spaceId, epoch: input.epoch, kind: input.kind,
+        sourceBotId: input.botId, text: input.text, ...(input.taskId ? { taskId: input.taskId } : {}), source: { type: 'bridge-execution' } });
+    });
+  }
+  private sceneCursorInner(spaceId: string, epoch: number): number {
+    return Number(this.one('SELECT MAX(sequence) AS cursor FROM host_scene_log WHERE space_id=? AND epoch=?', spaceId, epoch)?.cursor ?? 0);
+  }
+  sceneCursor(spaceId: string, botId: string): number {
+    const group = this.getGroup(spaceId); if (!group) throw new HostStateError('not-found', 'Unknown group');
+    this.assertMember(spaceId, botId, group.principalId, group.epoch);
+    return this.sceneCursorInner(spaceId, group.epoch);
+  }
+  readSceneUpdates(spaceId: string, botId: string, after: number, limit = 20): HostSceneUpdates {
+    return this.atomic(() => {
+      const group = this.getGroup(spaceId); if (!group) throw new HostStateError('not-found', 'Unknown group');
+      this.assertMember(spaceId, botId, group.principalId, group.epoch);
+      if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100)
+        throw new HostStateError('conflict', 'Scene cursor must be nonnegative and limit must be 1..100');
+      const cursor = this.sceneCursorInner(spaceId, group.epoch);
+      // Own synchronous effects were already known to this controller. An asynchronous completion was not.
+      const where = "space_id=? AND epoch=? AND sequence>? AND NOT (source_bot_id IS ? AND kind IN ('public','dispatch'))";
+      const args: SQLInputValue[] = [spaceId, group.epoch, after, botId];
+      const total = Number(this.one(`SELECT COUNT(*) AS n FROM host_scene_log WHERE ${where}`, ...args)!.n);
+      const updates = this.rows(`SELECT * FROM (SELECT * FROM host_scene_log WHERE ${where} ORDER BY sequence DESC LIMIT ?) ORDER BY sequence`,
+        ...args, limit).map(row => this.sceneUpdate(row));
+      return { cursor, updates, total, truncated: total > updates.length || updates.some(value => value.textTruncated) };
+    });
+  }
+  /** One extra model judgment per Bot and original owner request, shared by derived collaboration roots. */
+  consumeSceneRefresh(rootId: string, botId: string): boolean {
+    return this.atomic(() => {
+      const source = this.mustRoot(rootId);
+      this.assertCollaborationRoot(source);
+      this.assertMember(source.spaceId, botId, source.principalId, source.epoch);
+      this.assertCurrent(botId, source.generations[botId] ?? 0);
+      const key = source.replyTo.collaborationBudgetKey ?? source.id;
+      const original = this.getRoot(key);
+      if (original && original.principalId !== source.principalId)
+        throw new HostStateError('forbidden', 'Scene refresh causal key belongs to another authorization');
+      const previous = this.one('SELECT * FROM host_scene_refreshes WHERE causal_key=? AND bot_id=?', key, botId);
+      if (previous && previous.principal_id !== source.principalId)
+        throw new HostStateError('forbidden', 'Scene refresh budget cannot cross group authorization');
+      return this.run('INSERT OR IGNORE INTO host_scene_refreshes(causal_key,bot_id,principal_id,space_id,epoch) VALUES(?,?,?,?,?)',
+        key, botId, source.principalId, source.spaceId, source.epoch) === 1;
+    });
+  }
+
   appendPublic(input: { id: string; rootId: string; authorBotId?: string; principalId: string; text: string; attachments?: unknown[] }): HostPublicMessage {
     return this.atomic(() => {
       const source = this.mustRoot(input.rootId);
@@ -892,6 +1008,7 @@ export class HostStore {
         if (old.root_id !== input.rootId || old.author_bot_id !== (input.authorBotId ?? null) || old.text !== input.text || !same(parse<unknown[]>(old.attachments_json), input.attachments ?? [])) throw new HostStateError('conflict', 'Public message identity reused');
       } else this.run('INSERT INTO host_public_log(id,root_id,space_id,epoch,author_bot_id,principal_id,text,attachments_json) VALUES (?,?,?,?,?,?,?,?)',
         input.id, source.id, source.spaceId, source.epoch, input.authorBotId ?? null, input.principalId, input.text, JSON.stringify(input.attachments ?? []));
+      this.appendPublicSceneInner(input.id, source.spaceId, source.epoch, input.authorBotId ?? null, input.text);
       return this.publicMessage(this.one('SELECT * FROM host_public_log WHERE id=?', input.id)!);
     });
   }
@@ -906,6 +1023,7 @@ export class HostStore {
         if (previous.root_id !== source.id || previous.author_bot_id !== delivery.botId || previous.text !== text || !same(parse<unknown[]>(previous.attachments_json), attachments)) throw new HostStateError('conflict', 'Public message identity reused');
       } else this.run('INSERT INTO host_public_log(id,root_id,space_id,epoch,author_bot_id,principal_id,text,attachments_json) VALUES (?,?,?,?,?,?,?,?)',
         messageId, source.id, source.spaceId, source.epoch, delivery.botId, source.principalId, text, JSON.stringify(attachments));
+      this.appendPublicSceneInner(messageId, source.spaceId, source.epoch, delivery.botId, text);
       return this.publicMessage(this.one('SELECT * FROM host_public_log WHERE id=?', messageId)!);
     });
   }
@@ -1005,6 +1123,7 @@ export class HostStore {
       this.run('INSERT INTO host_public_log(id,root_id,space_id,epoch,author_bot_id,principal_id,text,attachments_json) VALUES (?,?,?,?,?,?,?,?)',
         publicId, rootId, target.spaceId!, target.epoch!, source.botId, source.principalId, delivery.payload.text,
         JSON.stringify(delivery.payload.paths.map(path => ({ sourceBotId: source.botId, path }))));
+      this.appendPublicSceneInner(publicId, target.spaceId!, target.epoch!, source.botId, delivery.payload.text);
       return this.publicMessage(this.one('SELECT * FROM host_public_log WHERE id=?', publicId)!);
     });
   }
@@ -1071,7 +1190,8 @@ export class HostStore {
     });
   }
 
-  claimTask(input: { id: string; rootId: string; botId: string; generation: number; title: string; resources?: readonly string[] }): { claimed: boolean; task: HostTask } {
+  claimTask(input: { id: string; rootId: string; botId: string; generation: number; title: string; resources?: readonly string[];
+    automaticDispatch?: Omit<HostAutomaticDispatch, 'taskId' | 'botId'> }): { claimed: boolean; task: HostTask } {
     return this.atomic(() => {
       const source = this.mustRoot(input.rootId);
       this.assertMember(source.spaceId, input.botId, source.principalId, source.epoch);
@@ -1081,6 +1201,7 @@ export class HostStore {
       const previous = this.getTask(input.id);
       if (previous) {
         if (previous.rootId !== input.rootId) throw new HostStateError('conflict', 'Task identity cannot cross root authorization');
+        if (input.automaticDispatch) this.registerAutomaticDispatchInner({ ...input.automaticDispatch, taskId: input.id, botId: input.botId });
         return { claimed: false, task: previous };
       }
       const resources = sorted(input.resources ?? []);
@@ -1092,11 +1213,51 @@ export class HostStore {
       this.run('INSERT INTO host_tasks(id,root_id,space_id,owner_bot_id,generation,title,resources_json,reply_json) VALUES (?,?,?,?,?,?,?,?)',
         input.id, input.rootId, source.spaceId, input.botId, input.generation, input.title, JSON.stringify(resources), JSON.stringify(source.replyTo));
       for (const resource of resources) this.run('INSERT INTO host_resource_claims(resource,task_id) VALUES (?,?)', resource, input.id);
+      if (input.automaticDispatch) this.registerAutomaticDispatchInner({ ...input.automaticDispatch, taskId: input.id, botId: input.botId });
       return { claimed: true, task: this.getTask(input.id)! };
     });
   }
   getTask(id: string): HostTask | null { const row = this.one('SELECT * FROM host_tasks WHERE id=?', id); return row ? task(row) : null; }
   listTasks(spaceId?: string): HostTask[] { return this.rows(`SELECT * FROM host_tasks ${spaceId ? 'WHERE space_id=?' : ''} ORDER BY rowid`, ...(spaceId ? [spaceId] : [])).map(task); }
+  registerAutomaticDispatch(input: HostAutomaticDispatch): HostAutomaticDispatch {
+    return this.atomic(() => this.registerAutomaticDispatchInner(input));
+  }
+  private registerAutomaticDispatchInner(input: HostAutomaticDispatch): HostAutomaticDispatch {
+      required(input.conversationId, 'Automatic dispatch conversation'); required(input.callId, 'Automatic dispatch call id');
+      if (!['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker'].includes(input.toolName))
+        throw new HostStateError('conflict', 'Unknown automatic dispatch tool');
+      const value = this.getTask(input.taskId);
+      if (!value || value.ownerBotId !== input.botId)
+        throw new HostStateError('forbidden', 'Automatic dispatch does not belong to this bot task');
+      const sameCall = this.one('SELECT task_id FROM host_automatic_dispatches WHERE bot_id=? AND conversation_id=? AND call_id=?',
+        input.botId, input.conversationId, input.callId);
+      if (sameCall && sameCall.task_id !== input.taskId) throw new HostStateError('conflict', 'Automatic dispatch call belongs to another task');
+      const previous = this.one('SELECT * FROM host_automatic_dispatches WHERE task_id=? AND conversation_id=? AND call_id=?',
+        input.taskId, input.conversationId, input.callId);
+      if (previous) {
+        if (previous.bot_id !== input.botId || previous.tool_name !== input.toolName)
+          throw new HostStateError('conflict', 'Automatic dispatch identity reused');
+        return { taskId: input.taskId, botId: input.botId, conversationId: input.conversationId, callId: input.callId, toolName: input.toolName };
+      }
+      if (value.state !== 'active') throw new HostStateError('blocked', 'Automatic dispatch task is not active');
+      const source = this.mustRoot(value.rootId);
+      this.assertMember(source.spaceId, input.botId, source.principalId, source.epoch);
+      const current = this.assertCurrent(input.botId, value.generation);
+      if (current.controller!.conversationId !== input.conversationId) throw new HostStateError('stale', 'Automatic dispatch conversation changed');
+      this.run('INSERT INTO host_automatic_dispatches(task_id,bot_id,conversation_id,call_id,tool_name) VALUES(?,?,?,?,?)',
+        input.taskId, input.botId, input.conversationId, input.callId, input.toolName);
+      return { taskId: input.taskId, botId: input.botId, conversationId: input.conversationId, callId: input.callId, toolName: input.toolName };
+  }
+  getAutomaticDispatch(taskId: string): HostAutomaticDispatch | null {
+    const row = this.one('SELECT * FROM host_automatic_dispatches WHERE task_id=? ORDER BY sequence DESC LIMIT 1', taskId);
+    return row ? { taskId: String(row.task_id), botId: String(row.bot_id), conversationId: String(row.conversation_id),
+      callId: String(row.call_id), toolName: String(row.tool_name) as HostAutomaticDispatch['toolName'] } : null;
+  }
+  listAutomaticDispatches(taskId: string): HostAutomaticDispatch[] {
+    return this.rows('SELECT * FROM host_automatic_dispatches WHERE task_id=? ORDER BY sequence', taskId)
+      .map(row => ({ taskId: String(row.task_id), botId: String(row.bot_id), conversationId: String(row.conversation_id),
+        callId: String(row.call_id), toolName: String(row.tool_name) as HostAutomaticDispatch['toolName'] }));
+  }
   registerTaskWorker(taskId: string, botId: string, workerId: string): void {
     required(workerId, 'workerId');
     this.atomic(() => {
@@ -1116,6 +1277,38 @@ export class HostStore {
   getTaskForWorker(botId: string, workerId: string): HostTask | null {
     const row = this.one('SELECT t.* FROM host_tasks t JOIN host_task_workers w ON w.task_id=t.id WHERE w.bot_id=? AND w.worker_id=?', botId, workerId);
     return row ? task(row) : null;
+  }
+  /** Continue an existing assistant without replacing its original task authority or reply address. */
+  reopenTaskForContinuation(taskId: string, botId: string, generation: number, rootId: string): HostTask {
+    return this.atomic(() => {
+      const value = this.getTask(taskId); if (!value) throw new HostStateError('not-found', 'Unknown continuation task');
+      if (value.ownerBotId !== botId) throw new HostStateError('forbidden', 'Continuation task belongs to another bot');
+      const original = this.mustRoot(value.rootId), source = this.mustRoot(rootId);
+      if (source.principalId !== original.principalId || source.spaceId !== value.spaceId)
+        throw new HostStateError('forbidden', 'Continuation cannot widen the original task authorization');
+      if (source.epoch !== original.epoch) throw new HostStateError('stale', 'Continuation cannot cross group activation epochs');
+      this.assertCollaborationRoot(source);
+      this.assertMember(source.spaceId, botId, source.principalId, source.epoch);
+      const current = this.assertCurrent(botId, generation);
+      if (source.generations[botId] !== generation) throw new HostStateError('stale', 'Continuation root has another controller generation');
+      if (current.ownerPrincipalId !== source.principalId) throw new HostStateError('forbidden', 'Continuation owner changed');
+      if (!current.ready) throw new HostStateError('blocked', 'Continuation controller is not ready');
+      if (this.one('SELECT 1 FROM host_control_locks WHERE bot_id=?', botId)) throw new HostStateError('blocked', 'Bot control operation is frozen');
+      if (this.one("SELECT 1 FROM host_handoffs WHERE task_id=? AND state='proposed'", taskId))
+        throw new HostStateError('blocked', 'Resolve pending handoff before continuing execution');
+      if (value.state === 'active') {
+        if (value.generation !== generation) throw new HostStateError('stale', 'Active task belongs to another controller generation');
+        return value;
+      }
+      if (!value.executionStoppedProof?.trim()) throw new HostStateError('blocked', 'Previous execution has not been confirmed stopped');
+      for (const resource of value.resources) {
+        const owner = this.one('SELECT task_id FROM host_resource_claims WHERE resource=?', resource);
+        if (owner && owner.task_id !== taskId) throw new HostStateError('blocked', `Resource ${resource} is owned by task ${owner.task_id}`);
+      }
+      for (const resource of value.resources) this.run('INSERT OR IGNORE INTO host_resource_claims(resource,task_id) VALUES (?,?)', resource, taskId);
+      this.run("UPDATE host_tasks SET state='active',generation=?,stopped_proof=NULL WHERE id=?", generation, taskId);
+      return this.getTask(taskId)!;
+    });
   }
   private ownedTask(taskId: string, botId: string): HostTask {
     const value = this.getTask(taskId);

@@ -99,6 +99,11 @@ export class ControllerStore {
     if (String(row.fingerprint) !== fingerprint) throw new Error('重复工具调用的参数发生变化，拒绝再次派发');
     return JSON.parse(String(row.result_json));
   }
+  /** 宿主只读核对：持久回执与 worker/job 在同一事务提交，缺失不能假称已派发。 */
+  readCallReceipt(id: string): unknown | undefined {
+    const row = this.db.prepare('SELECT result_json FROM controller_calls WHERE id=?').get(id);
+    return row ? JSON.parse(String(row.result_json)) : undefined;
+  }
   getWorkspaceInitialization(conversationId: string): unknown | undefined {
     return this.getCall(`workspace-context:${conversationId}`, 'workspace-context-once');
   }

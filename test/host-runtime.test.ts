@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { setImmediate as nextImmediate } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { HostRuntime } from '../src/host-runtime.js';
+import { HostStore } from '../src/host-store.js';
+import { ControllerStore } from '../src/controller/store.js';
+import type { ControllerWorker, ControllerJobStatus } from '../src/controller/runtime-types.js';
 import { SessionManager, type SessionManagerOptions } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import type { BotRuntime } from '../src/bot-runtime.js';
@@ -117,6 +120,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
   const calls: Array<{ botId: string; turn: AgentTurn }> = [];
   const host = new HostRuntime(config, marker, async () => ({ accepted: true }), line => reports.push(line));
   const managers = new Map<string, SessionManager>(), sessions = new Map<string, SessionStore>();
+  const controllerStores = new Map<string, ControllerStore>();
   const hooks = new Map(configs.map(c => [c.botId!, host.hooks(c)]));
   const workerStopped = new Map<string, boolean>();
   const workerLists = new Map<string, WorkerOverview[]>();
@@ -178,9 +182,10 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
       async downloadImages(_original: IncomingDM) { return downloads.get(botId)?.() ?? []; },
       isIdle() { return true; },
     };
+    const controllerStore = new ControllerStore(c.dataDir); controllerStores.set(botId, controllerStore);
     const bot = { config: c, manager, transport,
       controller: { queryWorkerOverview: () => [], isWorkerStopped: (workerId: string) => workerStopped.get(`${botId}/${workerId}`) === true,
-        store: { workers: () => [] } },
+        store: controllerStore },
       beginDrain() { manager.beginDrain(); }, isIdle() { return manager.isIdle(); }, isReady() { return true; },
       async confirmControllerStopped() { return stoppedProofs.get(botId) ?? true; },
       async send(channel: string, text: string, replyOptions?: ReplyOptions) {
@@ -198,6 +203,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
   const close = async () => {
     if (closed) return; closed = true; for (const wait of ownedGates) wait.release();
     await host.close(); for (const inspect of sessions.values()) inspect.close();
+    for (const controllerStore of controllerStores.values()) controllerStore.close();
   };
   t.after(async () => {
     await close(); assert.equal(dirname(resolve(path)), resolve(tmpdir())); assert(basename(path).startsWith('bridge-host-runtime-test-'));
@@ -220,10 +226,180 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
     await eventual(() => host.isIdle() && !host.store.listEvents().some(e => ['queued', 'reserved', 'running'].includes(e.state)), 'host and all managed native turns idle');
     await nextImmediate();
   };
-  return { path, host, config, configs, managers, sessions, hooks, replies, calls, reports, workerStopped, workerLists, workerQueries, workerReads, groupChecks, downloads, histories, conversationHistories, stoppedProofs, ids,
+  function registerExecution(botId: string, turn: AgentTurn, callId: string, workerId: string, status: ControllerJobStatus = 'running', ownership: 'bridge' | 'user' = 'bridge') {
+    const store = controllerStores.get(botId)!, callKey = turn.conversation.id + ':' + callId;
+    const previous = store.readCallReceipt(callKey); if (previous !== undefined) return previous as { workerId: string; status: string };
+    const now = new Date().toISOString(), origin = { conversationId: turn.conversation.id, userId: turn.conversation.userId,
+      agent: turn.conversation.agent, nativeId: turn.conversation.nativeId, cwd: turn.conversation.cwd,
+      channelId: turn.source?.channelId ?? turn.groupContext!.originChannelId, originMessageId: turn.source?.messageId ?? turn.groupContext!.eventId,
+      groupContext: turn.groupContext };
+    const worker: ControllerWorker = { id: workerId, origin, agent: 'codex', model: null, actualModel: null, effort: null,
+      cwd: turn.conversation.cwd, title: 'fixture execution', nativeId: 'native-' + workerId, imagePaths: [], ownership,
+      wakeAllowed: true, createdAt: now, updatedAt: now };
+    const receipt = { workerId, status: status === 'running' ? 'started' : status };
+    store.transaction(() => {
+      store.addWorker(worker);
+      store.addJob({ id: 'job-' + callId, workerId, origin, prompt: 'fixture task', imagePaths: [], status,
+        taskId: null, result: null, cancelReason: null, createdAt: now, updatedAt: now });
+      store.saveCall(callKey, 'fixture-' + callId, receipt);
+    });
+    return receipt;
+  }
+  return { path, host, config, configs, managers, sessions, controllerStores, registerExecution, hooks, replies, calls, reports, workerStopped, workerLists, workerQueries, workerReads, groupChecks, downloads, histories, conversationHistories, stoppedProofs, ids,
     message, activate, drain, close, mentionViews, humanMentions, mentionReads, originals, run: (next: TurnHandler) => { handler = next; },
     gate: () => { const wait = gate(); ownedGates.push(wait); return wait; } };
 }
+
+async function holdSceneTurns(f: ReturnType<typeof fixture>, id: string) {
+  const wait = f.gate(), turns = new Map<string, AgentTurn>();
+  f.run(async (botId, turn) => {
+    if (!turn.event) { turns.set(botId, turn); await wait.promise; }
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, id, '主人授权：检查当前任务', G1));
+  await eventual(() => turns.has(A) && turns.has(B), 'both controllers received the same owner input');
+  return { turns, release: wait.release };
+}
+
+test('automatic group dispatch needs no claim, replays one atomic receipt and closes only after actual worker stop', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'auto-dispatch-owner'), turn = held.turns.get(A)!;
+  let registrations = 0;
+  const delegate = async (input: Record<string, unknown>) => {
+    assert.equal('workId' in input, false); assert.equal('resources' in input, false);
+    if (f.controllerStores.get(A)!.readCallReceipt(turn.conversation.id + ':auto-once') === undefined) registrations++;
+    return f.registerExecution(A, turn, 'auto-once', 'auto-worker');
+  };
+  const args = { title: '检查私聊', prompt: '只读检查', resources: ['browser:shared'] };
+  const first: any = await f.host.invoke(A, turn, 'bridge_start_worker', args, 'auto-once', delegate);
+  const task = f.host.store.getTaskForWorker(A, first.workerId)!;
+  assert.match(task.id, /^auto-work:/); assert.equal(task.rootId, turn.groupContext!.rootId); assert.equal(task.state, 'active');
+  assert.equal(f.host.store.getAutomaticDispatch(task.id)!.callId, 'auto-once');
+  assert.deepEqual(await f.host.invoke(A, turn, 'bridge_start_worker', args, 'auto-once', delegate), first);
+  assert.equal(registrations, 1); assert.equal(f.controllerStores.get(A)!.workers().length, 1); assert.equal(f.controllerStores.get(A)!.jobs().length, 1);
+  f.controllerStores.get(A)!.setJob('job-auto-once', 'completed', { result: '检查完毕' });
+  f.hooks.get(A)!.onExecutionSettled!(); assert.equal(f.host.store.getTask(task.id)!.state, 'active');
+  f.workerStopped.set(`${A}/auto-worker`, true); f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask(task.id)!.state, 'completed'); assert.ok(f.host.store.getTask(task.id)!.executionStoppedProof);
+  assert.equal(f.host.store.claimTask({ id: 'resource-after-real-stop', rootId: turn.groupContext!.rootId, botId: B, generation: 1,
+    title: '可使用已释放资源', resources: ['browser:shared'] }).claimed, true);
+  held.release(); await f.drain();
+});
+
+test('prepared automatic dispatch is visible before its worker receipt and forces only one durable same-root scene refresh', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'auto-preparing-owner');
+  const a = held.turns.get(A)!, b = held.turns.get(B)!, dispatch = f.gate();
+  const pending = f.host.invoke(A, a, 'bridge_start_worker', { title: '先开始的私聊检查', prompt: '只读检查' }, 'preparing', async () => {
+    await dispatch.promise; return f.registerExecution(A, a, 'preparing', 'prepared-worker');
+  });
+  await eventual(() => f.host.store.listTasks().length === 1, 'automatic preparation is durable before worker receipt');
+  assert.equal(f.controllerStores.get(A)!.workers().length, 0);
+  const refresh = await b.onSceneCheck!({ name: 'bridge_start_worker', args: {}, callId: 'late-plan' });
+  assert.equal(refresh.refreshRequired, true); const scene = JSON.parse(refresh.scene!);
+  assert.equal(scene.newAuthorization, false); assert.ok(scene.updates.some((update: any) => update.kind === 'dispatch' && /准备/.test(update.text)));
+  assert.ok(scene.updates.every((update: any) => update.canAuthorize === false));
+  const reopened = new HostStore(f.config.rootDataDir);
+  try { assert.equal(reopened.consumeSceneRefresh(b.groupContext!.rootId, B), false); }
+  finally { reopened.close(); }
+  dispatch.release(); await pending;
+  assert.equal((await b.onSceneCheck!({ name: 'bridge_start_worker', args: {}, callId: 'after-refresh' })).refreshRequired, false);
+  held.release(); await f.drain();
+});
+
+test('new non-owner group messages enter refreshed evidence without granting execution authorization', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'nonowner-scene-owner'), turn = held.turns.get(B)!;
+  const guest = f.message(A, 'scene-guest-update', '群友补充的现场事实'); guest.userId = `${A}|outside-whitelist`;
+  await f.host.receive(A, guest);
+  const before = f.host.store.listEvents().length;
+  const refresh = await turn.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'guest-refresh' });
+  assert.equal(refresh.refreshRequired, true); const scene = JSON.parse(refresh.scene!);
+  assert.equal(scene.originalRootId, turn.groupContext!.rootId); assert.equal(scene.originalPrincipalId, P); assert.equal(scene.newAuthorization, false);
+  assert.ok(scene.updates.some((update: any) => update.text === '群友补充的现场事实' && update.canAuthorize === false));
+  assert.equal(f.host.store.listEvents().length, before);
+  const guest2 = f.message(A, 'scene-guest-more', '第二条事实'); guest2.userId = `${A}|outside-whitelist`; await f.host.receive(A, guest2);
+  assert.equal((await turn.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'guest-second-refresh' })).refreshRequired, false);
+  held.release(); await f.drain();
+});
+
+test('legacy claimed work uses automatic dispatch reconciliation and cannot reopen a user-owned worker', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'legacy-auto-owner'), turn = held.turns.get(A)!;
+  await f.host.invoke(A, turn, 'bridge_claim_work', { taskId: 'legacy-worker-work', title: '旧会话已登记任务', resources: ['legacy:resource'] });
+  await f.host.invoke(A, turn, 'bridge_start_worker', { workId: 'legacy-worker-work', title: '继续兼容', prompt: '按原任务执行' }, 'legacy-auto', async () =>
+    f.registerExecution(A, turn, 'legacy-auto', 'legacy-user-worker', 'running', 'user'));
+  assert.equal(f.host.store.getAutomaticDispatch('legacy-worker-work')!.callId, 'legacy-auto');
+  f.controllerStores.get(A)!.setJob('job-legacy-auto', 'completed'); f.workerStopped.set(`${A}/legacy-user-worker`, true); f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask('legacy-worker-work')!.state, 'completed');
+  await turn.onSceneCheck!({ name: 'bridge_continue_worker', args: {}, callId: 'ack-completed' });
+  let delegated = false;
+  await assert.rejects(f.host.invoke(A, turn, 'bridge_continue_worker', { workerId: 'legacy-user-worker', prompt: '不得自动接管用户会话' }, 'user-owned-continue', async () => {
+    delegated = true; return {};
+  }), /用户|user|所有权|归属|不可续接|不能.*续/);
+  assert.equal(delegated, false); assert.equal(f.host.store.getTask('legacy-worker-work')!.state, 'completed');
+  assert.equal(f.host.store.claimTask({ id: 'legacy-resource-stays-released', rootId: turn.groupContext!.rootId, botId: B, generation: 1,
+    title: '资源不被失败续接重新占用', resources: ['legacy:resource'] }).claimed, true);
+  held.release(); await f.drain();
+});
+
+test('concurrent worker continuations retain the automatic task until every admitted dispatch settles', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'parallel-continue-owner'), turn = held.turns.get(A)!;
+  await f.host.invoke(A, turn, 'bridge_start_worker', { title: '原任务', prompt: '第一次执行' }, 'parallel-original', async () =>
+    f.registerExecution(A, turn, 'parallel-original', 'parallel-worker'));
+  const task = f.host.store.getTaskForWorker(A, 'parallel-worker')!;
+  f.controllerStores.get(A)!.setJob('job-parallel-original', 'completed'); f.workerStopped.set(`${A}/parallel-worker`, true); f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask(task.id)!.state, 'completed');
+  await turn.onSceneCheck!({ name: 'bridge_continue_worker', args: {}, callId: 'ack-original-end' });
+  const first = f.gate(), second = f.gate(); let entered = 0;
+  const continueTask = (callId: string, wait: ReturnType<typeof gate>) => f.host.invoke(A, turn, 'bridge_continue_worker', { workerId: 'parallel-worker', prompt: '补充任务' }, callId, async () => {
+    entered++; await wait.promise; const receipt = { workerId: 'parallel-worker', status: 'delivered' };
+    f.controllerStores.get(A)!.saveCall(turn.conversation.id + ':' + callId, 'fixture-' + callId, receipt); return receipt;
+  });
+  const one = continueTask('parallel-one', first), two = continueTask('parallel-two', second);
+  await eventual(() => entered === 2, 'both continuations admitted'); assert.equal(f.host.store.getTask(task.id)!.state, 'active');
+  first.release(); await one; f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask(task.id)!.state, 'active');
+  second.release(); await two; f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask(task.id)!.state, 'completed'); assert.equal(f.host.store.getTask(task.id)!.rootId, task.rootId);
+  assert.deepEqual(f.host.store.taskWorkers(task.id), [{ botId: A, workerId: 'parallel-worker' }]);
+  held.release(); await f.drain();
+});
+
+test('a failed parallel continuation cannot finish or release work while another admitted continuation has no receipt yet', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'parallel-failure-owner'), turn = held.turns.get(A)!;
+  await f.host.invoke(A, turn, 'bridge_start_worker', { title: '原始资源任务', prompt: '第一次执行', resources: ['parallel-failure:shared'] }, 'failure-original', async () =>
+    f.registerExecution(A, turn, 'failure-original', 'failure-worker'));
+  const task = f.host.store.getTaskForWorker(A, 'failure-worker')!, controller = f.controllerStores.get(A)!;
+  controller.setJob('job-failure-original', 'completed'); f.workerStopped.set(`${A}/failure-worker`, true); f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask(task.id)!.state, 'completed');
+  await turn.onSceneCheck!({ name: 'bridge_continue_worker', args: {}, callId: 'ack-before-parallel-failure' });
+  const failing = f.gate(), succeeding = f.gate(); let entered = 0;
+  const first = f.host.invoke(A, turn, 'bridge_continue_worker', { workerId: 'failure-worker', prompt: '第一个续接失败' }, 'failure-first', async () => {
+    entered++; await failing.promise; throw new Error('expected first continuation failure');
+  });
+  const rejected = assert.rejects(first, /expected first continuation failure/);
+  const second = f.host.invoke(A, turn, 'bridge_continue_worker', { workerId: 'failure-worker', prompt: '第二个续接尚在校验' }, 'failure-second', async () => {
+    entered++; await succeeding.promise;
+    const now = new Date().toISOString(), worker = controller.getWorker('failure-worker')!, receipt = { workerId: worker.id, status: 'queued' };
+    controller.transaction(() => {
+      controller.addJob({ id: 'job-failure-second', workerId: worker.id, origin: worker.origin, prompt: '正常登记的第二个续接', imagePaths: [], status: 'running',
+        taskId: null, result: null, cancelReason: null, createdAt: now, updatedAt: now });
+      controller.saveCall(turn.conversation.id + ':failure-second', 'fixture-failure-second', receipt);
+    });
+    f.workerStopped.set(`${A}/failure-worker`, false); return receipt;
+  });
+  await eventual(() => entered === 2, 'both continuation delegates entered before either has a new receipt');
+  failing.release(); await rejected;
+  assert.equal(controller.readCallReceipt(turn.conversation.id + ':failure-second'), undefined);
+  assert.equal(f.host.store.getTask(task.id)!.state, 'active', 'one failed delegate must not finish another pending continuation');
+  assert.throws(() => f.host.store.claimTask({ id: 'parallel-failure-cannot-steal', rootId: turn.groupContext!.rootId, botId: B, generation: 1,
+    title: '资源仍被尚未登记完的续接持有', resources: ['parallel-failure:shared'] }), /Resource/);
+  succeeding.release(); assert.equal((await second as { workerId: string }).workerId, 'failure-worker');
+  assert.equal(f.host.store.getTask(task.id)!.state, 'active');
+  assert.deepEqual(f.host.store.taskWorkers(task.id), [{ botId: A, workerId: 'failure-worker' }]);
+  controller.setJob('job-failure-second', 'completed'); f.workerStopped.set(`${A}/failure-worker`, true); f.hooks.get(A)!.onExecutionSettled!();
+  assert.equal(f.host.store.getTask(task.id)!.state, 'completed');
+  assert.equal(f.host.store.claimTask({ id: 'parallel-failure-resource-released', rootId: turn.groupContext!.rootId, botId: B, generation: 1,
+    title: '最后一个执行真正结束后资源可用', resources: ['parallel-failure:shared'] }).claimed, true);
+  held.release(); await f.drain();
+});
 
 function scopedView(f: ReturnType<typeof fixture>, botId: string, source: IncomingDM, mentions: GroupMentionView['mentions']): GroupMentionView {
   const sourceConfig = f.configs.find(c => source.id.startsWith(c.scopePrefix!))!;
@@ -697,11 +873,12 @@ test('program checks linked workers before handoff, ignores model proof, and kee
   const f = fixture(t); await f.activate(); let refused = false;
   f.run(async (botId, turn) => {
     if (botId === A && !turn.groupContext!.eventKind) {
-      let unauthorizedDispatch = false;
-      await assert.rejects(f.host.invoke(A, turn, 'bridge_start_worker', { workId: 'not-claimed', title: 'unsafe', prompt: 'must not run' }, 'unsafe', async () => {
-        unauthorizedDispatch = true; return { workerId: 'bad' };
-      }), /先认领/);
-      assert.equal(unauthorizedDispatch, false);
+      let directDispatch = false;
+      await f.host.invoke(A, turn, 'bridge_start_worker', { workId: 'not-claimed', title: 'direct task', prompt: 'authorized direct execution' }, 'direct', async input => {
+        directDispatch = true; assert.equal('workId' in input, false); return f.registerExecution(A, turn, 'direct', 'direct-worker');
+      });
+      assert.equal(directDispatch, true); assert.equal(f.host.store.getTask('not-claimed'), null);
+      assert.match(f.host.store.getTaskForWorker(A, 'direct-worker')!.id, /^auto-work:/);
       await f.host.invoke(A, turn, 'bridge_claim_work', { taskId: 'work', title: 'investigate' });
       await f.host.invoke(A, turn, 'bridge_start_worker', { workId: 'work', title: 'investigation', prompt: 'authorized child work' }, 'start', async input => {
         assert.equal('workId' in input, false); return { workerId: 'worker' };
@@ -715,15 +892,54 @@ test('program checks linked workers before handoff, ignores model proof, and kee
       let oldWorkerContinued = false;
       await assert.rejects(f.host.invoke(B, turn, 'bridge_continue_worker', { workId: 'work', workerId: 'worker', prompt: 'do not hijack A child' }, 'bad-continue', async () => {
         oldWorkerContinued = true; return {};
-      }), /助手不属于当前任务/);
+      }), /不属于当前用户和父会话|助手不属于当前任务/);
       assert.equal(oldWorkerContinued, false);
     }
     await turn.onSilent?.();
   });
   await f.host.receive(A, f.message(A, 'handoff-root', 'please investigate', G1, [A])); await f.drain();
   assert.equal(refused, true); assert.equal(f.host.store.getTask('work')?.ownerBotId, B);
+  assert.equal(f.host.store.getTask('work')?.state, 'active', 'accepted handoff waits for the new owner to dispatch');
   assert.equal(f.host.store.getTask('work')?.replyTo.channelId, `${A}|oc_a_group_1`);
   assert.deepEqual(f.host.store.taskWorkers('work'), [{ botId: A, workerId: 'worker' }]);
+});
+
+test('accepted handoff stays active until the new owner dispatches and then checks historical workers through their real Bots', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); let accepted = false, completed = false;
+  const taskId = 'handoff-auto-lifecycle';
+  f.run(async (botId, turn) => {
+    if (botId === A && !turn.event) {
+      await f.host.invoke(A, turn, 'bridge_claim_work', { taskId, title: '交接后由 B 继续的任务', resources: ['handoff:shared-resource'] });
+      await f.host.invoke(A, turn, 'bridge_start_worker', { workId: taskId, title: 'A 的原始执行', prompt: '第一阶段' }, 'handoff-first', async () =>
+        f.registerExecution(A, turn, 'handoff-first', 'historical-a-worker'));
+      f.controllerStores.get(A)!.setJob('job-handoff-first', 'cancelled'); f.workerStopped.set(`${A}/historical-a-worker`, true);
+      await f.host.invoke(A, turn, 'bridge_propose_handoff', { taskId, targetBotId: B, summary: 'A 已停止，请 B 用自己的助手继续原任务' });
+    } else if (botId === B && turn.text.startsWith('交接提议')) {
+      const handoff = f.host.store.listHandoffs(taskId)[0]!;
+      await f.host.invoke(B, turn, 'bridge_accept_handoff', { handoffId: handoff.id }); accepted = true;
+      assert.equal(f.host.store.getTask(taskId)!.ownerBotId, B); assert.equal(f.host.store.getTask(taskId)!.state, 'active');
+      f.hooks.get(B)!.onExecutionSettled!();
+      assert.equal(f.host.store.getTask(taskId)!.state, 'active', 'A old journal cannot finish a newly accepted B task');
+      let hijacked = false;
+      await assert.rejects(f.host.invoke(B, turn, 'bridge_continue_worker', { workId: taskId, workerId: 'historical-a-worker', prompt: '不得操作 A 助手' }, 'handoff-hijack', async () => {
+        hijacked = true; return {};
+      }), /不属于当前用户和父会话|助手不属于当前任务/);
+      assert.equal(hijacked, false);
+      await f.host.invoke(B, turn, 'bridge_start_worker', { workId: taskId, title: 'B 的独立执行', prompt: '继续第二阶段' }, 'handoff-second', async () =>
+        f.registerExecution(B, turn, 'handoff-second', 'current-b-worker'));
+      assert.equal(f.host.store.getAutomaticDispatch(taskId)!.botId, B); assert.equal(f.host.store.getTask(taskId)!.state, 'active');
+      assert.equal(f.workerStopped.has(`${B}/historical-a-worker`), false, 'B has no stop proof for A historical worker');
+      f.controllerStores.get(B)!.setJob('job-handoff-second', 'completed'); f.workerStopped.set(`${B}/current-b-worker`, true);
+      f.hooks.get(B)!.onExecutionSettled!();
+      assert.equal(f.host.store.getTask(taskId)!.state, 'completed', 'new B completed receipt, rather than old A cancelled receipt, determines the outcome'); completed = true;
+    }
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'handoff-auto-lifecycle-owner', '按阶段协作检查', G1)); await f.drain();
+  assert.equal(accepted, true); assert.equal(completed, true);
+  assert.equal(f.host.store.getTask(taskId)!.ownerBotId, B); assert.equal(f.host.store.getTask(taskId)!.state, 'completed');
+  assert.equal(f.host.store.getTask(taskId)!.replyTo.channelId, `${A}|oc_a_group_1`);
+  assert.deepEqual(f.host.store.taskWorkers(taskId), [{ botId: A, workerId: 'historical-a-worker' }, { botId: B, workerId: 'current-b-worker' }]);
 });
 
 test('group stop retains authorized tasks/results and never redirects a late completion to another group', { timeout: 10000 }, async t => {

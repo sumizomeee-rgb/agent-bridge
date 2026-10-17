@@ -24,7 +24,7 @@ import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 export interface BotRuntimeHooks {
   authorize(userId: string, text: string): boolean;
   receiveGroup(message: IncomingDM): Promise<void>;
-  manager: Pick<SessionManagerOptions, 'binding' | 'onConversationScene' | 'onGroupTurnStart' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
+  manager: Pick<SessionManagerOptions, 'binding' | 'onConversationScene' | 'onGroupTurnStart' | 'onSceneCheck' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
   invoke(turn: AgentTurn, name: string, input: Record<string, unknown>, callId: string | undefined, delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown>;
   pauseGroup(): void;
   resumeGroup(): void;
@@ -33,6 +33,7 @@ export interface BotRuntimeHooks {
   allowDelivery(channelId: string): boolean;
   isGroupChannel?(channelId: string): boolean;
   onReady(): void;
+  onExecutionSettled?(): void;
   /** Reconnect group recovery stays in the host; the DM journal never reads group history. */
   onReconnect?(): Promise<void>;
 }
@@ -96,6 +97,7 @@ export class BotRuntime {
     this.controller = config.controllerMode ? new ControllerRuntime(config, this.execution, this.tasks, {
       targetCatalog: this.targetCatalog,
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
+      onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
       onCompletion: () => this.manager.completionAvailable(),
       onCountChanged: id => this.manager.refreshTaskCounts(id),
       onWorkCountsChanged: counts => this.transport.setWorkCounts(counts),

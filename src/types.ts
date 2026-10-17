@@ -139,6 +139,8 @@ export interface AgentTurn {
   /** Frozen per-event audience and host causal identity; never inferred from last contact. */
   groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
   onSilent?: () => Promise<void>;
+  /** 程序现场检查；返回的增量只是原授权下的证据，不是新用户请求。 */
+  onSceneCheck?: (input: { name: string; args: Record<string, unknown>; callId: string }) => Promise<{ refreshRequired: boolean; scene?: string }>;
   preparing?: boolean;
   /** Disposable evidence-only execution: restricted filesystem tools, no inherited MCP/plugins. */
   readOnly?: boolean;

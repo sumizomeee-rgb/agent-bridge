@@ -39,6 +39,7 @@ export interface SessionManagerOptions {
   binding?: ControllerBinding; authorizeUser?: (userId: string) => boolean;
   onGroupTurnError?: (context: GroupTurnContext) => Promise<boolean>;
   onGroupTurnStart?: (context: GroupTurnContext) => Promise<string>;
+  onSceneCheck?: (context: GroupTurnContext, input: Parameters<NonNullable<AgentTurn['onSceneCheck']>>[0]) => ReturnType<NonNullable<AgentTurn['onSceneCheck']>>;
   onGroupTurnFinished?: (context: GroupTurnContext, outcome: 'completed' | 'silent' | 'failed') => Promise<void>;
   onGroupSilent?: (context: GroupTurnContext) => Promise<void>;
   onGroupCompletion?: (event: TaskCompletionEvent) => Promise<'queued' | 'retain'>;
@@ -1081,6 +1082,10 @@ export class SessionManager {
         const result = await this.adapters[target.agent].run({
           ...(context ? { taskContextPath: context.contextPath } : {}),
           ...(chatScene != null ? { chatScene } : {}),
+          ...(groupContext && this.options.onSceneCheck ? { onSceneCheck: async (input: Parameters<NonNullable<AgentTurn['onSceneCheck']>>[0]) => {
+            if (!current()) throw new Error('现场检查时原主控轮次已停止。');
+            return this.options.onSceneCheck!(groupContext!, input);
+          } } : {}),
           ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
           ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: item.text } } : {}),
           conversation: target, source: this.turnSource(item), text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
