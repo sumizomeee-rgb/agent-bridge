@@ -6,6 +6,7 @@ import type { BridgeConfig, IncomingDM, ReplyOptions, BridgeMessage, GroupSpaceI
 import type { WorkCounts } from './overview.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import type { GroupMentionView } from './group-mentions.js';
+import type { ConversationHistoryOptions, ConversationHistoryPage } from './group-history.js';
 
 export class PlatformTransport {
   private readonly transport: DiscordTransport | FeishuTransport;
@@ -20,7 +21,7 @@ export class PlatformTransport {
   get botUser(): { id?: string; username: string } | undefined { return this.transport.botUser ?? undefined; }
   private scoped(message: IncomingDM): IncomingDM {
     const scope = this.config.scopePrefix ?? '';
-    return { ...message, id: scope + message.id, userId: scope + message.userId, channelId: scope + message.channelId };
+    return { ...message, id: scope + message.id, userId: scope + message.userId, channelId: scope + message.channelId, ...(message.source ? { source: { ...message.source, messageId: scope + message.source.messageId, userId: scope + message.source.userId, channelId: scope + message.source.channelId, ...(message.space ? { space: message.space } : {}) } } : {}) };
   }
   private raw(id: string): string { return externalId(this.config.scopePrefix ?? '', id); }
   private unscoped(message: IncomingDM): IncomingDM {
@@ -49,7 +50,7 @@ export class PlatformTransport {
     if (!(this.transport instanceof DiscordTransport)) throw new Error('当前平台没有原生斜杠交互。');
     return this.transport.sendInteractionText(interaction, text, options);
   }
-  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {
+  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string; includeObservers?: boolean } = {}): Promise<DMHistoryPage> {
     if (this.transport instanceof FeishuTransport) return this.transport.readGroupHistory(spaceId, options);
     const cursor = (id: string) => this.config.scopePrefix && id.startsWith(this.config.scopePrefix) ? this.raw(id) : id;
     const page = await this.transport.readGroupHistory(spaceId, { ...options,
@@ -58,6 +59,7 @@ export class PlatformTransport {
     return { ...page, messages: page.messages.map(message => this.scoped(message)),
       oldestId: page.oldestId ? scope + page.oldestId : null, newestId: page.newestId ? scope + page.newestId : null };
   }
+  readConversationHistory(spaceId: string, options: ConversationHistoryOptions = {}): Promise<ConversationHistoryPage> { return this.transport.readConversationHistory(spaceId, options); }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
     if (this.transport instanceof FeishuTransport) return this.transport.readDMHistory(this.raw(channelId), options);
     const rawOptions = { ...options, ...(options.before ? { before: this.raw(options.before) } : {}), ...(options.after ? { after: this.raw(options.after) } : {}) };

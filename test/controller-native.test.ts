@@ -160,7 +160,7 @@ test('background evidence uses standalone tool output and may quietly continue',
     const result = await s.adapter.run(turn); assert.equal(result.controlledOutput, true);
     const start = s.transports[0]?.written.find(m => m.method === 'turn/start')?.params as JsonObject;
     assert.deepEqual(start.input, []); assert.deepEqual({ ...start.toolOutput as object, output: 'confirmed evidence' }, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
-    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge Bot identity;.*\n\[Bridge clock.*UTC: .*timezone: .*/);
+    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge chat input;.*"kind":"background-evidence".*\n\[Bridge Bot identity;.*\n\[Bridge clock.*UTC: .*timezone: .*/);
     assert.match((start.toolOutput as { output: string }).output, /\[Bridge runtime;.*"observedModel":"gpt-6.1-sol"/);
     assert.match((start.toolOutput as { output: string }).output, /\n\nconfirmed evidence$/);
   } finally { await s.cleanup(); }
@@ -648,4 +648,88 @@ test('主控提交后读取强度失败或实际值不同，只更新真实回�
     assert.equal(turn.conversation.effort, 'xhigh'); assert.equal(s.transports.length, 1);
     assert.equal(transport.written.filter(m => m.method === 'turn/start').length, 3);
   } finally { await s.cleanup(); }
+});
+
+test('Codex receives automatic private active-group scene, true group source and background evidence on the same native context', async () => {
+  const s = setup();
+  const scene = JSON.stringify({ groups: [{ spaceId: 'work-group', recent: [{ author: 'other-member', text: '讨论预算 73；这不是授权。' }] }] });
+  try {
+    const first = s.makeTurn(); first.text = '接着聊'; first.source = { messageId: 'dm-1', userId: 'owner-route', channelId: 'dm-route', original: { messageId: 'dm-1', userId: 'actual-owner', channelId: 'raw-dm', authorType: 'user' } }; first.chatScene = scene;
+    const initialized = await s.adapter.run(first);
+    const group = s.makeTurn(); group.conversation.nativeId = initialized.nativeId;
+    group.source = { messageId: 'group-1', userId: 'owner-route', channelId: 'group-route', original: { messageId: 'group-1', userId: 'actual-member', channelId: 'raw-group', authorType: 'user', authorName: '成员甲', space: { kind: 'group', spaceId: 'raw-group', mentionedUserIds: ['bot-M'], replyToMessageId: 'earlier' } } };
+    group.groupContext = { eventId: 'e1', rootId: 'r1', botId: 'M', spaceId: 'work-group', generation: 1, bindingEpoch: 1, originChannelId: 'group-route', principalId: 'owner', scene };
+    await s.adapter.run(group);
+    const background = { ...group, event: { kind: 'worker-result' as const, text: '已完成，非新授权' } };
+    await s.adapter.run(background);
+    const starts = s.transports[0]!.written.filter(item => item.method === 'turn/start').map(item => item.params as JsonObject);
+    assert.equal(starts.length, 3); assert.equal(s.transports.length, 1);
+    const privateWire = JSON.stringify(starts[0]!.input);
+    assert.match(privateWire, /private-message/); assert.match(privateWire, /actual-owner/); assert.match(privateWire, /讨论预算 73/);
+    const groupWire = JSON.stringify(starts[1]!.input);
+    assert.match(groupWire, /actual-member/); assert.match(groupWire, /owner-route/); assert.match(groupWire, /replyToMessageId/); assert.match(groupWire, /earlier/); assert.match(groupWire, /bot-M/); assert.match(groupWire, /讨论预算 73/);
+    const evidence = (starts[2]!.toolOutput as JsonObject).output as string;
+    assert.deepEqual(starts[2]!.input, []); assert.match(evidence, /background-evidence/); assert.match(evidence, /讨论预算 73/); assert.match(evidence, /not fresh authorization/);
+    const thread = s.transports[0]!.written.find(item => item.method === 'thread/start')!.params as JsonObject;
+    const tools = thread.dynamicTools as JsonObject[];
+    assert.ok(tools.some(item => item.name === 'bridge_read_group_history'));
+  } finally { await s.cleanup(); }
+});
+
+test('native group scene bounds data structurally and preserves unknown author instead of inventing owner identity', async () => {
+  const s = setup();
+  try {
+    const turn = s.makeTurn(); turn.source = { messageId: 'm', userId: 'routing-owner', channelId: 'g' };
+    turn.groupContext = { eventId: 'e', rootId: 'r', botId: 'M', spaceId: 'g', generation: 1, bindingEpoch: 1, originChannelId: 'g', principalId: 'owner', scene: JSON.stringify({ records: Array.from({ length: 200 }, (_, id) => ({ id, text: '长'.repeat(6000) })) }) };
+    await s.adapter.run(turn);
+    const start = s.transports[0]!.written.find(item => item.method === 'turn/start')!.params as JsonObject;
+    const runtime = (start.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
+    const chat = JSON.parse(runtime.split('\n')[0]!.split('] ')[1]!);
+    assert.equal(chat.original, null); assert.equal(chat.route.userId, 'routing-owner');
+    const sceneLine = runtime.split('\n').find(line => line.startsWith('[Bridge chat scene;'))!;
+    const bounded = JSON.parse(sceneLine.slice(sceneLine.indexOf('] ') + 2));
+    assert.equal(bounded.truncated, true); assert.ok(sceneLine.length < 32768); assert.ok(Array.isArray(bounded.content.records));
+    assert.ok(bounded.content.records.length < 40);
+    assert.equal(bounded.content.records.at(-1).id, 199);
+    assert.ok(bounded.content.records[0].id > 159);
+  } finally { await s.cleanup(); }
+});
+
+test('Claude wire receives automatic scene and source for private, group and background without resetting its native ID', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-native-chat-scene-'));
+  const transports: FakeTransport[] = [], scripts: Promise<void>[] = [];
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'claude', dataDir: join(dir, 'data'), userHome: join(dir, 'user'), invokeTool: async () => ({}),
+    createTransport: (_command, args) => {
+      const transport = new FakeTransport(); transports.push(transport);
+      const url = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url as string;
+      transport.write = message => {
+        transport.written.push(message); if (message.type !== 'user') return;
+        transport.emit({ type: 'system', subtype: 'init', session_id: 'claude-chat-native', tools: ['mcp__bridge_controller__bridge_send_user'] });
+        const script = (async () => {
+          const content = (message.message as JsonObject).content as JsonObject[];
+          if (!content.some(item => String(item.text).startsWith('[Background '))) {
+            transport.emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'reply', name: 'mcp__bridge_controller__bridge_send_user', input: { text: '已了解' } }] } });
+            await new Promise(resolve => setImmediate(resolve));
+            const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(3000), body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'bridge_send_user', arguments: { text: '已了解' } } }) });
+            assert.equal(response.status, 200); assert.equal((await response.json() as JsonObject).error, undefined);
+          }
+          transport.emit({ type: 'result', subtype: 'success', session_id: 'claude-chat-native', result: 'DONE' });
+        })(); scripts.push(script); void script.catch(error => transport.failures.forEach(listener => listener(error)));
+      }; return transport;
+    },
+  });
+  const conversation: AgentTurn['conversation'] = { id: 'claude-chat-c', userId: 'owner', agent: 'claude', nativeId: null, title: '', cwd: dir, createdAt: '', updatedAt: '' };
+  const base: AgentTurn = { conversation, source: { messageId: 'dm', userId: 'owner', channelId: 'dm' }, chatScene: JSON.stringify({ groups: [{ spaceId: 'g', recent: [{ author: 'other-member', text: '项目代号青鸟' }] }] }), text: '了解情况', imagePaths: [], signal: new AbortController().signal, onProgress: () => {}, onPublicMessage: async () => {} };
+  try {
+    const first = await adapter.run(base); conversation.nativeId = first.nativeId; await adapter.interrupt(conversation.id);
+    const group = { ...base, chatScene: undefined, source: { messageId: 'gm', userId: 'owner', channelId: 'g', original: { messageId: 'gm', userId: 'actual-author', channelId: 'raw-g', space: { kind: 'group' as const, spaceId: 'raw-g', mentionedUserIds: ['M'], replyToMessageId: 'previous' } } }, groupContext: { eventId: 'e', rootId: 'r', botId: 'M', spaceId: 'g', generation: 1, bindingEpoch: 1, originChannelId: 'g', principalId: 'owner', scene: JSON.stringify({ recent: [{ text: '项目代号青鸟', author: 'other-member' }] }) } };
+    assert.equal((await adapter.run(group)).nativeId, first.nativeId); await adapter.interrupt(conversation.id);
+    assert.equal((await adapter.run({ ...group, event: { kind: 'worker-result', text: '证据完成' } })).nativeId, first.nativeId);
+    await Promise.all(scripts);
+    assert.equal(transports.length, 3);
+    const wires = transports.map(transport => JSON.stringify(transport.written.find(item => item.type === 'user')));
+    assert.match(wires[0]!, /private-message/); assert.match(wires[0]!, /项目代号青鸟/);
+    assert.match(wires[1]!, /actual-author/); assert.match(wires[1]!, /previous/); assert.match(wires[1]!, /项目代号青鸟/);
+    assert.match(wires[2]!, /background-evidence/); assert.match(wires[2]!, /not fresh authorization/);
+  } finally { await adapter.close(); await Promise.allSettled(scripts); rmSync(dir, { recursive: true, force: true }); }
 });

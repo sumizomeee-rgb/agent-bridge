@@ -33,7 +33,8 @@ test('explicit delivery preserves the real private source and does not complete 
   const gate = new Promise<void>(resolve => { release = resolve; });
   const sources: Array<{ id: string; channel: string; target?: string; finish: boolean }> = [];
   const f = fixture(t, async turn => {
-    assert.deepEqual(turn.source, { messageId: 'source-one', userId: 'owner', channelId: 'owner-dm' });
+    assert.deepEqual(turn.source, { messageId: 'source-one', userId: 'owner', channelId: 'owner-dm',
+      original: { messageId: 'source-one', userId: 'owner', channelId: 'owner-dm', authorType: 'user' } });
     await turn.onPublicMessage!('补充私聊', [], 'supplement-one', 'private', false);
     await gate;
     await turn.onPublicMessage!('群内最终答复', [], 'final-one', 'group:verified:1:1', true);

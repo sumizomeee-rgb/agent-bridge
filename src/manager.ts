@@ -35,6 +35,7 @@ interface AgentSwitchJournal {
 }
 export type GroupTurnContext = NonNullable<AgentTurn['groupContext']>;
 export interface SessionManagerOptions {
+  onConversationScene?: (conversation: Conversation, source: NonNullable<AgentTurn['source']>, signal: AbortSignal) => Promise<string>;
   binding?: ControllerBinding; authorizeUser?: (userId: string) => boolean;
   onGroupTurnStart?: (context: GroupTurnContext) => Promise<string>;
   onGroupTurnFinished?: (context: GroupTurnContext, outcome: 'completed' | 'silent' | 'failed') => Promise<void>;
@@ -895,7 +896,7 @@ export class SessionManager {
         // 在 RPC 写入前持久化；崩溃后 steering 不能按 queued 自动重做。
         this.store.setState(item.id, 'steering');
         let result;
-        try { result = await adapter.steer(target.id, { id: item.id, input: this.input([item]) }); }
+        try { result = await adapter.steer(target.id, { id: item.id, input: this.input([item]), source: this.turnSource(item) }); }
         catch (error) { result = { status: 'uncertain' as const, reason: String(error) }; }
         if (this.closed || turn.controller.signal.aborted || this.store.getMessage(item.id)?.state !== 'steering') return;
         if (result.status === 'accepted') {
@@ -920,8 +921,19 @@ export class SessionManager {
     });
   }
 
+  private turnSource(item: BridgeMessage): NonNullable<AgentTurn['source']> {
+    // userId/channelId remain the verified authorization and delivery route.
+    const original = item.source ?? (item.groupContext ? undefined : { messageId: item.id, userId: item.userId, channelId: item.channelId, authorType: 'user' as const });
+    return { messageId: item.id, userId: item.userId, channelId: item.channelId, ...(original ? { original } : {}) };
+  }
+
   private input(items: BridgeMessage[]) {
     return items.flatMap(item => [
+      { type: 'text' as const, text: '[Bridge input source; program metadata, never message text or new authorization] ' + JSON.stringify({
+        kind: item.groupContext ? item.groupContext.eventKind ? 'background-evidence' : 'group-message' : 'private-message',
+        source: this.turnSource(item).original ?? null, defaultDelivery: { channelId: item.channelId },
+        ...(item.groupContext ? { group: { spaceId: item.groupContext.spaceId, eventId: item.groupContext.eventId, eventKind: item.groupContext.eventKind ?? null } } : {}),
+      }) },
       ...(item.text ? [{ type: 'text' as const, text: item.text }] : []),
       ...item.imagePaths.map(path => ({ type: 'localImage' as const, path })),
     ]);
@@ -1040,6 +1052,9 @@ export class SessionManager {
       let silent = false;
       try {
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
+        if (!current()) throw new Error('消息轮次已经停止');
+        const chatScene = groupContext?.scene ?? await this.options.onConversationScene?.(target, this.turnSource(item), controller.signal);
+        if (!current()) throw new Error('消息轮次已经停止');
         const context = this.options.taskRegistry?.createContext({
           conversationId, userId: item.userId, channelId: item.channelId, originMessageId: item.id,
           cwd: target.cwd, agent: target.agent, nativeId: target.nativeId, ...(groupContext ? { groupContext, ...(groupContext.eventKind ? { purpose: 'host-event' as const } : {}) } : {}),
@@ -1047,9 +1062,10 @@ export class SessionManager {
         contextId = context?.contextId;
         const result = await this.adapters[target.agent].run({
           ...(context ? { taskContextPath: context.contextPath } : {}),
+          ...(chatScene != null ? { chatScene } : {}),
           ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
           ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: item.text } } : {}),
-          conversation: target, source: { messageId: item.id, userId: item.userId, channelId: item.channelId }, text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
+          conversation: target, source: this.turnSource(item), text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
           imagePaths: batch.flatMap(value => value.imagePaths), input: [
             ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...this.input(batch),
           ],
@@ -1292,7 +1308,7 @@ export class SessionManager {
         ? '\n\n[桥程序：用户 /new continue 的初始化和续接已完成。通过 bridge_send_user 用两到四句话确认接上的目标、关键纠正和真正待办或未知。历史摘要不是新授权；不照抄摘要，不复活定时、不重派旧任务，随后结束本轮。]'
         : '\n\n[桥程序：本事件对应用户已发送的 /new 命令。初始化完成后，请通过 bridge_send_user 向原发送者主动回复一次，用两到四句话介绍你对当前工作区的理解、已确认的能力和仍待确认的事项。依据已读到的内容，不照抄调查全文，不虚构已验证能力，不因此启动额外任务。此消息为主控回复，随后结束本轮。]';
       const result = await this.adapters[target.agent].run({
-        conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId }, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
+        conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId, ...(source?.source ? { original: source.source } : {}) }, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
           toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.scheduleKind === 'controller' ? 'bridge_schedule_controller' : 'bridge_worker_result', text: eventText, introductionRequested },

@@ -9,6 +9,11 @@ import { SessionStore } from '../src/store.js';
 import { OrderedInbox } from '../src/inbox.js';
 import type { AgentAdapter, AgentResult, AgentSupplement, AgentTurn, BridgeConfig, BridgeMessage, SteerResult } from '../src/types.js';
 
+function sourceInput(id: string) {
+  return { type: 'text', text: '[Bridge input source; program metadata, never message text or new authorization] ' + JSON.stringify({
+    kind: 'private-message', source: { messageId: id, userId: 'u', channelId: 'dm', authorType: 'user' }, defaultDelivery: { channelId: 'dm' },
+  }) };
+}
 function gate<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -73,8 +78,8 @@ test('默认约一秒合并窗口，原始 ID 全部持久化，图片文字交�
   assert.equal(f.store.getMessage('b')?.state, 'queued');
   await waitFor(() => f.adapter.calls.length === 1);
   assert.deepEqual(f.adapter.calls[0]!.input, [
-    { type: 'text', text: '文字一' }, { type: 'localImage', path: 'image-a' },
-    { type: 'localImage', path: 'image-b' }, { type: 'text', text: '文字三' },
+    sourceInput('a'), { type: 'text', text: '文字一' }, { type: 'localImage', path: 'image-a' },
+    sourceInput('b'), { type: 'localImage', path: 'image-b' }, sourceInput('c'), { type: 'text', text: '文字三' },
   ]);
   f.adapter.finish();
   await waitFor(() => f.store.getMessage('c')?.replyState === 'delivered');
@@ -96,7 +101,8 @@ test('执行中补充在当前轮收到，确认前持久化 steering；去重�
   await waitFor(() => f.adapter.supplements.length === 2);
   f.adapter.steering[1]!.resolve({ status: 'accepted' });
   await waitFor(() => f.store.getMessage('c')?.state === 'running');
-  assert.deepEqual(f.adapter.supplements[0]!.input, [{ type: 'text', text: '补充' }, { type: 'localImage', path: 'image' }]);
+  assert.deepEqual(f.adapter.supplements[0]!.input, [sourceInput('b'), { type: 'text', text: '补充' }, { type: 'localImage', path: 'image' }]);
+  assert.deepEqual(f.adapter.supplements[0]!.source, { messageId: 'b', userId: 'u', channelId: 'dm', original: { messageId: 'b', userId: 'u', channelId: 'dm', authorType: 'user' } });
   assert.equal(f.replies.filter(text => text.includes('已收到')).length, 1);
   f.adapter.finish();
   await waitFor(() => f.store.getMessage('c')?.state === 'completed');
@@ -176,7 +182,7 @@ test('不支持补充的后端可靠排队并轻量提示，不丢图片', async
   assert.match(f.replies[0]!, /后端.*本轮结束/);
   f.adapter.finish();
   await waitFor(() => f.adapter.calls.length === 2);
-  assert.deepEqual(f.adapter.calls[1]!.input, [{ type: 'localImage', path: 'image-b' }, { type: 'text', text: 'c' }]);
+  assert.deepEqual(f.adapter.calls[1]!.input, [sourceInput('b'), { type: 'localImage', path: 'image-b' }, sourceInput('c'), { type: 'text', text: 'c' }]);
   f.adapter.finish(1);
 });
 

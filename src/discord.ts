@@ -12,6 +12,7 @@ import { discordPresentationPages } from './presentation.js';
 import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { discordReplyHeader } from './reply.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
+import { historyOptions, historyPage, type ConversationHistoryOptions, type ConversationHistoryPage, type ConversationHistoryMessage } from './group-history.js';
 
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
 export interface DiscordTransportOptions {
@@ -406,7 +407,7 @@ export class DiscordTransport {
     return { messages, oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: result.length === limit };
   }
 
-  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {
+  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string; includeObservers?: boolean } = {}): Promise<DMHistoryPage> {
     if (this.config.groupMode !== true || !snowflake(spaceId) || (options.after !== undefined && !snowflake(options.after))
       || (options.before !== undefined && !snowflake(options.before)) || (options.after && options.before)) throw new Error('Discord 群历史未启用或游标无效。');
     const owner = options.ownerUserId ?? (this.allowedUsers.size === 1 ? [...this.allowedUsers][0] : undefined);
@@ -422,13 +423,44 @@ export class DiscordTransport {
     const ids = result.map(item => String(item.id)).sort((left, right) => BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
     const messages = new Map<string, IncomingDM>();
     for (const item of result) {
-      if (!record(item.author) || item.author.id !== owner) continue;
+      if (!record(item.author) || (!options.includeObservers && item.author.id !== owner)) continue;
       const message = this.parseIncoming({ ...item, guild_id: info.guildId });
       if (message && !messages.has(message.id)) messages.set(message.id, message);
     }
     return { messages: [...messages.values()], oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: result.length === limit };
   }
 
+  async readConversationHistory(spaceId: string, options: ConversationHistoryOptions = {}): Promise<ConversationHistoryPage> {
+    if (this.config.groupMode !== true || !snowflake(spaceId)) throw new Error('Discord 群历史未启用或群标识无效。');
+    const { limit, start, end } = historyOptions(options);
+    const owner = options.ownerUserId ?? (this.allowedUsers.size === 1 ? [...this.allowedUsers][0] : undefined);
+    if (!owner || !this.allowedUsers.has(owner)) throw new Error('Discord 群历史需要明确的已授权负责人账号。');
+    if (options.pageToken && !snowflake(options.pageToken)) throw new Error('Discord 群历史内部游标无效。');
+    const info = await this.getGroupInfo(spaceId);
+    if (info.botIsMember !== true || !await this.getGroupMember(spaceId, owner)) throw new Error('Discord 群历史访问权已失效。');
+    const endSnowflake = end === undefined ? undefined : String(BigInt(Math.max(0, end - 1420070400000)) << 22n);
+    const before = options.pageToken ?? endSnowflake;
+    const query = new URLSearchParams({ limit: String(limit), ...(before ? { before } : {}) });
+    const result = await this.rest(`/channels/${spaceId}/messages?${query}`, 'GET');
+    if (!Array.isArray(result) || result.length > limit || result.some(item => !record(item) || !snowflake(item.id) || item.channel_id !== spaceId || (item.guild_id != null && item.guild_id !== info.guildId))) throw new Error('Discord 群历史返回格式或群身份无效。');
+    const messages = new Map<string, ConversationHistoryMessage>();
+    let oldest: string | undefined, reachedStart = false;
+    for (const item of result) {
+      if (!oldest || BigInt(item.id) < BigInt(oldest)) oldest = item.id;
+      const timestamp = Date.parse(item.timestamp);
+      if (!Number.isFinite(timestamp)) throw new Error('Discord 群历史消息时间无效。');
+      if (start !== undefined && timestamp < start) { reachedStart = true; continue; }
+      if (end !== undefined && timestamp >= end) continue;
+      const author = record(item.author) ? item.author : {};
+      const mentions = Array.isArray(item.mentions) ? item.mentions.flatMap((m: unknown) => record(m) && snowflake(m.id) ? [{ id: m.id, ...(typeof m.username === 'string' ? { name: m.username } : {}) }] : []) : [];
+      const attachments = Array.isArray(item.attachments) ? item.attachments.flatMap((a: unknown) => record(a) && typeof a.id === 'string' ? [{ id: a.id, ...(typeof a.filename === 'string' ? { name: a.filename } : {}), ...(typeof a.content_type === 'string' ? { contentType: a.content_type } : {}), ...(typeof a.size === 'number' && Number.isSafeInteger(a.size) && a.size >= 0 ? { size: a.size } : {}) }] : []) : [];
+      const message: ConversationHistoryMessage = { id: item.id, author: { id: snowflake(author.id) ? author.id : 'unknown', type: item.webhook_id != null || author.bot === true ? 'bot' : author.system === true ? 'system' : snowflake(author.id) ? 'user' : 'unknown', ...(typeof author.username === 'string' ? { name: author.username } : {}) }, time: new Date(timestamp).toISOString(), text: typeof item.content === 'string' ? item.content : '', mentions, attachments,
+        ...(record(item.message_reference) && snowflake(item.message_reference.message_id) ? { replyToMessageId: item.message_reference.message_id } : {}) };
+      messages.set(message.id, message);
+    }
+    const hasMore = result.length === limit && !reachedStart;
+    return historyPage(spaceId, options, [...messages.values()], hasMore, hasMore ? oldest : undefined, ['Discord 按消息 ID 向前翻页，时间范围在本地精确筛选；满页仅表示可能还有更早记录。', '缺 MESSAGE_CONTENT intent 时正文/附件可能为空；不将空内容当作完整群历史。']);
+  }
   private async groupAccess(spaceId: string, userId: string): Promise<{ channel: RecordValue; allowed: boolean; isBot?: boolean }> {
     if (!snowflake(spaceId) || !snowflake(userId)) throw new Error('Discord 群或账号标识无效。');
     const channel = await this.rest(`/channels/${spaceId}`, 'GET');
@@ -890,7 +922,7 @@ export class DiscordTransport {
   private parseIncoming(data: RecordValue): IncomingDM | null {
     const author = data.author;
     if ((data.guild_id != null && !(this.config.groupMode === true && snowflake(data.guild_id))) || data.webhook_id != null || !record(author) || author.bot === true || author.system === true ||
-        !snowflake(author.id) || !this.allowedUsers.has(author.id) || !snowflake(data.id) ||
+        !snowflake(author.id) || (data.guild_id == null && !this.allowedUsers.has(author.id)) || !snowflake(data.id) ||
         !snowflake(data.channel_id)) return null;
     const attachments: DiscordAttachment[] = [];
     if (Array.isArray(data.attachments)) {
@@ -908,7 +940,8 @@ export class DiscordTransport {
       let match: RegExpExecArray | null;
       while ((match = /^\s*<@!?(\d{1,20})>\s*/.exec(text)) && mentionedUserIds.includes(match[1]!)) text = text.slice(match[0].length);
     }
-    return { id: data.id, userId: author.id, channelId: data.channel_id, text, attachments,
+    const source = data.guild_id != null ? { messageId: data.id, userId: author.id, channelId: data.channel_id, authorType: 'user' as const, ...(typeof author.username === 'string' ? { authorName: author.username } : {}), ...(typeof data.timestamp === 'string' && Number.isFinite(Date.parse(data.timestamp)) ? { time: new Date(data.timestamp).toISOString() } : {}) } : undefined;
+    return { id: data.id, userId: author.id, channelId: data.channel_id, text, attachments, ...(source ? { source } : {}),
       ...(data.guild_id != null ? { space: { kind: 'group' as const, spaceId: data.channel_id, mentionedUserIds,
         ...(record(data.message_reference) && snowflake(data.message_reference.message_id) ? { replyToMessageId: data.message_reference.message_id } : {}) } } : {}) };
   }

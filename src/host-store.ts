@@ -36,6 +36,11 @@ export interface HostEvent {
   initial: boolean; automatic: boolean; decision: 'published' | 'silent' | null; nativeEnded: boolean;
   causeEventId: string | null; sourceBotId: string | null; error: string | null;
 }
+export interface HostContextRecord {
+  sequence: number; id: string; spaceId: string; epoch: number; receivedAt: string;
+  source: { botId: string; messageId: string; userId: string; channelId: string; authorType: string; textTruncated?: true; authorName?: string; time?: string; mentionedUserIds: string[]; replyToMessageId?: string };
+  text: string; attachments: unknown[]; canAuthorize: boolean;
+}
 export interface HostPublicMessage {
   sequence: number; id: string; rootId: string; spaceId: string; epoch: number;
   authorBotId: string | null; principalId: string; text: string; attachments: unknown[];
@@ -189,6 +194,11 @@ export class HostStore {
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_id TEXT NOT NULL REFERENCES host_roots(id),
         space_id TEXT NOT NULL, epoch INTEGER NOT NULL, author_bot_id TEXT, principal_id TEXT NOT NULL,
         text TEXT NOT NULL, attachments_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS host_context_records(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,space_id TEXT NOT NULL,epoch INTEGER NOT NULL,
+        source_json TEXT NOT NULL,text TEXT NOT NULL,attachments_json TEXT NOT NULL,can_authorize INTEGER NOT NULL,received_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS host_context_cursors(
+        bot_id TEXT NOT NULL,space_id TEXT NOT NULL,epoch INTEGER NOT NULL,cursor INTEGER NOT NULL,PRIMARY KEY(bot_id,space_id,epoch));
       CREATE TABLE IF NOT EXISTS host_public_cursors(
         bot_id TEXT NOT NULL, space_id TEXT NOT NULL, epoch INTEGER NOT NULL, cursor INTEGER NOT NULL,
         PRIMARY KEY(bot_id,space_id,epoch));
@@ -640,6 +650,43 @@ export class HostStore {
     for (const row of this.rows("SELECT id FROM host_events WHERE bot_id=? AND generation<=? AND state IN ('queued','reserved')", botId, generation)) this.cancelEventInner(String(row.id), 'generation-replaced');
     this.run("UPDATE host_handoffs SET state='cancelled',evidence='generation-replaced' WHERE state='proposed' AND (from_bot_id=? OR to_bot_id=?)", botId, botId);
     this.run("UPDATE host_outbox SET state='rejected',evidence='generation-replaced' WHERE bot_id=? AND generation<=? AND state='registered'", botId, generation);
+  }
+
+  /** Evidence has no authorization root and cannot enqueue work or grant an owner identity. */
+  appendContext(input: Omit<HostContextRecord, 'sequence' | 'receivedAt'> & { receiverBotId: string; principalId: string; revision: number }): HostContextRecord {
+    return this.atomic(() => {
+      const group = this.assertMember(input.spaceId, input.receiverBotId, input.principalId, input.epoch);
+      if (group.revision !== input.revision) throw new HostStateError('stale', 'Context binding changed');
+      const value = { source: input.source, text: input.text, attachments: input.attachments, canAuthorize: input.canAuthorize };
+      const previous = this.one('SELECT * FROM host_context_records WHERE id=?', input.id);
+      if (previous) {
+        if (previous.space_id !== input.spaceId || Number(previous.epoch) !== input.epoch
+          || !same(parse<unknown>(previous.source_json), value.source) || previous.text !== input.text
+          || !same(parse<unknown>(previous.attachments_json), value.attachments) || !!previous.can_authorize !== value.canAuthorize)
+          throw new HostStateError('conflict', 'Context message identity reused');
+      } else this.run('INSERT INTO host_context_records(id,space_id,epoch,source_json,text,attachments_json,can_authorize,received_at) VALUES(?,?,?,?,?,?,?,?)',
+        input.id, input.spaceId, input.epoch, JSON.stringify(value.source), input.text, JSON.stringify(value.attachments), Number(value.canAuthorize), new Date().toISOString());
+      return this.contextRecord(this.one('SELECT * FROM host_context_records WHERE id=?', input.id)!);
+    });
+  }
+  private contextRecord(row: Row): HostContextRecord {
+    return { sequence: Number(row.sequence), id: String(row.id), spaceId: String(row.space_id), epoch: Number(row.epoch),
+      receivedAt: String(row.received_at), source: parse<HostContextRecord['source']>(row.source_json), text: String(row.text),
+      attachments: parse<unknown[]>(row.attachments_json), canAuthorize: !!row.can_authorize };
+  }
+  readContext(spaceId: string, botId: string, limit = 40): { recent: HostContextRecord[]; unread: HostContextRecord[]; unreadCount: number; truncated: boolean } {
+    const group = this.getGroup(spaceId); if (!group) throw new HostStateError('not-found', 'Unknown group');
+    this.assertMember(spaceId, botId, group.principalId, group.epoch);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new HostStateError('conflict', 'Context limit must be 1..100');
+    const cursor = Number(this.one('SELECT cursor FROM host_context_cursors WHERE bot_id=? AND space_id=? AND epoch=?', botId, spaceId, group.epoch)?.cursor ?? 0);
+    const recent = this.rows('SELECT * FROM (SELECT * FROM host_context_records WHERE space_id=? AND epoch=? ORDER BY sequence DESC LIMIT ?) ORDER BY sequence', spaceId, group.epoch, limit).map(r => this.contextRecord(r));
+    const unreadCount = Number(this.one('SELECT COUNT(*) AS n FROM host_context_records WHERE space_id=? AND epoch=? AND sequence>?', spaceId, group.epoch, cursor)!.n);
+    return { recent, unread: recent.filter(r => r.sequence > cursor), unreadCount, truncated: unreadCount > recent.filter(r => r.sequence > cursor).length };
+  }
+  ackContext(botId: string, spaceId: string, epoch: number, cursor: number): void {
+    const group = this.getGroup(spaceId); if (!group || group.epoch !== epoch) throw new HostStateError('stale', 'Context epoch changed');
+    this.assertMember(spaceId, botId, group.principalId, epoch);
+    this.run('INSERT INTO host_context_cursors(bot_id,space_id,epoch,cursor) VALUES(?,?,?,?) ON CONFLICT(bot_id,space_id,epoch) DO UPDATE SET cursor=MAX(cursor,excluded.cursor)', botId, spaceId, epoch, cursor);
   }
 
   appendPublic(input: { id: string; rootId: string; authorBotId?: string; principalId: string; text: string; attachments?: unknown[] }): HostPublicMessage {

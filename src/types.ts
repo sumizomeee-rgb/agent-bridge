@@ -74,7 +74,7 @@ export interface AgentModel {
 }
 export interface AgentModelInfo { models: AgentModel[]; defaultModel: string | null; source?: string; cliVersion?: string }
 export type AgentInput = { type: 'text'; text: string } | { type: 'localImage'; path: string };
-export interface AgentSupplement { id: string; input: AgentInput[] }
+export interface AgentSupplement { id: string; input: AgentInput[]; source?: AgentTurn['source'] }
 export type SteerResult = { status: 'accepted' } | { status: 'queued'; reason?: string; unsupported?: boolean } | { status: 'uncertain'; reason: string };
 export interface AgentActivityMetadata {
   at: string;
@@ -108,7 +108,7 @@ export interface EffortMetadata {
 export interface AgentTurn {
   conversation: Conversation;
   /** The real source of this input, never the last contacted destination. */
-  source?: { messageId: string; userId: string; channelId: string };
+  source?: { messageId: string; userId: string; channelId: string; original?: ChatInputSource };
   text: string;
   imagePaths: string[];
   /** 连续消息保留文字与图片的交错顺序。 */
@@ -130,6 +130,8 @@ export interface AgentTurn {
   onNativeId?: (nativeId: string) => void;
   /** Only this explicit channel may publish coordinating-agent output. */
   onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string, targetId?: string, finish?: boolean) => Promise<void>;
+  /** Automatically supplied bounded active-group evidence; never a fresh request. */
+  chatScene?: string;
   /** Frozen per-event audience and host causal identity; never inferred from last contact. */
   groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
   onSilent?: () => Promise<void>;
@@ -160,6 +162,8 @@ export interface AgentAdapter {
   getModelInfo?(cwd: string): Promise<AgentModelInfo>;
 }
 export interface BridgeMessage {
+  /** Actual platform sender and region, separate from the owner's internal authorization route. */
+  source?: ChatInputSource;
   groupContext?: AgentTurn['groupContext'];
   id: string;
   userId: string;
@@ -203,7 +207,14 @@ export interface GroupMessageSpace {
 export interface GroupSpaceInfo { spaceId: string; name?: string; ownerId?: string; guildId?: string; memberCount?: number; botIsMember?: boolean }
 export interface GroupMember { id: string; idType: 'open_id' | 'user_id' | 'union_id' | 'discord'; isBot?: boolean }
 export interface GroupMembersPage { members: GroupMember[]; hasMore: boolean; pageToken?: string; verification: 'verified' | 'unknown'; reason?: string; scope?: 'humans' | 'channel' }
+export interface ChatInputSource {
+  messageId: string; userId: string; channelId: string;
+  space?: GroupMessageSpace;
+  authorType?: 'user' | 'bot' | 'system' | 'unknown';
+  authorName?: string; time?: string;
+}
 export interface IncomingDM {
+  source?: ChatInputSource;
   space?: GroupMessageSpace;
   id: string;
   userId: string;

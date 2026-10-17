@@ -38,6 +38,7 @@ class LocalTransport implements BotTransport {
   async sendText(channel: string, text: string, options?: ReplyOptions) { this.sent.push({ channel, text, options }); }
   async sendInteractionText(_interaction: NonNullable<IncomingDM['interaction']>, text: string, options?: ReplyOptions) { this.sent.push({ channel: 'interaction', text, options }); }
   async readDMHistory(channel: string, options: DMHistoryOptions = {}) { this.histories.push({ channel, options }); return this.history; }
+  async readConversationHistory(): Promise<never> { throw new Error('This lifecycle fixture does not read group history'); }
   async readGroupHistory() { assert.fail('群历史不能由Bot的DM恢复入口读取'); return this.history; }
   async getGroupInfo(spaceId: string) { return { spaceId, botIsMember: true }; }
   async listGroupMembers() { return { members: [], hasMore: false, verification: 'unknown' as const }; }

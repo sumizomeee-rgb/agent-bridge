@@ -37,6 +37,7 @@ function inbox(row: Row): InboxItem {
   return {
     id: String(row.id), userId: String(row.user_id), channelId: String(row.channel_id),
     text: String(row.text), imagePaths: JSON.parse(String(row.images_json)) as string[],
+    ...(row.source_json ? { source: JSON.parse(String(row.source_json)) as BridgeMessage['source'] } : {}),
     ...(row.group_json ? { groupContext: JSON.parse(String(row.group_json)) as BridgeMessage['groupContext'] } : {}),
     conversationId: row.conversation_id === null ? null : String(row.conversation_id),
     state: String(row.state) as InboxState,
@@ -110,6 +111,7 @@ export class SessionStore {
     if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
     const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
     if (!inboxColumns.has('group_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN group_json TEXT');
+    if (!inboxColumns.has('source_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN source_json TEXT');
     if (!inboxColumns.has('reply_state')) this.db.exec('ALTER TABLE inbox ADD COLUMN reply_state TEXT');
     const publicColumns = new Set(this.db.prepare('PRAGMA table_info(controller_public_messages)').all().map(row => String(row.name)));
     if (!publicColumns.has('text')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN text TEXT');
@@ -122,10 +124,11 @@ export class SessionStore {
   addMessage(message: BridgeMessage, conversationId: string | null, state: InboxState): boolean {
     const now = new Date().toISOString();
     const result = this.db.prepare(`INSERT OR IGNORE INTO inbox
-      (id, user_id, channel_id, text, images_json, conversation_id, state, created_at, updated_at, group_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      (id, user_id, channel_id, text, images_json, conversation_id, state, created_at, updated_at, group_json, source_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       message.id, message.userId, message.channelId, message.text,
       JSON.stringify(message.imagePaths), conversationId, state, now, now, message.groupContext ? JSON.stringify(message.groupContext) : null,
+      message.source ? JSON.stringify(message.source) : null,
     );
     return Number(result.changes) === 1;
   }

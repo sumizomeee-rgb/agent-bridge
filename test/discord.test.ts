@@ -892,12 +892,12 @@ test('Discord群收件只在显式启用时接收真人，频道和话题分别�
   f.dispatch({ id: '303', guild_id: '333', author: { id: '444', bot: false } });
   f.dispatch({ id: '304', guild_id: '333', webhook_id: '345' });
   f.dispatch({ id: '305', guild_id: 'malformed' });
-  await eventually(() => received.length === 2); await delay(15);
-  assert.equal(received.length, 2); assert.equal(received[0]!.text, '/group start');
+  await eventually(() => received.length === 3); await delay(15);
+  assert.equal(received.length, 3); assert.equal(received.find(message => message.id === '303')!.userId, '444'); assert.equal(received.find(message => message.id === '303')!.source?.authorType, 'user'); assert.equal(received[0]!.text, '/group start');
   assert.deepEqual(received[0]!.space, { kind: 'group', spaceId: '222', mentionedUserIds: ['999'], replyToMessageId: '299' });
-  assert.deepEqual(received[1]!.space, { kind: 'group', spaceId: '224', mentionedUserIds: [] });
-  assert.equal(received[1]!.text, '@同名 /new');
-  f.dispatch({ id: '306', content: 'p2p' }); await eventually(() => received.length === 3); assert.equal(received[2]!.space, undefined);
+  assert.deepEqual(received.find(message => message.id === '301')!.space, { kind: 'group', spaceId: '224', mentionedUserIds: [] });
+  assert.equal(received.find(message => message.id === '301')!.text, '@同名 /new');
+  f.dispatch({ id: '306', content: 'p2p' }); await eventually(() => received.length === 4); assert.equal(received[3]!.space, undefined);
 });
 
 test('Discord群元数据可读不代表能收发，按角色覆盖及话题权限核实当前Bot和负责人', async t => {

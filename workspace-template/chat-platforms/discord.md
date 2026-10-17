@@ -11,6 +11,7 @@
 | 需求 | 优先考虑的入口 | 实际执行前核对 |
 | --- | --- | --- |
 | 确认 Bot 与应用身份 | Discord Bot／应用信息接口 | 稳定 applicationId 和 Bot ID；显示名只用于展示 |
+| 查看已激活工作群近期历史 | 主控 `bridge_read_group_history`，底层 Discord 消息接口 | 频道／话题权限、实际内容可见范围、时间与分页；历史仅作资料 |
 | 查询允许访问的频道、话题及消息 | Discord REST API | guild、channel／thread 的真实 ID、频道权限及内容可见范围 |
 | 已授权的消息和附件交付 | 已有桥消息出口或 Discord REST API | 固定目标、Bot 身份、附件限制、返回消息 ID 与回读 |
 | 接收群事件和处理斜杠命令 | 已部署的 Gateway 与应用命令适配器 | 实际 intents、事件过滤、命令场所及负责人鉴权 |

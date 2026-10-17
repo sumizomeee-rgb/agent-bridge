@@ -585,3 +585,54 @@ test('忙中切换 Agent 等待当前轮安全结束，排队输入交给最新�
   assert(f.sink.replies.some(reply => reply.text.endsWith('\n\nsafe old answer')));
   assert.equal(f.codex.calls.length, 1);
 });
+
+test('merged and steered inputs retain each real source instead of relabeling the batch as its last sender', async t => {
+  const f = fixture(t, false); await f.manager.close();
+  const steered: Parameters<NonNullable<AgentAdapter['steer']>>[1][] = [];
+  const adapter: AgentAdapter = { run: turn => { const pending = f.codex.run(turn); turn.onReady?.(); return pending; },
+    steer: async (_id, input) => { steered.push(input); return { status: 'accepted' }; }, interrupt: id => f.codex.interrupt(id), close: () => f.codex.close() };
+  f.manager = new SessionManager(f.config, { codex: adapter, claude: f.claude }, f.sink, { mergeDelayMs: 20 });
+  const first = { ...message('label-a', '第一个输入'), source: { messageId: 'real-a', userId: 'actual-a', channelId: 'origin-a', authorType: 'user' as const, time: '2026-10-17T10:00:00Z' } };
+  const second = { ...message('label-b', '第二个输入'), source: { messageId: 'real-b', userId: 'actual-b', channelId: 'origin-b', authorType: 'user' as const } };
+  await f.manager.handle(first); await f.manager.handle(second);
+  await waitFor(() => f.codex.calls.length === 1);
+  const main = f.codex.calls[0]!;
+  assert.equal(main.source?.userId, 'u1'); assert.deepEqual(main.source?.original, first.source);
+  const blocks = main.input!.filter(item => item.type === 'text').map(item => item.text);
+  assert.match(blocks[0]!, /actual-a/); assert.equal(blocks[1], '第一个输入'); assert.match(blocks[2]!, /actual-b/); assert.equal(blocks[3], '第二个输入');
+  const third = { ...message('label-c', '补充'), source: { messageId: 'real-c', userId: 'actual-c', channelId: 'origin-c', authorType: 'user' as const } };
+  await f.manager.handle(third); await waitFor(() => steered.length === 1);
+  assert.deepEqual(steered[0]!.source?.original, third.source); assert.equal(steered[0]!.source?.channelId, 'dm-u1');
+  assert.match(JSON.stringify(steered[0]!.input), /actual-c/); assert.doesNotMatch(JSON.stringify(steered[0]!.input), /actual-a|actual-b/);
+  f.codex.finish(0); await waitFor(() => f.sink.replies.some(item => item.text.startsWith('[Codex')));
+});
+
+test('private turns automatically receive active-group scene while keeping native continuity and original reply address', async t => {
+  const f = fixture(t); await f.manager.close();
+  const seen: { source: NonNullable<AgentTurn['source']>; nativeId: string | null }[] = [];
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink, { mergeDelayMs: 0,
+    onConversationScene: async (conversation, source, signal) => { assert.equal(signal.aborted, false); seen.push({ source, nativeId: conversation.nativeId }); return JSON.stringify({ groups: [{ spaceId: 'g', recent: [{ author: 'non-owner', text: '讨论材料' }] }] }); },
+  });
+  await f.manager.handle(message('scene-private-1', '那个群在聊什么'));
+  await waitFor(() => f.sink.replies.length === 1);
+  await f.manager.handle(message('scene-private-2', '继续'));
+  await waitFor(() => f.sink.replies.length === 2);
+  assert.equal(seen.length, 2); assert.equal(seen[0]!.source.channelId, 'dm-u1');
+  assert.equal(seen[0]!.nativeId, null); assert.equal(seen[1]!.nativeId, f.codex.result(f.codex.calls[0]!).nativeId);
+  assert.match(f.codex.calls[0]!.chatScene!, /non-owner/); assert.match(f.codex.calls[1]!.chatScene!, /讨论材料/);
+  assert.equal(f.codex.calls[0]!.conversation.id, f.codex.calls[1]!.conversation.id);
+  assert.ok(f.sink.replies.every(item => item.channelId === 'dm-u1'));
+});
+
+test('scene acquisition cannot dispatch a stale controller turn after shutdown', async t => {
+  const f = fixture(t); await f.manager.close();
+  let release!: (scene: string) => void, acquiring = false;
+  const scene = new Promise<string>(resolve => { release = resolve; });
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink, { mergeDelayMs: 0,
+    onConversationScene: async () => { acquiring = true; return scene; },
+  });
+  await f.manager.handle(message('scene-cancel', '了解当前群'));
+  await waitFor(() => acquiring);
+  const closing = f.manager.close(); release('{"groups":[]}'); await closing;
+  assert.equal(f.codex.calls.length, 0);
+});

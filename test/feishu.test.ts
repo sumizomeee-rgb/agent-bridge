@@ -166,7 +166,7 @@ test('飞书重启后找回自己的处理中表情，送达失败时保留处�
 });
 
 
-test('飞书群入口显式启用后只收白名单真人，实体提及和回复链保留原始平台身份', async t => {
+test('飞书群入口显式启用后向Host提交全部真人，实体提及和回复链保留原始平台身份', async t => {
   const { config, cleanup } = setup(t); config.groupMode = true;
   const accepted: IncomingDM[] = [], captured: IncomingDM[] = [];
   const bridge = new FeishuTransport(config, async message => { accepted.push(message); }, { onReceive: message => { captured.push(message); } }); cleanup(() => bridge.close());
@@ -180,11 +180,11 @@ test('飞书群入口显式启用后只收白名单真人，实体提及和回�
   const bot = event('om_bot', { chat_type: 'group' }); bot.event.sender.sender_type = 'app'; await bridge.receiveEvent(bot);
   const outsider = event('om_outsider', { chat_type: 'group' }); outsider.event.sender.sender_id.open_id = 'ou_outsider'; await bridge.receiveEvent(outsider);
   const foreign = event('om_foreign', { chat_type: 'group' }); foreign.header.app_id = 'cli_other'; await bridge.receiveEvent(foreign);
-  assert.equal(accepted.length, 1);
+  assert.equal(accepted.length, 2); assert.equal(accepted[1]!.source?.authorType, 'user');
   await bridge.receiveEvent(event('om_plain', { chat_type: 'group', content: '{"text":"@同名显示名 /new"}' }));
-  assert.deepEqual(accepted[1]!.space?.mentionedUserIds, []); assert.equal(accepted[1]!.text, '@同名显示名 /new');
+  assert.deepEqual(accepted[2]!.space?.mentionedUserIds, []); assert.equal(accepted[2]!.text, '@同名显示名 /new');
   await bridge.receiveEvent(event('om_p2p', { mentions: [{ key: '@_user_1', id: { open_id: 'ou_realBot' } }] }));
-  assert.equal(accepted[2]!.space, undefined, '启用群功能不改变私聊事件归属');
+  assert.equal(accepted[3]!.space, undefined, '启用群功能不改变私聊事件归属');
 });
 
 test('飞书群信息须逐应用验证is_in_chat，名称和数量不代替在群证明', async t => {

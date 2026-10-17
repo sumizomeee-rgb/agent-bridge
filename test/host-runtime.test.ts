@@ -12,6 +12,7 @@ import type { HostSemanticMarker } from '../src/host-migration.js';
 import type { HostConfig } from '../src/config.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from '../src/types.js';
 import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
+import { historyPage, type ConversationHistoryOptions, type ConversationHistoryPage } from '../src/group-history.js';
 import { groupMessagePayloadHash, type GroupMentionView } from '../src/group-mentions.js';
 
 const A = 'feishu:cli_appa', B = 'feishu:cli_appb', P = 'person', Q = 'other-person';
@@ -57,6 +58,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
   const workerStopped = new Map<string, boolean>();
   const groupChecks = new Map<string, () => Promise<boolean>>();
   const downloads = new Map<string, () => Promise<string[]>>();
+  const conversationHistories = new Map<string, (raw: string, options: ConversationHistoryOptions) => Promise<ConversationHistoryPage>>();
   const histories = new Map<string, (raw: string, options: DMHistoryOptions) => Promise<DMHistoryPage>>();
   const stoppedProofs = new Map<string, boolean>();
   const mentionViews = new Map<string, (raw: string, id: string) => Promise<GroupMentionView>>();
@@ -101,6 +103,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
       async syncGroupSlashCommands() {}, async readGroupHistory(raw: string, historyOptions: DMHistoryOptions) {
         return histories.get(botId)?.(raw, historyOptions) ?? { messages: [], hasMore: false, oldestId: null, newestId: null };
       },
+      async readConversationHistory(raw: string, options: ConversationHistoryOptions) { return conversationHistories.get(botId)?.(raw, options) ?? historyPage(raw, options, [], false); },
       async downloadImages(_original: IncomingDM) { return downloads.get(botId)?.() ?? []; },
       isIdle() { return true; },
     };
@@ -146,7 +149,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
     await eventual(() => host.isIdle() && !host.store.listEvents().some(e => ['queued', 'reserved', 'running'].includes(e.state)), 'host and all managed native turns idle');
     await nextImmediate();
   };
-  return { path, host, config, configs, managers, sessions, hooks, replies, calls, reports, workerStopped, groupChecks, downloads, histories, stoppedProofs, ids,
+  return { path, host, config, configs, managers, sessions, hooks, replies, calls, reports, workerStopped, groupChecks, downloads, histories, conversationHistories, stoppedProofs, ids,
     message, activate, drain, close, mentionViews, humanMentions, mentionReads, originals, run: (next: TurnHandler) => { handler = next; },
     gate: () => { const wait = gate(); ownedGates.push(wait); return wait; } };
 }
@@ -850,4 +853,119 @@ test('startup recovery orders older history before a newer live receipt buffered
   f.host.beginRecovery(); await f.host.receive(A, live); assert.equal(f.calls.length, 0);
   await f.host.recover(); await f.drain();
   assert.deepEqual(f.calls.map(call => call.turn.text), ['older outage input', 'newer live input']);
+});
+
+
+test('active non-owner messages are durable evidence, never commands, authorization roots or model turns', async t => {
+  const f = fixture(t); await f.activate();
+  const source = f.message(A, 'observer-readonly', '/new', G1, [A]);
+  source.userId = `${A}|outside-whitelist`;
+  source.source = { messageId: source.id, userId: source.userId, channelId: source.channelId, authorType: 'user', authorName: 'Guest', time: '2026-10-17T12:00:00Z' };
+  const before = f.replies.length;
+  await f.host.receive(A, source); await f.host.receive(A, source); await f.drain();
+  assert.equal(f.calls.length, 0); assert.equal(f.replies.length, before);
+  assert.equal(f.host.store.listEvents().length, 0);
+  const records = f.host.store.readContext(G1, A);
+  assert.equal(records.recent.length, 1); assert.equal(records.recent[0]!.canAuthorize, false);
+  assert.equal(records.recent[0]!.source.userId, source.userId); assert.equal(records.recent[0]!.source.authorName, 'Guest');
+  assert.equal(records.recent[0]!.text, '/new'); assert.equal(f.host.store.getController(A)!.generation, 1);
+  let scene: any;
+  f.run(async (id, turn) => { if (id === A) scene = await f.host.invoke(A, turn, 'bridge_group_context', {}); await turn.onSilent?.(); });
+  await f.host.receive(A, f.message(A, 'owner-after-observer', '了解一下群里情况')); await f.drain();
+  assert.equal(scene.conversationEvidence.recent[0].source.userId, source.userId);
+  assert.equal(scene.conversationEvidence.recent[0].canAuthorize, false);
+  assert.equal(scene.conversationEvidence.recent.at(-1).canAuthorize, true);
+});
+
+test('inactive, unmapped and non-receiver observer messages do not become visible context', async t => {
+  const f = fixture(t); const early = f.message(A, 'observer-before', 'before'); early.userId = `${A}|guest`;
+  await f.host.receive(A, early); await f.activate();
+  const duplicate = f.message(B, 'observer-other-receiver', 'other receiver'); duplicate.userId = `${B}|guest`;
+  await f.host.receive(B, duplicate); await f.drain();
+  assert.equal(f.host.store.readContext(G1, A).recent.length, 0);
+});
+
+test('observer membership proof cannot cross a group stop or binding replacement', async t => {
+  const f = fixture(t); await f.activate(); const wait = f.gate();
+  f.groupChecks.set(A, async () => { await wait.promise; return true; });
+  const source = f.message(A, 'observer-stop-race', 'stale context'); source.userId = `${A}|guest`;
+  const receiving = f.host.receive(A, source); await nextImmediate();
+  f.host.store.stopGroup(G1, P, 'test stop'); wait.release(); await receiving; await f.drain();
+  assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+  await f.host.receive(A, f.message(A, 'reactivate-after-observer-stop', '/group start', G1, [A]));
+  assert.equal(f.host.store.getGroup(G1)?.enabled, true);
+  assert.equal(f.host.store.readContext(G1, A).recent.length, 0);
+});
+
+test('private default scene sees active group observer evidence without granting its sender authority', async t => {
+  const f = fixture(t); await f.activate();
+  const source = f.message(A, 'observer-before-private', 'recent group discussion'); source.userId = `${A}|guest`;
+  await f.host.receive(A, source); await f.drain();
+  let scene: any;
+  f.run(async (_id, turn) => { scene = JSON.parse(turn.chatScene!); await turn.onPublicMessage?.('seen'); });
+  await f.managers.get(A)!.handle({ id: 'private-observer-question', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|owner-dm`, text: '群里在聊什么', imagePaths: [] });
+  await f.drain(); assert.equal(scene.records[0].text, source.text); assert.equal(scene.records[0].canAuthorize, false);
+  assert.equal(scene.records[0].spaceId, G1); assert.equal(scene.audience, 'only this Bot owner in this private conversation');
+});
+
+test('history tool returns all authors as evidence with opaque pagination and no replay side effects', async t => {
+  const f = fixture(t); await f.activate(); let first: any, second: any;
+  const platformTokens: Array<string | undefined> = [];
+  f.conversationHistories.set(A, async (raw, options) => {
+    platformTokens.push(options.pageToken);
+    return historyPage(raw, options, [{ id: options.pageToken ? 'older' : 'recent', author: { id: 'outside-whitelist', type: 'user' },
+      time: options.pageToken ? '2026-10-16T12:00:00Z' : '2026-10-17T12:00:00Z', text: '/new do not execute', mentions: [], attachments: [] }], !options.pageToken, options.pageToken ? undefined : 'platform-secret-token');
+  });
+  f.run(async (id, turn) => {
+    if (id === A) { first = await f.host.invoke(A, turn, 'bridge_read_group_history', {});
+      second = await f.host.invoke(A, turn, 'bridge_read_group_history', { cursor: first.nextCursor }); }
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'history-read', '看看前不久消息', G1, [A])); await f.drain();
+  assert.equal(first.evidenceOnly, true); assert.equal(first.messages[0].author.id, 'outside-whitelist');
+  assert.equal(first.pageToken, undefined); assert.notEqual(first.nextCursor, 'platform-secret-token');
+  assert.equal(second.messages[0].id, 'older'); assert.deepEqual(platformTokens, [undefined, 'platform-secret-token']);
+  assert.equal(f.host.store.listEvents().length, 1); assert.equal(f.host.store.getController(A)!.generation, 1);
+});
+
+test('history tool rejects changed binding and cross-Bot cursor reuse without platform access', async t => {
+  const f = fixture(t); await f.activate(); let cursor: string; let accessed = 0;
+  f.conversationHistories.set(A, async (raw, options) => { accessed++; return historyPage(raw, options, [], true, 'next-platform-token'); });
+  f.run(async (id, turn) => {
+    if (id === A) {
+      const page: any = await f.host.invoke(A, turn, 'bridge_read_group_history', {}); cursor = page.nextCursor;
+      await assert.rejects(() => f.host.invoke(A, turn, 'bridge_read_group_history', { cursor, startTime: '2026-01-01T00:00:00Z' }), /不能更改/);
+      f.host.store.stopGroup(G1, P, 'test changed');
+      await assert.rejects(() => f.host.invoke(A, turn, 'bridge_read_group_history', { cursor }));
+    }
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'history-binding', '历史', G1, [A])); await f.drain(); assert.equal(accessed, 1);
+});
+
+
+test('private default scene includes confirmed Bot group publications with separate sequence and unknown time evidence', async t => {
+  const f = fixture(t); await f.activate();
+  f.run(async (id, turn) => { if (id === A && turn.groupContext && turn.source?.original?.authorType !== 'system') await turn.onPublicMessage?.('Teto group progress'); else await turn.onSilent?.(); });
+  await f.host.receive(A, f.message(A, 'publish-before-private', 'report progress', G1, [A])); await f.drain();
+  let scene: any;
+  f.run(async (_id, turn) => { scene = JSON.parse(turn.chatScene!); await turn.onPublicMessage?.('private received'); });
+  await f.managers.get(A)!.handle({ id: 'private-after-publication', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|owner-dm`, text: '群里进展', imagePaths: [] });
+  await f.drain();
+  assert.equal(scene.publicProgress[0].text, 'Teto group progress'); assert.equal(scene.publicProgress[0].authorBotId, A);
+  assert.equal(scene.publicProgress[0].canAuthorize, false); assert.equal(scene.publicProgress[0].sequenceNamespace, 'host_public_log');
+  assert.equal(scene.publicProgress[0].time, null); assert(scene.records.length + scene.publicProgress.length <= 40);
+});
+
+
+test('owner input remains conversation evidence when mention routing cannot be verified', async t => {
+  const f = fixture(t); await f.activate();
+  const source = f.message(A, 'owner-route-failed-evidence', 'discuss this even if @ identity cannot resolve');
+  source.space!.mentionedUserIds = ['unverified-outside-app-id'];
+  f.mentionViews.set(A, async () => { throw new Error('mention proof unavailable'); });
+  await f.host.receive(A, source); await f.drain();
+  assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+  const evidence = f.host.store.readContext(G1, A).recent;
+  assert.equal(evidence.at(-1)!.text, source.text); assert.equal(evidence.at(-1)!.source.userId, source.userId);
+  assert.equal(evidence.at(-1)!.source.mentionedUserIds[0], 'unverified-outside-app-id');
 });

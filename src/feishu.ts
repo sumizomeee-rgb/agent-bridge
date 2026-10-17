@@ -8,6 +8,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { WSClient, EventDispatcher, Domain, type HttpInstance } from '@larksuiteoapi/node-sdk';
 import type { BridgeConfig, IncomingDM, DiscordAttachment, ReplyOptions, BridgeMessage, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
+import { historyOptions, historyPage, type ConversationHistoryOptions, type ConversationHistoryPage, type ConversationHistoryMessage } from './group-history.js';
 import { compareMessageIds } from './routing.js';
 import { groupMessagePayloadHash, type GroupMentionView } from './group-mentions.js';
 
@@ -158,8 +159,10 @@ export class FeishuTransport {
     if (this.closed || sender?.sender_type !== 'user' || (message?.chat_type !== 'p2p' && !(this.config.groupMode === true && message?.chat_type === 'group'))) return;
     if (event.header?.app_id && event.header.app_id !== this.config.applicationId) return;
     const user = sender.sender_id?.open_id;
-    if (typeof user !== 'string' || !this.config.externalAllowedUserIds?.includes(user)) return;
+    if (typeof user !== 'string' || !/^ou_[a-zA-Z0-9_-]+$/.test(user) || (message.chat_type === 'p2p' && !this.config.externalAllowedUserIds?.includes(user))) return;
+    if (!/^\d{10,16}$/.test(String(message.create_time ?? '')) || !Number.isFinite(new Date(Number(message.create_time)).getTime())) return;
     const normalized = this.normalize(message, user);
+    if (normalized.space) normalized.source = { messageId: normalized.id, userId: normalized.userId, channelId: normalized.channelId, space: normalized.space, authorType: 'user', ...(typeof sender.name === 'string' ? { authorName: sender.name } : {}), time: new Date(Number(message.create_time)).toISOString() };
     if (this.seenMessages.has(normalized.id)) return;
     // This must finish durable capture before SDK acknowledgement; it never waits for model work.
     const captured = this.options.onReceive?.(normalized);
@@ -228,7 +231,7 @@ export class FeishuTransport {
       payloadHash: groupMessagePayloadHash(normalized), mentions };
   }
   /** Group recovery has its own authorization and retains group space/mentions, never a synthetic DM. */
-  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {
+  async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string; includeObservers?: boolean } = {}): Promise<DMHistoryPage> {
     if (this.config.groupMode !== true || !/^oc_[a-zA-Z0-9_-]+$/.test(spaceId)) throw new Error('飞书群历史未启用或群标识无效。');
     const users = this.config.externalAllowedUserIds ?? [];
     const owner = options.ownerUserId ?? (users.length === 1 ? users[0] : undefined);
@@ -256,12 +259,79 @@ export class FeishuTransport {
     for (const item of data.items as Json[]) {
       if (item.chat_id != null && item.chat_id !== spaceId) throw new Error('飞书群历史返回了其他群的消息。');
       const id = this.messageId(item); ids.push(id);
-      if (item.deleted === true || item.sender?.sender_type !== 'user' || item.sender?.id_type !== 'open_id' || item.sender.id !== owner) continue;
-      if (!messages.has(id)) messages.set(id, this.normalize({ ...item, chat_id: spaceId, chat_type: 'group' }, owner));
+      if (item.deleted === true || item.sender?.sender_type !== 'user' || item.sender?.id_type !== 'open_id' || !/^ou_[a-zA-Z0-9_-]+$/.test(item.sender.id ?? '') || (!options.includeObservers && item.sender.id !== owner)) continue;
+      if (!messages.has(id)) {
+        const message = this.normalize({ ...item, chat_id: spaceId, chat_type: 'group' }, item.sender.id);
+        if (options.includeObservers) message.source = { messageId: message.id, userId: message.userId, channelId: message.channelId, space: message.space, authorType: 'user', ...(typeof item.sender.name === 'string' ? { authorName: item.sender.name } : {}), time: new Date(Number(item.create_time)).toISOString() };
+        messages.set(id, message);
+      }
     }
     ids.sort(compareMessageIds);
     return { messages: [...messages.values()], oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: data.has_more === true,
       ...(data.has_more === true ? { pageToken: data.page_token } : {}) };
+  }
+  /** All visible authors are evidence only; this endpoint never replays commands or downloads resources. */
+  async readConversationHistory(spaceId: string, options: ConversationHistoryOptions = {}): Promise<ConversationHistoryPage> {
+    if (this.config.groupMode !== true || !/^oc_[a-zA-Z0-9_-]+$/.test(spaceId)) throw new Error('飞书群历史未启用或群标识无效。');
+    const { limit, start, end } = historyOptions(options);
+    const users = this.config.externalAllowedUserIds ?? [];
+    const owner = options.ownerUserId ?? (users.length === 1 ? users[0] : undefined);
+    if (!owner || !users.includes(owner)) throw new Error('飞书群历史需要明确的已授权负责人账号。');
+    const info = await this.getGroupInfo(spaceId);
+    if (info.botIsMember !== true || !await this.getGroupMember(spaceId, owner)) throw new Error('飞书群历史访问权已失效。');
+    const params = new URLSearchParams({ container_id_type: 'chat', container_id: spaceId, page_size: String(limit), sort_type: 'ByCreateTimeDesc' });
+    if (start !== undefined) params.set('start_time', String(Math.floor(start / 1000)));
+    if (end !== undefined) params.set('end_time', String(Math.ceil(end / 1000)));
+    if (options.pageToken) params.set('page_token', options.pageToken);
+    const data = await this.api(`/im/v1/messages?${params}`);
+    if (!Array.isArray(data.items) || data.items.length > limit || typeof data.has_more !== 'boolean' || (data.has_more && (typeof data.page_token !== 'string' || !data.page_token || data.page_token.length > 4096))) throw new Error('飞书群历史分页格式无效。');
+    const messages = new Map<string, ConversationHistoryMessage>();
+    for (const item of data.items as Json[]) {
+      if (item.chat_id != null && item.chat_id !== spaceId) throw new Error('飞书群历史返回了其他群的消息。');
+      this.messageId(item);
+      const timestamp = Number(item.create_time);
+      if (!Number.isFinite(timestamp) || !Number.isFinite(new Date(timestamp).getTime())) throw new Error('飞书群历史时间无效。');
+      if ((start !== undefined && timestamp < start) || (end !== undefined && timestamp >= end)) continue;
+      const sender = item.sender ?? {};
+      const authorType = sender.sender_type === 'user' ? 'user' : sender.sender_type === 'app' ? 'bot' : sender.sender_type === 'system' ? 'system' : 'unknown';
+      const authorId = typeof sender.id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(sender.id) ? sender.id : 'unknown';
+      const type = item.msg_type ?? item.message_type;
+      let content: Json = {}, text = '', truncated = false;
+      try { const parsed = JSON.parse(String(item.body?.content ?? item.content ?? '{}')); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) content = parsed; else truncated = true; } catch { truncated = true; }
+      const attachments: ConversationHistoryMessage['attachments'] = [];
+      const attachment = (id: unknown, name?: unknown, contentType?: string) => { if (typeof id === 'string' && id) attachments.push({ id, ...(typeof name === 'string' ? { name } : {}), ...(contentType ? { contentType } : {}) }); };
+      if (item.deleted === true) text = '[消息已撤回或删除]';
+      else if (type === 'text') text = typeof content.text === 'string' ? content.text : '';
+      else if (type === 'interactive') {
+        const parts: string[] = []; let visited = 0;
+        const collect = (value: unknown, depth = 0): void => {
+          if (depth > 12 || visited++ > 500) { truncated = true; return; }
+          if (Array.isArray(value)) { for (const child of value) collect(child, depth + 1); return; }
+          if (!value || typeof value !== 'object') return;
+          const node = value as Json;
+          if (typeof node.content === 'string') parts.push(node.content);
+          if (typeof node.text === 'string') parts.push(node.text);
+          if (typeof node.title === 'string') parts.push(node.title);
+          for (const key of ['title', 'header', 'body', 'elements', 'fields', 'text', 'content', 'columns']) if (node[key] && typeof node[key] === 'object') collect(node[key], depth + 1);
+        };
+        collect(content); text = parts.join('\n'); if (!text) { text = '[卡片消息：当前接口未提取正文]'; truncated = true; }
+      }
+      else if (type === 'post') {
+        const post = content.content ? content : content.zh_cn ?? content.en_us ?? {};
+        text = [typeof post.title === 'string' ? post.title : '', ...(Array.isArray(post.content) ? post.content : []).map((line: Json[]) => Array.isArray(line) ? line.map(node => {
+          if (!node || typeof node !== 'object') return '';
+          if (node.tag === 'img') { attachment(node.image_key, 'image', 'image/unknown'); return ''; }
+          return typeof node.text === 'string' ? node.text : typeof node.user_id === 'string' ? `@${node.user_id}` : '';
+        }).join('') : '')].filter(Boolean).join('\n');
+      } else if (type === 'image') attachment(content.image_key, 'image', 'image/unknown');
+      else if (content.file_key) attachment(content.file_key, content.file_name, 'application/octet-stream');
+      else { text = `[${String(type ?? 'unknown').slice(0, 64)} 消息：当前接口未提取正文]`; truncated = true; }
+      const mentions = (Array.isArray(item.mentions) ? item.mentions : []).flatMap((mention: Json) => mention && typeof mention.id === 'string' ? [{ id: mention.id, ...(typeof mention.name === 'string' ? { name: mention.name } : {}) }] : []);
+      const message: ConversationHistoryMessage = { id: item.message_id, author: { id: authorId, type: authorType, ...(typeof sender.name === 'string' ? { name: sender.name } : {}) }, time: new Date(timestamp).toISOString(), text, mentions, attachments,
+        ...(typeof item.parent_id === 'string' && /^om_[a-zA-Z0-9_-]+$/.test(item.parent_id) ? { replyToMessageId: item.parent_id } : {}), ...(truncated ? { truncated: true } : {}) };
+      messages.set(message.id, message);
+    }
+    return historyPage(spaceId, options, [...messages.values()], data.has_more, data.page_token, ['飞书接口实际可见记录；ID 仅属于当前应用命名空间，不可跨应用互换。', '按创建时间倒序；删除、权限或接口保留范围可能造成缺口，不声称完整历史。']);
   }
   async readDMHistory(channelId: string, options: DMHistoryOptions = {}): Promise<DMHistoryPage> {
     const params = new URLSearchParams({ container_id_type: 'chat', container_id: channelId, page_size: String(Math.min(options.limit ?? 50, 50)), sort_type: 'ByCreateTimeDesc' });

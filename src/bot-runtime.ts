@@ -24,7 +24,7 @@ import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 export interface BotRuntimeHooks {
   authorize(userId: string, text: string): boolean;
   receiveGroup(message: IncomingDM): Promise<void>;
-  manager: Pick<SessionManagerOptions, 'binding' | 'onGroupTurnStart' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
+  manager: Pick<SessionManagerOptions, 'binding' | 'onConversationScene' | 'onGroupTurnStart' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
   invoke(turn: AgentTurn, name: string, input: Record<string, unknown>, callId: string | undefined, delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown>;
   pauseGroup(): void;
   resumeGroup(): void;
