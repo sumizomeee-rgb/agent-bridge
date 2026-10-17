@@ -5,6 +5,7 @@ import { DatabaseSync, backup } from 'node:sqlite';
 import { readJson, selectProfile, profileScope, type BotProfile } from './profiles.js';
 import { acquireInstanceLock } from './instance-lock.js';
 import type { HostConfig, PrincipalMapping } from './config.js';
+import { inspectStoppedExecution, verifyStoppedExecutions, type HostMigrationProofTestHooks, type StoppedExecutionProof } from './host-migration-proof.js';
 
 const databaseNames = ['bridge.sqlite', 'ingress.sqlite', 'controller.sqlite', 'tasks.sqlite', 'native-session-leases.sqlite', 'restart.sqlite'];
 export interface MigratedBot {
@@ -18,12 +19,14 @@ export interface HostMigrationOptions {
   dryRun?: boolean; startupProfiles?: string[];
   /** Explicitly migrate inactive bots, including other platforms, without starting them. */
   includeProfiles?: string[];
+  /** 旧本机 uncertain job 的精确只读证明；不能通用跳过迁移阻断。 */
+  stoppedExecutionProofs?: string[];
   /** Bot identity -> raw platform account. Multiple active users always require a choice. */
   owners?: Record<string, string>;
   /** Give accounts in different apps the same principal only after verifying their identity. */
   principalIds?: Record<string, string>;
 }
-export interface HostMigrationPlan { version: 3; dryRun: boolean; sourceDataDir: string; startupProfiles: string[]; registeredProfiles: string[]; bots: MigratedBot[]; warnings: string[]; blockers: string[]; backupDir?: string }
+export interface HostMigrationPlan { version: 3; dryRun: boolean; sourceDataDir: string; startupProfiles: string[]; registeredProfiles: string[]; bots: MigratedBot[]; warnings: string[]; blockers: string[]; stoppedExecutions: { jobId: string; botId: string; proofSha256: string }[]; backupDir?: string }
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
 interface Legacy { raw: Record<string, unknown>; profiles: BotProfile[]; startupProfiles: string[]; configPath: string; project: string; dataDir: string; bytes: Buffer; bots: MigratedBot[] }
 function local(project: string, value: unknown, fallback: string): string { return resolve(project, String(value ?? fallback)); }
@@ -87,10 +90,11 @@ function jsonOwner(value: unknown, scope: string, exact = false): boolean {
   if (Array.isArray(object)) return object.some(item => jsonOwner(item, scope, exact));
   return Object.entries(object).some(([key, item]) => key === 'userId' && typeof item === 'string' && (exact ? item === scope : item.startsWith(scope)) || item && typeof item === 'object' && jsonOwner(item, scope, exact));
 }
-function quiescenceBlockers(source: Legacy): string[] {
+function quiescenceBlockers(source: Legacy, stoppedJobIds = new Set<string>()): string[] {
   const blockers: string[] = [];
   for (const [database, table, states] of [['tasks.sqlite', 'tasks', ['running']], ['controller.sqlite', 'controller_jobs', ['running', 'uncertain']], ['controller.sqlite', 'controller_schedules', ['dispatching', 'running', 'uncertain']], ['bridge.sqlite', 'inbox', ['running', 'steering', 'uncertain']]] as const) {
-    const rows = databaseRows(source.dataDir, database, table).filter(row => (states as readonly unknown[]).includes(row.status ?? row.state));
+    const rows = databaseRows(source.dataDir, database, table).filter(row => (states as readonly unknown[]).includes(row.status ?? row.state)
+      && !(table === 'controller_jobs' && row.status === 'uncertain' && stoppedJobIds.has(String(row.id))));
     if (rows.length) blockers.push(`${database}/${table} 有 ${rows.length} 项执行中或结果未知，先核对停止状态。`);
   }
   return blockers;
@@ -189,9 +193,18 @@ function encodedJson(value: unknown, original?: Buffer): string {
   const text = JSON.stringify(value, null, 2) + '\n';
   return (original?.subarray(0, 3).equals(Buffer.from([239,187,191])) ? '\uFEFF' : '') + (original?.toString('utf8').includes('\r\n') ? text.replace(/\n/g, '\r\n') : text);
 }
-export async function migrateHostConfig(configPath: string, options: HostMigrationOptions = {}): Promise<HostMigrationPlan> {
+export function inspectHostStoppedExecution(configPath: string, jobId: string, nativePath: string, options: HostMigrationOptions = {}, testHooks: HostMigrationProofTestHooks = {}): StoppedExecutionProof {
   const source = legacy(configPath, options);
-  const plan: HostMigrationPlan = { version: 3, dryRun: options.dryRun !== false, sourceDataDir: source.dataDir, startupProfiles: source.startupProfiles, registeredProfiles: source.profiles.map(profile => profile.name), bots: source.bots, blockers: quiescenceBlockers(source),
+  return inspectStoppedExecution({ dataDir: source.dataDir, botIds: source.bots.map(bot => bot.botId) }, jobId, nativePath, testHooks);
+}
+export async function migrateHostConfig(configPath: string, options: HostMigrationOptions = {}, testHooks: HostMigrationProofTestHooks = {}): Promise<HostMigrationPlan> {
+  const source = legacy(configPath, options);
+  const proofPaths = options.stoppedExecutionProofs ?? [];
+  if (!Array.isArray(proofPaths) || proofPaths.some(path => typeof path !== 'string' || !path)) throw new Error('stoppedExecutionProofs 必须是明确的证明文件清单。');
+  const proofSource = { dataDir: source.dataDir, botIds: source.bots.map(bot => bot.botId) };
+  let verified = verifyStoppedExecutions(proofSource, proofPaths, testHooks);
+  const stoppedJobs = new Set(verified.map(item => item.proof.jobId));
+  const plan: HostMigrationPlan = { version: 3, dryRun: options.dryRun !== false, sourceDataDir: source.dataDir, startupProfiles: source.startupProfiles, registeredProfiles: source.profiles.map(profile => profile.name), bots: source.bots, blockers: quiescenceBlockers(source, stoppedJobs), stoppedExecutions: verified.map(item => ({ jobId: item.proof.jobId, botId: item.proof.botId, proofSha256: item.proofSha256 })),
     warnings: ['历史保留；仅明确 owner 的活动会话继续生效。未被选中的账号不自动继承控制权。', '迁移不连接模型或平台；应用身份和跨应用操作者映射需要部署前核实。'] };
   if (plan.dryRun) return plan;
   if (plan.blockers.length) throw new Error(plan.blockers.join('\n'));
@@ -201,6 +214,13 @@ export async function migrateHostConfig(configPath: string, options: HostMigrati
   const markerPath = join(source.dataDir, 'host-semantic-version.json');
   let markerWritten = false, configWritten = false;
   try {
+    // 确认桥已离线并取得锁后，重新核对配置字节与停止证据。
+    assertOffline(source);
+    if (!readFileSync(source.configPath).equals(source.bytes)) throw new Error('迁移准备期间配置变化，取消安装。');
+    const checked = verifyStoppedExecutions(proofSource, proofPaths, testHooks);
+    if (checked.some((item, index) => item.proofSha256 !== verified[index]?.proofSha256)) throw new Error('迁移准备期间停止证明变化。');
+    verified = checked;
+    const remaining = quiescenceBlockers(source, stoppedJobs); if (remaining.length) throw new Error(remaining.join('\n'));
     if (existsSync(markerPath)) throw new Error('存在宿主语义标记；若迁移中断请先按备份 manifest 恢复，不重复覆盖。');
     for (const bot of source.bots) if (existsSync(bot.dataDir)) throw new Error('目标 Bot 数据目录已存在，拒绝覆盖。');
     mkdirSync(stage, { recursive: true }); copyFileSync(source.configPath, join(backupDir, 'config.original.json'));
@@ -257,7 +277,12 @@ export async function migrateHostConfig(configPath: string, options: HostMigrati
     const common = { ...source.raw, version: 3, startupProfiles: source.startupProfiles, registeredProfiles: source.profiles.map(profile => profile.name), principals, spaces: [] };
     for (const key of ['startupProfile', 'platformProfiles', 'workspace', 'logsDir', 'attachmentsDir']) delete (common as Record<string, unknown>)[key];
     const marker: HostSemanticMarker = { version: 3, status: 'in-progress', migrationId, migratedAt: new Date().toISOString(), bots: source.bots, backupDir };
-    const manifest = { ...marker, configPath: source.configPath, dataDir: source.dataDir, sourceConfigSha256: createHash('sha256').update(source.bytes).digest('hex'),
+    const stoppedExecutions = verified.map((item, index) => {
+      const name = `stopped-execution-${index}.proof.json`; writeFileSync(join(backupDir, name), item.bytes, { flag: 'wx', mode: 0o600 });
+      return { jobId: item.proof.jobId, workerId: item.proof.workerId, taskId: item.proof.taskId, botId: item.proof.botId, preservedStatus: 'uncertain', workerBlocked: true,
+        proofFile: name, proofSha256: item.proofSha256, verification: item.verification };
+    });
+    const manifest = { ...marker, stoppedExecutions, configPath: source.configPath, dataDir: source.dataDir, sourceConfigSha256: createHash('sha256').update(source.bytes).digest('hex'),
       files: profileChanges, targetDirectories: source.bots.map(bot => bot.dataDir), savedData };
     writeFileSync(join(backupDir, 'manifest.json'), encodedJson(manifest), { mode: 0o600 });
     writeFileSync(markerPath, encodedJson(marker), { flag: 'wx', mode: 0o600 }); markerWritten = true;

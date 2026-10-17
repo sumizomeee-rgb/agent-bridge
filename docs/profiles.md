@@ -95,6 +95,20 @@ Discord 可选 `reactions`、`nativeCommands`、`presence`；飞书支持收件�
 ```
 
 2. 核对计划中的 Bot、owner、上下文路径、记录计数、冻结项与 `blockers`。正常停止桥及监督进程，核实本机和远端执行状态。工具拒绝仍在执行或结果未知的任务、主控 job、已触发计划和收件记录；停止标记与进程锁也必须通过。不能删记录、改状态、删除锁或伪造 `disabled` 来强清阻塞；先取得真实停止证据并处理原状态。
+对于旧 Windows 本机 Codex job，若原记录为 `uncertain`、worker 已冻结、TaskRegistry 已失败／取消并关闭回唤，且笔记本在执行后已真正重启，可以只解除该条迁移阻断，保留未知历史。只读生成器现场核对 Windows 身份、重启时间、精确关联进程、原生最后一轮 `task_started/task_complete`、源登记和凭据文件；它不接受 proof 中自报的进程状态代替现场检查。
+
+```powershell
+& .\.local\runtime\win-x64\node.exe .\dist\src\host-migration-cli.js `
+  --config '<v2 配置绝对路径>' --profile feishu/bot1 --profile feishu/bot2 `
+  --include-profile discord/legacy `
+  --inspect-stopped-job '<旧 job UUID>' --native-session '<原 Codex rollout JSONL 绝对路径>' `
+  | Set-Content -LiteralPath '<私有 proof 绝对路径>' -Encoding utf8
+```
+
+多 owner 时仍须带原计划的 `--owner`／`--principal`。核对生成器退出码再使用输出；proof 仅含标识、路径、时间和哈希，不含票据 token、凭据或聊天正文。随后在原迁移命令追加 `--stopped-proof '<私有 proof 绝对路径>'`，先 dry-run，再离线 apply。apply 取得锁后重新验证，proof 原字节、SHA256 和现场核验摘要写入备份 manifest。proof 只适用于精确匹配的一个旧本机 `controller_jobs/uncertain`；running、远端、仍有租约／关联工作、证据变动、重复或未匹配证明均拒绝。
+
+迁移后该 job 仍为 `uncertain`，原 TaskRegistry 失败历史、已关闭的回唤和 worker `blocked` 保留；不重跑、不追加完成事件、不转交旧 worker。原生完成只证明该轮结束；后续同机重启证明旧本机进程不能仍存活。任务是否完成、已发生的改动以及是否曾在其他电脑／服务启动后台活动，仍需人工核对，证明不宣称业务成功。
+
 3. 在完全静止后用相同参数将 `--dry-run` 改为 `--apply`。工具备份原配置、Profile 和数据库，拆分各 Bot 资料，写入宿主语义标记并保留历史。未选中的账号不继承主控、执行和预约权限；查看输出的冻结清单，不把冻结项理解为仍在自动运行。
 4. 核对备份 manifest、生成配置和各 Bot 独立工作区，补齐已核实的操作者／群登记，再执行 `start.ps1 -Check`。确认后更新登录启动任务，并启动完整集合。
 
