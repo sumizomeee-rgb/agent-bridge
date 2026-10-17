@@ -596,11 +596,10 @@ export class HostStore {
     });
   }
   private budgetRoots(source: HostRoot): HostRoot[] {
-    const key = source.replyTo.collaborationBudgetKey;
-    if (!key) return [source];
-    // The runtime derives this key from the real owner input, independently of mode and destination group.
-    return this.rows("SELECT * FROM host_roots WHERE principal_id=? AND json_extract(reply_json,'$.collaborationBudgetKey')=?",
-      source.principalId, key).map(root);
+    const key = source.replyTo.collaborationBudgetKey ?? source.id;
+    // Include the original human root even when it predates the shared-budget field.
+    return this.rows("SELECT * FROM host_roots WHERE principal_id=? AND (id=? OR json_extract(reply_json,'$.collaborationBudgetKey')=?)",
+      source.principalId, key, key).map(root);
   }
   budgetSnapshot(rootId: string): { limit: number; used: number; reserved: number } {
     const values = this.budgetRoots(this.mustRoot(rootId));

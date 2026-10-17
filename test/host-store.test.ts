@@ -198,6 +198,34 @@ test('first human turns are free; automatic reservations share an exact finite b
   assert.equal(store.getRoot('root-1')?.automaticUsed, 2);
 });
 
+test('broadcast human root and both Bot-derived collaboration roots share reservations, usage and one exhaustion notice', async t => {
+  const store = open(t, await directory(t)); seed(store); root(store, 'original-broadcast', [A, B], 3);
+  for (const [id, initiator] of [['derived-a', A], ['derived-b', B]]) {
+    store.acceptRoot({ id: id!, spaceId: SPACE, principalId: P, sourceEventId: `derived-source-${initiator}`,
+      targetBotIds: [initiator!], replyTo: { ...ADDRESS, collaborationMode: 'public', initiatorBotId: initiator!,
+        collaborationBudgetKey: 'original-broadcast' } });
+  }
+  // Real human participation remains free; no derived human events are fabricated.
+  enqueue(store, 'human-a', A, 'human', 'original-broadcast'); enqueue(store, 'human-b', B, 'human', 'original-broadcast');
+  store.finishEvent(start(store, A), 'silent'); store.finishEvent(start(store, B), 'silent');
+  enqueue(store, 'original-auto', A, 'consultation', 'original-broadcast');
+  store.finishEvent(start(store, A), 'silent');
+  enqueue(store, 'derived-a-auto', A, 'consultation', 'derived-a');
+  enqueue(store, 'derived-b-auto', B, 'consultation', 'derived-b');
+  const a = store.claimNextEvent(A)!, b = store.claimNextEvent(B)!;
+  for (const id of ['original-broadcast', 'derived-a', 'derived-b']) assert.deepEqual(store.budgetSnapshot(id), { limit: 3, used: 1, reserved: 2 });
+  store.startEvent(a.id); store.finishEvent(a.id, 'silent'); store.startEvent(b.id); store.finishEvent(b.id, 'silent');
+  for (const [index, id] of ['original-broadcast', 'derived-a', 'derived-b'].entries()) {
+    enqueue(store, `exhausted-${index}`, A, 'consultation', id);
+    assert.equal(store.claimNextEvent(A), null); assert.equal(store.getEvent(`exhausted-${index}`)?.error, 'root-budget-exhausted');
+    assert.deepEqual(store.budgetSnapshot(id), { limit: 3, used: 3, reserved: 0 });
+  }
+  assert.equal(store.claimBudgetExhaustionNotice('derived-b'), true);
+  assert.equal(store.claimBudgetExhaustionNotice('original-broadcast'), false);
+  assert.equal(store.claimBudgetExhaustionNotice('derived-a'), false);
+  assert.equal(store.listEvents().filter(event => event.kind === 'human').length, 2);
+});
+
 test('same-root observations coalesce while independent human roots take priority and retain addresses', async t => {
   const store = open(t, await directory(t)); seed(store); root(store);
   enqueue(store, 'observer-1', B, 'observation'); enqueue(store, 'observer-2', B, 'observation');

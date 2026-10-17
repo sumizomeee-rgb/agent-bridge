@@ -727,12 +727,74 @@ test('Claude wire receives automatic scene and source for private, group and bac
     const first = await adapter.run(base); conversation.nativeId = first.nativeId; await adapter.interrupt(conversation.id);
     const group = { ...base, chatScene: undefined, source: { messageId: 'gm', userId: 'owner', channelId: 'g', original: { messageId: 'gm', userId: 'actual-author', channelId: 'raw-g', space: { kind: 'group' as const, spaceId: 'raw-g', mentionedUserIds: ['M'], replyToMessageId: 'previous' } } }, groupContext: { eventId: 'e', rootId: 'r', botId: 'M', spaceId: 'g', generation: 1, bindingEpoch: 1, originChannelId: 'g', principalId: 'owner', scene: JSON.stringify({ recent: [{ text: '项目代号青鸟', author: 'other-member' }] }) } };
     assert.equal((await adapter.run(group)).nativeId, first.nativeId); await adapter.interrupt(conversation.id);
-    assert.equal((await adapter.run({ ...group, event: { kind: 'worker-result', text: '证据完成' } })).nativeId, first.nativeId);
+    const internalMessage = { eventId: 'consult', rootId: 'r', eventKind: 'consultation', speaker: { type: 'bot', botId: 'T', aliases: ['Teto'] }, visibility: 'internal', authorization: { freshOwnerInput: false, principalId: 'owner' }, defaultDelivery: { area: 'internal', targetBotId: 'T' } };
+    assert.equal((await adapter.run({ ...group, chatScene: JSON.stringify({ currentMessage: internalMessage, recent: [] }), event: { kind: 'group-event', text: '证据完成' } })).nativeId, first.nativeId);
     await Promise.all(scripts);
     assert.equal(transports.length, 3);
     const wires = transports.map(transport => JSON.stringify(transport.written.find(item => item.type === 'user')));
     assert.match(wires[0]!, /private-message/); assert.match(wires[0]!, /项目代号青鸟/);
     assert.match(wires[1]!, /actual-author/); assert.match(wires[1]!, /previous/); assert.match(wires[1]!, /项目代号青鸟/);
     assert.match(wires[2]!, /background-evidence/); assert.match(wires[2]!, /not fresh authorization/);
+    const content = (transports[2]!.written.find(item => item.type === 'user')!.message as JsonObject).content as { text: string }[];
+    const runtime = content.find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
+    const chat = JSON.parse(runtime.split('\n')[0]!.split('] ')[1]!);
+    assert.deepEqual(chat.currentMessage, internalMessage); assert.deepEqual(chat.defaultDelivery, internalMessage.defaultDelivery);
+    const scene = JSON.parse(runtime.split('\n').find(line => line.startsWith('[Bridge chat scene;'))!.split('] ')[1]!);
+    assert.equal(scene.content.currentMessage, undefined);
   } finally { await adapter.close(); await Promise.allSettled(scripts); rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('native current message separates author, original owner and internal delivery, without repeating its envelope in scene evidence', async () => {
+  const s = setup();
+  try {
+    const turn = s.makeTurn();
+    turn.source = { messageId: 'root-message', userId: 'owner-route', channelId: 'original-group' };
+    const currentMessage = { eventId: 'consult-1', rootId: 'root', causeEventId: 'owner-1', eventKind: 'consultation',
+      speaker: { type: 'bot', botId: 'M', aliases: ['Miku'] }, visibility: 'internal',
+      authorization: { freshOwnerInput: false, principalId: 'owner' }, defaultDelivery: { area: 'internal', targetBotId: 'M' } };
+    turn.chatScene = JSON.stringify({ currentMessage, recent: [{ text: '有界共同现场' }] });
+    turn.groupContext = { eventId: 'consult-1', rootId: 'root', botId: 'T', spaceId: 'shared-group', generation: 1, bindingEpoch: 1, originChannelId: 'original-group', principalId: 'owner', scene: '旧现场' };
+    turn.event = { kind: 'group-event', text: '请核对证据' };
+    await s.adapter.run(turn);
+    const start = s.transports[0]!.written.find(item => item.method === 'turn/start')!.params as JsonObject;
+    const wire = (start.toolOutput as JsonObject).output as string;
+    const lines = wire.split('\n');
+    const chat = JSON.parse(lines[0]!.split('] ')[1]!);
+    assert.equal(chat.kind, 'background-evidence');
+    assert.deepEqual(chat.currentMessage, currentMessage);
+    assert.deepEqual(chat.defaultDelivery, { area: 'internal', targetBotId: 'M' });
+    assert.equal(chat.route.channelId, 'original-group');
+    const scene = JSON.parse(lines.find(line => line.startsWith('[Bridge chat scene;'))!.split('] ')[1]!);
+    assert.equal(scene.content.currentMessage, undefined);
+    assert.deepEqual(scene.content.recent, [{ text: '有界共同现场' }]);
+    assert.equal(wire.split('"eventId":"consult-1"').length - 1, 2); // chat.currentMessage and chat.group, never a second scene envelope.
+  } finally { await s.cleanup(); }
+});
+
+test('native preserves direct-recipient facts for ordinary owner group messages and falls back for legacy scenes', async () => {
+  const s = setup();
+  try {
+    const turn = s.makeTurn();
+    turn.source = { messageId: 'owner-1', userId: 'owner', channelId: 'shared-group' };
+    const currentMessage = { eventId: 'owner-1', rootId: 'root', eventKind: 'human', speaker: { type: 'user', userId: 'actual-owner' }, visibility: 'group',
+      authorization: { freshOwnerInput: true, principalId: 'owner' }, defaultDelivery: { area: 'group', targetId: 'group:shared-group:1:1' },
+      directRecipients: { botIds: ['M', 'T'], meaning: 'registered delivery only; not read or accepted' } };
+    turn.groupContext = { eventId: 'owner-1', rootId: 'root', botId: 'M', spaceId: 'shared-group', generation: 1, bindingEpoch: 1, originChannelId: 'shared-group', principalId: 'owner', scene: JSON.stringify({ currentMessage, recent: [] }) };
+    await s.adapter.run(turn);
+    const first = s.transports[0]!.written.find(item => item.method === 'turn/start')!.params as JsonObject;
+    const runtime = (first.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
+    const chat = JSON.parse(runtime.split('\n')[0]!.split('] ')[1]!);
+    assert.deepEqual(chat.currentMessage.directRecipients.botIds, ['M', 'T']);
+    assert.equal(chat.currentMessage.speaker.userId, 'actual-owner');
+    assert.equal(chat.requesterPrincipalId, 'owner');
+    assert.deepEqual(chat.defaultDelivery, currentMessage.defaultDelivery);
+    turn.chatScene = 'legacy scene';
+    await s.adapter.run(turn);
+    const second = s.transports[0]!.written.filter(item => item.method === 'turn/start')[1]!.params as JsonObject;
+    const legacyRuntime = (second.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
+    const legacy = JSON.parse(legacyRuntime.split('\n')[0]!.split('] ')[1]!);
+    assert.equal(legacy.currentMessage, undefined);
+    assert.deepEqual(legacy.defaultDelivery, { area: 'group', channelId: 'shared-group' });
+  } finally { await s.cleanup(); }
 });

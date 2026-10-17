@@ -130,6 +130,8 @@ export interface AgentTurn {
   onNativeId?: (nativeId: string) => void;
   /** Only this explicit channel may publish coordinating-agent output. */
   onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string, targetId?: string, finish?: boolean) => Promise<void>;
+  /** Complete a verified same-group public collaboration delivery without sending another message. */
+  onPublicDeliveryComplete?: () => Promise<void>;
   /** Automatically supplied bounded active-group evidence; never a fresh request. */
   chatScene?: string;
   /** Frozen per-event audience and host causal identity; never inferred from last contact. */

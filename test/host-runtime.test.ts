@@ -15,6 +15,68 @@ import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
 import { historyPage, type ConversationHistoryOptions, type ConversationHistoryPage } from '../src/group-history.js';
 import { groupMessagePayloadHash, type GroupMentionView } from '../src/group-mentions.js';
 
+test('current group envelope reports real broadcast recipients, internal speaker and non-authorizing compact evidence', async t => {
+  const f = fixture(t); await f.activate();
+  const seen: Array<{ botId: string; text: string; scene: any }> = [];
+  f.run(async (botId, turn) => {
+    seen.push({ botId, text: turn.text, scene: JSON.parse(turn.chatScene!) });
+    if (botId === A && !turn.event) await f.host.invoke(A, turn, 'bridge_send_bot', { targetBotId: B, text: 'internal exact speaker' }, 'envelope-consult');
+    if (turn.event && turn.text === 'internal exact speaker') {
+      const targets: any = await f.host.invoke(botId, turn, 'bridge_delivery_targets', {});
+      assert.equal(targets.defaultTargetId, null);
+      await assert.rejects(turn.onPublicMessage!('not an implicit public reply'), /内部消息/);
+    }
+    await turn.onSilent?.();
+  });
+  const guest = f.message(A, 'envelope-guest', 'read-only guest evidence'); guest.userId = `${A}|outside-whitelist`;
+  await f.host.receive(A, guest);
+  await f.host.receive(A, f.message(A, 'envelope-owner', 'Teto please inspect', G1, [A])); await f.drain();
+  const humans = seen.filter(value => value.text === 'Teto please inspect');
+  assert.equal(humans.length, 2);
+  for (const { scene } of humans) {
+    assert.equal(scene.currentMessage.eventKind, 'human');
+    assert.equal(scene.currentMessage.speaker.type, 'user');
+    assert.deepEqual(scene.currentMessage.directRecipients.botIds, [A, B]);
+    assert.equal(scene.currentMessage.authorization.freshOwnerInput, true);
+    assert.equal(scene.currentMessage.defaultDelivery.area, 'group');
+    assert.equal(scene.conversationEvidence.recent.some((record: any) => record.text === 'Teto please inspect'), false);
+    assert.equal(scene.publicProgress.some((record: any) => record.text === 'Teto please inspect'), false);
+    assert.equal(scene.conversationEvidence.recent[0].canAuthorize, false);
+    assert.equal('unread' in scene.conversationEvidence, false);
+  }
+  const internal = seen.find(value => value.text === 'internal exact speaker')!.scene.currentMessage;
+  assert.equal(internal.eventKind, 'consultation'); assert.equal(internal.speaker.botId, A);
+  assert.equal(internal.visibility, 'internal'); assert.equal(internal.authorization.freshOwnerInput, false);
+  assert.equal(internal.defaultDelivery.area, 'internal'); assert.equal(internal.defaultDelivery.targetBotId, A);
+  assert.equal(internal.directRecipients, undefined);
+});
+
+test('same-group public collaboration completes the original delivery without a second acknowledgement', async t => {
+  const f = fixture(t); await f.activate();
+  let receipt: any;
+  f.run(async (botId, turn) => {
+    if (botId === A && !turn.event) {
+      const targets: any = await f.host.invoke(A, turn, 'bridge_delivery_targets', {});
+      receipt = await f.host.invoke(A, turn, 'bridge_start_collaboration', {
+        targetBotId: B, targetId: targets.defaultTargetId, mode: 'public', text: 'A meaningful public question',
+      }, 'same-group-question');
+      assert.equal(receipt.completion.publicDeliveryComplete, true);
+      await turn.onPublicDeliveryComplete!();
+    } else await turn.onSilent?.();
+  });
+  const before = f.replies.length;
+  await f.host.receive(A, f.message(A, 'same-group-source', 'Please discuss this together', G1, [A])); await f.drain();
+  const delivered = f.replies.slice(before).filter(reply => reply.text.includes('A meaningful public question'));
+  assert.equal(delivered.length, 1);
+  const original = f.host.store.listEvents(A).find(event => event.kind === 'human')!;
+  assert.equal(original.decision, 'published'); assert.equal(original.state, 'completed');
+  const request = f.host.store.getCollaborationRequest(receipt.requestId)!;
+  assert.equal(f.host.store.getRoot(request.rootId)!.replyTo.collaborationBudgetKey, original.rootId);
+  assert.deepEqual(f.host.store.budgetSnapshot(original.rootId), f.host.store.budgetSnapshot(request.rootId));
+  assert.equal(f.host.store.budgetSnapshot(original.rootId).used, 1);
+  assert.equal(f.calls.filter(value => value.botId === B && value.turn.text === 'A meaningful public question').length, 1);
+});
+
 const A = 'feishu:cli_appa', B = 'feishu:cli_appb', P = 'person', Q = 'other-person';
 const D1 = 'discord:111111111111111111', D2 = 'discord:222222222222222222';
 const G1 = 'canonical-group-1', G2 = 'canonical-group-2';
@@ -168,14 +230,14 @@ function crossAppMention(f: ReturnType<typeof fixture>, source: IncomingDM, repe
   f.mentionViews.set(B, async () => scopedView(f, B, source, keys.map(key => ({ key, id: `platform-${B}` }))));
 }
 
-test('Feishu receiver resolves repeated scoped @B tokens through original app views and submits only B initially', async t => {
+test('Feishu receiver broadcasts ordinary scoped mentions once to all ready members without app-view reads', async t => {
   const f = fixture(t); await f.activate();
   const source = f.message(A, 'cross-app-mention', 'only B initially', G1, [B]); crossAppMention(f, source, true);
   await f.host.receive(B, f.message(B, 'cross-app-mention', 'only B initially', G1, [B]));
   await f.host.receive(A, source); await f.host.receive(A, source); await f.drain();
-  assert.deepEqual(f.calls.map(c => c.botId), [B]);
-  assert.deepEqual(f.host.store.getRoot(f.host.store.listEvents()[0]!.rootId)!.targetBotIds, [B]);
-  assert.deepEqual(f.mentionReads.sort(), [A, B].sort());
+  assert.deepEqual(f.calls.map(c => c.botId).sort(), [A, B]);
+  assert.deepEqual(f.host.store.getRoot(f.host.store.listEvents()[0]!.rootId)!.targetBotIds.sort(), [A, B]);
+  assert.equal(f.mentionReads.length, 0);
 });
 
 test('unmentioned, receiver-own and positively verified human mentions retain ordinary semantics without app-view reads', async t => {
@@ -185,14 +247,14 @@ test('unmentioned, receiver-own and positively verified human mentions retain or
   const human = f.message(A, 'human-mention-fast', 'ordinary human reference'); human.space!.mentionedUserIds = ['ou_real_human'];
   f.humanMentions.add('ou_real_human'); await f.host.receive(A, human); await f.drain();
   assert.deepEqual(f.calls.filter(c => c.turn.text === 'ordinary all').map(c => c.botId).sort(), [A, B]);
-  assert.deepEqual(f.calls.filter(c => c.turn.text === 'only self').map(c => c.botId), [A]);
+  assert.deepEqual(f.calls.filter(c => c.turn.text === 'only self').map(c => c.botId).sort(), [A, B]);
   assert.deepEqual(f.calls.filter(c => c.turn.text === 'ordinary human reference').map(c => c.botId).sort(), [A, B]);
   assert.equal(f.mentionReads.length, 0);
 });
 
-for (const mismatch of ['message', 'time', 'space', 'author', 'payload', 'token', 'unavailable', 'scoped-id-collision']) test(`Feishu unknown mention fails closed for ${mismatch}, never expands fanout by display name`, async t => {
+for (const mismatch of ['message', 'time', 'space', 'author', 'payload', 'token', 'unavailable', 'scoped-id-collision']) test(`Feishu control unknown mention fails closed for ${mismatch}, never expands routing by display name`, async t => {
   const f = fixture(t); await f.activate();
-  const source = f.message(A, 'bad-' + mismatch, 'Miku must not imply identity'); crossAppMention(f, source);
+  const source = f.message(A, 'bad-' + mismatch, '/status'); crossAppMention(f, source);
   if (mismatch === 'scoped-id-collision') source.space!.mentionedUserIds = [`platform-${B}`];
   f.mentionViews.set(A, async () => scopedView(f, A, source, [{ key: '@_user_1', id: source.space!.mentionedUserIds[0]! }]));
   f.mentionViews.set(B, async () => {
@@ -210,28 +272,28 @@ for (const mismatch of ['message', 'time', 'space', 'author', 'payload', 'token'
   await f.host.receive(A, source); await f.drain();
   assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
   assert(f.replies.some(r => /提及.*无法可靠核对/.test(r.text)));
-  assert(f.reports.some(r => /GROUP_INPUT_FAILED/.test(r)));
+  assert(f.reports.some(r => /GROUP_MENTION_UNVERIFIED/.test(r)));
 });
 
-test('a slow scoped mention is durably captured before the later fast message and preserves each Bot input order', async t => {
+test('a slow membership check preserves durable broadcast input order for each Bot', async t => {
   const f = fixture(t); await f.activate(); const wait = f.gate();
   const source = f.message(A, 'slow-mention', 'first scoped B'); crossAppMention(f, source);
-  f.mentionViews.set(B, async () => { await wait.promise; return scopedView(f, B, source, [{ key: '@_user_1', id: `platform-${B}` }]); });
+  let entered = false; f.groupChecks.set(A, async () => { entered = true; await wait.promise; return true; });
   const first = f.host.receive(A, source);
-  await eventual(() => f.mentionReads.includes(B), 'slow first mention proof entered');
+  await eventual(() => entered, 'slow first membership proof entered');
   const second = f.host.receive(A, f.message(A, 'later-fast-input', 'second ordinary'));
   await eventual(() => f.host.inbox.pending().some(input => input.message.text === 'second ordinary'), 'later input durably received while the first is processing its proof');
   assert.equal(f.host.inbox.pending().length, 1, 'pending() excludes the first input already in processing state');
   assert.equal(f.calls.length, 0); wait.release(); await Promise.all([first, second]); await f.drain();
   assert.deepEqual(f.calls.filter(c => c.botId === B).map(c => c.turn.text), ['first scoped B', 'second ordinary']);
-  assert.deepEqual(f.calls.filter(c => c.botId === A).map(c => c.turn.text), ['second ordinary']);
+  assert.deepEqual(f.calls.filter(c => c.botId === A).map(c => c.turn.text), ['first scoped B', 'second ordinary']);
 });
 
-for (const change of ['new-generation', 'stop-start']) test(`a pending scoped proof cannot move an old human input across ${change}`, async t => {
+for (const change of ['new-generation', 'stop-start']) test(`a pending broadcast cannot move an old human input across ${change}`, async t => {
   const f = fixture(t); await f.activate(); const wait = f.gate();
   const source = f.message(A, 'proof-race-' + change, 'do not cross reset'); crossAppMention(f, source);
-  f.mentionViews.set(B, async () => { await wait.promise; return scopedView(f, B, source, [{ key: '@_user_1', id: `platform-${B}` }]); });
-  const receiving = f.host.receive(A, source); await eventual(() => f.mentionReads.includes(B), 'proof is awaiting API');
+  let entered = false; f.groupChecks.set(A, async () => { entered = true; await wait.promise; return true; });
+  const receiving = f.host.receive(A, source); await eventual(() => entered, 'membership proof is awaiting API');
   if (change === 'stop-start') {
     f.host.store.stopGroup(G1, P); f.host.store.startGroup({ spaceId: G1, principalId: P, receiverBotId: A, memberBotIds: [A, B] });
   } else {
@@ -242,22 +304,29 @@ for (const change of ['new-generation', 'stop-start']) test(`a pending scoped pr
   assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
 });
 
-test('pending durable group input re-proves scoped mentions on recovery instead of trusting old own-ID strings', async t => {
+test('pending durable ordinary group input broadcasts on recovery without trusting scoped mention identity', async t => {
   const f = fixture(t); await f.activate(); const source = f.message(A, 'recover-scoped', 'recover only B'); crossAppMention(f, source);
   f.host.inbox.capture('durable-scoped-recovery', A, source, false, { [A]: 1, [B]: 1 }, f.host.store.getGroup(G1)!.epoch);
   assert.equal(f.mentionReads.length, 0); await f.host.recover(); await f.drain();
-  assert.deepEqual(f.calls.map(c => c.botId), [B]); assert.deepEqual(f.mentionReads.sort(), [A, B].sort());
+  assert.deepEqual(f.calls.map(c => c.botId).sort(), [A, B]); assert.equal(f.mentionReads.length, 0);
 });
 
-test('a new generation during the not-ready control hint cannot admit an old partially ready multi-mention', async t => {
-  const f = fixture(t, { initialized: [A] }); await f.activate(); const wait = f.gate(); let entered = false;
-  const transport = f.host.bots.get(A)!.transport, send = transport.sendText.bind(transport);
-  transport.sendText = async (channel, text, options) => { if (/未初始化|未就绪/.test(text)) { entered = true; await wait.promise; } await send(channel, text, options); };
-  const receiving = f.host.receive(A, f.message(A, 'not-ready-race', 'do not cross hint reset', G1, [A, B]));
-  await eventual(() => entered, 'not-ready hint in flight');
-  const c = f.configs[0]!, next = f.sessions.get(A)!.createConversation(c.ownerUserId!, 'codex', c.workspace, { controllerMode: true });
-  f.host.store.setController(A, P, { conversationId: next.id, generation: 2, agent: 'codex', nativeId: null }, 1);
-  wait.release(); await receiving; await f.drain(); assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+test('ordinary mentions of uninitialized members still reach ready peers without a control hint', async t => {
+  const f = fixture(t, { initialized: [A] }); await f.activate(); f.replies.length = 0;
+  await f.host.receive(A, f.message(A, 'partially-ready-broadcast', 'talk to B', G1, [B])); await f.drain();
+  assert.deepEqual(f.calls.map(c => c.botId), [A]); assert.equal(f.mentionReads.length, 0);
+  assert(!f.replies.some(r => /未初始化|未就绪/.test(r.text)));
+});
+
+for (const stale of ['partial-generation-snapshot', 'binding-revision']) test(`durable broadcast rejects ${stale} before creating model events`, async t => {
+  const f = fixture(t); await f.activate();
+  const source = f.message(A, 'stale-broadcast-' + stale, 'must not replay old subset', G1, [A]);
+  const group = f.host.store.getGroup(G1)!;
+  f.host.inbox.capture('stale-broadcast', A, source, false, stale === 'partial-generation-snapshot' ? { [A]: 1 } : { [A]: 1, [B]: 1 }, group.epoch, group.revision);
+  if (stale === 'binding-revision') f.host.store.startGroup({ spaceId: G1, principalId: P, receiverBotId: B, memberBotIds: [A, B] });
+  await f.host.recover(); await f.drain();
+  assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+  assert.equal(f.mentionReads.length, 0);
 });
 
 test('pending control input re-proves its original scoped entities before execution', async t => {
@@ -271,10 +340,10 @@ test('pending control input re-proves its original scoped entities before execut
   assert.equal(f.host.inbox.get('durable-control-proof')!.state, 'accepted');
 });
 
-test('Discord global mention IDs keep direct routing and never call the Feishu correlation API', async t => {
+test('Discord ordinary mentions broadcast and never call the Feishu correlation API', async t => {
   const f = fixture(t, { platform: 'discord' }); await f.activate();
   await f.host.receive(D1, f.message(D1, 'discord-explicit-target', 'only D2', G1, [D2])); await f.drain();
-  assert.deepEqual(f.calls.map(c => c.botId), [D2]); assert.equal(f.mentionReads.length, 0);
+  assert.deepEqual(f.calls.map(c => c.botId).sort(), [D1, D2]); assert.equal(f.mentionReads.length, 0);
 });
 
 
@@ -369,9 +438,8 @@ test('explicitly targeting an uninitialized member gives a control hint instead 
   const f = fixture(t, { initialized: [A] }); await f.activate();
   const prior = f.replies.length;
   await f.host.receive(A, f.message(A, 'ask-uninitialized-b', 'please help B', G1, [B])); await f.drain();
-  assert.equal(f.calls.length, 0);
-  assert.equal(f.replies.length, prior + 1);
-  assert.match(f.replies.at(-1)!.text, /未初始化|未就绪/);
+  assert.deepEqual(f.calls.map(c => c.botId), [A]);
+  assert.equal(f.replies.length, prior);
 });
 
 test('only the owner and receiver admit ordinary messages; cross-app duplicate receipt runs each target once', { timeout: 10000 }, async t => {
@@ -394,6 +462,7 @@ test('shared controller fixes each group reply address despite another group and
   const f = fixture(t); await f.activate(); await f.activate(G2);
   const wait = f.gate();
   f.run(async (_botId, turn) => {
+    if (_botId !== A) { await turn.onSilent?.(); return; }
     if (turn.groupContext && turn.text === 'from first group') { await wait.promise; await turn.onPublicMessage!('first-group answer'); }
     else if (turn.groupContext && turn.text === 'from second group') await turn.onPublicMessage!('second-group answer');
     else await turn.onSilent?.();
@@ -421,7 +490,7 @@ test('automatic public discussion consumes the shared eight-turn budget and term
   assert.equal(f.replies.filter(reply => reply.text.includes('自动协作已达到')).length, 1);
 });
 
-test('a paused Bot holds accepted platform input durably until resume, then uses the current generation', { timeout: 10000 }, async t => {
+test('paused ordinary group input is durably captured but cancelled after a controller reset', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate();
   const pause = f.hooks.get(A)!;
   pause.pauseGroup();
@@ -429,8 +498,9 @@ test('a paused Bot holds accepted platform input durably until resume, then uses
   assert.equal(f.host.inbox.pending().length, 1); assert.equal(f.calls.length, 0);
   const configA = f.configs[0]!, target = f.sessions.get(A)!.createConversation(configA.ownerUserId!, 'codex', configA.workspace, { controllerMode: true });
   f.host.store.setController(A, P, { conversationId: target.id, generation: 2, agent: 'codex', nativeId: null }, 1);
-  pause.resumeGroup(); await eventual(() => f.calls.length === 1, 'resumed input reaches Agent'); await f.drain();
-  assert.equal(f.host.inbox.pending().length, 0); assert.equal(f.calls[0]!.turn.groupContext?.generation, 2);
+  pause.resumeGroup(); await f.drain();
+  assert.equal(f.host.inbox.pending().length, 0); assert.equal(f.calls.length, 0);
+  assert.equal(f.host.store.listEvents().length, 0);
 });
 
 test('failed batch preflight/preparation never reports all members reset or changes only one current pointer', { timeout: 10000 }, async t => {
@@ -516,7 +586,7 @@ test('durable intake order survives a slower first permission probe and does not
   const first = f.host.receive(A, f.message(A, 'order-first', 'first received', G1, [A])); await entered.promise;
   const second = f.host.receive(A, f.message(A, 'order-second', 'second received', G1, [A]));
   await nextImmediate(); firstProbe.release(); await Promise.all([first, second]); await f.drain();
-  assert.deepEqual(f.calls.map(c => c.turn.text), ['first received', 'second received']);
+  for (const id of [A, B]) assert.deepEqual(f.calls.filter(c => c.botId === id).map(c => c.turn.text), ['first received', 'second received']);
   assert.equal(f.host.inbox.cursor(A, G1), f.message(A, 'order-second', '').id);
 });
 
@@ -547,14 +617,14 @@ test('successful group reset suppresses per-Bot introduction notices and keeps o
   assert.equal(f.replies.filter(r => /已提交本群/.test(r.text)).length, 1);
 });
 
-test('an unrelated member private reset does not cancel an already received message explicitly targeting A', { timeout: 10000 }, async t => {
+test('any member private reset cancels an already received broadcast even when it only mentions A', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); const wait = f.gate(), entered = f.gate(); let probes = 0;
   f.groupChecks.set(A, async () => { if (++probes === 1) { entered.release(); await wait.promise; } return true; });
   const delivery = f.host.receive(A, f.message(A, 'only-a-before-b-new', 'only A should handle this', G1, [A])); await entered.promise;
   const configB = f.configs[1]!, newB = f.sessions.get(B)!.createConversation(configB.ownerUserId!, 'codex', configB.workspace, { controllerMode: true });
   f.host.store.setController(B, P, { conversationId: newB.id, generation: 2, agent: 'codex', nativeId: null }, 1);
   wait.release(); await delivery; await f.drain();
-  assert.deepEqual(f.calls.map(call => call.botId), [A]);
+  assert.equal(f.calls.length, 0);
 });
 
 test('input captured before a continuous backend switch follows its preserved controller rather than being cancelled', { timeout: 10000 }, async t => {
@@ -564,8 +634,8 @@ test('input captured before a continuous backend switch follows its preserved co
   const configA = f.configs[0]!, newA = f.sessions.get(A)!.createConversation(configA.ownerUserId!, 'claude', configA.workspace, { controllerMode: true });
   f.host.store.replaceControllerForAgentSwitch(A, P, { conversationId: newA.id, generation: 2, agent: 'claude', nativeId: 'new-claude' }, 1);
   wait.release(); await delivery; await f.drain();
-  assert.equal(f.calls.length, 1); assert.equal(f.calls[0]!.turn.conversation.agent, 'claude');
-  assert.equal(f.calls[0]!.turn.groupContext!.generation, 2);
+  assert.equal(f.calls.length, 2); const switched = f.calls.find(c => c.botId === A)!; assert.equal(switched.turn.conversation.agent, 'claude');
+  assert.equal(switched.turn.groupContext!.generation, 2);
 });
 
 test('input captured in an old group epoch is cancelled after stop and reactivation even if native generations stay unchanged', { timeout: 10000 }, async t => {
@@ -584,7 +654,7 @@ test('one Bot retains durable intake order across two groups with different perm
   const first = f.host.receive(A, f.message(A, 'g1-first', 'first from G1', G1, [A])); await entered.promise;
   const second = f.host.receive(A, f.message(A, 'g2-second', 'second from G2', G2, [A]));
   await nextImmediate(); wait.release(); await Promise.all([first, second]); await f.drain();
-  assert.deepEqual(f.calls.map(call => call.turn.text), ['first from G1', 'second from G2']);
+  for (const id of [A, B]) assert.deepEqual(f.calls.filter(c => c.botId === id).map(call => call.turn.text), ['first from G1', 'second from G2']);
 });
 
 test('controller timer wakes share the original root budget while genuine worker completion remains deliverable', { timeout: 10000 }, async t => {
@@ -597,10 +667,10 @@ test('controller timer wakes share the original root budget while genuine worker
     await f.drain();
   }
   assert.equal(f.host.store.getRoot(context.rootId)?.automaticUsed, 8);
-  assert.equal(f.calls.length, 9); // Initial human participation plus eight charged timer wakes.
+  assert.equal(f.calls.filter(c => c.botId === A).length, 9); // Initial human participation plus eight charged timer wakes.
   await hook.onGroupCompletion!({ ...common, id: 'actual-worker-completion', scheduleKind: 'worker', text: 'completed result' } as never);
   await f.drain();
-  assert.equal(f.calls.length, 10);
+  assert.equal(f.calls.filter(c => c.botId === A).length, 10);
   assert.equal(f.calls.at(-1)?.turn.event?.kind, 'worker-result');
 });
 
@@ -693,7 +763,7 @@ test('Discord recovery walks before cursors without page tokens and admits buffe
     return { messages: [first, activation], oldestId: activation.id, newestId: first.id, hasMore: true };
   });
   await f.host.recover(); await f.drain();
-  assert.deepEqual(f.calls.map(call => call.turn.text), ['history first', 'history second', 'history third']);
+  for (const id of [D1, D2]) assert.deepEqual(f.calls.filter(c => c.botId === id).map(call => call.turn.text), ['history first', 'history second', 'history third']);
   assert.equal(requestOptions.length, 2); assert.equal(requestOptions[0]!.before, undefined);
   assert.equal(requestOptions[1]!.before, second.id);
   assert.equal(requestOptions.every(options => options.pageToken === undefined && options.after === undefined && options.since === undefined), true);
@@ -717,13 +787,13 @@ test('uncertain native work is never replayed; only program confirmation release
   f.host.store.startEvent(f.host.store.claimNextEvent(A)!.id);
   f.host.store.recoverInFlight(); f.stoppedProofs.set(A, false);
   await f.host.recover();
-  assert.equal(f.host.store.getEvent('prior-native')?.state, 'uncertain'); assert.equal(f.calls.length, 0);
+  assert.equal(f.host.store.getEvent('prior-native')?.state, 'uncertain'); assert.equal(f.calls.filter(c => c.botId === A).length, 0);
   assert(f.reports.some(report => report.startsWith('HOST_NATIVE_STOP_UNCONFIRMED')));
   await f.host.receive(A, f.message(A, 'new-after-crash', 'a new real instruction', G1, [A]));
-  assert.equal(f.calls.length, 0);
+  assert.equal(f.calls.filter(c => c.botId === A).length, 0);
   f.stoppedProofs.set(A, true); await f.host.recover(); await f.drain();
   assert.equal(f.host.store.getEvent('prior-native')?.state, 'failed');
-  assert.deepEqual(f.calls.map(call => call.turn.text), ['a new real instruction']);
+  for (const id of [A, B]) assert.deepEqual(f.calls.filter(c => c.botId === id).map(call => call.turn.text), ['a new real instruction']);
 });
 
 test('initialization callbacks update only the current controller readiness and status never mistakes a pointer for readiness', { timeout: 10000 }, async t => {
@@ -784,17 +854,19 @@ test('recovery resumes only pending initialization in an already committed batch
 
 test('a stalled A attachment download does not block two successive independent B roots or later pump cycles', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); await f.activate(G2);
+  f.host.store.startGroup({ spaceId: G1, principalId: P, receiverBotId: A, memberBotIds: [A] });
+  f.host.store.startGroup({ spaceId: G2, principalId: P, receiverBotId: B, memberBotIds: [B] });
   const download = f.gate(), entered = f.gate();
   f.downloads.set(A, async () => { entered.release(); await download.promise; return []; });
   const image = f.message(A, 'stalled-a-image', 'A handles the image', G1, [A]);
   image.attachments = [{ id: 'image-reference', filename: 'image.png', url: '', size: 10, content_type: 'image/png',
     resourceKey: 'source-a-image-resource', messageId: 'om_stalled_image' }];
   await f.host.receive(A, image); await entered.promise;
-  await f.host.receive(A, f.message(A, 'independent-b-one', 'B independent first root', G2, [B]));
+  await f.host.receive(B, f.message(B, 'independent-b-one', 'B independent first root', G2, [B]));
   await eventual(() => f.calls.filter(call => call.botId === B).length === 1
     && f.host.store.listEvents(B).every(event => event.nativeEnded), 'B completes while A is still downloading');
   assert.equal(f.calls.filter(call => call.botId === A).length, 0);
-  await f.host.receive(A, f.message(A, 'independent-b-two', 'B independent second root', G2, [B]));
+  await f.host.receive(B, f.message(B, 'independent-b-two', 'B independent second root', G2, [B]));
   await eventual(() => f.calls.filter(call => call.botId === B).length === 2
     && f.host.store.listEvents(B).every(event => event.nativeEnded), 'later pump cycles also remain independent');
   assert.equal(f.calls.filter(call => call.botId === A).length, 0);
@@ -810,7 +882,7 @@ test('failed group stop with an unavailable member leaves online members dispatc
   assert.match(f.replies.at(-1)!.text, /未完成|离线/);
   f.host.bots.set(B, b);
   await f.host.receive(A, f.message(A, 'after-failed-stop', 'continue after failed control', G1, [A])); await f.drain();
-  assert.equal(f.calls.length, 1); assert.equal(f.calls[0]!.botId, A);
+  assert.deepEqual(f.calls.map(c => c.botId).sort(), [A, B]);
 });
 
 test('disabled completion wake retains the result after stop without reviving its group controller', { timeout: 10000 }, async t => {
@@ -821,7 +893,7 @@ test('disabled completion wake retains the result after stop without reviving it
   const hook = f.hooks.get(A)!.manager as SessionManagerOptions;
   const result = await hook.onGroupCompletion!({ id: 'cancelled-late-result', wakeAllowed: false,
     conversationId: f.host.store.getController(A)!.conversationId, groupContext: context, text: 'late cancelled worker result' } as never);
-  await f.drain(); assert.equal(result, 'retain'); assert.equal(f.host.store.listEvents(A).length, before); assert.equal(f.calls.length, 1);
+  await f.drain(); assert.equal(result, 'retain'); assert.equal(f.host.store.listEvents(A).length, before); assert.equal(f.calls.filter(c => c.botId === A).length, 1);
 });
 
 test('turning group mode off pauses persisted bindings before Bot startup and does not transfer ownership', { timeout: 10000 }, async t => {
@@ -842,7 +914,7 @@ test('unknown prior native ownership blocks only that Bot before any manager sta
   f.host.bots.get(A)!.confirmControllerStopped = async () => false;
   await f.host.prepareRecoveryBots();
   assert.equal(f.host.failures.has(A), true); assert.equal(f.host.failures.has(B), false);
-  assert.equal(f.host.store.getEvent('unfinished-proof')?.state, 'uncertain'); assert.equal(f.calls.length, 1);
+  assert.equal(f.host.store.getEvent('unfinished-proof')?.state, 'uncertain'); assert.equal(f.calls.filter(c => c.botId === A).length, 1);
 });
 
 test('startup recovery orders older history before a newer live receipt buffered during the history probe', { timeout: 10000 }, async t => {
@@ -852,7 +924,7 @@ test('startup recovery orders older history before a newer live receipt buffered
   f.host.bots.get(A)!.transport.readGroupHistory = async () => ({ messages: [older], oldestId: older.id, newestId: older.id, hasMore: false });
   f.host.beginRecovery(); await f.host.receive(A, live); assert.equal(f.calls.length, 0);
   await f.host.recover(); await f.drain();
-  assert.deepEqual(f.calls.map(call => call.turn.text), ['older outage input', 'newer live input']);
+  for (const id of [A, B]) assert.deepEqual(f.calls.filter(c => c.botId === id).map(call => call.turn.text), ['older outage input', 'newer live input']);
 });
 
 
@@ -925,7 +997,7 @@ test('history tool returns all authors as evidence with opaque pagination and no
   assert.equal(first.evidenceOnly, true); assert.equal(first.messages[0].author.id, 'outside-whitelist');
   assert.equal(first.pageToken, undefined); assert.notEqual(first.nextCursor, 'platform-secret-token');
   assert.equal(second.messages[0].id, 'older'); assert.deepEqual(platformTokens, [undefined, 'platform-secret-token']);
-  assert.equal(f.host.store.listEvents().length, 1); assert.equal(f.host.store.getController(A)!.generation, 1);
+  assert.equal(f.host.store.listEvents().length, 2); assert.equal(f.host.store.getController(A)!.generation, 1);
 });
 
 test('history tool rejects changed binding and cross-Bot cursor reuse without platform access', async t => {
@@ -958,13 +1030,13 @@ test('private default scene includes confirmed Bot group publications with separ
 });
 
 
-test('owner input remains conversation evidence when mention routing cannot be verified', async t => {
+test('owner ordinary input broadcasts and preserves raw mention evidence without identity lookup', async t => {
   const f = fixture(t); await f.activate();
   const source = f.message(A, 'owner-route-failed-evidence', 'discuss this even if @ identity cannot resolve');
   source.space!.mentionedUserIds = ['unverified-outside-app-id'];
   f.mentionViews.set(A, async () => { throw new Error('mention proof unavailable'); });
   await f.host.receive(A, source); await f.drain();
-  assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+  assert.equal(f.calls.length, 2); assert.equal(f.host.store.listEvents().length, 2); assert.equal(f.mentionReads.length, 0);
   const evidence = f.host.store.readContext(G1, A).recent;
   assert.equal(evidence.at(-1)!.text, source.text); assert.equal(evidence.at(-1)!.source.userId, source.userId);
   assert.equal(evidence.at(-1)!.source.mentionedUserIds[0], 'unverified-outside-app-id');
@@ -1133,7 +1205,8 @@ test('internal failure cannot send back to an origin group stopped during cross-
       await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: targets.targets.find((x: any) => x.spaceId === G2).targetId,
         targetBotId: B, mode: 'internal', text: '跨群后台核对' });
       await turn.onSilent!(); f.host.store.stopGroup(G1, P);
-    } else if (id === B) throw new Error('target error');
+    } else if (id === B && turn.groupContext?.eventKind === undefined) await turn.onSilent!();
+    else if (id === B) throw new Error('target error');
     else throw new Error('initiator summary also failed');
   });
   await f.host.receive(A, f.message(A, 'cross-group-internal', '从群一发起群二后台核对', G1, [A]));

@@ -101,3 +101,79 @@ test('静默等待已接纳管理动作，后来的并行越界调用不能派�
   release(); const result = await running; assert.equal(result.controlledOutput, true); assert.equal(f.silent, 1);
   assert.deepEqual(f.invoked, ['bridge_list_workers']); assert.equal(f.published, 0);
 });
+
+
+test('同群公开协作可信收据完成交付，不再额外发一次确认，原生DONE等待派发与回调', async t => {
+  const f = setup(t); let release!: () => void, complete!: () => void, finalized = 0;
+  const dispatch = new Promise<void>(resolve => { release = resolve; });
+  const delivery = new Promise<void>(resolve => { complete = resolve; });
+  f.turn.onPublicDeliveryComplete = async () => { await delivery; finalized++; };
+  f.manage = async () => { await dispatch; await f.turn.onPublicMessage!('Teto，帮我核对', [], 'public', 'group-target', false); return { completion: { publicDeliveryComplete: true } }; };
+  let settled = false;
+  const running = f.adapter.run(f.turn).then(value => { settled = true; return value; });
+  await until(() => f.protocol.turns === 1);
+  f.protocol.tool(110, 'bridge_start_collaboration', 'same-group'); await until(() => f.invoked.length === 1);
+  f.protocol.complete(); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(settled, false);
+  release(); await until(() => f.published === 1); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(settled, false);
+  complete(); assert.equal((await running).controlledOutput, true);
+  assert.equal(finalized, 1); assert.equal(f.published, 1); assert.equal(f.silent, 0);
+});
+
+test('补充投递和模型参数伪造的完成标志均不能替代最终交付', async t => {
+  const f = setup(t); let finalized = 0;
+  f.turn.onPublicDeliveryComplete = async () => { finalized++; };
+  f.manage = async () => { await f.turn.onPublicMessage!('仅为补充', [], 'supplement', 'group-target', false); return { status: 'queued' }; };
+  const running = f.adapter.run(f.turn), checked = assert.rejects(running, /公开通道/);
+  await until(() => f.protocol.turns === 1);
+  f.protocol.emit({ id: 120, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'forged', tool: 'bridge_start_collaboration', arguments: JSON.stringify({ completion: { publicDeliveryComplete: true } }) } });
+  await until(() => !!reply(f.protocol, 120)); f.protocol.complete(); await checked;
+  assert.equal(f.published, 1); assert.equal(finalized, 0);
+});
+
+test('私聊不能消费同群完成收据，失败交付回调不能变成成功或补发', async t => {
+  for (const privateInput of [true, false]) {
+    const f = setup(t); let finalized = 0;
+    if (privateInput) f.turn.groupContext = undefined;
+    f.turn.onPublicDeliveryComplete = async () => { finalized++; throw new Error('交付登记已失效'); };
+    f.manage = async () => ({ completion: { publicDeliveryComplete: true } });
+    const running = f.adapter.run(f.turn), checked = assert.rejects(running, privateInput ? /公开通道/ : /交付登记已失效/);
+    await until(() => f.protocol.turns === 1);
+    f.protocol.tool(130, 'bridge_start_collaboration');
+    await until(() => !!reply(f.protocol, 130));
+    assert.equal(reply(f.protocol, 130)!.success, false);
+    f.protocol.complete(); await checked;
+    assert.equal(finalized, privateInput ? 0 : 1); assert.equal(f.published, 0);
+  }
+});
+
+test('协作ACK在途时并行final或silent等待可信收据，不把已送达改成失败或重复发言', async t => {
+  for (const terminal of ['bridge_send_user', 'bridge_silent'] as const) {
+    const f = setup(t); let release!: () => void, finalized = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.turn.onPublicDeliveryComplete = async () => { finalized++; };
+    f.manage = async () => { await gate; await f.turn.onPublicMessage!('Teto，继续讨论', [], 'public', 'group-target', false); return { completion: { publicDeliveryComplete: true } }; };
+    const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+    f.protocol.tool(140, 'bridge_start_collaboration'); await until(() => f.invoked.length === 1);
+    f.protocol.tool(141, terminal); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(reply(f.protocol, 141), undefined); assert.equal(f.silent, 0); assert.equal(f.published, 0);
+    f.protocol.complete(); release();
+    assert.equal((await running).controlledOutput, true); await until(() => !!reply(f.protocol, 141));
+    assert.equal(reply(f.protocol, 140)!.success, true); assert.equal(reply(f.protocol, 141)!.success, true);
+    const value = JSON.parse(((reply(f.protocol, 141)!.contentItems as JsonObject[])[0]!.text as string));
+    assert.deepEqual(value, { alreadyCompleted: true });
+    assert.equal(finalized, 1); assert.equal(f.published, 1); assert.equal(f.silent, 0);
+  }
+});
+
+test('在途协作无完成收据时并行final正常交付，不把队列成功当成同群交付', async t => {
+  const f = setup(t); let release!: () => void, finalized = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.turn.onPublicDeliveryComplete = async () => { finalized++; };
+  f.manage = async () => { await gate; return { status: 'queued' }; };
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+  f.protocol.tool(150, 'bridge_start_collaboration'); await until(() => f.invoked.length === 1);
+  f.protocol.tool(151, 'bridge_send_user'); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(f.published, 0); release(); await until(() => !!reply(f.protocol, 151));
+  f.protocol.complete(); assert.equal((await running).controlledOutput, true);
+  assert.equal(reply(f.protocol, 151)!.success, true); assert.equal(f.published, 1); assert.equal(finalized, 0);
+});

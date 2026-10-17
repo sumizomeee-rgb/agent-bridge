@@ -1059,6 +1059,7 @@ export class SessionManager {
       let groupContext = item.groupContext;
       let groupOutcome: 'completed' | 'silent' | 'failed' = 'failed';
       let silent = false;
+      let supplementaryPublished = false;
       try {
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
         if (!current()) throw new Error('消息轮次已经停止');
@@ -1100,8 +1101,13 @@ export class SessionManager {
             if (!current()) throw new Error('当前主控轮次已经停止');
             if (finish) this.store.setReplyState(turn.messageIds, 'pending');
             await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
+            if (!finish && current()) supplementaryPublished = true;
             if (finish && current()) { this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds); }
           },
+          ...(groupContext ? { onPublicDeliveryComplete: async () => {
+            if (!current() || !supplementaryPublished) throw new Error('本轮没有已确认的群公开投递，不能完成交付。');
+            this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds);
+          } } : {}),
         });
         turn.executing = false;
         if (current()) {
