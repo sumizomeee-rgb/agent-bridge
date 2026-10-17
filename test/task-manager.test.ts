@@ -424,7 +424,7 @@ test('后台汇总复用原模型和附件发送流程', async t => {
   assert.match(reply.text, /6\.1-sol · 中/);
 });
 
-test('后台汇总本轮未回报 metadata 时显示未知，不拿历史值冒充本轮', async t => {
+test('后台汇总本轮未回报 metadata 时明确未回报，不拿历史值冒充本轮', async t => {
   const f = fixture(t);
   await f.manager.handle(message('origin', 'delegate'));
   await waitFor(() => f.codex.calls.length === 1);
@@ -436,7 +436,7 @@ test('后台汇总本轮未回报 metadata 时显示未知，不拿历史值冒�
   await waitFor(() => f.codex.calls.length === 2);
   f.codex.finish(1, 'checked');
   await waitFor(() => f.registry.eventState(event.id) === 'delivered');
-  assert.match(f.sink.replies.at(-1)!.text, /模型未知 · 强度未知/);
+  assert.match(f.sink.replies.at(-1)!.text, /模型未知 · CLI 默认 · 未回报/);
   assert.equal(f.inspect.getConversation(event.conversationId)?.actualModel, 'gpt-6.1-sol', '历史记录仍保留供 status');
 });
 

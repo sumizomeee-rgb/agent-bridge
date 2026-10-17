@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentName, AgentExecutionProgress, AgentToolActivity, EffortConfiguration } from '../types.js';
+import type { AgentAdapter, AgentName, AgentExecutionProgress, AgentToolActivity, EffortConfiguration, EffortMetadata } from '../types.js';
 import type { TaskCompletionEvent, TaskOrigin } from '../tasks.js';
 import type { ExecutionTargetBinding, RemoteHandoff, TargetSummary } from '../remote/types.js';
 import type { NativeSessionAdoptArgs, NativeSessionAdoption, NativeSessionPage, NativeSessionRead, NativeSessionReadOptions, NativeSessionRef } from '../native-sessions.js';
@@ -9,6 +9,7 @@ export interface ControllerWorker {
   id: string; origin: TaskOrigin; agent: AgentName; model: string | null; actualModel: string | null;
   actualEffort?: string | null;
   effortConfiguration?: EffortConfiguration | null;
+  effortMetadata?: EffortMetadata | null;
   modelPolicy?: 'cli-default';
   effort: string | null; cwd: string; title: string; nativeId: string | null; imagePaths: string[];
   target?: ExecutionTargetBinding; ownership?: 'bridge' | 'user'; handoffPending?: boolean;

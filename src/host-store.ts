@@ -46,6 +46,19 @@ export interface HostOutbox {
   payload: unknown; state: 'registered' | 'sending' | 'delivered' | 'uncertain' | 'rejected';
   evidence: string | null;
 }
+export interface RoutedDeliverySource {
+  botId: string; principalId: string; conversationId: string; generation: number;
+  messageId: string; userId: string; channelId: string;
+  eventId?: string; rootId?: string; spaceId?: string; bindingEpoch?: number;
+}
+export interface RoutedDeliveryTarget {
+  id: string; kind: 'private' | 'group'; botId: string; principalId: string; channelId: string;
+  userId?: string; spaceId?: string; epoch?: number; revision?: number;
+}
+export interface RoutedDelivery {
+  id: string; source: RoutedDeliverySource; target: RoutedDeliveryTarget; payload: { text: string; paths: string[] };
+  state: 'registered' | 'sending' | 'delivered' | 'uncertain' | 'rejected'; evidence: string | null;
+}
 export interface HostTask {
   id: string; rootId: string; spaceId: string; ownerBotId: string; generation: number;
   title: string; resources: string[]; replyTo: HostReplyAddress;
@@ -183,6 +196,9 @@ export class HostStore {
         id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES host_events(id), bot_id TEXT NOT NULL, generation INTEGER NOT NULL,
         root_id TEXT NOT NULL, audience TEXT NOT NULL, targets_json TEXT NOT NULL, reply_json TEXT NOT NULL,
         payload_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'registered', evidence TEXT);
+      CREATE TABLE IF NOT EXISTS host_routed_outbox(
+        id TEXT PRIMARY KEY, source_json TEXT NOT NULL, target_json TEXT NOT NULL, payload_json TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'registered', evidence TEXT);
       CREATE TABLE IF NOT EXISTS host_tasks(
         id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES host_roots(id), space_id TEXT NOT NULL,
         owner_bot_id TEXT NOT NULL, generation INTEGER NOT NULL, title TEXT NOT NULL,
@@ -673,6 +689,86 @@ export class HostStore {
       ON CONFLICT(bot_id,space_id,epoch) DO UPDATE SET cursor=MAX(cursor,excluded.cursor)`, botId, source.spaceId, source.epoch, cursor);
   }
 
+  private routedDelivery(row: Row): RoutedDelivery {
+    return { id: String(row.id), source: parse<RoutedDeliverySource>(row.source_json), target: parse<RoutedDeliveryTarget>(row.target_json),
+      payload: parse<RoutedDelivery['payload']>(row.payload_json), state: String(row.state) as RoutedDelivery['state'], evidence: row.evidence == null ? null : String(row.evidence) };
+  }
+  getRoutedDelivery(id: string): RoutedDelivery | null { const row = this.one('SELECT * FROM host_routed_outbox WHERE id=?', id); return row ? this.routedDelivery(row) : null; }
+  listRoutedDeliveries(): RoutedDelivery[] { return this.rows('SELECT * FROM host_routed_outbox ORDER BY rowid').map(row => this.routedDelivery(row)); }
+  private assertRoutedDelivery(source: RoutedDeliverySource, target: RoutedDeliveryTarget): void {
+    this.assertMapped(source.botId, source.principalId);
+    const bot = this.assertCurrent(source.botId, source.generation);
+    if (bot.ownerPrincipalId !== source.principalId || bot.controller?.conversationId !== source.conversationId
+      || source.userId !== source.botId + '|' + this.principalAccount(source.botId, source.principalId)
+      || !source.channelId.startsWith(source.botId + '|') || target.botId !== source.botId || target.principalId !== source.principalId
+      || !target.channelId.startsWith(source.botId + '|')) throw new HostStateError('forbidden', '投递主体、来源或目标身份不匹配');
+    if (this.one('SELECT 1 FROM host_control_locks WHERE bot_id=?', source.botId)) throw new HostStateError('blocked', '控制操作已冻结，不能开始新发送');
+    if (source.eventId) {
+      const event = this.mustEvent(source.eventId), root = this.mustRoot(event.rootId);
+      if (event.botId !== source.botId || event.generation !== source.generation || root.id !== source.rootId || root.spaceId !== source.spaceId
+        || root.epoch !== source.bindingEpoch || root.principalId !== source.principalId || !this.canProduceEffects(event.id)) throw new HostStateError('stale', '原群输入已结束、停用或失权');
+    } else if (source.rootId || source.spaceId || source.bindingEpoch != null) throw new HostStateError('forbidden', '私聊来源不能伪装成群事件');
+    if (target.kind === 'group') {
+      const binding = this.assertMember(target.spaceId!, source.botId, source.principalId, target.epoch);
+      if (!bot.ready || binding.revision !== target.revision || this.resolveSpace(source.botId, target.channelId.slice(source.botId.length + 1)) !== target.spaceId) throw new HostStateError('stale', '目标群或当前主控已改变');
+    } else if (target.kind !== 'private' || target.userId !== this.principalAccount(source.botId, source.principalId)
+      || this.resolveSpace(source.botId, target.channelId.slice(source.botId.length + 1))) throw new HostStateError('forbidden', '私聊目标不是本 Bot 负责人真实私聊地址');
+  }
+  private principalAccount(botId: string, principalId: string): string | null {
+    const row = this.one('SELECT platform_user_id FROM host_principal_maps WHERE bot_id=? AND principal_id=?', botId, principalId);
+    return row ? String(row.platform_user_id) : null;
+  }
+  registerRoutedDelivery(input: { id: string; source: RoutedDeliverySource; target: RoutedDeliveryTarget; payload: RoutedDelivery['payload'] }): RoutedDelivery {
+    return this.atomic(() => {
+      const previous = this.getRoutedDelivery(input.id);
+      if (previous) {
+        if (!same(previous.source, input.source) || !same(previous.target, input.target) || !same(previous.payload, input.payload)) throw new HostStateError('conflict', '投递调用标识被不同来源、目标或内容复用');
+        return previous;
+      }
+      const unresolved = this.rows("SELECT * FROM host_routed_outbox WHERE state IN ('sending','uncertain')").map(row => this.routedDelivery(row));
+      if (unresolved.some(value => value.source.botId === input.source.botId && value.source.conversationId === input.source.conversationId && value.source.messageId === input.source.messageId)) throw new HostStateError('blocked', '本输入已有发送中或结果未知的投递，不能换调用ID重发');
+      this.assertRoutedDelivery(input.source, input.target);
+      this.run('INSERT INTO host_routed_outbox(id,source_json,target_json,payload_json) VALUES (?,?,?,?)', input.id, JSON.stringify(input.source), JSON.stringify(input.target), JSON.stringify(input.payload));
+      return this.getRoutedDelivery(input.id)!;
+    });
+  }
+  beginRoutedDelivery(id: string): RoutedDelivery | null {
+    return this.atomic(() => {
+      const value = this.getRoutedDelivery(id); if (!value) throw new HostStateError('not-found', '投递记录不存在');
+      if (value.state !== 'registered') return null;
+      try { this.assertRoutedDelivery(value.source, value.target); }
+      catch (error) { if (!(error instanceof HostStateError)) throw error; this.run("UPDATE host_routed_outbox SET state='rejected',evidence=? WHERE id=?", error.message, id); return null; }
+      this.run("UPDATE host_routed_outbox SET state='sending' WHERE id=?", id); return this.getRoutedDelivery(id)!;
+    });
+  }
+  finishRoutedDelivery(id: string, state: 'delivered' | 'uncertain', evidence: string): void {
+    this.atomic(() => {
+      const value = this.getRoutedDelivery(id); if (!value || value.state !== 'sending') throw new HostStateError('conflict', '只有实际开始的发送可以登记结果');
+      this.run('UPDATE host_routed_outbox SET state=?,evidence=? WHERE id=?', state, evidence, id);
+    });
+  }
+  appendRoutedPublic(id: string): HostPublicMessage | null {
+    return this.atomic(() => {
+      const delivery = this.getRoutedDelivery(id); if (!delivery || delivery.state !== 'delivered') throw new HostStateError('blocked', '未确认送达不能写入公开记录');
+      if (delivery.target.kind !== 'group') return null;
+      const publicId = 'routed:' + id, previous = this.one('SELECT * FROM host_public_log WHERE id=?', publicId);
+      if (previous) return this.publicMessage(previous);
+      const source = delivery.source, target = delivery.target;
+      let rootId = source.rootId;
+      if (!rootId) {
+        // 仅为实际公开投递保存原私聊来源；不创建参与事件，不伪造真人群输入或自动预算。
+        rootId = 'delivery-source:' + id;
+        this.run(`INSERT INTO host_roots(id,space_id,principal_id,source_event_id,targets_json,generations_json,reply_json,epoch,revision,auto_limit)
+          VALUES (?,?,?,?,?,?,?,?,?,0)`, rootId, target.spaceId!, source.principalId, rootId, JSON.stringify([source.botId]),
+        JSON.stringify({ [source.botId]: source.generation }), JSON.stringify({ botId: source.botId, channelId: source.channelId, sourceMessageId: source.messageId }), target.epoch!, target.revision!);
+      }
+      this.run('INSERT INTO host_public_log(id,root_id,space_id,epoch,author_bot_id,principal_id,text,attachments_json) VALUES (?,?,?,?,?,?,?,?)',
+        publicId, rootId, target.spaceId!, target.epoch!, source.botId, source.principalId, delivery.payload.text,
+        JSON.stringify(delivery.payload.paths.map(path => ({ sourceBotId: source.botId, path }))));
+      return this.publicMessage(this.one('SELECT * FROM host_public_log WHERE id=?', publicId)!);
+    });
+  }
+
   registerOutbox(input: { id: string; eventId: string; audience: HostOutbox['audience']; targetBotIds?: readonly string[]; replyTo?: HostReplyAddress; payload: unknown }): HostOutbox {
     return this.atomic(() => {
       const value = this.mustEvent(input.eventId);
@@ -982,7 +1078,8 @@ export class HostStore {
         this.run("UPDATE host_events SET state='queued' WHERE id=?", value.id);
       }
       const uncertainEvents = this.run("UPDATE host_events SET state='uncertain',error='host-restarted-before-native-end' WHERE state='running'");
-      const uncertainSends = this.run("UPDATE host_outbox SET state='uncertain',evidence='host-restarted-during-send' WHERE state='sending'");
+      const uncertainSends = this.run("UPDATE host_outbox SET state='uncertain',evidence='host-restarted-during-send' WHERE state='sending'")
+        + this.run("UPDATE host_routed_outbox SET state='uncertain',evidence='host-restarted-during-send' WHERE state='sending'");
       const blockedBatches = this.run("UPDATE host_batches SET state='blocked',error='host-restarted-during-cancellation-or-preparation; reconcile external effects' WHERE state IN ('frozen','cancelling','prepared')");
       return { uncertainEvents, requeuedReservations: reservations.length, uncertainSends, blockedBatches };
     });

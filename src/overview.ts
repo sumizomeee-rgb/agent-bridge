@@ -1,4 +1,5 @@
-import type { AgentName, EffortConfiguration } from './types.js';
+import type { AgentName, EffortConfiguration, EffortMetadata } from './types.js';
+import { formatEffortEvidence } from './effort.js';
 import { discordPresentationText, type BridgePresentation } from './presentation.js';
 
 export interface WorkCounts { running: number; queued: number }
@@ -11,7 +12,7 @@ export interface WorkerOverview {
   workerId: string; conversationId: string; conversationTitle?: string;
   targetId: string; targetLabel: string; agent: AgentName; title: string;
   model: string | null; effort: string | null; nativeId: string | null;
-  requestedEffort?: string | null; effortConfiguration?: EffortConfiguration | null;
+  requestedEffort?: string | null; effortConfiguration?: EffortConfiguration | null; effortMetadata?: EffortMetadata | null;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
   running: boolean; queued: number; startedAt: string | null; endedAt?: string | null;
   blocked?: boolean; ownership?: 'bridge' | 'user'; statusReason?: string;
@@ -27,12 +28,8 @@ const clean = (value: string, limit = 120): string => {
   const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();
   return text.length <= limit ? text : text.slice(0, limit - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
 };
-const effortNames: Record<string, string> = { none: '无', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', auto: '自动' };
 function workerEffort(item: WorkerOverview): string {
-  const label = (value: string) => Object.hasOwn(effortNames, value.toLowerCase()) ? effortNames[value.toLowerCase()]! : clean(value, 30);
-  if (item.effort) return label(item.effort);
-  if (item.effortConfiguration) return `${label(item.effortConfiguration.value)}〔${item.effortConfiguration.source === 'argument' ? '启动参数' : item.effortConfiguration.source === 'environment' ? '环境配置' : 'CLI 配置'}〕`;
-  return item.requestedEffort ? `${label(item.requestedEffort)}〔指定〕` : 'CLI 默认 · 未回报';
+  return formatEffortEvidence(item.effortMetadata ?? { actual: item.effort, requested: item.requestedEffort, configuration: item.effortConfiguration });
 }
 const agentLabel = (agent: AgentName): string => agent === 'codex' ? 'Codex' : 'Claude Code';
 const checkedTime = (value: string | null): string => {
@@ -166,8 +163,11 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
     const lines = [`${index + 1}. ${computer} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
       `会话名：${clean(item.title, 80)}`, `电脑：${clean(item.targetLabel)} · target ID：${clean(item.targetId, 64)}`,
       `workerId：${clean(item.workerId, 256)}`, `原生会话 ID：${item.nativeId ? clean(item.nativeId, 256) : '未回报'}`];
-    lines.push(`强度指定：${item.requestedEffort ? clean(item.requestedEffort, 30) : 'CLI 默认'} · CLI 回报：${item.effort ? clean(item.effort, 30) : '未回报'}`);
-    if (item.effortConfiguration) lines.push(`启动配置：${clean(item.effortConfiguration.value, 30)} · 来源：${item.effortConfiguration.source}`);
+    const metadata = item.effortMetadata, configuration = metadata ? metadata.configuration : item.effortConfiguration;
+    const requested = metadata ? metadata.requested : item.requestedEffort, observed = metadata ? metadata.actual : item.effort;
+    lines.push(`强度指定：${requested ? clean(requested, 30) : 'CLI 默认'} · CLI 回报：${observed ? clean(observed, 30) : '未回报'}`);
+    if (configuration) lines.push(`启动配置：${clean(configuration.value, 30)} · 来源：${configuration.source}${configuration.applied === false ? ` · 未采用${configuration.reason ? `：${clean(configuration.reason, 100)}` : ''}` : ''}`);
+    if (metadata) lines.push(`强度能力：${metadata.capability.status === 'unsupported' ? '不支持可调强度' : metadata.capability.status === 'supported' ? metadata.capability.levels.map(value => clean(value, 32)).join('、') : '未提供证据'} · 来源：${clean(metadata.capability.source, 80)}`);
     if (scope === 'all') lines.push(`主控对话：${clean(item.conversationTitle ?? item.conversationId, 80)}`);
     if (item.blocked) lines.push('阻塞：已阻塞，需先核对结果与进程');
     if (item.ownership) lines.push(`拥有权：${item.ownership === 'user' ? '用户' : '桥'}`);

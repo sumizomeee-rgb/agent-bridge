@@ -6,12 +6,28 @@ export interface BotProfile {
   platform: BridgePlatform; name: string; applicationId?: string; token?: string; appSecret?: string;
   network?: { proxyPort: number | null };
   workspace?: string; workingCwd?: string; ownerPrincipalId?: string; defaultAgent?: AgentName;
+  aliases?: string[];
   allowedUserIds: string[]; features?: { reactions?: boolean; nativeCommands?: boolean; presence?: boolean };
 }
 export function readJson(path: string): Record<string, unknown> {
   const value: unknown = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''));
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('配置必须是 JSON 对象。');
   return value as Record<string, unknown>;
+}
+/** Comparison only: aliases never establish an application or account identity. */
+export function profileAliasKey(alias: string): string { return alias.trim().normalize('NFKC').toLowerCase(); }
+function profileAliases(raw: unknown): string[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > 32) throw new Error('Profile aliases 必须是至多 32 项的字符串数组。');
+  const seen = new Set<string>();
+  return raw.map(value => {
+    if (typeof value !== 'string') throw new Error('Profile aliases 仅接受字符串。');
+    const alias = value.trim();
+    if (!alias || Array.from(alias).length > 64 || /[\u0000-\u001f\u007f-\u009f]/.test(alias)) throw new Error('Profile aliases 每项须为 1–64 字符且不含控制字符。');
+    const key = profileAliasKey(alias);
+    if (seen.has(key)) throw new Error('Profile aliases 规范化后不能重复。');
+    seen.add(key); return alias;
+  });
 }
 export function selectProfile(common: Record<string, unknown>, configPath: string, selection?: string): BotProfile {
   const name = selection ?? (typeof common.startupProfile === 'string' ? common.startupProfile : undefined);
@@ -23,6 +39,7 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
   const applicationId = String(raw.applicationId ?? '').trim();
   if (!(platform === 'discord' ? /^\d{15,22}$/ : /^cli_[a-zA-Z0-9]+$/).test(applicationId)) throw new Error('Profile 缺少有效 applicationId。');
   if (!Array.isArray(raw.allowedUserIds) || !raw.allowedUserIds.length) throw new Error('Profile 必须配置 allowedUserIds。');
+  const aliases = profileAliases(raw.aliases);
   const network = raw.network as Record<string, unknown> | undefined;
   if (network != null && (typeof network !== 'object' || Array.isArray(network) || Object.keys(network).some(key => key !== 'proxyPort'))) throw new Error('network 仅支持 proxyPort。');
   const proxyPort = network?.proxyPort ?? null;
@@ -35,7 +52,7 @@ export function selectProfile(common: Record<string, unknown>, configPath: strin
     if (platform === 'feishu' && enabled && key !== 'reactions') throw new Error(`飞书暂不支持可选功能 ${key}。`);
   }
   for (const key of ['workspace', 'workingCwd', 'ownerPrincipalId']) if (raw[key] != null && (typeof raw[key] !== 'string' || !String(raw[key]).trim())) throw new Error(`Profile ${key} 必须是非空字符串。`);
-  return { platform, name, applicationId, defaultAgent: raw.defaultAgent as AgentName | undefined, workspace: raw.workspace as string | undefined, workingCwd: raw.workingCwd as string | undefined, ownerPrincipalId: raw.ownerPrincipalId as string | undefined, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
+  return { platform, name, applicationId, aliases, defaultAgent: raw.defaultAgent as AgentName | undefined, workspace: raw.workspace as string | undefined, workingCwd: raw.workingCwd as string | undefined, ownerPrincipalId: raw.ownerPrincipalId as string | undefined, token: String(raw.token ?? '').trim(), appSecret: String(raw.appSecret ?? '').trim(),
     allowedUserIds: raw.allowedUserIds.map(String), network: { proxyPort: proxyPort as number | null }, features: features as BotProfile['features'] };
 }
 /** A credential rotation or profile alias change retains the bot's actual identity. */

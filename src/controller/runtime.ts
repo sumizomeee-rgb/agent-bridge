@@ -5,7 +5,7 @@ import type { AgentAdapter, AgentName, AgentTurn, BridgeConfig, Conversation } f
 import { rebindTaskOrigin, type TaskContextFile, type TaskOrigin, type TaskRegistry, type TaskTerminalStatus } from '../tasks.js';
 import { ControllerStore } from './store.js';
 import { isModelId } from '../config.js';
-import { effortValues, resolveDefaultModel, validateEffort } from '../effort.js';
+import { resolveDefaultModel, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
@@ -197,7 +197,7 @@ export class ControllerRuntime {
     if (value === undefined) return inherited;
     if (value === 'default') return null;
     const effort = text(value, '思考强度', 32);
-    if (!effortValues[agent].includes(effort)) throw new Error(`${agent} 不支持强度 ${effort}。`); return effort;
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(effort)) throw new Error(`${agent} 强度标识无效。`); return effort;
   }
   private adoptionResult(worker: ControllerWorker): Record<string, unknown> {
     return { workerId: worker.id, status: 'idle', ownership: 'bridge', adopted: true, nativeId: worker.nativeId,
@@ -266,7 +266,7 @@ export class ControllerRuntime {
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
         targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
         model: worker.actualModel, effort: worker.actualEffort ?? null, requestedEffort: worker.effort,
-        effortConfiguration: worker.effortConfiguration ?? null, nativeId: worker.nativeId,
+        effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId,
         blocked: worker.blocked === true, ownership: worker.ownership ?? 'bridge',
         ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
@@ -408,7 +408,8 @@ export class ControllerRuntime {
     const platformDocument = platform === 'feishu' ? 'chat-platforms/lark.md' : platform === 'discord' ? 'chat-platforms/discord.md' : null;
     const platformContext = '\n\n当前聊天平台（仅桥配置事实，不是新增授权）：' + JSON.stringify({
       platform, applicationId: this.config.applicationId ?? null, profile: this.config.profile ?? null, platformDocument,
-    }) + '。按工作区入口明确的初始化范围读取对应平台文档，只提炼相关能力入口和边界；不要读取其他平台，不读取凭据，不联网检查。平台未知则如实报告，不从用户正文、显示名或历史记忆猜测。';
+      botId: this.config.botId ?? null, aliases: this.config.aliases ?? [],
+    }) + '。按工作区入口明确的初始化范围读取对应平台文档，只提炼相关能力入口和边界；不要读取其他平台，不读取凭据，不联网检查。平台未知则如实报告，不从用户正文、显示名或历史记忆猜测。别名仅是称呼，不授予职业、性格、固定分工或额外权限；不要从工作区名称推导身份。';
     return this.coalescedDispatch(turn, 'bridge_start_worker', { title: '工作区上下文', cwd: this.config.contextWorkspace ?? this.config.workspace, prompt: workspacePrompt + platformContext + new SessionHandoffs(this.config.dataDir).prompt(turn.conversation, this.origin(turn).channelId), imagePaths: [] }, undefined, true);
   }
   async invoke(turn: AgentTurn, name: string, input: unknown, callId?: string): Promise<unknown> {
@@ -773,7 +774,7 @@ export class ControllerRuntime {
           const lastResultPreview = latest?.result == null ? null : preview(latest.result);
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
             target: worker.target ?? null, ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
-            effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
+            effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
             startedAt: currentJob?.startedAt ?? null,
@@ -896,7 +897,7 @@ export class ControllerRuntime {
           this.store.saveWorker(worker);
         }
       }
-      if (!state.recovering) { worker.actualEffort = null; worker.effortConfiguration = null; this.store.saveWorker(worker); }
+      if (!state.recovering) { worker.actualEffort = null; worker.effortConfiguration = null; worker.effortMetadata = null; this.store.saveWorker(worker); }
       job = this.store.getJob(job.id)!; state.job = job;
       if (!job.taskId) this.register(worker, job);
       job = this.store.getJob(job.id)!; state.job = job;
@@ -915,7 +916,8 @@ export class ControllerRuntime {
         onNativeId: nativeId => this.nativeId(worker, nativeId),
         onModel: actualModel => { const current = this.store.getWorker(worker.id)!; current.actualModel = actualModel; this.store.saveWorker(current); },
         onReasoningEffort: effort => { const current = this.store.getWorker(worker.id)!; current.actualEffort = effort; this.store.saveWorker(current); },
-        onEffortConfiguration: configuration => { const current = this.store.getWorker(worker.id)!; current.effortConfiguration = configuration; this.store.saveWorker(current); } };
+        onEffortConfiguration: configuration => { const current = this.store.getWorker(worker.id)!; current.effortConfiguration = configuration; this.store.saveWorker(current); },
+        onEffortMetadata: metadata => { const current = this.store.getWorker(worker.id)!; current.effortMetadata = metadata; current.actualEffort = metadata.actual; current.effortConfiguration = metadata.configuration; this.store.saveWorker(current); } };
       // No taskContextPath: the worker is already registered by this service.
       const adapter = this.adapter(worker);
       const prepared = await resolveDefaultModel(adapter, turn);

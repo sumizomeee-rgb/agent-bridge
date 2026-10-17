@@ -293,7 +293,7 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user
     title: 'test', cwd: root, createdAt: 'before', updatedAt: 'now' }, text: 'fake', imagePaths: [], signal: new AbortController().signal,
     onProgress: () => {}, onModel: model => reported.push(model), onReasoningEffort: effort => efforts.push(effort) });
   assert.deepEqual(reported, ['gpt-6-sol', 'provider-effective-model']);
-  assert.deepEqual(efforts, agent === 'codex' ? ['high'] : [null]);
+  assert.deepEqual(efforts, agent === 'codex' ? [null, 'high'] : [null]);
   trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   if (agent === 'codex') {
     const resume = trace.find(message => message.method === 'thread/resume');

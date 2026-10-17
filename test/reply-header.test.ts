@@ -89,7 +89,7 @@ test('本轮未回报 metadata 时不把旧实际值、参考默认或已选别�
   await respond('first');
   await send('/model custom selected-alias');
   const reply = await respond('unconfirmed');
-  assert.match(reply.text, /^\[Codex · 模型未知 · 强度未知 · [^\n]+\]\n\nunconfirmed$/);
+  assert.match(reply.text, /^\[Codex · 模型未知 · CLI 默认 · 未回报 · [^\n]+\]\n\nunconfirmed$/);
   assert(!reply.text.includes('prior-model') && !reply.text.includes('selected-alias') && !reply.text.includes('reference-only-model'));
 });
 
@@ -97,7 +97,7 @@ test('回复头不含连续绿勾，命令不改变投递记录，同尾号原�
   const { f, send, respond, inspect } = fixture(t);
   f.codex.plans.push({ nativeId: 'first-abcdef' });
   const first = await respond('first');
-  assert.equal(first.options?.repeatHeader, '[Codex · 模型未知 · 强度未知 · cdef]');
+  assert.equal(first.options?.repeatHeader, '[Codex · 模型未知 · CLI 默认 · 未回报 · cdef]');
   const prior = inspect(store => store.getLastDelivery('owner', 'owner-dm'));
   assert.equal(prior?.nativeId, 'first-abcdef');
   await send('/help');
@@ -184,7 +184,7 @@ test('/agent 菜单和同后端选择不重置，来回切换向前交接并保�
   await send('/agent claude');
   assert.match(f.replies.at(-1)!.text, /已切换到 Claude Code/);
   const claudeReply = await respond('claude context');
-  assert.match(claudeReply.text, /^\[Claude · 模型未知 · 强度未知/);
+  assert.match(claudeReply.text, /^\[Claude · 模型未知 · CLI 默认 · 未回报/);
   assert(!claudeReply.text.includes('✅'));
   const claude = inspect(store => store.getActive('owner')!);
   await send('/agent codex');

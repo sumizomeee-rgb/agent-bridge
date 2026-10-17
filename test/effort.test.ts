@@ -73,7 +73,7 @@ test('capabilities distinguish supported/unsupported/unknown and trust only expl
   assert.equal(modelEffortCapability({ ...info, defaultModel: null }, { ...target, model: null }).status, 'unknown');
   const evidence = { source: 'fixture', modelId: 'haiku' };
   assert.equal(normalizeEffortCapability('claude', [], evidence).status, 'unsupported');
-  assert.equal(normalizeEffortCapability('claude', ['xhigh'], evidence).status, 'unknown');
+  assert.equal(normalizeEffortCapability('claude', ['xhigh'], evidence).status, 'supported');
   assert.equal(normalizeEffortCapability('claude', ['high', null], evidence).status, 'unknown');
   assert.equal(normalizeEffortCapability('claude', undefined, evidence).status, 'unknown');
   const resolved = { ...info, models: [{ id: 'haiku', resolvedModel: 'provider-model', displayName: 'Alias', supportedEfforts: ['high'] }] };
@@ -82,7 +82,7 @@ test('capabilities distinguish supported/unsupported/unknown and trust only expl
   const adapter = { run: async () => { throw new Error('no generation'); }, interrupt: async () => {}, close: async () => {},
     getModelInfo: async () => ({ defaultModel: 'haiku', models: [{ id: 'haiku', displayName: 'Haiku', supportedEfforts: [] }] }) };
   await assert.rejects(validateEffort(adapter, target, 'high'), /不支持可调/);
-  await assert.rejects(validateEffort(adapter, target, 'xhigh'), /claude 不支持/);
+  await assert.rejects(validateEffort(adapter, target, 'xhigh'), /不支持可调/);
   adapter.getModelInfo = async () => ({ defaultModel: 'haiku', models: [] });
   await assert.rejects(validateEffort(adapter, target, 'high'), /不能确认兼容性/);
 });

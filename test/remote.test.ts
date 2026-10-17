@@ -24,7 +24,8 @@ class FakeNative implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     this.turn = turn; this.nativeId = turn.conversation.nativeId ?? this.nativeId;
     turn.onNativeId?.(this.nativeId); turn.onModel?.('actual-model'); turn.onReasoningEffort?.('medium');
-    turn.onEffortConfiguration?.({ value: 'high', source: 'user-settings' }); turn.onReady?.();
+    turn.onEffortConfiguration?.({ value: 'high', source: 'user-settings' });
+    turn.onEffortMetadata?.({ requested: null, actual: 'medium', configuration: { value: 'high', source: 'user-settings' }, capability: { status: 'supported', levels: ['low', 'medium', 'high'], source: 'remote-native-fixture', modelId: 'actual-model' } }); turn.onReady?.();
     return new Promise((resolve, reject) => { this.resolve = resolve; this.reject = reject; });
   }
   async steer(_id: string, input: AgentSupplement): Promise<SteerResult> { this.supplements.push(input); return { status: 'accepted' }; }
@@ -317,7 +318,8 @@ test('remote native progress is durable and repeated polling never fabricates a 
 test('remote launch configuration survives storage and polling separately from native confirmation', async () => {
   const f = fixture();
   try {
-    const turn = f.turn(); const configurations: unknown[] = [], actual: unknown[] = [];
+    const turn = f.turn(); const configurations: unknown[] = [], actual: unknown[] = [], metadata: unknown[] = [];
+    turn.onEffortMetadata = value => metadata.push(value);
     turn.onEffortConfiguration = value => configurations.push(value);
     turn.onReasoningEffort = value => actual.push(value);
     const running = f.adapter.run(turn);
@@ -325,6 +327,8 @@ test('remote launch configuration survives storage and polling separately from n
     const stored = f.daemon.store.job(turn.dispatchId!)!;
     assert.deepEqual(stored.effortConfiguration, { value: 'high', source: 'user-settings' });
     assert.equal(stored.actualEffort, 'medium');
+    assert.deepEqual(stored.effortMetadata, { requested: null, actual: 'medium', configuration: { value: 'high', source: 'user-settings' }, capability: { status: 'supported', levels: ['low', 'medium', 'high'], source: 'remote-native-fixture', modelId: 'actual-model' } });
+    assert.deepEqual(metadata.at(-1), stored.effortMetadata);
     f.natives[0]!.finish(); await running;
     assert.deepEqual(configurations, [{ value: 'high', source: 'user-settings' }]);
     assert.deepEqual(actual, ['medium']);

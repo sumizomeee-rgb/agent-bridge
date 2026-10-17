@@ -2,6 +2,7 @@
   "platform": "discord",
   "applicationId": "FILL_IN_APPLICATION_ID",
   "token": "FILL_IN_BOT_TOKEN",
+  "aliases": [],
   "allowedUserIds": [
     "FILL_IN_DISCORD_USER_ID"
   ],

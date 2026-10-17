@@ -1,5 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
-import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
+import { createEffortReporter, effortCapabilityForModel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
 import { claudeEffortConfiguration } from './claude-effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
@@ -71,9 +71,15 @@ export class ClaudeAdapter implements AgentAdapter {
     if (turn.signal.aborted) throw abortError();
     turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
-    if (effort) await validateEffort(this, turn.conversation, effort);
-    turn.onReasoningEffort?.(null);
-    turn.onEffortConfiguration?.(await claudeEffortConfiguration(this.command, this.env, turn.conversation.cwd, effort));
+    const capability = effort ? await validateEffort(this, turn.conversation, effort)
+      : normalizeEffortCapability('claude', undefined, { source: 'claude-initialize', modelId: turn.conversation.model ?? null });
+    const reportEffort = createEffortReporter(turn, 'claude', { capability, configuration: await claudeEffortConfiguration(this.command, this.env, turn.conversation.cwd, effort) });
+    reportEffort();
+    let currentCapability = capability;
+    const reportModel = (model: string) => {
+      currentCapability = effortCapabilityForModel(currentCapability, model);
+      reportEffort({ capability: currentCapability }); turn.onModel?.(model);
+    };
     const conversationId = turn.conversation.id;
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');
     const content: JsonObject[] = [];
@@ -164,13 +170,17 @@ export class ClaudeAdapter implements AgentAdapter {
     });
     const removeMessage = transport.onMessage((message) => {
       observeContent(message);
+      const actualEffort = observedClaudeEffort(message);
+      if (actualEffort !== undefined) reportEffort({ actual: actualEffort });
       if (message.type === 'system' && message.subtype === 'init') {
         // Persist the session before the first potentially long model/tool call.
         initialized = true;
         const prior = nativeId;
         recordNativeId(message.session_id);
         if (nativeId && prior === nativeId) turn.onNativeId?.(nativeId);
-        if (typeof message.model === 'string' && message.model) turn.onModel?.(message.model);
+        if (typeof message.model === 'string' && message.model) reportModel(message.model);
+        if (message.supportsEffort === false || Array.isArray(message.supportedEffortLevels)) reportEffort({ capability: currentCapability = normalizeEffortCapability('claude', message.supportedEffortLevels,
+          { source: 'claude-init', modelId: typeof message.model === 'string' ? message.model : turn.conversation.model ?? null }, message.supportsEffort === false) });
         // 2.1.76 verified: stdin prompts enter the current SDK loop at tool boundaries,
         // replay UUID is emitted when consumed; cancel_async_message removes unconsumed input.
         const version = typeof message.claude_code_version === 'string' ? message.claude_code_version.match(/^2\.(\d+)\.(\d+)/) : null;
@@ -188,7 +198,7 @@ export class ClaudeAdapter implements AgentAdapter {
           ? { status: 'accepted' } : { status: 'uncertain', reason: 'Claude 回显未确认同一当前轮和输入；不能重发。' });
       } else if (message.type === 'assistant' && !message.parent_tool_use_id && isObject(message.message)) {
         // The assistant envelope can resolve an init alias to the provider's actual model ID.
-        if (typeof message.message.model === 'string' && message.message.model) turn.onModel?.(message.message.model);
+        if (typeof message.message.model === 'string' && message.message.model) reportModel(message.message.model);
       } else if (message.type === 'stream_event' && !message.parent_tool_use_id && isObject(message.event)) {
         const event = message.event;
         if (event.type === 'content_block_start' && isObject(event.content_block)

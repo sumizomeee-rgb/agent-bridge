@@ -1,5 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
-import { normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
+import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, safeError, type JsonObject, type RpcTransport } from './process.js';
 
@@ -56,7 +56,15 @@ export class CodexAdapter implements AgentAdapter {
     if (turn.signal.aborted) throw abortError();
     turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
-    if (effort) await validateEffort(this, turn.conversation, effort);
+    const capability = effort ? await validateEffort(this, turn.conversation, effort)
+      : normalizeEffortCapability('codex', undefined, { source: 'codex-model-list', modelId: turn.conversation.model ?? null });
+    const reportEffort = createEffortReporter(turn, 'codex', { capability, configuration: effort ? { value: effort, source: 'argument' } : null });
+    reportEffort();
+    let currentCapability = capability;
+    const reportModel = (model: string) => {
+      currentCapability = effortCapabilityForModel(currentCapability, model);
+      reportEffort({ capability: currentCapability }); turn.onModel?.(model);
+    };
     if (turn.signal.aborted) throw abortError();
     if (this.closed) throw new Error('Codex 适配器已关闭。');
     const conversationId = turn.conversation.id;
@@ -115,7 +123,7 @@ export class CodexAdapter implements AgentAdapter {
       } else if (message.method === 'item/agentMessage/delta' && typeof params.delta === 'string') {
         turn.onProgress(params.delta);
       } else if (message.method === 'model/rerouted' && typeof params.toModel === 'string' && params.toModel) {
-        turn.onModel?.(params.toModel);
+        reportModel(params.toModel);
       } else if (message.method === 'item/started') {
         activity(params.item, false);
       } else if (message.method === 'item/completed') {
@@ -195,6 +203,7 @@ export class CodexAdapter implements AgentAdapter {
         throw new Error('Codex 当前供应商配置无效，本轮任务尚未提交。');
       }
       const modelProvider = typeof configuredProvider === 'string' ? configuredProvider : 'openai';
+      if (!effort && isEffortLevel(configured.config.model_reasoning_effort)) reportEffort({ configuration: { value: configured.config.model_reasoning_effort, source: 'session-settings' } });
       // Resume full server-side context, without copying its image/tool history back into stdio.
       const resumeId = nativeId;
       let thread: JsonObject;
@@ -220,14 +229,14 @@ export class CodexAdapter implements AgentAdapter {
       if (resumeId && thread.thread.id !== resumeId) {
         throw new Error('Codex 续接返回了不同会话；原会话已保留，本轮任务尚未提交。');
       }
-      if (effort && typeof thread.model === 'string' && thread.model !== turn.conversation.model) await validateEffort(this, { ...turn.conversation, model: thread.model }, effort);
+      if (effort && typeof thread.model === 'string' && thread.model !== turn.conversation.model) currentCapability = await validateEffort(this, { ...turn.conversation, model: thread.model }, effort);
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
-      if (typeof thread.model === 'string' && thread.model) turn.onModel?.(thread.model);
+      if (typeof thread.model === 'string' && thread.model) reportModel(thread.model);
       if (!effort && (typeof thread.reasoningEffort === 'string' || thread.reasoningEffort === null)) {
-        turn.onReasoningEffort?.(thread.reasoningEffort);
+        reportEffort({ actual: thread.reasoningEffort });
       }
-      if (effort) turn.onReasoningEffort?.(null);
+      if (effort) reportEffort({ actual: null });
       if (cancelled) throw abortError();
       const input: JsonObject[] = [];
       for (const value of turn.input ?? [
@@ -245,8 +254,8 @@ export class CodexAdapter implements AgentAdapter {
         try {
           const configured = await rpc.request('thread/read', { includeTurns: false, threadId: nativeId });
           const actual = isObject(configured.thread) ? configured.thread.reasoningEffort : null;
-          turn.onReasoningEffort?.(typeof actual === 'string' ? actual : null);
-        } catch { turn.onReasoningEffort?.(null); } // Metadata failure must not replay an already submitted turn.
+          reportEffort({ actual: typeof actual === 'string' ? actual : null });
+        } catch { reportEffort({ actual: null }); } // Metadata failure must not replay an already submitted turn.
       }
       if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 没有返回任务标识。');
       turnId = started.turn.id;

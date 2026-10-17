@@ -118,7 +118,7 @@ async function fixture(agent: AgentName, mode = 'success') {
     }
     throw new Error('fake turn did not start');
   };
-  const cleanup = async () => { await adapter.close(); await rm(directory, { recursive: true, force: true }); };
+  const cleanup = async () => { await adapter.close(); await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 }); };
   return { adapter, controller, turn, progress, nativeIds, traces, waitStarted, cleanup, image, env, command };
 }
 

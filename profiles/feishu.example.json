@@ -2,6 +2,7 @@
   "platform": "feishu",
   "applicationId": "FILL_IN_APP_ID",
   "appSecret": "FILL_IN_APP_SECRET",
+  "aliases": [],
   "allowedUserIds": [
     "FILL_IN_USER_OPEN_ID"
   ],

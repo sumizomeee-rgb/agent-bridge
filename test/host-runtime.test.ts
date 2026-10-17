@@ -137,6 +137,83 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
     gate: () => { const wait = gate(); ownedGates.push(wait); return wait; } };
 }
 
+
+
+test('private input queries authorized delivery regions and explicitly publishes to an owned active group without moving its source', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); await f.activate(G2); f.configs[0]!.aliases = ['T', '主Bot'];
+  const original = f.host.store.getController(A), owner = f.configs[0]!.ownerUserId!, dm = `${A}|oc_verified_owner_private`;
+  let inspected: any;
+  f.run(async (botId, turn) => {
+    assert.equal(botId, A); inspected = await f.host.invoke(A, turn, 'bridge_delivery_targets', {});
+    const target = inspected.targets.find((target: any) => target.spaceId === G1); assert.ok(target);
+    await turn.onPublicMessage!('private source to selected group', [], 'dm-to-group', target.targetId);
+  });
+  await f.managers.get(A)!.handle({ id: `${A}|1792180000900|om_dm_choose_group`, userId: owner, channelId: dm, text: 'choose a group', imagePaths: [] }); await f.drain();
+  assert.equal(inspected.defaultTargetId, 'private'); assert.deepEqual(inspected.aliases, ['T', '主Bot']); assert.equal(inspected.targets.length, 3);
+  assert.equal(f.calls.length, 1); assert.equal(f.replies.filter(reply => reply.text.includes('private source to selected group'))[0]!.channel, `${A}|oc_a_group_1`);
+  const delivery = f.host.store.listRoutedDeliveries()[0]!; assert.equal(delivery.source.channelId, dm); assert.equal(delivery.target.spaceId, G1); assert.equal(delivery.state, 'delivered');
+  assert.equal(f.host.store.readPublic(G1, A).some(item => item.text === 'private source to selected group'), true);
+  assert.deepEqual(f.host.store.getController(A), original); assert.equal(f.host.store.getRoot(f.host.store.readPublic(G1, A)[0]!.rootId)?.replyTo.channelId, dm);
+});
+
+test('group input can supplement another owned group and owner DM then finish in its original group with unchanged task delivery', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); await f.activate(G2); const owner = f.configs[0]!.ownerUserId!, dm = `${A}|oc_verified_owner_private`;
+  await f.managers.get(A)!.handle({ id: `${A}|1792180000901|om_verified_dm`, userId: owner, channelId: dm, text: 'record this private address', imagePaths: [] }); await f.drain();
+  f.configs[0]!.aliases = ['T']; f.configs[1]!.aliases = ['M'];
+  f.run(async (botId, turn) => {
+    if (botId === A && turn.text === 'route supplements') {
+      const context = turn.groupContext!, scene = JSON.parse(context.scene); assert.deepEqual(scene.aliases, ['T']); assert.deepEqual(scene.memberIdentities.find((b: any) => b.botId === B).aliases, ['M']);
+      const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      await f.host.invoke(A, turn, 'bridge_claim_work', { taskId: 'fixed-delivery-task', title: 'original group work' });
+      const other = regions.targets.find((target: any) => target.spaceId === G2);
+      await turn.onPublicMessage!('supplement to another group', [], 'to-other-group', other.targetId, false);
+      await turn.onPublicMessage!('owner only supplemental detail', [], 'owner-detail', 'private', false);
+      assert.equal(f.host.store.canProduceEffects(context.eventId), true);
+      await turn.onPublicMessage!('final in original group', [], 'original-final');
+      assert.equal(f.host.store.canProduceEffects(context.eventId), false);
+    } else await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'route-input', 'route supplements', G1, [A])); await f.drain();
+  assert.equal(f.replies.find(reply => reply.text.includes('supplement to another group'))!.channel, `${A}|oc_a_group_2`);
+  assert.equal(f.replies.find(reply => reply.text.includes('owner only supplemental detail'))!.channel, dm);
+  assert.equal(f.replies.find(reply => reply.text.includes('final in original group'))!.channel, `${A}|oc_a_group_1`);
+  assert.equal(f.host.store.getTask('fixed-delivery-task')?.replyTo.channelId, `${A}|oc_a_group_1`);
+  assert.equal(f.host.store.readPublic(G1, A).some(item => item.text.includes('owner only')), false);
+  assert.equal(f.host.store.readPublic(G1, A).some(item => item.text.includes('another group')), false);
+  assert.deepEqual(f.host.store.readPublic(G2, A).map(item => item.text), ['supplement to another group']);
+  assert.equal(f.calls.filter(call => call.turn.groupContext?.spaceId === G2).length, 0);
+});
+
+test('a private final selected from a group seals its event without publishing private content to any public log', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); const owner = f.configs[0]!.ownerUserId!, dm = `${A}|oc_verified_owner_private`;
+  await f.managers.get(A)!.handle({ id: `${A}|1792180000902|om_owner_dm`, userId: owner, channelId: dm, text: 'register private route', imagePaths: [] }); await f.drain();
+  f.run(async (botId, turn) => {
+    if (botId === A) { await turn.onPublicMessage!('private final only', [], 'private-final', 'private'); assert.equal(f.host.store.canProduceEffects(turn.groupContext!.eventId), false); }
+    else await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'private-final-input', 'please decide audience', G1, [A])); await f.drain();
+  assert.equal(f.replies.find(reply => reply.text.includes('private final only'))!.channel, dm);
+  assert.equal(f.host.store.readPublic(G1, A).some(item => item.text === 'private final only'), false);
+  assert.equal(f.host.store.listEvents(A).at(-1)?.decision, 'published');
+});
+
+test('stale group target IDs and a target revoked during its live permission probe cannot send or change original work ownership', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); await f.activate(G2);
+  f.run(async (botId, turn) => {
+    if (botId === A && turn.text === 'test target changes') {
+      const regions = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any, selected = regions.targets.find((target: any) => target.spaceId === G2);
+      const old = f.host.store.getGroup(G2)!; f.host.store.stopGroup(G2, P); f.host.store.startGroup({ spaceId: G2, principalId: P, receiverBotId: A, memberBotIds: old.memberBotIds });
+      await assert.rejects(turn.onPublicMessage!('must not use stale target', [], 'stale-target', selected.targetId, false), /目标ID/);
+      const refreshed = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any, target = refreshed.targets.find((target: any) => target.spaceId === G2);
+      let probes = 0; f.groupChecks.set(A, async () => { if (++probes === 2) f.host.store.stopGroup(G2, P); return true; });
+      await assert.rejects(turn.onPublicMessage!('must not reach revoked group', [], 'revoked-target', target.targetId, false), /disabled|改变|目标/);
+      f.groupChecks.delete(A); await turn.onSilent?.();
+    } else await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'target-changes', 'test target changes', G1, [A])); await f.drain();
+  assert.equal(f.replies.some(reply => reply.text.includes('must not')), false); assert.equal(f.host.store.listRoutedDeliveries().length, 0);
+});
+
 test('group activation preserves existing controllers; uninitialized members do not call an Agent', { timeout: 10000 }, async t => {
   const f = fixture(t, { initialized: [A] }); const before = f.host.store.getController(A);
   await f.activate();

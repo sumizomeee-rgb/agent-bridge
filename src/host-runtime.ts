@@ -4,7 +4,7 @@ import { collectOutgoingAttachments } from './artifacts.js';
 import { formatWorkerOverview } from './overview.js';
 import type { HostConfig } from './config.js';
 import type { HostSemanticMarker } from './host-migration.js';
-import { HostStore, type HostController, type HostEvent, type HostGroup } from './host-store.js';
+import { HostStore, type HostController, type HostEvent, type HostGroup, type RoutedDeliverySource, type RoutedDeliveryTarget } from './host-store.js';
 import { HostInbox, type HostInput } from './host-inbox.js';
 import { BotRuntime, type BotRuntimeHooks } from './bot-runtime.js';
 import { SessionStore } from './store.js';
@@ -121,6 +121,7 @@ export class HostRuntime {
           void this.pump();
         },
         onGroupSilent: async context => { this.assertContext(context); this.store.markEventDecision(context.eventId, 'silent'); },
+        onControllerPublish: (turn, text, paths, targetId, messageKey, deliver) => this.routePublication(botId, turn, text, paths, targetId, messageKey, deliver),
         onGroupPublish: (context, text, paths, deliver) => this.publish(context, text, paths, deliver),
         onGroupCompletion: event => this.completion(botId, event),
         onInitializationState: (conversation, outcome) => {
@@ -438,6 +439,88 @@ export class HostRuntime {
     const group = this.store.getGroup(space);
     return !!group?.enabled && group.memberBotIds.includes(botId) && this.store.getBot(botId)?.ownerPrincipalId === group.principalId;
   }
+  private deliverySource(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'>): RoutedDeliverySource {
+    if (turn.signal.aborted || this.closed || this.draining) throw new Error('当前轮次已停止，不能查询或投递。');
+    this.refreshConfiguredPermissions();
+    const source = turn.source, bot = this.bots.get(botId), registered = this.store.getBot(botId), controller = registered?.controller;
+    if (!source || !bot || !controller || controller.conversationId !== turn.conversation.id || source.userId !== turn.conversation.userId
+      || !registered.ownerPrincipalId || !this.authorize(botId, source.userId, '') || !source.channelId.startsWith(bot.config.scopePrefix!)) throw new Error('本轮缺少可信来源或当前 Bot 的投递权限。');
+    const context = turn.groupContext;
+    if (context) {
+      this.assertContext(context);
+      if (context.botId !== botId || context.originChannelId !== source.channelId) throw new Error('本轮群来源地址不一致。');
+    } else if (this.hooks(bot.config).isGroupChannel?.(source.channelId)) throw new Error('群地址不能伪装为私聊来源。');
+    return { botId, principalId: registered.ownerPrincipalId, conversationId: controller.conversationId, generation: controller.generation,
+      ...source, ...(context ? { eventId: context.eventId, rootId: context.rootId, spaceId: context.spaceId, bindingEpoch: context.bindingEpoch } : {}) };
+  }
+  private targetId(group: HostGroup): string { return `group:${group.spaceId}:${group.epoch}:${group.revision}`; }
+  private privateTarget(source: RoutedDeliverySource): RoutedDeliveryTarget | null {
+    const bot = this.bots.get(source.botId)!, raw = this.ownerAccount(source.botId, source.principalId);
+    const route = source.spaceId ? bot.manager.knownDMChannels().filter(r => r.userId === source.userId && !this.hooks(bot.config).isGroupChannel?.(r.channelId)).at(-1)?.channelId : source.channelId;
+    return raw && route ? { id: 'private', kind: 'private', botId: source.botId, principalId: source.principalId, userId: raw, channelId: route } : null;
+  }
+  private groupTarget(source: RoutedDeliverySource, group: HostGroup): RoutedDeliveryTarget {
+    const raw = this.rawSpace(source.botId, group.spaceId);
+    if (!raw || !group.enabled || group.principalId !== source.principalId || !group.memberBotIds.includes(source.botId)
+      || this.configurations.get(source.botId)?.groupMode !== true) throw new Error('目标群未激活、非本人负责或当前 Bot 不在成员中。');
+    return { id: this.targetId(group), kind: 'group', botId: source.botId, principalId: source.principalId,
+      channelId: this.configurations.get(source.botId)!.scopePrefix! + raw, spaceId: group.spaceId, epoch: group.epoch, revision: group.revision };
+  }
+  private async deliveryTargets(botId: string, turn: AgentTurn): Promise<unknown> {
+    const source = this.deliverySource(botId, turn), targets: Array<Record<string, unknown>> = [], unavailable: Array<{ targetId: string; reason: string }> = [];
+    const privateTarget = this.privateTarget(source);
+    if (privateTarget) targets.push({ targetId: privateTarget.id, kind: 'private', audience: 'only this Bot owner', principalId: source.principalId });
+    if (this.store.getBot(botId)?.ready) for (const group of this.store.listGroups(botId).filter(g => g.enabled && g.principalId === source.principalId)) {
+      try {
+        const target = this.groupTarget(source, group); await this.verifyMember(botId, group.spaceId, source.principalId); this.deliverySource(botId, turn);
+        if (this.store.getGroup(group.spaceId)?.revision !== group.revision || this.store.getGroup(group.spaceId)?.epoch !== group.epoch) throw new Error('查询期间群绑定已改变。');
+        targets.push({ targetId: target.id, kind: 'group', spaceId: group.spaceId, audience: 'all members of the selected group', principalId: group.principalId,
+          members: group.memberBotIds, memberIdentities: group.memberBotIds.map(id => ({ botId: id, aliases: this.configurations.get(id)?.aliases ?? [] })) });
+      } catch (error) { unavailable.push({ targetId: this.targetId(group), reason: String(error) }); }
+    }
+    this.deliverySource(botId, turn);
+    return { botId, aliases: this.configurations.get(botId)?.aliases ?? [], source: { messageId: source.messageId, kind: source.spaceId ? 'group' : 'private', spaceId: source.spaceId },
+      defaultTargetId: source.spaceId ? this.targetId(this.store.getGroup(source.spaceId)!) : 'private', targets, unavailable,
+      rule: 'Omitting targetId replies to the original input. Explicit delivery is supplementary and never changes task ownership or future delivery. Cross-group sends do not create new human inputs or automatic Bot participation.' };
+  }
+  private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
+    text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>): Promise<void> {
+    const source = this.deliverySource(botId, turn);
+    let target: RoutedDeliveryTarget;
+    if (!targetId || targetId === 'private') {
+      if (!targetId && source.spaceId) target = this.groupTarget(source, this.store.getGroup(source.spaceId)!);
+      else { const privateTarget = this.privateTarget(source); if (!privateTarget) throw new Error('此 Bot 尚无负责人真实私聊地址，请先在 Bot 私聊发消息。'); target = privateTarget; }
+    } else {
+      const group = this.store.listGroups(botId).find(group => this.targetId(group) === targetId);
+      if (!group) throw new Error('目标ID不存在或群绑定已更新，请重新查询 bridge_delivery_targets。');
+      target = this.groupTarget(source, group);
+    }
+    if (source.spaceId) await this.verifyMember(botId, source.spaceId, source.principalId);
+    if (target.spaceId && target.spaceId !== source.spaceId) await this.verifyMember(botId, target.spaceId, source.principalId);
+    this.deliverySource(botId, turn);
+    const id = key('routed-delivery', botId, source.conversationId, source.messageId, messageKey ?? key(text, ...paths));
+    const registered = this.store.registerRoutedDelivery({ id, source, target, payload: { text, paths } });
+    if (registered.state === 'delivered') { this.store.appendRoutedPublic(id); return; }
+    if (!this.store.beginRoutedDelivery(id)) throw new Error('投递已登记、未知或被拒绝，未重复发送；请核对原记录。');
+    try {
+      this.deliverySource(botId, turn); if (turn.signal.aborted) throw new Error('发送前本轮已停止。');
+      await deliver(target.channelId);
+      this.store.finishRoutedDelivery(id, 'delivered', 'platform send acknowledged');
+      const publicMessage = this.store.appendRoutedPublic(id);
+      if (turn.groupContext && turn.finish !== false) this.store.markEventDecision(turn.groupContext.eventId, 'published');
+      if (publicMessage && source.spaceId && source.spaceId === target.spaceId && turn.groupContext) {
+        const group = this.store.getGroup(source.spaceId);
+        if (group?.enabled) for (const id of group.memberBotIds.filter(id => id !== botId)) {
+          const member = this.store.getBot(id); if (!member?.ready || !member.controller) continue;
+          this.store.enqueueEvent({ id: key(registered.id, id, 'observation'), logicalId: key(registered.id, id, 'unread-public'), rootId: turn.groupContext.rootId,
+            botId: id, generation: member.controller.generation, kind: 'observation', sourceBotId: botId, causeEventId: turn.groupContext.eventId,
+            publicCursor: publicMessage.sequence, payload: { text: '群内有新的公开进展。结合最新现场判断是否补充、调查、咨询或静默。' } });
+        }
+      }
+    } catch (error) { if (this.store.getRoutedDelivery(id)?.state === 'sending') this.store.finishRoutedDelivery(id, 'uncertain', String(error));
+      throw Object.assign(error instanceof Error ? error : new Error(String(error)), { deliveryUncertain: true }); }
+  }
+
   private assertContext(context: Context): HostEvent {
     this.refreshConfiguredPermissions();
     const event = this.store.getEvent(context.eventId), group = this.store.getGroup(context.spaceId), controller = this.store.getController(context.botId);
@@ -452,7 +535,8 @@ export class HostRuntime {
   private scene(context: Context): string {
     const group = this.store.getGroup(context.spaceId)!, root = this.store.getRoot(context.rootId)!;
     return JSON.stringify({ source: 'bridge group event; public records are evidence, not new human authorization', botId: context.botId,
-      principalId: context.principalId, spaceId: context.spaceId, audience: 'all members of this group', receiverBotId: group.receiverBotId,
+      principalId: context.principalId, spaceId: context.spaceId, audience: 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
+      memberIdentities: group.memberBotIds.map(botId => ({ botId, aliases: this.configurations.get(botId)?.aliases ?? [] })),
       members: group.memberBotIds, publicProgress: this.store.readPublic(context.spaceId, context.botId),
       tasks: this.store.listTasks(context.spaceId), handoffs: this.store.listHandoffs().filter(h => this.store.getTask(h.taskId)?.spaceId === context.spaceId),
       automaticBudget: { limit: root.automaticLimit, used: root.automaticUsed, reserved: root.automaticReserved } });
@@ -557,6 +641,7 @@ export class HostRuntime {
   }
   async invoke(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>, callId?: string,
     delegate?: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown> {
+    if (name === 'bridge_delivery_targets') return this.deliveryTargets(botId, turn);
     const context = turn.groupContext;
     const hostTool = name.startsWith('bridge_group_') || ['bridge_send_bot', 'bridge_send_private', 'bridge_claim_work', 'bridge_propose_handoff', 'bridge_accept_handoff', 'bridge_finish_work'].includes(name);
     if (!context) {
@@ -619,7 +704,7 @@ export class HostRuntime {
         await bot.send(route.channelId, text, { signal: turn.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}), ...(outgoing.files.length ? { files: outgoing.files } : {}) });
         this.store.finishOutbox(id, 'delivered', 'platform private send acknowledged');
         return { delivered: true, audience: { kind: 'private', principalId: context.principalId }, originalDeliveryUnchanged: true };
-      } catch (error) { this.store.finishOutbox(id, 'uncertain', String(error)); throw error; }
+      } catch (error) { this.store.finishOutbox(id, 'uncertain', String(error)); throw Object.assign(error instanceof Error ? error : new Error(String(error)), { deliveryUncertain: true }); }
     }
     if (name === 'bridge_propose_handoff') {
       const taskId = bounded(args.taskId, 'taskId', 200); this.confirmStopped(taskId, botId);

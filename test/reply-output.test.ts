@@ -42,7 +42,7 @@ function message(id: string, text = 'hello'): BridgeMessage {
 }
 
 function finalBody(text: string): string {
-  assert.match(text, /^\[Codex · 模型未知 · 强度未知 · [^\n]+\]\n\n/);
+  assert.match(text, /^\[Codex · 模型未知 · CLI 默认 · 未回报 · [^\n]+\]\n\n/);
   return text.slice(text.indexOf('\n\n') + 2);
 }
 

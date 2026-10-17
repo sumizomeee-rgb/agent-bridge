@@ -1,3 +1,4 @@
+import { normalizeEffortCapability, selectedEffort } from '../effort.js';
 import { readFile, lstat, mkdir, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -128,6 +129,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
         try { await this.connection().request<RemoteJob>('dispatch', request); }
         catch (error) { if (this.knownRejection(error)) throw error; await this.inspectDispatch(turn.dispatchId); }
       }
+      let effortMetadataKey: string | undefined;
       for (;;) {
         if (turn.signal.aborted) { await this.interrupt(turn.conversation.id); throw Object.assign(new Error('远端任务已停止。'), { name: 'AbortError' }); }
         const job = await this.inspectDispatch(turn.dispatchId);
@@ -138,6 +140,9 @@ export class RemoteAgentAdapter implements AgentAdapter {
         if (job.effortConfiguration !== undefined && configurationKey !== JSON.stringify(job.effortConfiguration)) {
           configurationKey = JSON.stringify(job.effortConfiguration); turn.onEffortConfiguration?.(job.effortConfiguration);
         }
+        const effortMetadata = job.effortMetadata ?? { requested: selectedEffort(turn), actual: job.actualEffort ?? null, configuration: job.effortConfiguration ?? null,
+          capability: normalizeEffortCapability(this.binding.agent, undefined, { source: 'remote-legacy', modelId: job.actualModel ?? turn.conversation.model ?? null }) };
+        if (effortMetadataKey !== JSON.stringify(effortMetadata)) { effortMetadataKey = JSON.stringify(effortMetadata); turn.onEffortMetadata?.(effortMetadata); }
         if (job.ready && !ready) { ready = true; turn.onReady?.(); }
         if (job.progress && job.progress.sequence > activitySequence) {
           activitySequence = job.progress.sequence;

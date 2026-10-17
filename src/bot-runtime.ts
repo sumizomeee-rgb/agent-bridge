@@ -24,7 +24,7 @@ import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 export interface BotRuntimeHooks {
   authorize(userId: string, text: string): boolean;
   receiveGroup(message: IncomingDM): Promise<void>;
-  manager: Pick<SessionManagerOptions, 'binding' | 'onGroupTurnStart' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
+  manager: Pick<SessionManagerOptions, 'binding' | 'onGroupTurnStart' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
   invoke(turn: AgentTurn, name: string, input: Record<string, unknown>, callId: string | undefined, delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown>;
   pauseGroup(): void;
   resumeGroup(): void;
@@ -111,9 +111,9 @@ export class BotRuntime {
       hooks.invoke(turn, name, args, id, input => this.controller!.invoke(turn, name, input, id));
     const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke) ?? {
       codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir,
-        metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, invokeTool: invoke }),
+        metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
       claude: new NativeControllerAdapter(config.commands.claude, env, { agent: 'claude', dataDir: config.dataDir,
-        metadataAdapter: this.execution.claude, defaultModels: config.defaultModels, invokeTool: invoke }),
+        metadataAdapter: this.execution.claude, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
     } : this.execution;
     this.controllerAdapters = adapters;
     this.manager = new SessionManager(config, adapters, {

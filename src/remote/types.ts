@@ -1,4 +1,4 @@
-import type { AgentCommand, AgentInput, AgentName, AgentResult, AgentSupplement, AgentModelInfo, SteerResult, AgentExecutionProgress, EffortConfiguration } from '../types.js';
+import type { AgentCommand, AgentInput, AgentName, AgentResult, AgentSupplement, AgentModelInfo, SteerResult, AgentExecutionProgress, EffortConfiguration, EffortMetadata } from '../types.js';
 
 /** Non-secret snapshot. Native homes, provider credentials and history stay on the target. */
 export interface ExecutionTargetBinding {
@@ -43,6 +43,7 @@ export interface RemoteJob {
   dispatchId: string; workerId: string; status: 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain';
   nativeId: string | null; ready: boolean; actualModel?: string; actualEffort?: string | null;
   effortConfiguration?: EffortConfiguration | null;
+  effortMetadata?: EffortMetadata | null;
   result?: AgentResult; artifacts?: RemoteArtifact[]; error?: string; stopped?: boolean;
   /** Native-owned progress snapshot, distinct from transport query/heartbeat timestamps. */
   progress?: AgentExecutionProgress;

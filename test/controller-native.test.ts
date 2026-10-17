@@ -160,7 +160,7 @@ test('background evidence uses standalone tool output and may quietly continue',
     const result = await s.adapter.run(turn); assert.equal(result.controlledOutput, true);
     const start = s.transports[0]?.written.find(m => m.method === 'turn/start')?.params as JsonObject;
     assert.deepEqual(start.input, []); assert.deepEqual({ ...start.toolOutput as object, output: 'confirmed evidence' }, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
-    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge clock.*UTC: .*timezone: .*/);
+    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge Bot identity;.*\n\[Bridge clock.*UTC: .*timezone: .*/);
     assert.match((start.toolOutput as { output: string }).output, /\[Bridge runtime;.*"observedModel":"gpt-6.1-sol"/);
     assert.match((start.toolOutput as { output: string }).output, /\n\nconfirmed evidence$/);
   } finally { await s.cleanup(); }
@@ -644,7 +644,7 @@ test('主控提交后读取强度失败或实际值不同，只更新真实回�
     await s.adapter.run(turn); assert.deepEqual(reports, [null, 'medium']);
     reports.length = 0; failRead = true;
     const result = await s.adapter.run(turn);
-    assert.equal(result.nativeId, turn.conversation.nativeId); assert.deepEqual(reports, [null, null]);
+    assert.equal(result.nativeId, turn.conversation.nativeId); assert.deepEqual(reports, [null]);
     assert.equal(turn.conversation.effort, 'xhigh'); assert.equal(s.transports.length, 1);
     assert.equal(transport.written.filter(m => m.method === 'turn/start').length, 3);
   } finally { await s.cleanup(); }

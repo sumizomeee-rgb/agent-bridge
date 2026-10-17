@@ -29,7 +29,7 @@ export async function claudeEffortConfiguration(command: AgentCommand, env: Node
   const enabled = new Set((option(command.args, '--setting-sources') ?? 'user,project,local').split(','));
   const home = env.CLAUDE_CONFIG_DIR || join(env.USERPROFILE || env.HOME || homedir(), '.claude');
   let root = resolve(cwd);
-  for (let current = root; ; current = dirname(current)) {
+  if (enabled.has('project') || enabled.has('local')) for (let current = root; ; current = dirname(current)) {
     try { await stat(join(current, '.git')); root = current; break; } catch {}
     if (dirname(current) === current) break;
   }

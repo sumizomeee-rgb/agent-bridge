@@ -53,6 +53,38 @@ function start(store: HostStore, botId = A): string {
   store.startEvent(reserved.id); return reserved.id;
 }
 
+
+test('routed sends bind source and exact destination, keep unknown sends across restart, and reject new IDs for an unresolved input', async t => {
+  const path = await directory(t); let store = open(t, path); seed(store);
+  const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1, messageId: 'real-private-input', userId: A + '|open-' + A, channelId: A + '|private-owner' };
+  const binding = store.getGroup(SPACE)!;
+  const target = { id: 'group-target', kind: 'group' as const, botId: A, principalId: P, channelId: A + '|native-' + A + '-' + SPACE, spaceId: SPACE, epoch: binding.epoch, revision: binding.revision };
+  const input = { id: 'routed-first', source, target, payload: { text: 'authorized public supplement', paths: [] } };
+  store.registerRoutedDelivery(input); assert.equal(store.beginRoutedDelivery(input.id)?.state, 'sending');
+  assert.throws(() => store.registerRoutedDelivery({ ...input, id: 'parallel-new-id' }), /发送中或结果未知/);
+  store.close(); store = open(t, path); assert.equal(store.recoverInFlight().uncertainSends, 1);
+  assert.equal(store.getRoutedDelivery(input.id)?.state, 'uncertain'); assert.equal(store.beginRoutedDelivery(input.id), null);
+  assert.throws(() => store.registerRoutedDelivery({ ...input, id: 'retry-new-id' }), /发送中或结果未知/);
+  assert.throws(() => store.registerRoutedDelivery({ ...input, target: { ...target, botId: B } }), /复用/);
+  assert.deepEqual(store.readPublic(SPACE, A), []);
+  const next = { ...input, id: 'different-real-input', source: { ...source, messageId: 'next-private-input' } };
+  store.registerRoutedDelivery(next); assert.equal(store.beginRoutedDelivery(next.id)?.state, 'sending'); store.finishRoutedDelivery(next.id, 'delivered', 'platform acknowledgement');
+  const publicMessage = store.appendRoutedPublic(next.id)!; assert.equal(store.appendRoutedPublic(next.id)?.sequence, publicMessage.sequence);
+  assert.equal(store.getRoot(publicMessage.rootId)?.replyTo.channelId, source.channelId); assert.equal(store.listEvents().length, 0);
+  const stopped = { ...next, id: 'revoked-before-send', source: { ...source, messageId: 'later-input' } }; store.registerRoutedDelivery(stopped); store.stopGroup(SPACE, P);
+  assert.equal(store.beginRoutedDelivery(stopped.id), null); assert.equal(store.getRoutedDelivery(stopped.id)?.state, 'rejected');
+});
+
+test('routed delivery rejects cross-Bot destinations and revoked owner authority before any sending state', async t => {
+  const store = open(t, await directory(t)); seed(store);
+  const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1, messageId: 'private-source', userId: A + '|open-' + A, channelId: A + '|private-owner' };
+  const target = { id: 'private', kind: 'private' as const, botId: B, principalId: P, userId: 'open-' + B, channelId: B + '|private-owner' };
+  assert.throws(() => store.registerRoutedDelivery({ id: 'cross-bot', source, target, payload: { text: 'blocked', paths: [] } }), /身份不匹配/);
+  store.setPrincipalEnabled(P, false);
+  assert.throws(() => store.registerRoutedDelivery({ id: 'revoked', source, target: { ...target, botId: A, userId: 'open-' + A, channelId: A + '|private-owner' }, payload: { text: 'blocked', paths: [] } }), /revoked/);
+  assert.deepEqual(store.listRoutedDeliveries(), []);
+});
+
 test('bot identity, explicit principal/space proofs, and a claimed owner survive reopening', async t => {
   const path = await directory(t);
   const first = new HostStore(path);

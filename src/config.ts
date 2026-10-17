@@ -2,7 +2,7 @@ import { readFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgentCommand, AgentName, BridgeConfig } from './types.js';
-import { readJson, selectProfile, profileScope, type BotProfile } from './profiles.js';
+import { readJson, selectProfile, profileScope, profileAliasKey, type BotProfile } from './profiles.js';
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export function isModelId(value: string): boolean {
@@ -88,7 +88,7 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
   const config: BridgeConfig = {
     token, allowedUserIds: profile.allowedUserIds.map(id => scopePrefix + id), defaultAgent,
     platform: profile.platform, profile: profile.name, applicationId: profile.applicationId, appSecret: profile.appSecret,
-    externalAllowedUserIds: profile.allowedUserIds, scopePrefix, features: profile.features,
+    externalAllowedUserIds: profile.allowedUserIds, scopePrefix, features: profile.features, aliases: [...(profile.aliases ?? [])],
     workspace: localPath(raw.workspace, '.local/workspace'), proxyUrl,
     commands: { codex: command('codex'), claude: command('claude') },
     dataDir,
@@ -127,6 +127,17 @@ export function loadHostConfig(argv = process.argv.slice(2), createDirectories =
   const inventory = [...new Set([...names, ...((raw.registeredProfiles ?? []) as string[])])].map(name => selectProfile(raw, configPath, name));
   const inventoryIds = inventory.map(profile => profileScope(profile).slice(0, -1));
   if (new Set(inventoryIds).size !== inventoryIds.length) throw new Error('不同 Profile 指向同一个真实 Bot，拒绝重复登记。');
+  // Include registered offline members: aliases must remain unambiguous when the startup set changes.
+  const identifiers = new Map(inventory.flatMap(profile => [profile.name, profileScope(profile).slice(0, -1)]
+    .map(identifier => [profileAliasKey(identifier), profileScope(profile)] as const)));
+  const aliasOwners = new Map<string, string>();
+  for (const profile of inventory) for (const alias of profile.aliases ?? []) {
+    const key = profileAliasKey(alias), owner = profileScope(profile);
+    if (aliasOwners.has(key) && aliasOwners.get(key) !== owner || identifiers.has(key) && identifiers.get(key) !== owner) {
+      throw new Error('同一宿主不同 Bot 的 aliases 不能重复或遮蔽其他 Bot 的真实 ID／Profile。');
+    }
+    aliasOwners.set(key, owner);
+  }
   const profiles = names.map(name => inventory.find(profile => profile.name === name)!);
   const platform = profiles[0]!.platform;
   if (profiles.some(profile => profile.platform !== platform)) throw new Error('同一宿主的 startupProfiles 必须属于同一平台。');

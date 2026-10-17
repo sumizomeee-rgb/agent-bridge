@@ -4,7 +4,7 @@
 
 ## 身份与启动集合
 
-Profile 是本地预设名，例如 `feishu/bot1`、`feishu/bot2`。稳定身份使用真实应用 ID：`feishu:<applicationId>` 或 `discord:<applicationId>`；内部用户、频道和消息再以 `botId + "|"` 为命名空间。Bot 显示名和 Profile 名可以调整；不能把另一个应用的 ID 写进旧 Profile 来冒充原 Bot。
+Profile 是本地预设名，例如 `feishu/bot1`、`feishu/bot2`。稳定身份使用真实应用 ID：`feishu:<applicationId>` 或 `discord:<applicationId>`；内部用户、频道和消息再以 `botId + "|"` 为命名空间。Bot 显示名和 Profile 名可以调整；不能把另一个应用的 ID 写进旧 Profile 来冒充原 Bot。每个 Bot 的现有私有 Profile 可以用 `aliases` 登记称呼，例如 `"aliases": ["Miku"]`；省略为空数组，不另建身份 Markdown。别名最多 32 项，每项 1–64 个字符，禁止空值、控制字符、规范化重复和不同 Bot 的歧义；不改变真实 ID、白名单、目录、职责或权限。桥将本人及参与成员的别名作为运行事实提供给主控，普通称呼由模型理解，不作为真实 @ 实体或强制派工条件。
 
 公共配置的 `startupProfiles` 是完整启动集合，所有成员必须属于同一平台，不允许重复应用身份。`-Profile` 只检查它是否属于这个集合，`-Platform` 只检查平台一致，均不会单独启动一个成员或遗留其他成员。更换集合应先正常停止宿主，再修改公共配置并重新启动。
 

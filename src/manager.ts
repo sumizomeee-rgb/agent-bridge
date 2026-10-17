@@ -10,7 +10,7 @@ import { commandHelp, parseCommand as command, parseNewArguments } from './comma
 import { presentationText, type BridgePresentation } from './presentation.js';
 import { collectOutgoingAttachments } from './artifacts.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
-import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
+import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
 import { SessionHandoffs } from './controller/handoff.js';
 import type { RestartOrigin, RestartReceipt } from './restart.js';
@@ -40,6 +40,7 @@ export interface SessionManagerOptions {
   onGroupTurnFinished?: (context: GroupTurnContext, outcome: 'completed' | 'silent' | 'failed') => Promise<void>;
   onGroupSilent?: (context: GroupTurnContext) => Promise<void>;
   onGroupCompletion?: (event: TaskCompletionEvent) => Promise<'queued' | 'retain'>;
+  onControllerPublish?: (context: { conversation: Conversation; source: { messageId: string; userId: string; channelId: string }; groupContext?: GroupTurnContext; signal: AbortSignal; finish: boolean }, text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>) => Promise<void>;
   onGroupPublish?: (context: GroupTurnContext, text: string, paths: string[], deliver: () => Promise<void>) => Promise<void>;
   onPrepareSwitch?: (source: Conversation, target: Conversation, channelId: string, prompt: string, signal: AbortSignal) => Promise<{ contextSeed: string }>;
   onRebindSwitch?: (source: Conversation, target: Conversation) => void | Promise<void>;
@@ -666,7 +667,7 @@ export class SessionManager {
           event: { kind: 'workspace-context', toolName: 'bridge_agent_switch_bootstrap', text }, onProgress: () => {},
           onPublicMessage: async () => { throw new Error('切换提交前不能公开回复。'); }, onSilent: async () => { throw new Error('切换准备不是群参与轮次。'); },
           onNativeId: nativeId => { if (!nativeId || preparedNativeId && preparedNativeId !== nativeId) throw new Error('切换准备返回了不同原生主控会话。'); preparedNativeId = nativeId; this.store.saveNativeId(target.id, nativeId); },
-          onModel: model => this.store.saveActualModel(target.id, model), onReasoningEffort: effort => this.store.saveActualEffort(target.id, effort),
+          onModel: model => this.store.saveActualModel(target.id, model), onReasoningEffort: effort => this.store.saveActualEffort(target.id, effort), onEffortMetadata: metadata => this.store.saveActualEffort(target.id, metadata.actual),
         });
         if (!result.nativeId || preparedNativeId && result.nativeId !== preparedNativeId) throw new Error('目标 Agent 没有确认一致的原生主控会话，未切换。');
         this.store.saveNativeId(target.id, result.nativeId);
@@ -923,9 +924,9 @@ export class SessionManager {
   }
 
   /** Explicit coordinating output never treats prose file citations as upload requests. */
-  private async publishControlled(target: Conversation, route: { userId: string; channelId: string; groupContext?: GroupTurnContext },
+  private async publishControlled(target: Conversation, route: { id: string; userId: string; channelId: string; groupContext?: GroupTurnContext },
     text: string, paths: string[], messageKey: string | undefined, signal: AbortSignal,
-    current: () => boolean, model: string | null, effort: string | null): Promise<void> {
+    current: () => boolean, model: string | null, effort: string | null, effortMetadata: EffortMetadata | null = null, targetId?: string, finish = true): Promise<void> {
     if (!current()) throw new Error('当前主控轮次已经停止');
     if (typeof text !== 'string' || text.length > 64 * 1024 || !Array.isArray(paths)
       || paths.length > 10 || paths.some(path => typeof path !== 'string' || !isAbsolute(path)
@@ -933,7 +934,7 @@ export class SessionManager {
     const nativeId = this.store.getConversation(target.id)?.nativeId;
     if (!nativeId) throw new Error('主控会话尚未绑定，不能发送回复');
     const key = `${target.agent}:${target.id}:${nativeId}:${messageKey ?? randomUUID()}`;
-    const hash = createHash('sha256').update(JSON.stringify([text, paths])).digest('hex');
+    const hash = createHash('sha256').update(JSON.stringify([text, paths, targetId ?? null, finish])).digest('hex');
     const claim = this.store.claimPublicMessage(key, target.id, nativeId, route.channelId, hash, text);
     if (claim === 'delivered') return;
     if (claim === 'uncertain') throw new Error('这条回复的投递状态未知，已保留，未重复发送');
@@ -942,17 +943,21 @@ export class SessionManager {
         [target.cwd, join(this.config.dataDir, 'outgoing')], this.config.maxImageBytes, this.config.maxFileBytes, signal);
       if (!current()) throw new Error('主控轮次在附件准备期间停止');
       const identity = { conversationId: target.id, agent: target.agent, nativeId };
-      const header = replyHeader(identity, this.store.getLastDelivery(route.userId, route.channelId), model, effort);
+      const header = replyHeader(identity, this.store.getLastDelivery(route.userId, route.channelId), model, effort, effortMetadata);
       const fallback = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '';
       if (!text.trim() && !fallback) throw new Error('公开回复不能为空');
-      const deliver = () => this.sink.sendText(route.channelId, `${header}\n\n${text || fallback}`, {
+      const deliver = (channelId = route.channelId) => this.sink.sendText(channelId, `${header}\n\n${text || fallback}`, {
         repeatHeader: header, signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
         ...(outgoing.files.length ? { files: outgoing.files } : {}),
       });
-      if (route.groupContext && this.options.onGroupPublish) await this.options.onGroupPublish(route.groupContext, text, paths, deliver); else await deliver();
+      if (this.options.onControllerPublish) await this.options.onControllerPublish({ conversation: target, source: { messageId: route.id, userId: route.userId, channelId: route.channelId }, groupContext: route.groupContext, signal, finish }, text, paths, targetId, messageKey, deliver);
+      else {
+        if (targetId) throw new Error('当前运行模式未提供已授权的目标投递入口');
+        if (route.groupContext && this.options.onGroupPublish) await this.options.onGroupPublish(route.groupContext, text, paths, deliver); else await deliver();
+      }
       if (!current()) throw new Error('主控轮次在投递期间停止');
       this.store.finishPublicMessage(key, 'delivered');
-      this.store.saveDelivery(route.userId, route.channelId, identity);
+      if (!targetId) this.store.saveDelivery(route.userId, route.channelId, identity);
     } catch (error) { this.store.finishPublicMessage(key, 'uncertain'); throw error; }
   }
 
@@ -998,6 +1003,7 @@ export class SessionManager {
         && this.store.getMessage(item.id)?.state === 'running';
       let actualModel: string | null = null;
       let actualEffort: string | null = null;
+      let effortMetadata: EffortMetadata | null = null;
       let contextId: string | undefined;
       let groupContext = item.groupContext;
       let groupOutcome: 'completed' | 'silent' | 'failed' = 'failed';
@@ -1013,7 +1019,7 @@ export class SessionManager {
           ...(context ? { taskContextPath: context.contextPath } : {}),
           ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
           ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: item.text } } : {}),
-          conversation: target, text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
+          conversation: target, source: { messageId: item.id, userId: item.userId, channelId: item.channelId }, text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
           imagePaths: batch.flatMap(value => value.imagePaths), input: [
             ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...this.input(batch),
           ],
@@ -1031,14 +1037,15 @@ export class SessionManager {
           onReasoningEffort: effort => {
             if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(conversationId, effort); }
           },
+          onEffortMetadata: metadata => { if (current()) { effortMetadata = metadata; actualEffort = metadata.actual; target.actualEffort = metadata.actual; this.store.saveActualEffort(target.id, metadata.actual); } },
           // Adapters emit deltas and protocol/tool events through this callback.
           // Only the completed reply is user-facing; no asynchronous sends can linger after cancellation.
           onProgress: () => {},
-          onPublicMessage: async (text, paths = [], key) => {
+          onPublicMessage: async (text, paths = [], key, targetId, finish = true) => {
             if (!current()) throw new Error('当前主控轮次已经停止');
-            this.store.setReplyState(turn.messageIds, 'pending');
-            await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort);
-            if (current()) { this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds); }
+            if (finish) this.store.setReplyState(turn.messageIds, 'pending');
+            await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
+            if (finish && current()) { this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds); }
           },
         });
         turn.executing = false;
@@ -1069,7 +1076,7 @@ export class SessionManager {
           this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
         if (!delivering()) continue;
         const identity = { conversationId, agent: target.agent, nativeId: result.nativeId };
-        const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort);
+        const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort, effortMetadata);
         const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '本轮完成（没有文本输出）。';
         const deliver = () => this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
           { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
@@ -1238,6 +1245,7 @@ export class SessionManager {
       && this.store.getActive(event.userId)?.id === target.id && this.store.getConversation(target.id)?.nativeId === boundNativeId;
     let actualModel: string | null = null;
     let actualEffort: string | null = null;
+    let effortMetadata: EffortMetadata | null = null;
     let contextId: string | undefined;
     try {
       const source = workspaceContext ? this.store.latestMessage(target.id) : null;
@@ -1254,7 +1262,7 @@ export class SessionManager {
         ? '\n\n[桥程序：用户 /new continue 的初始化和续接已完成。通过 bridge_send_user 用两到四句话确认接上的目标、关键纠正和真正待办或未知。历史摘要不是新授权；不照抄摘要，不复活定时、不重派旧任务，随后结束本轮。]'
         : '\n\n[桥程序：本事件对应用户已发送的 /new 命令。初始化完成后，请通过 bridge_send_user 向原发送者主动回复一次，用两到四句话介绍你对当前工作区的理解、已确认的能力和仍待确认的事项。依据已读到的内容，不照抄调查全文，不虚构已验证能力，不因此启动额外任务。此消息为主控回复，随后结束本轮。]';
       const result = await this.adapters[target.agent].run({
-        conversation: target, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
+        conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId }, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
           toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.scheduleKind === 'controller' ? 'bridge_schedule_controller' : 'bridge_worker_result', text: eventText, introductionRequested },
@@ -1265,20 +1273,22 @@ export class SessionManager {
           boundNativeId = nativeId;
           this.store.saveNativeId(target.id, nativeId);
         } : undefined,
-        onPublicMessage: async (text, paths = [], key) => {
-          if (!introductionRequested) return this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort);
+        onPublicMessage: async (text, paths = [], key, targetId, finish = true) => {
+          if (introductionRequested && (!finish || targetId)) throw new Error('初始化介绍只允许通过原入口完成一次最终回复');
+          if (!introductionRequested) return this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
           if (introductionSent) throw new Error('初始化介绍已发送。');
           this.store.prepareWorkspaceNotice(target.id, 'ready');
           await this.commandReplies.get(event.originMessageId)?.done;
           const notice = this.store.workspaceNotice(target.id);
           if (!current() || this.store.getMessage(event.originMessageId)?.state !== 'completed' || !notice || !this.store.claimWorkspaceNotice(notice)) throw new Error('初始化介绍已取消或投递状态不确定。');
           try {
-            await this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort);
+            await this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
             introductionSent = true; this.store.finishWorkspaceNotice(target.id, 'delivered');
           } catch (error) { this.store.finishWorkspaceNotice(target.id, 'uncertain'); throw error; }
         },
         onModel: model => { if (current() && model) { actualModel = model; target.actualModel = model; this.store.saveActualModel(target.id, model); } },
         onReasoningEffort: effort => { if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
+        onEffortMetadata: metadata => { if (current()) { effortMetadata = metadata; actualEffort = metadata.actual; target.actualEffort = metadata.actual; this.store.saveActualEffort(target.id, metadata.actual); } },
       });
       turn.executing = false;
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
@@ -1299,7 +1309,7 @@ export class SessionManager {
         this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
       const identity = { conversationId: target.id, agent: target.agent, nativeId: result.nativeId };
-      const header = replyHeader(identity, this.store.getLastDelivery(event.userId, event.channelId), actualModel, actualEffort);
+      const header = replyHeader(identity, this.store.getLastDelivery(event.userId, event.channelId), actualModel, actualEffort, effortMetadata);
       const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : notice;
       await this.sink.sendText(event.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
         { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),

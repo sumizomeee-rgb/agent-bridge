@@ -26,6 +26,8 @@ export interface AgentCommand { command: string; args: string[] }
 export interface BridgeConfig {
   /** Runtime identity is stable across profile/display-name changes. */
   botId?: string;
+  /** Human names only; never identity, authorization, or routing selectors. */
+  aliases?: string[];
   ownerPrincipalId?: string;
   ownerUserId?: string;
   contextWorkspace?: string;
@@ -93,9 +95,20 @@ export interface AgentActivity extends AgentActivityMetadata {
 export interface EffortConfiguration {
   value: string;
   source: 'argument' | 'environment' | 'user-settings' | 'project-settings' | 'local-settings' | 'session-settings';
+  /** False means the bridge did not pass this setting to the launched backend. */
+  applied?: boolean;
+  reason?: string;
+}
+export interface EffortMetadata {
+  requested: string | null;
+  configuration: EffortConfiguration | null;
+  capability: EffortCapability;
+  actual: string | null;
 }
 export interface AgentTurn {
   conversation: Conversation;
+  /** The real source of this input, never the last contacted destination. */
+  source?: { messageId: string; userId: string; channelId: string };
   text: string;
   imagePaths: string[];
   /** 连续消息保留文字与图片的交错顺序。 */
@@ -116,7 +129,7 @@ export interface AgentTurn {
   onActivity?: (activity: AgentActivity) => void;
   onNativeId?: (nativeId: string) => void;
   /** Only this explicit channel may publish coordinating-agent output. */
-  onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string) => Promise<void>;
+  onPublicMessage?: (text: string, attachmentPaths?: string[], messageKey?: string, targetId?: string, finish?: boolean) => Promise<void>;
   /** Frozen per-event audience and host causal identity; never inferred from last contact. */
   groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
   onSilent?: () => Promise<void>;
@@ -131,6 +144,8 @@ export interface AgentTurn {
   onReasoningEffort?: (effort: string | null) => void;
   /** Captured on the execution machine at launch; separate from native confirmation. */
   onEffortConfiguration?: (configuration: EffortConfiguration | null) => void;
+  /** Adapter-owned evidence, shared by controllers, workers and every presentation. */
+  onEffortMetadata?: (metadata: EffortMetadata) => void;
 }
 export interface AgentResult { nativeId: string; text: string; controlledOutput?: boolean }
 export interface AgentAdapter {
