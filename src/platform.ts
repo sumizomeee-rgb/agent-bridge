@@ -5,6 +5,7 @@ import { externalId } from './routing.js';
 import type { BridgeConfig, IncomingDM, ReplyOptions, BridgeMessage, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
 import type { WorkCounts } from './overview.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
+import type { GroupMentionView } from './group-mentions.js';
 
 export class PlatformTransport {
   private readonly transport: DiscordTransport | FeishuTransport;
@@ -33,6 +34,10 @@ export class PlatformTransport {
   getGroupInfo(spaceId: string): Promise<GroupSpaceInfo> { return this.transport.getGroupInfo(spaceId); }
   listGroupMembers(spaceId: string, options: { pageToken?: string; limit?: number } = {}): Promise<GroupMembersPage> { return this.transport.listGroupMembers(spaceId, options); }
   getGroupMember(spaceId: string, userId: string): Promise<GroupMember | null> { return this.transport.getGroupMember(spaceId, userId); }
+  readGroupMentionView(spaceId: string, messageId: string): Promise<GroupMentionView> {
+    if (!(this.transport instanceof FeishuTransport)) throw new Error('当前平台不使用跨应用提及关联。');
+    return this.transport.readGroupMentionView(spaceId, messageId);
+  }
   async syncGroupSlashCommands(guildId: string): Promise<void> {
     if (this.config.features?.nativeCommands !== false && this.transport instanceof DiscordTransport) await this.transport.syncGroupSlashCommands(guildId);
   }

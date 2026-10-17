@@ -144,6 +144,26 @@ export class SessionManager {
     const path = this.initializationJournalPath(journal.conversationId); mkdirSync(join(this.config.dataDir, 'workspace-initialization'), { recursive: true });
     const temp = path + '.' + randomUUID() + '.tmp'; journal.updatedAt = new Date().toISOString(); writeFileSync(temp, JSON.stringify(journal), { mode: 0o600 }); renameSync(temp, path);
   }
+  /** A delivered introduction is proof only together with the completed, accepted initialization for this exact parent. */
+  private completedInitializationSource(target: Conversation): BridgeMessage | null {
+    if (!this.config.controllerMode || !target.nativeId) return null;
+    const notice = this.store.workspaceNotice(target.id);
+    if (!notice || notice.userId !== target.userId || notice.outcome !== 'ready' || notice.state !== 'delivered') return null;
+    const completed = this.options.taskRegistry?.completedWorkspaceInitialization(target);
+    if (!completed || completed.originMessageId !== notice.sourceMessageId || completed.channelId !== notice.channelId) return null;
+    const source = this.store.getMessage(completed.originMessageId);
+    if (!source || source.userId !== target.userId || source.channelId !== completed.channelId || source.state !== 'completed'
+      || source.conversationId !== target.id && !(source.conversationId === null && command(source.text)?.name === 'new')) return null;
+    // The original handoff still belongs to its original entrance. A later DM/group entrance does not consume it again.
+    const handoff = this.handoffs.get(target);
+    if (handoff && (handoff.status !== 'ready' || handoff.channelId !== source.channelId)) return null;
+    return source;
+  }
+  private async restoreCompletedInitialization(target: Conversation, source: BridgeMessage): Promise<void> {
+    this.writeInitializationJournal({ version: 1, conversationId: target.id, userId: target.userId,
+      sourceMessageId: source.id, channelId: source.channelId, nativeId: target.nativeId, outcome: 'ready', updatedAt: new Date().toISOString() });
+    await this.reportInitializationState(target, 'ready', source);
+  }
   private async reportInitializationState(target: Conversation, outcome: WorkspaceNoticeOutcome, source?: BridgeMessage): Promise<void> {
     const previous = this.readInitializationJournal(target), origin = source ?? this.initializationSource(target);
     if (previous || origin) this.writeInitializationJournal({ version: 1, conversationId: target.id, userId: target.userId,
@@ -379,6 +399,8 @@ export class SessionManager {
     }
     for (const userId of this.authorizedUsers()) {
       const active = this.store.getActive(userId);
+      const completedSource = active ? this.completedInitializationSource(active) : null;
+      if (active && completedSource) { await this.restoreCompletedInitialization(active, completedSource); continue; }
       const source = active ? this.initializationSource(active) : null;
       const head = active ? this.store.nextQueued(active.id) : null;
       if (active && source && !source.groupContext && (!head || this.canProcessQueued(head))) this.initializeWorkspace(active, source);
@@ -398,8 +420,16 @@ export class SessionManager {
   /** Start a real read-only child without occupying the conversational turn or inventing a user prompt. */
   private initializeWorkspace(target: Conversation, source: BridgeMessage): void {
     const recorded = this.readInitializationJournal(target);
+    if (this.closed || this.draining) return;
+    if (recorded?.outcome === 'ready' && target.nativeId && recorded.nativeId === target.nativeId) return;
+    const completedSource = this.completedInitializationSource(target);
+    if (completedSource) {
+      const recovery = this.restoreCompletedInitialization(target, completedSource)
+        .catch(error => this.options.onInitializationError?.(target, error)).finally(() => this.initializationRecoveries.delete(recovery));
+      this.initializationRecoveries.add(recovery); return;
+    }
     if (recorded && recorded.outcome !== 'pending') return;
-    if (this.closed || this.draining || !this.config.controllerMode || !this.options.onInitializeWorkspace || !this.options.taskRegistry
+    if (!this.config.controllerMode || !this.options.onInitializeWorkspace || !this.options.taskRegistry
       || this.initializationAttempts.has(target.id)) return;
     const registeredSource = this.store.getMessage(source.id);
     if (!registeredSource || registeredSource.userId !== target.userId || registeredSource.channelId !== source.channelId

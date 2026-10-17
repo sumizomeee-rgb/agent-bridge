@@ -42,6 +42,7 @@ class LocalTransport implements BotTransport {
   async getGroupInfo(spaceId: string) { return { spaceId, botIsMember: true }; }
   async listGroupMembers() { return { members: [], hasMore: false, verification: 'unknown' as const }; }
   async getGroupMember(_spaceId: string, userId: string) { return { id: userId, idType: 'discord' as const, isBot: false }; }
+  async readGroupMentionView(): Promise<never> { throw new Error('Discord fixture does not use scoped mention correlation'); }
   async downloadImages(message: IncomingDM) { this.downloads.push(message); return []; }
   async markReplyDelivered() {} async setTaskCount() {} setWorkCounts() {}
   async onBridgeLifecycle(event: BridgeLifecycleEvent) { this.lifecycle.push(event); }

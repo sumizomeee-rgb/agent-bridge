@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { FeishuTransport, splitUtf8 } from '../src/feishu.js';
 import { DurableIngress } from '../src/ingress.js';
 import type { BridgeConfig, IncomingDM } from '../src/types.js';
+import { groupMessagePayloadHash } from '../src/group-mentions.js';
 const prefix = 'feishu:cli_testApp|';
 function setup(t: TestContext) {
   const cleaners: Array<() => void | Promise<void>> = [];
@@ -293,4 +294,45 @@ test('飞书群历史成员撤销、群地址错配和分页损坏均拒绝，�
   await assert.rejects(bridge.readGroupHistory('oc_chat', { since: 'feishu:cli_other|1700000000000|om_wrong' }), /不属于/);
   await assert.rejects(bridge.readGroupHistory('oc_chat', { ownerUserId: 'ou_other' }), /已授权/);
   assert.equal(calls, before);
+});
+
+test('飞书跨应用提及观察只读绑定原消息、群、时间和真人作者，按实体token归一化正文', async t => {
+  const { config, cleanup } = setup(t); config.groupMode = true;
+  const paths: string[] = [];
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any, options: any) => {
+    const url = new URL(String(input)); paths.push(url.pathname);
+    if (url.pathname.includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    assert.equal(options.method, 'GET'); assert.equal(url.pathname, '/open-apis/im/v1/messages/om_source');
+    return response({ code: 0, data: { items: [{ message_id: 'om_source', chat_id: 'oc_chat', create_time: '1700000000123', msg_type: 'text',
+      sender: { id: 'ou_owner', id_type: 'open_id', sender_type: 'user' }, body: { content: '{"text":"@_user_1 @_user_2 question"}' },
+      mentions: [{ key: '@_user_1', id: 'ou_bot_in_this_app', id_type: 'open_id', name: 'renamable' },
+        { key: '@_user_2', id: 'ou_bot_in_this_app', id_type: 'open_id', name: 'renamable' }] }] } });
+  }) as any }); cleanup(() => bridge.close());
+  const view = await bridge.readGroupMentionView('oc_chat', '1700000000123|om_source');
+  assert.equal(view.messageId, 'om_source'); assert.equal(view.spaceId, 'oc_chat'); assert.equal(view.senderId, 'ou_owner');
+  assert.equal(view.payloadHash, groupMessagePayloadHash({ text: 'question', attachments: [] }));
+  assert.deepEqual(view.mentions, [{ key: '@_user_1', id: 'ou_bot_in_this_app' }, { key: '@_user_2', id: 'ou_bot_in_this_app' }]);
+  assert.equal(paths.length, 2);
+});
+
+test('飞书提及观察拒绝错误消息、群、时间、非真人、失效或重复token，关闭时不请求', async t => {
+  const { config, cleanup } = setup(t); let mode = 'message', calls = 0;
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (input: any) => {
+    calls++; if (String(input).includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    const item: any = { message_id: 'om_source', chat_id: 'oc_chat', create_time: '1700000000123', msg_type: 'text',
+      sender: { id: 'ou_owner', id_type: 'open_id', sender_type: 'user' }, body: { content: '{"text":"@_user_1 q"}' },
+      mentions: [{ key: '@_user_1', id: 'ou_bot', id_type: 'open_id' }] };
+    if (mode === 'message') item.message_id = 'om_other';
+    if (mode === 'space') item.chat_id = 'oc_other';
+    if (mode === 'time') item.create_time = '1700000000999';
+    if (mode === 'app') item.sender.sender_type = 'app';
+    if (mode === 'id-type') item.sender.id_type = 'union_id';
+    if (mode === 'deleted') item.deleted = true;
+    if (mode === 'token') item.mentions.push({ ...item.mentions[0], id: 'ou_other' });
+    if (mode === 'mention-type') item.mentions[0].id_type = 'union_id';
+    return response({ code: 0, data: { items: [item] } });
+  }) as any }); cleanup(() => bridge.close());
+  await assert.rejects(bridge.readGroupMentionView('oc_chat', '1700000000123|om_source'), /无效/); assert.equal(calls, 0);
+  config.groupMode = true;
+  for (mode of ['message', 'space', 'time', 'app', 'id-type', 'deleted', 'token', 'mention-type']) await assert.rejects(bridge.readGroupMentionView('oc_chat', '1700000000123|om_source'), /无效|无法核对/);
 });

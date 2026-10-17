@@ -12,6 +12,7 @@ import type { HostSemanticMarker } from '../src/host-migration.js';
 import type { HostConfig } from '../src/config.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from '../src/types.js';
 import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
+import { groupMessagePayloadHash, type GroupMentionView } from '../src/group-mentions.js';
 
 const A = 'feishu:cli_appa', B = 'feishu:cli_appb', P = 'person', Q = 'other-person';
 const D1 = 'discord:111111111111111111', D2 = 'discord:222222222222222222';
@@ -58,6 +59,9 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
   const downloads = new Map<string, () => Promise<string[]>>();
   const histories = new Map<string, (raw: string, options: DMHistoryOptions) => Promise<DMHistoryPage>>();
   const stoppedProofs = new Map<string, boolean>();
+  const mentionViews = new Map<string, (raw: string, id: string) => Promise<GroupMentionView>>();
+  const humanMentions = new Set<string>(), mentionReads: string[] = [];
+  const originals = new Map<string, IncomingDM>();
   const ownedGates: ReturnType<typeof gate>[] = [];
   let handler: TurnHandler = options.run ?? (async (_botId, turn) => { await turn.onSilent?.(); });
   let closed = false;
@@ -82,7 +86,15 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
       async getGroupInfo(_raw: string) { return { spaceId: _raw, botIsMember: true }; },
       async getGroupMember(_raw: string, ownerId: string) {
         const permitted = await (groupChecks.get(botId)?.() ?? Promise.resolve(true));
-        return permitted ? { id: ownerId, idType: 'open_id' as const } : null;
+        return permitted ? { id: ownerId, idType: 'open_id' as const, ...(humanMentions.has(ownerId) ? { isBot: false } : {}) } : null;
+      },
+      async readGroupMentionView(raw: string, id: string): Promise<GroupMentionView> {
+        mentionReads.push(botId);
+        if (mentionViews.has(botId)) return mentionViews.get(botId)!(raw, id);
+        const original = originals.get(id); if (!original) throw new Error('test original missing');
+        return { messageId: id.split('|')[1]!, createTime: id.split('|')[0]!, spaceId: raw,
+          senderId: c.ownerUserId!.slice(c.scopePrefix!.length), payloadHash: groupMessagePayloadHash(original),
+          mentions: original.space!.mentionedUserIds.map((id, index) => ({ key: `@_user_${index + 1}`, id })) };
       },
       async sendText(channel: string, text: string, replyOptions?: ReplyOptions) { replies.push({ botId, channel, text, options: replyOptions }); },
       async sendInteractionText(_interaction: unknown, text: string) { replies.push({ botId, channel: 'interaction', text }); },
@@ -121,8 +133,10 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
     const c = configs.find(item => item.botId === botId)!, raw = config.spaces.find(s => s.id === spaceId)!.accounts[botId]!;
     if (!sourceIds.has(externalId)) sourceIds.set(externalId, platform === 'feishu'
       ? `${1792180000000 + sourceIds.size}|om_${externalId.replace(/[^A-Za-z0-9_-]/g, '_')}` : String(1792180000000000000n + BigInt(sourceIds.size)));
-    return { id: `${c.scopePrefix}${sourceIds.get(externalId)!}`, userId: c.ownerUserId!, channelId: `${c.scopePrefix}${raw}`, text,
+    const result = { id: `${c.scopePrefix}${sourceIds.get(externalId)!}`, userId: c.ownerUserId!, channelId: `${c.scopePrefix}${raw}`, text,
       attachments: [], space: { kind: 'group', spaceId: raw, mentionedUserIds: mentions.map(id => `platform-${id}`) } };
+    originals.set(sourceIds.get(externalId)!, result as IncomingDM);
+    return result as IncomingDM;
   }
   const activate = async (spaceId = G1) => {
     await host.receive(primary, message(primary, `activate-${spaceId}`, '/group start', spaceId, [primary]));
@@ -133,9 +147,132 @@ function fixture(t: TestContext, options: { initialized?: string[]; run?: TurnHa
     await nextImmediate();
   };
   return { path, host, config, configs, managers, sessions, hooks, replies, calls, reports, workerStopped, groupChecks, downloads, histories, stoppedProofs, ids,
-    message, activate, drain, close, run: (next: TurnHandler) => { handler = next; },
+    message, activate, drain, close, mentionViews, humanMentions, mentionReads, originals, run: (next: TurnHandler) => { handler = next; },
     gate: () => { const wait = gate(); ownedGates.push(wait); return wait; } };
 }
+
+function scopedView(f: ReturnType<typeof fixture>, botId: string, source: IncomingDM, mentions: GroupMentionView['mentions']): GroupMentionView {
+  const sourceConfig = f.configs.find(c => source.id.startsWith(c.scopePrefix!))!;
+  const rawId = source.id.slice(sourceConfig.scopePrefix!.length), c = f.configs.find(c => c.botId === botId)!;
+  const space = f.config.spaces.find(s => s.accounts[sourceConfig.botId!] === source.space!.spaceId)!;
+  return { messageId: rawId.split('|')[1]!, createTime: rawId.split('|')[0]!, spaceId: space.accounts[botId]!,
+    senderId: c.ownerUserId!.slice(c.scopePrefix!.length), payloadHash: groupMessagePayloadHash(source), mentions };
+}
+function crossAppMention(f: ReturnType<typeof fixture>, source: IncomingDM, repeat = false): void {
+  source.space!.mentionedUserIds = ['ou_b_in_receiver_namespace'];
+  const keys = repeat ? ['@_user_1', '@_user_2'] : ['@_user_1'];
+  f.mentionViews.set(A, async () => scopedView(f, A, source, keys.map(key => ({ key, id: 'ou_b_in_receiver_namespace' }))));
+  f.mentionViews.set(B, async () => scopedView(f, B, source, keys.map(key => ({ key, id: `platform-${B}` }))));
+}
+
+test('Feishu receiver resolves repeated scoped @B tokens through original app views and submits only B initially', async t => {
+  const f = fixture(t); await f.activate();
+  const source = f.message(A, 'cross-app-mention', 'only B initially', G1, [B]); crossAppMention(f, source, true);
+  await f.host.receive(B, f.message(B, 'cross-app-mention', 'only B initially', G1, [B]));
+  await f.host.receive(A, source); await f.host.receive(A, source); await f.drain();
+  assert.deepEqual(f.calls.map(c => c.botId), [B]);
+  assert.deepEqual(f.host.store.getRoot(f.host.store.listEvents()[0]!.rootId)!.targetBotIds, [B]);
+  assert.deepEqual(f.mentionReads.sort(), [A, B].sort());
+});
+
+test('unmentioned, receiver-own and positively verified human mentions retain ordinary semantics without app-view reads', async t => {
+  const f = fixture(t); await f.activate();
+  await f.host.receive(A, f.message(A, 'no-mention-fast', 'ordinary all')); await f.drain();
+  await f.host.receive(A, f.message(A, 'own-mention-fast', 'only self', G1, [A])); await f.drain();
+  const human = f.message(A, 'human-mention-fast', 'ordinary human reference'); human.space!.mentionedUserIds = ['ou_real_human'];
+  f.humanMentions.add('ou_real_human'); await f.host.receive(A, human); await f.drain();
+  assert.deepEqual(f.calls.filter(c => c.turn.text === 'ordinary all').map(c => c.botId).sort(), [A, B]);
+  assert.deepEqual(f.calls.filter(c => c.turn.text === 'only self').map(c => c.botId), [A]);
+  assert.deepEqual(f.calls.filter(c => c.turn.text === 'ordinary human reference').map(c => c.botId).sort(), [A, B]);
+  assert.equal(f.mentionReads.length, 0);
+});
+
+for (const mismatch of ['message', 'time', 'space', 'author', 'payload', 'token', 'unavailable', 'scoped-id-collision']) test(`Feishu unknown mention fails closed for ${mismatch}, never expands fanout by display name`, async t => {
+  const f = fixture(t); await f.activate();
+  const source = f.message(A, 'bad-' + mismatch, 'Miku must not imply identity'); crossAppMention(f, source);
+  if (mismatch === 'scoped-id-collision') source.space!.mentionedUserIds = [`platform-${B}`];
+  f.mentionViews.set(A, async () => scopedView(f, A, source, [{ key: '@_user_1', id: source.space!.mentionedUserIds[0]! }]));
+  f.mentionViews.set(B, async () => {
+    if (mismatch === 'unavailable') throw new Error('app unavailable');
+    const view = scopedView(f, B, source, [{ key: '@_user_1', id: `platform-${B}` }]);
+    if (mismatch === 'message') view.messageId = 'om_another';
+    if (mismatch === 'time') view.createTime = '1792189999999';
+    if (mismatch === 'space') view.spaceId = 'oc_another';
+    if (mismatch === 'author') view.senderId = 'not-this-principal';
+    if (mismatch === 'payload') view.payloadHash = 'different';
+    if (mismatch === 'token') view.mentions[0]!.key = '@_user_99';
+    if (mismatch === 'scoped-id-collision') view.mentions[0]!.id = 'ou_someone_else';
+    return view;
+  });
+  await f.host.receive(A, source); await f.drain();
+  assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+  assert(f.replies.some(r => /提及.*无法可靠核对/.test(r.text)));
+  assert(f.reports.some(r => /GROUP_INPUT_FAILED/.test(r)));
+});
+
+test('a slow scoped mention is durably captured before the later fast message and preserves each Bot input order', async t => {
+  const f = fixture(t); await f.activate(); const wait = f.gate();
+  const source = f.message(A, 'slow-mention', 'first scoped B'); crossAppMention(f, source);
+  f.mentionViews.set(B, async () => { await wait.promise; return scopedView(f, B, source, [{ key: '@_user_1', id: `platform-${B}` }]); });
+  const first = f.host.receive(A, source);
+  await eventual(() => f.mentionReads.includes(B), 'slow first mention proof entered');
+  const second = f.host.receive(A, f.message(A, 'later-fast-input', 'second ordinary'));
+  await eventual(() => f.host.inbox.pending().some(input => input.message.text === 'second ordinary'), 'later input durably received while the first is processing its proof');
+  assert.equal(f.host.inbox.pending().length, 1, 'pending() excludes the first input already in processing state');
+  assert.equal(f.calls.length, 0); wait.release(); await Promise.all([first, second]); await f.drain();
+  assert.deepEqual(f.calls.filter(c => c.botId === B).map(c => c.turn.text), ['first scoped B', 'second ordinary']);
+  assert.deepEqual(f.calls.filter(c => c.botId === A).map(c => c.turn.text), ['second ordinary']);
+});
+
+for (const change of ['new-generation', 'stop-start']) test(`a pending scoped proof cannot move an old human input across ${change}`, async t => {
+  const f = fixture(t); await f.activate(); const wait = f.gate();
+  const source = f.message(A, 'proof-race-' + change, 'do not cross reset'); crossAppMention(f, source);
+  f.mentionViews.set(B, async () => { await wait.promise; return scopedView(f, B, source, [{ key: '@_user_1', id: `platform-${B}` }]); });
+  const receiving = f.host.receive(A, source); await eventual(() => f.mentionReads.includes(B), 'proof is awaiting API');
+  if (change === 'stop-start') {
+    f.host.store.stopGroup(G1, P); f.host.store.startGroup({ spaceId: G1, principalId: P, receiverBotId: A, memberBotIds: [A, B] });
+  } else {
+    const c = f.configs[1]!, next = f.sessions.get(B)!.createConversation(c.ownerUserId!, 'codex', c.workspace, { controllerMode: true });
+    f.host.store.setController(B, P, { conversationId: next.id, generation: 2, agent: 'codex', nativeId: null }, 1);
+  }
+  wait.release(); await receiving; await f.drain();
+  assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+});
+
+test('pending durable group input re-proves scoped mentions on recovery instead of trusting old own-ID strings', async t => {
+  const f = fixture(t); await f.activate(); const source = f.message(A, 'recover-scoped', 'recover only B'); crossAppMention(f, source);
+  f.host.inbox.capture('durable-scoped-recovery', A, source, false, { [A]: 1, [B]: 1 }, f.host.store.getGroup(G1)!.epoch);
+  assert.equal(f.mentionReads.length, 0); await f.host.recover(); await f.drain();
+  assert.deepEqual(f.calls.map(c => c.botId), [B]); assert.deepEqual(f.mentionReads.sort(), [A, B].sort());
+});
+
+test('a new generation during the not-ready control hint cannot admit an old partially ready multi-mention', async t => {
+  const f = fixture(t, { initialized: [A] }); await f.activate(); const wait = f.gate(); let entered = false;
+  const transport = f.host.bots.get(A)!.transport, send = transport.sendText.bind(transport);
+  transport.sendText = async (channel, text, options) => { if (/未初始化|未就绪/.test(text)) { entered = true; await wait.promise; } await send(channel, text, options); };
+  const receiving = f.host.receive(A, f.message(A, 'not-ready-race', 'do not cross hint reset', G1, [A, B]));
+  await eventual(() => entered, 'not-ready hint in flight');
+  const c = f.configs[0]!, next = f.sessions.get(A)!.createConversation(c.ownerUserId!, 'codex', c.workspace, { controllerMode: true });
+  f.host.store.setController(A, P, { conversationId: next.id, generation: 2, agent: 'codex', nativeId: null }, 1);
+  wait.release(); await receiving; await f.drain(); assert.equal(f.calls.length, 0); assert.equal(f.host.store.listEvents().length, 0);
+});
+
+test('pending control input re-proves its original scoped entities before execution', async t => {
+  const f = fixture(t); await f.activate(); const source = f.message(A, 'recover-control-scoped', '/status', G1, [A, B]);
+  source.space!.mentionedUserIds = [`platform-${A}`, 'ou_b_foreign'];
+  f.mentionViews.set(A, async () => scopedView(f, A, source, [{ key: '@_user_1', id: `platform-${A}` }, { key: '@_user_2', id: 'ou_b_foreign' }]));
+  f.mentionViews.set(B, async () => scopedView(f, B, source, [{ key: '@_user_1', id: 'ou_a_foreign' }, { key: '@_user_2', id: `platform-${B}` }]));
+  f.host.inbox.capture('durable-control-proof', A, source, true, { [A]: 1, [B]: 1 }, f.host.store.getGroup(G1)!.epoch);
+  await f.host.recover(); await f.drain();
+  assert.equal(f.calls.length, 0); assert.deepEqual(f.mentionReads.sort(), [A, B].sort());
+  assert.equal(f.host.inbox.get('durable-control-proof')!.state, 'accepted');
+});
+
+test('Discord global mention IDs keep direct routing and never call the Feishu correlation API', async t => {
+  const f = fixture(t, { platform: 'discord' }); await f.activate();
+  await f.host.receive(D1, f.message(D1, 'discord-explicit-target', 'only D2', G1, [D2])); await f.drain();
+  assert.deepEqual(f.calls.map(c => c.botId), [D2]); assert.equal(f.mentionReads.length, 0);
+});
 
 
 

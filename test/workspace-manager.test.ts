@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -7,6 +7,7 @@ import test, { type TestContext } from 'node:test';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
+import { SessionHandoffs } from '../src/controller/handoff.js';
 import type { WorkCounts } from '../src/overview.js';
 import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, ReplyOptions } from '../src/types.js';
@@ -85,7 +86,7 @@ function fixture(t: TestContext, controllerMode = true) {
   let pauseCompletions = false;
   const counts: Array<{ id: string; count: number }> = [];
   const workCounts: WorkCounts[] = [];
-  const initializations: AgentTurn[] = []; const errors: unknown[] = [];
+  const initializations: AgentTurn[] = []; const errors: unknown[] = []; const initializationStates: string[] = [];
   let manager!: SessionManager; let runtime!: ControllerRuntime;
   const callbacks = { onCompletion: () => { if (!pauseCompletions) manager.completionAvailable(); },
     onCountChanged: (id: string) => manager.refreshTaskCounts(id), onWorkCountsChanged: (counts: WorkCounts) => { workCounts.push({ ...counts }); },
@@ -111,13 +112,14 @@ function fixture(t: TestContext, controllerMode = true) {
   }, { mergeDelayMs: 0, taskRegistry: registry,
     onInitializeWorkspace: turn => { initializations.push(turn); return runtime.initializeWorkspace(turn); },
     onInitializationError: (_conversation, error) => errors.push(error),
+    onInitializationState: (_conversation, outcome) => { initializationStates.push(outcome); },
     onPrepareSwitch: (source, target, channel, prompt, signal) => runtime.prepareAgentSwitch(source, target, channel, prompt, signal),
     onRebindSwitch: (source, target) => runtime.rebindConversation(source, target),
     onPauseSwitch: source => runtime.pauseConversation(source.id), onResumeSwitch: source => runtime.resumeConversation(source.id),
     onDetach: id => runtime.detachConversation(id), onStop: id => runtime.cancelConversation(id) });
   runtime = makeRuntime(); manager = makeManager();
   const inspect = new SessionStore(config.dataDir);
-  const f = { root, config, registry, children, controller, replies, counts, workCounts, initializations, errors, inspect,
+  const f = { root, config, registry, children, controller, replies, counts, workCounts, initializations, initializationStates, errors, inspect,
     get manager() { return manager; }, get runtime() { return runtime; }, delivery,
     pauseCompletions: () => { pauseCompletions = true; },
     send: (id: string, text: string, imagePaths: string[] = []) => manager.handle({ id, text, imagePaths, userId: 'user', channelId: 'dm' }),
@@ -823,4 +825,71 @@ test('/new continue without a prior controller does not switch, and malformed ha
   assert.equal(failure.length, 1); assert.equal(failure[0]!.event?.introductionRequested, false);
   assert.match(failure[0]!.text, /交接未完成/);
   assert.equal(f.inspect.workspaceNotice(target.id)!.outcome, 'read-failed');
+});
+
+
+for (const recorded of ['ready', 'missing', 'request-failed'] as const) {
+  test(`completed private handoff with ${recorded} initialization journal follows the same native controller into a group and recovers readiness`, async t => {
+    const f = fixture(t);
+    await f.send('old-goal', 'Keep the confirmed goal'); await until(() => f.children.turns.length === 1);
+    // Child completion is asynchronous; idle alone can precede its persisted completion and main-context acceptance.
+    f.children.finish(0); await until(() => f.manager.isIdle() && f.initializationStates.length === 1);
+    assert.deepEqual(f.initializationStates, ['ready']);
+    await f.send('private-continue', '/new continue'); await until(() => f.children.turns.length === 2);
+    f.children.finish(1, JSON.stringify({ workspaceContext: 'WORKSPACE', continuation: 'Keep the same confirmed goal.' }));
+    await until(() => f.manager.isIdle() && f.inspect.workspaceNotice(f.inspect.getActive('user')!.id)?.state === 'delivered');
+    const target = f.inspect.getActive('user')!, manifestPath = join(f.config.dataDir, 'session-handoffs', target.id, 'manifest.json');
+    assert.equal(f.controller.turns.filter(turn => turn.event?.kind === 'workspace-context').length, 2, 'both original and continued controllers accepted their context before changing entrance');
+    const manifest = readFileSync(manifestPath, 'utf8'), journalPath = join(f.config.dataDir, 'workspace-initialization', target.id + '.json');
+    const legacyState = (phase: string) => {
+      if (recorded === 'missing') renameSync(journalPath, journalPath + '.' + phase + '.fixture-saved');
+      if (recorded === 'request-failed') {
+        const journal = JSON.parse(readFileSync(journalPath, 'utf8'));
+        writeFileSync(journalPath, JSON.stringify({ ...journal, sourceMessageId: 'new-group-input', channelId: 'group-address', outcome: 'request-failed' }));
+      }
+    };
+    legacyState('before-group');
+    await f.manager.handle({ id: 'new-group-input', text: 'Continue the same goal here', userId: 'user', channelId: 'group-address', imagePaths: [],
+      groupContext: { eventId: 'group-event', rootId: 'group-root', botId: 'feishu:test', spaceId: 'test-space', generation: 1,
+        bindingEpoch: 1, originChannelId: 'group-address', principalId: 'owner', scene: 'test group' } });
+    await until(() => f.manager.isIdle() && f.inspect.getMessage('new-group-input')?.state === 'completed');
+    const groupTurn = f.controller.turns.find(turn => turn.groupContext?.eventId === 'group-event');
+    assert.ok(groupTurn, 'the new group input reaches the ordinary controller turn');
+    assert.equal(groupTurn.conversation.id, target.id); assert.equal(groupTurn.conversation.nativeId, target.nativeId);
+    assert.equal(f.children.turns.length, 2, 'a consumed handoff never launches another workspace reader');
+    assert.equal(f.initializations.length, 2);
+    assert.equal(f.controller.turns.filter(turn => turn.event?.kind === 'workspace-context').length, 2);
+    assert.equal(f.inspect.getActive('user')?.id, target.id); assert.equal(f.inspect.getActive('user')?.nativeId, target.nativeId);
+    assert.equal(readFileSync(manifestPath, 'utf8'), manifest, 'original private handoff remains unchanged');
+    assert.deepEqual(f.errors, []); assert.ok(f.initializationStates.every(outcome => outcome === 'ready'));
+    const restored = JSON.parse(readFileSync(journalPath, 'utf8'));
+    assert.equal(restored.outcome, 'ready'); assert.equal(restored.sourceMessageId, 'private-continue'); assert.equal(restored.channelId, 'dm');
+    // The newest stored source is now a group input. Recovery must still reconcile historical acceptance first.
+    legacyState('before-restart'); f.initializationStates.length = 0;
+    await f.restart(); await until(() => f.manager.isIdle());
+    assert.deepEqual(f.initializationStates, ['ready']); assert.equal(f.children.turns.length, 2); assert.equal(f.initializations.length, 2);
+    assert.equal(f.controller.turns.filter(turn => turn.event?.kind === 'workspace-context').length, 2);
+    assert.equal(f.inspect.getActive('user')?.nativeId, target.nativeId);
+    assert.equal(readFileSync(manifestPath, 'utf8'), manifest);
+    const recovered = JSON.parse(readFileSync(journalPath, 'utf8'));
+    assert.equal(recovered.outcome, 'ready'); assert.equal(recovered.sourceMessageId, 'private-continue'); assert.equal(recovered.nativeId, target.nativeId);
+  });
+}
+
+test('an unfinished private handoff still rejects a different group entrance and never establishes readiness', async t => {
+  const f = fixture(t), handoffs = new SessionHandoffs(f.config.dataDir);
+  const previous = f.inspect.createConversation('user', 'codex', f.root, { controllerMode: true });
+  const target = f.inspect.createConversation('user', 'codex', f.root, { controllerMode: true });
+  handoffs.prepare(previous, target, 'dm', [], []);
+  const source = { id: 'unfinished-private-continue', text: '/new continue', userId: 'user', channelId: 'dm', imagePaths: [] };
+  f.inspect.addMessage(source, null, 'command'); f.inspect.setState(source.id, 'completed'); f.inspect.requestWorkspaceNotice(target.id, source); f.inspect.setActive('user', target.id);
+  const manifestPath = join(f.config.dataDir, 'session-handoffs', target.id, 'manifest.json'), manifest = readFileSync(manifestPath, 'utf8');
+  await f.manager.handle({ id: 'wrong-entrance', text: 'Do not bypass the pending handoff', userId: 'user', channelId: 'group-address', imagePaths: [],
+    groupContext: { eventId: 'wrong-entrance', rootId: 'group-root', botId: 'feishu:test', spaceId: 'test-space', generation: 1,
+      bindingEpoch: 1, originChannelId: 'group-address', principalId: 'owner', scene: 'test group' } });
+  await until(() => f.manager.isIdle() && f.errors.length > 0);
+  assert.match(String(f.errors[0]), /交接材料与当前用户、入口或会话不匹配/);
+  assert.equal(f.children.turns.length, 0); assert.equal(f.initializations.length, 1);
+  assert(!f.initializationStates.includes('ready')); assert.equal(readFileSync(manifestPath, 'utf8'), manifest);
+  assert.equal(JSON.parse(readFileSync(join(f.config.dataDir, 'workspace-initialization', target.id + '.json'), 'utf8')).outcome, 'request-failed');
 });

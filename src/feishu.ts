@@ -9,6 +9,7 @@ import { WSClient, EventDispatcher, Domain, type HttpInstance } from '@larksuite
 import type { BridgeConfig, IncomingDM, DiscordAttachment, ReplyOptions, BridgeMessage, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import { compareMessageIds } from './routing.js';
+import { groupMessagePayloadHash, type GroupMentionView } from './group-mentions.js';
 
 type Json = Record<string, any>;
 export interface FeishuOptions {
@@ -209,6 +210,22 @@ export class FeishuTransport {
       if (pageToken) tokens.add(pageToken);
     } while (pageToken);
     return null;
+  }
+  /** Read the same original message in this app's ID namespace, never infer from names. */
+  async readGroupMentionView(spaceId: string, messageId: string): Promise<GroupMentionView> {
+    const match = /^(\d{10,16})\|(om_[a-zA-Z0-9_-]+)$/.exec(messageId);
+    if (this.config.groupMode !== true || !/^oc_[a-zA-Z0-9_-]+$/.test(spaceId) || !match) throw new Error('飞书提及关联消息无效。');
+    const data = await this.api(`/im/v1/messages/${match[2]}`);
+    if (!Array.isArray(data.items) || data.items.length !== 1) throw new Error('飞书提及关联消息数量无效。');
+    const item = data.items[0];
+    if (item.message_id !== match[2] || item.chat_id !== spaceId || String(item.create_time) !== match[1] || item.deleted === true
+      || item.sender?.sender_type !== 'user' || item.sender?.id_type !== 'open_id' || !/^ou_[a-zA-Z0-9_-]+$/.test(item.sender.id ?? '')) throw new Error('飞书提及关联消息身份无效。');
+    const mentions = (Array.isArray(item.mentions) ? item.mentions : []).map((m: Json) => ({ key: m.key, id: m.id }));
+    if (!Array.isArray(item.mentions) || mentions.some((m: Json) => typeof m.key !== 'string' || !m.key || !/^ou_[a-zA-Z0-9_-]+$/.test(m.id ?? ''))
+      || item.mentions.some((m: Json) => m.id_type !== 'open_id') || new Set(mentions.map((m: Json) => m.key)).size !== mentions.length) throw new Error('飞书提及实体无法核对。');
+    const normalized = this.normalize({ ...item, chat_type: 'group' }, item.sender.id);
+    return { messageId: item.message_id, spaceId, createTime: String(item.create_time), senderId: item.sender.id,
+      payloadHash: groupMessagePayloadHash(normalized), mentions };
   }
   /** Group recovery has its own authorization and retains group space/mentions, never a synthetic DM. */
   async readGroupHistory(spaceId: string, options: DMHistoryOptions & { ownerUserId?: string } = {}): Promise<DMHistoryPage> {

@@ -26,7 +26,7 @@ class DeliveryProtocol implements RpcTransport {
     if (message.method === 'config/read') this.emit({ id: message.id, result: { config: { model_provider: 'fixture' } } });
     if (message.method === 'thread/start' || message.method === 'thread/resume') this.emit({ id: message.id, result: { thread: { id: 'continued-native' }, modelProvider: 'fixture', model: 'fixture-model', reasoningEffort: null } });
     if (message.method === 'turn/start') { this.started = true; this.emit({ id: message.id, result: { turn: { id: 'delivery-turn' } } }); this.emit({ method: 'turn/started', params: { threadId: 'continued-native', turn: { id: 'delivery-turn' } } }); }
-    if (message.type === 'user') { this.started = true; this.emit({ type: 'system', subtype: 'init', session_id: 'continued-native', tools: ['mcp__bridge_controller__bridge_delivery_targets', 'mcp__bridge_controller__bridge_send_message', 'mcp__bridge_controller__bridge_list_workers'] }); }
+    if (message.type === 'user') { this.started = true; this.emit({ type: 'system', subtype: 'init', session_id: 'continued-native', tools: ['mcp__bridge_controller__bridge_delivery_targets', 'mcp__bridge_controller__bridge_send_message', 'mcp__bridge_controller__bridge_send_private', 'mcp__bridge_controller__bridge_list_workers'] }); }
   }
   async call(name: string, args: JsonObject): Promise<{ ok: boolean; value: unknown }> {
     const id = ++this.sequence, callId = 'delivery-call-' + id;
@@ -62,7 +62,61 @@ function fixture(t: TestContext, agent: AgentName) {
   return { adapter, protocol, turn, invoked, sends };
 }
 
+function groupFixture(t: TestContext, agent: AgentName) {
+  const f = fixture(t, agent);
+  f.turn.source = { messageId: 'real-group-request', userId: 'owner', channelId: 'original-group-channel' };
+  f.turn.groupContext = { eventId: 'group-private-event', rootId: 'group-private-root', botId: 'feishu:cli_fixture', spaceId: 'verified-test-group',
+    generation: 1, bindingEpoch: 1, originChannelId: 'original-group-channel', principalId: 'verified-owner-principal', scene: 'verified group owner' };
+  return f;
+}
+
+
 for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent} 旧私聊工具省略finish等待真实DM确认后DONE成功，群来源无需重复回复`, { timeout: 10000 }, async t => {
+    const f = groupFixture(t, agent), entered = gate(), acknowledged = gate(); let settled = false;
+    f.turn.onPublicMessage = async (text, _paths, _id, target, finish) => { f.sends.push({ text, target, finish }); entered.release(); await acknowledged.promise; };
+    const running = f.adapter.run(f.turn); void running.then(() => { settled = true; }, () => { settled = true; }); await until(() => f.protocol.started);
+    const publication = f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '仅私聊负责人' }); await entered.promise;
+    f.protocol.complete(); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(settled, false);
+    acknowledged.release(); assert.equal((await publication).ok, true); const result = await running;
+    assert.equal(result.controlledOutput, true); assert.equal(result.nativeId, 'continued-native'); assert.deepEqual(f.invoked, []);
+    assert.deepEqual(f.sends, [{ text: '仅私聊负责人', target: 'private', finish: true }]);
+    assert.equal(f.turn.source!.channelId, 'original-group-channel'); assert.equal(f.turn.groupContext!.eventId, 'group-private-event');
+  });
+
+  test(`${agent} 旧私聊显式false补充后仍可管理，再用同工具最终发送`, { timeout: 10000 }, async t => {
+    const f = groupFixture(t, agent), running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '私聊进度', finish: false })).ok, true);
+    assert.equal((await f.protocol.call('bridge_list_workers', {})).ok, true);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '私聊结果' })).ok, true);
+    f.protocol.complete(); assert.equal((await running).controlledOutput, true); assert.deepEqual(f.invoked, ['bridge_list_workers']);
+    assert.deepEqual(f.sends, [{ text: '私聊进度', target: 'private', finish: false }, { text: '私聊结果', target: 'private', finish: true }]);
+  });
+
+  test(`${agent} 旧私聊前置owner或参数拒绝不封闭本轮，也不绕过统一投递验权`, { timeout: 10000 }, async t => {
+    const f = groupFixture(t, agent), context = f.turn.groupContext!, running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'another-owner', text: '禁止越权' })).ok, false);
+    f.turn.groupContext = undefined;
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '缺少群来源' })).ok, false);
+    f.turn.groupContext = context;
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '无效收尾', finish: 'false' })).ok, false);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: 'x'.repeat(12001) })).ok, false);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '禁止\0空字符' })).ok, false);
+    assert.deepEqual(f.sends, []); assert.deepEqual(f.invoked, []);
+    assert.equal((await f.protocol.call('bridge_list_workers', {})).ok, true);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '合法回复', finish: true })).ok, true);
+    f.protocol.complete(); assert.equal((await running).controlledOutput, true);
+    assert.deepEqual(f.sends, [{ text: '合法回复', target: 'private', finish: true }]);
+  });
+
+  for (const finish of [undefined, false]) test(`${agent} 旧私聊${finish === false ? '补充' : '默认最终'}投递结果未知立即封闭且不盲重发`, { timeout: 10000 }, async t => {
+    const f = groupFixture(t, agent); let attempts = 0;
+    f.turn.onPublicMessage = async () => { attempts++; throw Object.assign(new Error('private delivery uncertain'), { deliveryUncertain: true }); };
+    const running = f.adapter.run(f.turn), rejected = assert.rejects(running, /private delivery uncertain/); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '真实私聊', ...(finish === false ? { finish } : {}) })).ok, false);
+    await rejected; assert.equal(f.protocol.stopped, true); assert.equal(attempts, 1); assert.deepEqual(f.invoked, []);
+  });
+
   test(`${agent} 原私聊查询后省略finish只投递测试群，DONE成功且无需补发私聊`, { timeout: 10000 }, async t => {
     const f = fixture(t, agent), entered = gate(), acknowledged = gate(); let settled = false;
     f.turn.onPublicMessage = async (text, _paths, _id, target, finish) => { f.sends.push({ text, target, finish }); entered.release(); await acknowledged.promise; };

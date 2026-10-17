@@ -355,6 +355,27 @@ export class TaskRegistry {
     return this.db.prepare(`SELECT 1 FROM task_observations o JOIN tasks t ON t.id=o.task_id
       WHERE o.id=? AND o.state IN ('queued','processing') AND t.status IN ('registered','running') AND t.wake_allowed=1`).get(id) !== undefined;
   }
+  /** Historical proof of completed initialization; never queues work or changes delivery state. */
+  completedWorkspaceInitialization(target: Pick<Conversation, 'id' | 'userId' | 'agent' | 'cwd' | 'nativeId'>): { originMessageId: string; channelId: string } | null {
+    if (!target.nativeId) return null;
+    const rows = this.db.prepare(`SELECT e.origin_json,t.origin_json AS task_origin_json FROM task_events e JOIN tasks t ON t.id=e.task_id
+      WHERE e.status='completed' AND e.state='delivered' AND t.status='completed'
+      AND json_valid(e.origin_json) AND json_extract(e.origin_json,'$.conversationId')=?
+      AND json_extract(e.origin_json,'$.purpose')='workspace-context' ORDER BY e.created_at,e.rowid`).all(target.id);
+    const matches = (origin: TaskOrigin) => origin.purpose === 'workspace-context' && origin.conversationId === target.id
+      && origin.userId === target.userId && origin.agent === target.agent && origin.cwd === target.cwd
+      && (origin.nativeId === null || origin.nativeId === target.nativeId)
+      && typeof origin.originMessageId === 'string' && !!origin.originMessageId
+      && typeof origin.channelId === 'string' && !!origin.channelId;
+    for (const row of rows) {
+      try {
+        const event = JSON.parse(String(row.origin_json)) as TaskOrigin, task = JSON.parse(String(row.task_origin_json)) as TaskOrigin;
+        if (matches(event) && matches(task) && event.originMessageId === task.originMessageId && event.channelId === task.channelId
+          && event.nativeId === task.nativeId) return { originMessageId: event.originMessageId, channelId: event.channelId };
+      } catch { /* Invalid historical evidence cannot establish initialization. */ }
+    }
+    return null;
+  }
   private event(row: Row): TaskCompletionEvent {
     const origin = JSON.parse(String(row.origin_json)) as TaskOrigin;
     if (row.kind === 'worker-progress') return { ...origin, kind: 'worker-progress', id: String(row.id), taskId: String(row.task_id), title: String(row.title),

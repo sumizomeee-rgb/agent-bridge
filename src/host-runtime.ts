@@ -12,6 +12,7 @@ import { parseCommand, groupCommands } from './commands.js';
 import { compareMessageIds, validMessageId } from './routing.js';
 import type { AgentTurn, BridgeConfig, BridgeMessage, IncomingDM, ReplyOptions } from './types.js';
 import type { TaskCompletionEvent } from './tasks.js';
+import { GroupMentionResolutionError, groupMessagePayloadHash } from './group-mentions.js';
 
 type Context = NonNullable<AgentTurn['groupContext']>;
 const key = (...v: string[]): string => createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -42,6 +43,7 @@ export class HostRuntime {
   private readonly scheduledInputs = new Set<string>();
   private readonly spaceTails = new Map<string, Promise<void>>();
   private readonly admissionTails = new Map<string, Promise<void>>();
+  private readonly ingressTails = new Map<string, Promise<void>>();
   private pumpAgain = false;
   private pumpDone: Promise<void> = Promise.resolve();
   private finishPump?: () => void;
@@ -207,9 +209,53 @@ export class HostRuntime {
     return this.config.spaces.find(s => s.id === spaceId)?.accounts[botId];
   }
   private ownerAccount(botId: string, principal: string): string | undefined { return this.config.principals.find(p => p.id === principal)?.accounts[botId]; }
-  private mentionBots(message: IncomingDM): string[] {
+  private mentionBots(message: IncomingDM, observerBotId: string): string[] {
     const ids = new Set(message.space?.mentionedUserIds ?? []);
-    return [...this.bots].filter(([, bot]) => bot.transport.botUser?.id && ids.has(bot.transport.botUser.id)).map(([id]) => id);
+    const scoped = this.configurations.get(observerBotId)?.platform === 'feishu';
+    return [...this.bots].filter(([id, bot]) => (!scoped || id === observerBotId) && bot.transport.botUser?.id && ids.has(bot.transport.botUser.id)).map(([id]) => id);
+  }
+  private async resolveGroupMentions(botId: string, message: IncomingDM, spaceId: string, principal: string): Promise<string[]> {
+    const known = this.mentionBots(message, botId), mentioned = message.space?.mentionedUserIds ?? [];
+    const unknown = mentioned.filter(id => id !== this.bots.get(botId)?.transport.botUser?.id);
+    if (!unknown.length || this.configurations.get(botId)?.platform !== 'feishu') return known;
+    try {
+      const sourceConfig = this.configurations.get(botId)!;
+      const receiver = this.bots.get(botId)!;
+      const humanProofs = await Promise.allSettled(unknown.map(id => receiver.transport.getGroupMember(this.rawSpace(botId, spaceId)!, id)));
+      const unresolved = unknown.filter((_id, index) => {
+        const proof = humanProofs[index]!; return proof.status !== 'fulfilled' || proof.value?.isBot !== false;
+      });
+      if (!unresolved.length) return known;
+      if (!message.id.startsWith(sourceConfig.scopePrefix!)) throw new Error();
+      const rawId = message.id.slice(sourceConfig.scopePrefix!.length), match = /^(\d{10,16})\|(om_[a-zA-Z0-9_-]+)$/.exec(rawId);
+      if (!match) throw new Error();
+      const members = this.store.getGroup(spaceId)?.memberBotIds;
+      const candidates = [...this.bots].filter(([id, bot]) => (!members || members.includes(id)) && bot.config.platform === 'feishu' && this.rawSpace(id, spaceId)
+        && this.ownerAccount(id, principal) && bot.transport.botUser?.id);
+      // Wait for every app view. A partially resolved explicit mention must never turn
+      // into an unmentioned all-member message, including after crash recovery.
+      const observations = await Promise.allSettled(candidates.map(async ([id, bot]) => ({ id, bot,
+        view: await bot.transport.readGroupMentionView(this.rawSpace(id, spaceId)!, rawId) })));
+      if (observations.some(result => result.status === 'rejected')) throw new Error();
+      const views = observations.flatMap(result => result.status === 'fulfilled' ? [result.value] : []);
+      const source = views.find(v => v.id === botId)?.view;
+      if (!source || new Set(source.mentions.map(m => m.id)).size !== new Set(mentioned).size
+        || source.mentions.some(m => !mentioned.includes(m.id))) throw new Error();
+      const sourceTokens = source.mentions.map(m => m.key).sort();
+      const targets = new Set(known), resolved = new Set<string>();
+      for (const { id, bot, view } of views) {
+        if (view.messageId !== match[2] || view.createTime !== match[1] || view.spaceId !== this.rawSpace(id, spaceId)
+          || view.senderId !== this.ownerAccount(id, principal) || view.payloadHash !== groupMessagePayloadHash(message)
+          || JSON.stringify(view.mentions.map(m => m.key).sort()) !== JSON.stringify(sourceTokens)) throw new Error();
+        for (const mention of view.mentions.filter(m => m.id === bot.transport.botUser!.id)) {
+          const original = source.mentions.find(m => m.key === mention.key);
+          if (!original) throw new Error();
+          targets.add(id); resolved.add(original.id);
+        }
+      }
+      if (unresolved.some(id => !resolved.has(id))) throw new Error();
+      return [...targets];
+    } catch { throw new GroupMentionResolutionError(); }
   }
   async receive(botId: string, message: IncomingDM): Promise<void> {
     if (this.closed || this.draining || !message.space || this.configurations.get(botId)?.groupMode !== true) return;
@@ -219,24 +265,45 @@ export class HostRuntime {
     const rawUser = this.rawUser(config, message.userId)!;
     const principal = this.store.resolvePrincipal(botId, rawUser); if (!principal || !this.principalAllowed(botId, principal)) return;
     const spaceId = this.space(botId, message.space.spaceId);
-    if (!spaceId) { if (parseCommand(message.text) && this.mentionBots(message).includes(botId)) await this.controlReply(botId, message, '本群缺少经核对的跨 Bot 地址登记，请先配置宿主 spaces 映射。'); return; }
-    const group = this.store.getGroup(spaceId); const command = parseCommand(message.text); const mentions = this.mentionBots(message);
+    if (!spaceId) { if (parseCommand(message.text) && this.mentionBots(message, botId).includes(botId)) await this.controlReply(botId, message, '本群缺少经核对的跨 Bot 地址登记，请先配置宿主 spaces 映射。'); return; }
+    const group = this.store.getGroup(spaceId); const command = parseCommand(message.text);
     if (group && group.principalId !== principal) return;
-    // Explicit control recipient takes precedence; ordinary input has one authoritative receiver.
-    const receiver = command && mentions.length ? [...mentions].sort()[0] : group?.receiverBotId;
-    if (receiver ? receiver !== botId : !mentions.includes(botId)) return;
+    if (!command && group?.receiverBotId !== botId) return;
     if (!group?.enabled && !(command && (command.name === 'group' && command.argument === 'start' || command.name === 'new'))) return;
     const rawId = message.interaction?.id ?? message.id.slice(config.scopePrefix!.length);
     const id = key(spaceId, rawId);
-    const requestedTargets = mentions.length ? mentions.filter(id => group?.memberBotIds.includes(id)) : group?.memberBotIds ?? [];
-    const generations = group && !requestedTargets.some(id => this.isPaused(id))
-      ? Object.fromEntries(requestedTargets.map(id => [id, this.store.getController(id)?.generation ?? 0])) : null;
-    const captured = this.inbox.capture(id, botId, message, !!command, generations, group?.epoch ?? null);
-    if (!captured || this.recovering) return;
-    const input = this.inbox.get(id)!;
-    const run = () => this.processInput(input, message.interaction);
-    if (command) { const job = this.controlTail.then(run, run); this.controlTail = job.catch(() => undefined); await job; }
-    else await this.scheduleInput(input, message.interaction);
+    // Reserve arrival order before any asynchronous proof. Freeze generations now,
+    // not when a slow earlier control message finally releases this ingress slot.
+    const direct = this.mentionBots(message, botId);
+    const hasUnknownScopedMention = config.platform === 'feishu' && message.space.mentionedUserIds.some(id => id !== this.bots.get(botId)?.transport.botUser?.id);
+    const observedTargets = direct.length && !hasUnknownScopedMention ? direct : group?.memberBotIds ?? [];
+    const observedGenerations = group && !observedTargets.some(id => this.isPaused(id))
+      ? Object.fromEntries(observedTargets.map(id => [id, this.store.getController(id)?.generation ?? 0])) : null;
+    const previous = this.ingressTails.get(spaceId) ?? Promise.resolve();
+    const admitted = previous.catch(() => undefined).then(async (): Promise<{ execution?: Promise<void> }> => {
+      if (this.closed || this.draining) return {};
+      let mentions = this.mentionBots(message, botId);
+      if (command) try { mentions = await this.resolveGroupMentions(botId, message, spaceId, principal); }
+      catch (error) {
+        const reporter = group?.receiverBotId ?? [...this.bots.keys()].sort()[0];
+        if (reporter !== botId || !this.inbox.capture(id, botId, message, true, observedGenerations, group?.epoch ?? null)) return {};
+        this.inbox.setState(id, 'failed', String(error)); this.report('GROUP_MENTION_UNVERIFIED ' + String(error));
+        await this.controlReply(botId, message, error instanceof Error ? error.message : '群提及身份无法核对，本条未派发。').catch(() => undefined);
+        return {};
+      }
+      // Ordinary input remains owned by its single receiver. Its proof runs only
+      // after durable capture, inside the existing space/target admission queue.
+      const receiver = command && mentions.length ? [...mentions].sort()[0] : group?.receiverBotId;
+      if (receiver ? receiver !== botId : !mentions.includes(botId)) return {};
+      const captured = this.inbox.capture(id, botId, message, !!command, observedGenerations, group?.epoch ?? null);
+      if (!captured || this.recovering) return {};
+      const input = this.inbox.get(id)!, run = () => this.processInput(input, message.interaction);
+      if (command) { const execution = this.controlTail.then(run, run); this.controlTail = execution.catch(() => undefined); return { execution }; }
+      return { execution: this.scheduleInput(input, message.interaction) };
+    });
+    const tail = admitted.then(() => undefined, () => undefined); this.ingressTails.set(spaceId, tail);
+    try { const { execution } = await admitted; await execution; }
+    finally { if (this.ingressTails.get(spaceId) === tail) this.ingressTails.delete(spaceId); }
   }
   private async scheduleInput(input: HostInput, interaction?: IncomingDM['interaction']): Promise<void> {
     if (this.scheduledInputs.has(input.id) || this.pending.has(input.id)) return;
@@ -261,18 +328,28 @@ export class HostRuntime {
       const rawUser = this.rawUser(this.configurations.get(botId)!, message.userId)!;
       const principal = this.store.resolvePrincipal(botId, rawUser)!;
       const command = parseCommand(message.text);
-      if (command) await this.command(input.id, botId, { ...message, ...(interaction ? { interaction } : {}) }, principal, spaceId, command);
+      if (command) {
+        const mentions = await this.resolveGroupMentions(botId, message, spaceId, principal);
+        if (mentions.length && [...mentions].sort()[0] !== botId) throw new GroupMentionResolutionError();
+        await this.command(input.id, botId, { ...message, ...(interaction ? { interaction } : {}) }, principal, spaceId, command);
+      }
       else {
         const group = this.store.getGroup(spaceId); if (!group?.enabled || group.principalId !== principal) throw new Error('工作群未激活或负责人已改变。');
         await this.verifyMember(botId, spaceId, principal);
+        const requested = await this.resolveGroupMentions(botId, message, spaceId, principal);
+        const stillCurrent = (): boolean => {
+          this.refreshConfiguredPermissions();
+          const binding = this.store.getGroup(spaceId);
+          return this.principalAllowed(botId, principal) && !!binding?.enabled && binding.principalId === principal && binding.epoch === input.bindingEpoch
+            && (!input.generations || !Object.entries(input.generations).some(([id, generation]) => (!requested.length || requested.includes(id)) && !this.continuousGeneration(id, generation)));
+        };
         const latestBinding = this.store.getGroup(spaceId);
-        if (!latestBinding?.enabled || latestBinding.epoch !== input.bindingEpoch || input.generations && Object.entries(input.generations).some(([id, generation]) => !this.continuousGeneration(id, generation))) {
+        if (!stillCurrent() || !latestBinding) {
           this.inbox.setState(input.id, 'accepted', '旧输入在控制切换前收到，已取消，不穿越新代次。'); return;
         }
-        const requested = this.mentionBots(message);
-        const mentioned = requested.filter(id => group.memberBotIds.includes(id));
+        const mentioned = requested.filter(id => latestBinding.memberBotIds.includes(id));
         if (requested.length && !mentioned.length) { this.inbox.setState(input.id, 'accepted', '明确目标不属于本群成员。'); return; }
-        const expected = mentioned.length ? mentioned : group.memberBotIds;
+        const expected = mentioned.length ? mentioned : latestBinding.memberBotIds;
         const targets = expected.filter(id => this.store.getBot(id)?.ready && this.store.getController(id));
         const notReady = expected.filter(id => !targets.includes(id));
         if ((mentioned.length && notReady.length) || !targets.length) {
@@ -280,6 +357,9 @@ export class HostRuntime {
           if (!targets.length) {
             this.inbox.setState(input.id, 'accepted'); this.inbox.saveCursor(botId, spaceId, message.id); return;
           }
+        }
+        if (!stillCurrent()) {
+          this.inbox.setState(input.id, 'accepted', '等待提及核验或回执期间控制状态已改变，本条旧输入已取消。'); return;
         }
         const root = this.store.acceptRoot({ id: input.id, spaceId, principalId: principal, sourceEventId: input.id,
           targetBotIds: targets, replyTo: { spaceId, channelId: message.channelId, botId } });
@@ -294,7 +374,7 @@ export class HostRuntime {
       this.inbox.setState(input.id, 'accepted'); this.inbox.saveCursor(botId, spaceId, message.id);
     } catch (error) {
       this.inbox.setState(input.id, 'failed', String(error));
-      if (input.control) await this.controlReply(botId, { ...message, ...(interaction ? { interaction } : {}) }, `命令未完成：${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+      if (input.control || error instanceof GroupMentionResolutionError) await this.controlReply(botId, { ...message, ...(interaction ? { interaction } : {}) }, `${input.control ? '命令未完成' : '输入未完成'}：${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
       this.report('GROUP_INPUT_FAILED ' + String(error));
     } finally { this.pending.delete(input.id); void this.pump(); }
   }
@@ -801,9 +881,9 @@ export class HostRuntime {
     }
   }
   beginDrain(): void { this.draining = true; for (const bot of this.bots.values()) bot.beginDrain(); }
-  isIdle(): boolean { return !this.pending.size && !this.scheduledInputs.size && !this.spaceTails.size && !this.pumping && !this.preparations.size && !this.budgetNotices.size && [...this.bots.values()].every(bot => bot.isIdle()); }
+  isIdle(): boolean { return !this.ingressTails.size && !this.pending.size && !this.scheduledInputs.size && !this.spaceTails.size && !this.pumping && !this.preparations.size && !this.budgetNotices.size && [...this.bots.values()].every(bot => bot.isIdle()); }
   async close(): Promise<void> {
-    this.closed = true; await this.controlTail; await Promise.allSettled([...this.spaceTails.values()]); await this.pumpDone;
+    this.closed = true; await Promise.allSettled([...this.ingressTails.values()]); await this.controlTail; await Promise.allSettled([...this.spaceTails.values()]); await this.pumpDone;
     await Promise.allSettled([...this.preparations.values(), ...this.budgetNotices]);
     const failures: unknown[] = [];
     for (const bot of this.bots.values()) try { await bot.close(); } catch (error) { failures.push(error); }
