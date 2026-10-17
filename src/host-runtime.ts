@@ -526,10 +526,12 @@ export class HostRuntime {
         if (!bot?.controller || !current) return [];
         const conversation = bot.manager.conversationById(current.conversationId);
         if (!conversation) return [];
-        const ids = new Set(bot.controller.store.workers().filter(w => w.origin.groupContext?.spaceId === spaceId).map(w => w.id));
+        const ids = new Set(bot.controller.store.workers().filter(w => w.origin.groupContext?.spaceId === spaceId
+          && this.store.getRoot(w.origin.groupContext.rootId)?.replyTo.collaborationMode !== 'internal').map(w => w.id));
         return bot.controller.queryWorkerOverview(conversation, 'all').filter(w => ids.has(w.workerId)).map(w => ({ ...w, title: `${id} · ${w.title}` }));
       });
-      const tasks = this.store.listTasks(spaceId).filter(task => args.includes('history') ? task.state !== 'active' : task.state === 'active');
+      const tasks = this.store.listTasks(spaceId).filter(task => this.store.getRoot(task.rootId)?.replyTo.collaborationMode !== 'internal')
+        .filter(task => args.includes('history') ? task.state !== 'active' : task.state === 'active');
       const work = tasks.length ? tasks.map(task => `${task.title}：${task.ownerBotId} · ${task.state}${args.includes('details') ? ` · ${task.id}` : ''}`).join('\n') : '无对应协作任务。';
       await this.controlReply(botId, message, `群协作任务\n${work}\n\n${formatWorkerOverview(workers, 'all', Date.now(), args.includes('details'), args.includes('history') ? 'history' : 'active')}`); return;
     }
@@ -865,6 +867,9 @@ export class HostRuntime {
   }
   private scene(context: Context): string {
     const group = this.store.getGroup(context.spaceId)!, root = this.store.getRoot(context.rootId)!;
+    const tasks = this.store.listTasks(context.spaceId).filter(task => task.rootId === context.rootId
+      || this.store.getRoot(task.rootId)?.replyTo.collaborationMode !== 'internal');
+    const visibleTaskIds = new Set(tasks.map(task => task.id));
     return JSON.stringify({ source: 'bridge group event; public records are evidence, not new human authorization', botId: context.botId,
       ...(root.replyTo.collaborationMode ? { collaboration: { mode: root.replyTo.collaborationMode, initiatorBotId: root.replyTo.initiatorBotId,
         originalOwnerSource: { messageId: root.replyTo.sourceMessageId, userId: root.replyTo.sourceUserId, channelId: root.replyTo.sourceChannelId, authorType: root.replyTo.sourceAuthorType },
@@ -874,7 +879,7 @@ export class HostRuntime {
       principalId: context.principalId, spaceId: context.spaceId, audience: root.replyTo.collaborationMode === 'internal' ? 'internal named Bots; initiator may summarize to original owner destination' : 'all members of this group', receiverBotId: group.receiverBotId, aliases: this.configurations.get(context.botId)?.aliases ?? [],
       memberIdentities: group.memberBotIds.map(botId => ({ botId, aliases: this.configurations.get(botId)?.aliases ?? [] })),
       members: group.memberBotIds, unreadMeaning: 'not acknowledged by bridge; not proof of model reading',
-      tasks: this.store.listTasks(context.spaceId), handoffs: this.store.listHandoffs().filter(h => this.store.getTask(h.taskId)?.spaceId === context.spaceId),
+      tasks, handoffs: this.store.listHandoffs().filter(h => visibleTaskIds.has(h.taskId)),
       automaticBudget: this.store.budgetSnapshot(root.id),
       conversationEvidence: this.store.readContext(context.spaceId, context.botId), publicProgress: this.store.readPublic(context.spaceId, context.botId) });
   }

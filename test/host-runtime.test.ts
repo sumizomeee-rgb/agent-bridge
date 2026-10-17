@@ -1151,3 +1151,25 @@ test('internal mutual consultation stops at eight automatic turns and only notif
   assert.equal(f.replies.filter(reply => reply.text.includes('内部协作已达到')).length, 1);
   assert.equal(f.host.store.readPublic(G1, A).length, 0);
 });
+
+
+test('internal task titles stay out of later public scenes and group worker listings', async t => {
+  const f = fixture(t); await f.activate(); let publicScene: any;
+  f.run(async (id, turn) => {
+    if (!turn.groupContext) {
+      const targets = await f.host.invoke(A, turn, 'bridge_delivery_targets', {}) as any;
+      await f.host.invoke(A, turn, 'bridge_start_collaboration', { targetId: targets.targets.find((x: any) => x.spaceId === G1).targetId,
+        targetBotId: B, mode: 'internal', text: '后台私密任务' }); await turn.onPublicMessage!('已登记。');
+    } else if (id === B && JSON.parse(turn.groupContext.scene).collaboration?.mode === 'internal') {
+      await f.host.invoke(B, turn, 'bridge_claim_work', { taskId: 'internal-private-task', title: '不应出现在群里的任务标题' });
+      assert.equal((await f.host.invoke(B, turn, 'bridge_group_context', {}) as any).tasks.length, 1);
+      await turn.onSilent!();
+    } else { publicScene = JSON.parse(turn.groupContext.scene); await turn.onSilent!(); }
+  });
+  await f.managers.get(A)!.handle({ id: 'private-task-source', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_task_private`, text: '内部安排', imagePaths: [] }); await f.drain();
+  assert.equal(f.host.store.listTasks(G1).length, 1);
+  await f.host.receive(A, f.message(A, 'later-public-scene', '正常群消息', G1, [A])); await f.drain();
+  assert.equal(publicScene.tasks.length, 0);
+  await f.host.receive(A, f.message(A, 'public-worker-status', '/workers', G1, [A])); await f.drain();
+  assert.equal(f.replies.some(reply => reply.channel === `${A}|oc_a_group_1` && reply.text.includes('不应出现在群里的任务标题')), false);
+});
