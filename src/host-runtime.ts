@@ -447,8 +447,9 @@ export class HostRuntime {
     if (!latest?.enabled || latest.epoch !== group.epoch || latest.revision !== group.revision
       || !this.principalAllowed(botId, group.principalId)
       || input.generations && Object.entries(input.generations).some(([id, generation]) => !this.continuousGeneration(id, generation))) throw new Error('登记群现场期间绑定或授权已改变。');
-    // Recording the real owner's words does not create a root or authorize a replay.
-    this.recordContext(input, latest, true, 'user');
+    // Controls execute in the program, not in a controller discussion or refresh.
+    // Keep the existing deduplicated owner-input quota reset for this group.
+    if (!input.control) this.recordContext(input, latest, true, 'user');
     this.store.resetPublicReplies(latest.spaceId, latest.principalId, input.id, latest.epoch);
   }
   private recordContext(input: HostInput, group: HostGroup, canAuthorize: boolean, authorType: string): void {

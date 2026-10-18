@@ -87,6 +87,37 @@ test('verified owner context advances reassessment while another member remains 
   assert.equal(store.readContext(SPACE, B).recent.length, 2);
 });
 
+test('owner controls and legacy control scene rows stay stored but outside default context, unread counts and refreshes', async t => {
+  const { store, open } = await setup(t), binding = store.getGroup(SPACE)!;
+  const input = { id: 'discussion', spaceId: SPACE, epoch: binding.epoch, revision: binding.revision,
+    principalId: P, receiverBotId: A, source: { botId: A, messageId: 'discussion', userId: 'user-' + A,
+      channelId: 'native-' + A, authorType: 'user', mentionedUserIds: [] }, text: '请解释 /workers 的用途', attachments: [], canAuthorize: true };
+  store.appendContext(input); const cursor = store.sceneCursor(SPACE, B);
+  store.appendContext({ ...input, id: 'guest-slash', text: '/workers', canAuthorize: false,
+    source: { ...input.source, userId: 'guest' } });
+  const legacy = new DatabaseSync(store.path);
+  for (let index = 0; index < 25; index++) {
+    const id = 'old-control-' + index, text = ['/workers', ' /STATUS ', '/unknown control', '新会话'][index % 4]!;
+    store.appendContext({ ...input, id, text });
+    legacy.prepare('INSERT INTO host_scene_log(id,space_id,epoch,kind,source_bot_id,text,source_json) VALUES(?,?,?,?,?,?,?)')
+      .run('context:' + id, SPACE, binding.epoch, 'context', null, text, JSON.stringify({ type: 'group-evidence' }));
+  }
+  legacy.close();
+  for (const reader of [store, open()]) {
+    const context = reader.readContext(SPACE, B, 2);
+    assert.deepEqual(context.recent.map(r => r.text), [input.text, '/workers']);
+    assert.equal(context.unreadCount, 2); assert.equal(context.truncated, false);
+    assert.equal(context.recent[1]!.canAuthorize, false, 'guest slash text remains read-only evidence');
+    assert.equal(reader.sceneCursor(SPACE, B), cursor);
+    assert.deepEqual(reader.readSceneUpdates(SPACE, B, cursor).updates, []);
+    assert.deepEqual(reader.readSceneUpdates(SPACE, B, 0).updates.map(r => r.text), [input.text]);
+  }
+  const retained = new DatabaseSync(store.path, { readOnly: true });
+  assert.equal(retained.prepare("SELECT COUNT(*) n FROM host_context_records WHERE id LIKE 'old-control-%'").get()!.n, 25);
+  assert.equal(retained.prepare("SELECT COUNT(*) n FROM host_scene_log WHERE id LIKE 'context:old-control-%'").get()!.n, 25);
+  retained.close();
+});
+
 test('legacy bystander scene rows remain stored but cannot advance the version or occupy refresh deltas after reopen', async t => {
   const { store, open } = await setup(t), binding = store.getGroup(SPACE)!;
   store.appendPublic({ id: 'bot-before-guest', rootId: 'root', authorBotId: A, principalId: P, text: 'Confirmed Bot reply' });

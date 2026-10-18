@@ -140,6 +140,16 @@ test('internal coordination keeps its shared budget while public replies use the
   }
   assert.deepEqual(store.budgetSnapshot('root'), { limit: 8, used: 8, reserved: 0 });
   assert.equal(store.publicReplySnapshot(B, SPACE).count, 8);
+  // Public discussion still has twelve slots after the separate internal budget is spent.
+  for (let index = 8; index < 20; index++) {
+    const request = store.registerCollaborationRequest({ ...input, id: 'public-extra-' + index, rootId: 'public', mode: 'public' });
+    store.queueCollaborationRequest(request.id);
+    const event = store.claimNextEvent(B); assert(event); store.startEvent(event.id);
+    const permit = store.reservePublicReply(event.id, SPACE); store.finishPublicReply(permit.reservationId!, 'confirmed');
+    store.finishEvent(event.id, 'completed');
+    assert.deepEqual(store.budgetSnapshot('root'), { limit: 8, used: 8, reserved: 0 });
+  }
+  assert.equal(store.publicReplySnapshot(B, SPACE).count, 20);
   addRoot('late-public');
   const late = store.registerCollaborationRequest({ ...input, id: 'late-request', rootId: 'late-public', mode: 'public' });
   store.queueCollaborationRequest(late.id);
@@ -154,7 +164,7 @@ test('internal coordination keeps its shared budget while public replies use the
   addRoot('after-notice');
   store.close(); const restored = open();
   assert.deepEqual(restored.budgetSnapshot('after-notice'), { limit: 8, used: 8, reserved: 0 });
-  assert.equal(restored.publicReplySnapshot(B, SPACE).count, 8);
+  assert.equal(restored.publicReplySnapshot(B, SPACE).count, 20);
   assert.equal(restored.claimBudgetExhaustionNotice('after-notice'), false);
 });
 

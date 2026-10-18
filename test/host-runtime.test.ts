@@ -307,6 +307,32 @@ test('prepared automatic dispatch is visible before its worker receipt and force
   held.release(); await f.drain();
 });
 
+for (const platform of ['feishu', 'discord'] as const) test(`${platform} group commands and program receipts do not enter discussion or consume scene reassessment`, { timeout: 10000 }, async t => {
+  const f = fixture(t, { platform }); await f.activate();
+  const [primary, secondary] = f.ids as [string, string], wait = f.gate(), turns = new Map<string, AgentTurn>();
+  f.run(async (botId, turn) => { turns.set(botId, turn); await wait.promise; await turn.onSilent?.(); });
+  await f.host.receive(primary, f.message(primary, 'control-boundary-owner', '正常主人讨论'));
+  await eventual(() => turns.has(primary) && turns.has(secondary), 'both owner turns started');
+  const cursor = f.host.store.sceneCursor(G1, secondary), events = f.host.store.listEvents().length,
+    publicCount = f.host.store.readPublic(G1, secondary, 0).length, replies = f.replies.length;
+  for (const [index, text] of ['/workers', '/status', '/help', '/restart'].entries()) {
+    await f.host.receive(primary, f.message(primary, 'control-boundary-' + index, text));
+    assert.equal(f.host.store.sceneCursor(G1, secondary), cursor);
+    assert.equal((await turns.get(secondary)!.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'after-control-' + index })).refreshRequired, false);
+  }
+  assert.ok(f.replies.length > replies, 'program command receipts were actually delivered');
+  assert.equal(f.calls.length, 2); assert.equal(f.host.store.listEvents().length, events);
+  assert.equal(f.host.store.readPublic(G1, secondary, 0).length, publicCount, 'yellow program receipts are not model publications');
+  assert.deepEqual(f.host.store.readContext(G1, secondary).recent.map(record => record.text), ['正常主人讨论']);
+  const context: any = await f.host.invoke(secondary, turns.get(secondary)!, 'bridge_group_context', {});
+  assert.equal(JSON.stringify(context.conversationEvidence).includes('/workers'), false);
+  for (const id of f.ids) assert.equal(f.host.store.publicReplySnapshot(id, G1).count, 0);
+  await turns.get(primary)!.onPublicMessage!('真实模型公开发言', [], 'actual-bot-publication', undefined, false);
+  assert.equal((await turns.get(secondary)!.onSceneCheck!({ name: 'bridge_send_message', args: {}, callId: 'after-real-bot' })).refreshRequired, true,
+    'program controls leave the once-only reassessment available for real discussion');
+  wait.release(); await f.drain();
+});
+
 test('non-owner observer messages stay readable without advancing scene or consuming reassessment', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'nonowner-scene-owner'), turn = held.turns.get(B)!;
   const beforeEvents = f.host.store.listEvents().length, beforeCursor = f.host.store.sceneCursor(G1, B);

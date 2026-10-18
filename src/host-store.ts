@@ -2,12 +2,15 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import type { AgentName, BridgePlatform } from './types.js';
+import { parseCommand } from './commands.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
+// Owner controls stay in durable history, outside default discussion and refreshes.
+const discussionContextEligible = '(can_authorize=0 OR bridge_is_control_text(text)=0)';
 // Readable bystander history, including legacy scene rows, does not trigger reassessment.
 const sceneRefreshEligible = `(kind<>'context' OR EXISTS (SELECT 1 FROM host_context_records c
   WHERE host_scene_log.id='context:'||c.id AND c.space_id=host_scene_log.space_id
-    AND c.epoch=host_scene_log.epoch AND c.can_authorize=1))`;
+    AND c.epoch=host_scene_log.epoch AND c.can_authorize=1 AND bridge_is_control_text(c.text)=0))`;
 export type HostReplyAddress = Readonly<Record<string, string>>;
 export class HostStateError extends Error {
   constructor(readonly code: 'not-found' | 'conflict' | 'forbidden' | 'stale' | 'blocked' | 'public-reply-limit', message: string) {
@@ -171,6 +174,7 @@ export class HostStore {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'host.sqlite');
     this.db = new DatabaseSync(this.path);
+    this.db.function('bridge_is_control_text', { deterministic: true }, value => parseCommand(String(value ?? '')) ? 1 : 0);
     this.db.exec(`
       PRAGMA busy_timeout=5000;
       PRAGMA journal_mode=WAL;
@@ -889,7 +893,7 @@ export class HostStore {
           throw new HostStateError('conflict', 'Context message identity reused');
       } else this.run('INSERT INTO host_context_records(id,space_id,epoch,source_json,text,attachments_json,can_authorize,received_at) VALUES(?,?,?,?,?,?,?,?)',
         input.id, input.spaceId, input.epoch, JSON.stringify(value.source), input.text, JSON.stringify(value.attachments), Number(value.canAuthorize), new Date().toISOString());
-      if (input.canAuthorize) this.appendSceneInner({ id: 'context:' + input.id, spaceId: input.spaceId, epoch: input.epoch,
+      if (input.canAuthorize && !parseCommand(input.text)) this.appendSceneInner({ id: 'context:' + input.id, spaceId: input.spaceId, epoch: input.epoch,
         kind: 'context', sourceBotId: null, text: input.text,
         source: { type: 'group-evidence', messageId: input.source.messageId, authorType: input.source.authorType,
           userId: input.source.userId, ...(input.source.authorName ? { authorName: input.source.authorName } : {}) } });
@@ -906,8 +910,8 @@ export class HostStore {
     this.assertMember(spaceId, botId, group.principalId, group.epoch);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new HostStateError('conflict', 'Context limit must be 1..100');
     const cursor = Number(this.one('SELECT cursor FROM host_context_cursors WHERE bot_id=? AND space_id=? AND epoch=?', botId, spaceId, group.epoch)?.cursor ?? 0);
-    const recent = this.rows('SELECT * FROM (SELECT * FROM host_context_records WHERE space_id=? AND epoch=? ORDER BY sequence DESC LIMIT ?) ORDER BY sequence', spaceId, group.epoch, limit).map(r => this.contextRecord(r));
-    const unreadCount = Number(this.one('SELECT COUNT(*) AS n FROM host_context_records WHERE space_id=? AND epoch=? AND sequence>?', spaceId, group.epoch, cursor)!.n);
+    const recent = this.rows(`SELECT * FROM (SELECT * FROM host_context_records WHERE space_id=? AND epoch=? AND ${discussionContextEligible} ORDER BY sequence DESC LIMIT ?) ORDER BY sequence`, spaceId, group.epoch, limit).map(r => this.contextRecord(r));
+    const unreadCount = Number(this.one(`SELECT COUNT(*) AS n FROM host_context_records WHERE space_id=? AND epoch=? AND sequence>? AND ${discussionContextEligible}`, spaceId, group.epoch, cursor)!.n);
     return { recent, unread: recent.filter(r => r.sequence > cursor), unreadCount, truncated: unreadCount > recent.filter(r => r.sequence > cursor).length };
   }
   ackContext(botId: string, spaceId: string, epoch: number, cursor: number): void {
