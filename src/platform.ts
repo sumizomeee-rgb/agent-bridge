@@ -68,9 +68,9 @@ export class PlatformTransport {
       oldestId: page.oldestId ? scope + page.oldestId : null, newestId: page.newestId ? scope + page.newestId : null };
   }
   downloadImages(message: IncomingDM): Promise<string[]> { return this.transport.downloadImages(this.transport instanceof FeishuTransport ? message : this.unscoped(message)); }
-  async markReplyDelivered(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void> {
+  async markReplyDelivered(messages: Array<Pick<BridgeMessage, 'id' | 'channelId'> & { text?: string; isGroup?: boolean }>): Promise<void> {
     if (this.config.features?.reactions === false) return;
-    await this.transport.markReplyDelivered(this.transport instanceof FeishuTransport ? messages : messages.map(message => ({ id: this.raw(message.id), channelId: this.raw(message.channelId) })));
+    await this.transport.markReplyDelivered(this.transport instanceof FeishuTransport ? messages : messages.map(message => ({ ...message, id: this.raw(message.id), channelId: this.raw(message.channelId) })));
   }
   async setTaskCount(message: Pick<BridgeMessage, 'id' | 'channelId'>, count: number): Promise<void> {
     if (this.config.features?.reactions === false || this.transport instanceof FeishuTransport) return;

@@ -10,6 +10,7 @@ import type { BridgeConfig, IncomingDM, DiscordAttachment, ReplyOptions, BridgeM
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import { historyOptions, historyPage, type ConversationHistoryOptions, type ConversationHistoryPage, type ConversationHistoryMessage } from './group-history.js';
 import { compareMessageIds } from './routing.js';
+import { shouldShowMessageReceipts, type ReceiptMessage } from './receipt-policy.js';
 import { groupMessagePayloadHash, type GroupMentionView } from './group-mentions.js';
 
 type Json = Record<string, any>;
@@ -169,7 +170,7 @@ export class FeishuTransport {
     if (captured !== false && !this.seenMessages.has(normalized.id)) {
       this.seenMessages.add(normalized.id);
       if (this.seenMessages.size > 5000) this.seenMessages.delete(this.seenMessages.values().next().value!);
-      void this.markReceived(normalized);
+      if (shouldShowMessageReceipts(this.config, normalized)) void this.markReceived(normalized);
     }
     await this.receive(normalized);
   }
@@ -433,8 +434,9 @@ export class FeishuTransport {
       if (typeof result.reaction_id === 'string') this.processingReactions.set(id, result.reaction_id);
     });
   }
-  async markReplyDelivered(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void> {
-    await Promise.all([...new Map(messages.map(message => [message.id, message])).values()].map(message => this.receipt(message, async id => {
+  async markReplyDelivered(messages: ReceiptMessage[]): Promise<void> {
+    await Promise.all([...new Map(messages.filter(message => shouldShowMessageReceipts(this.config, message))
+      .map(message => [message.id, message])).values()].map(message => this.receipt(message, async id => {
       await this.api(`/im/v1/messages/${id}/reactions`, 'POST', { reaction_type: { emoji_type: 'CheckMark' } }, AbortSignal.timeout(5000));
       const cached = this.processingReactions.get(id), pending: string[] = cached ? [cached] : [];
       // 重启后按平台身份找回自己的处理中表情，只删除当前 bot 的回执。

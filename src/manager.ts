@@ -13,6 +13,7 @@ import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
 import { SessionHandoffs } from './controller/handoff.js';
+import { shouldShowMessageReceipts } from './receipt-policy.js';
 import type { RestartOrigin, RestartReceipt } from './restart.js';
 
 interface WorkspaceInitializationJournal {
@@ -96,6 +97,23 @@ export class SessionManager {
   ) { this.store = new SessionStore(config.dataDir, options.binding); this.handoffs = new SessionHandoffs(config.dataDir); }
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
+
+  /** A different chat or command must not be overtaken by a private-input refresh. */
+  privateInputBarrier(userId: string, id: string): void {
+    if (this.config.controllerMode && !this.closed && this.config.allowedUserIds.includes(userId)
+      && this.options.authorizeUser?.(userId) !== false) this.store.markPrivateInputBarrier(userId, id);
+  }
+
+  /** Preserve cross-chat/control ordering before a slow attachment has been prepared. */
+  privateInputQueued(message: Pick<BridgeMessage, 'id' | 'userId' | 'channelId' | 'text'>): void {
+    if (!this.config.controllerMode || this.closed || !this.config.allowedUserIds.includes(message.userId)
+      || this.options.authorizeUser?.(message.userId) === false) return;
+    const running = this.running.get(message.userId);
+    const original = running ? this.store.getMessage(running.messageId) : null;
+    if (command(message.text) || original && original.channelId !== message.channelId)
+      this.privateInputBarrier(message.userId, 'private-ingress:' + message.id);
+    this.store.notePrivateInputArrival(message);
+  }
 
   async replyWorkers(userId: string, argument: string, reply: (text: string, options?: ReplyOptions) => Promise<void>,
     filter?: (items: WorkerOverview[]) => WorkerOverview[], createIfMissing = true): Promise<void> {
@@ -308,6 +326,7 @@ export class SessionManager {
     if (this.closed) throw new Error('桥已关闭');
     if (!this.config.allowedUserIds.includes(message.userId) || this.options.authorizeUser?.(message.userId) === false || this.hasMessage(message.id)) return;
     const parsed = message.groupContext?.eventKind ? null : command(message.text);
+    if (parsed || message.groupContext) this.privateInputBarrier(message.userId, 'input:' + message.id);
     if (this.pendingSwitches.has(message.userId) && parsed?.name !== 'status' && parsed?.name !== 'help') throw new Error('上次 Agent 切换提交尚待核对；请先恢复操作日志。');
     if (parsed) {
       // Raw command receipt stays in DurableIngress until the next process can execute it.
@@ -885,7 +904,8 @@ export class SessionManager {
     try {
       const messages = messageIds.flatMap(id => {
         const message = this.store.getMessage(id);
-        return message ? [{ id: message.id, channelId: message.channelId }] : [];
+        return message && shouldShowMessageReceipts(this.config, { text: message.text, isGroup: !!message.groupContext })
+          ? [{ id: message.id, channelId: message.channelId, text: message.text, isGroup: !!message.groupContext }] : [];
       });
       if (messages.length) void Promise.resolve()
         .then(() => this.sink.markReplyDelivered?.(messages))
@@ -1059,6 +1079,7 @@ export class SessionManager {
       for (const value of batch) this.store.setState(value.id, 'running');
       const current = () => !this.closed && !controller.signal.aborted
         && this.running.get(item.userId) === turn
+        && this.config.allowedUserIds.includes(item.userId) && this.options.authorizeUser?.(item.userId) !== false
         && this.store.getActive(item.userId)?.id === conversationId
         && this.store.getMessage(item.id)?.state === 'running';
       let actualModel: string | null = null;
@@ -1069,7 +1090,11 @@ export class SessionManager {
       let groupOutcome: 'completed' | 'silent' | 'failed' = 'failed';
       let silent = false;
       let supplementaryPublished = false;
+      let privateReplyDelivered = false;
+      let privateFinalStarted = false;
+      const privateControllerInput = this.config.controllerMode === true && !groupContext;
       try {
+        if (privateControllerInput) this.store.startPrivateBatch(item.id);
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
         if (!current()) throw new Error('消息轮次已经停止');
         const chatScene = groupContext?.scene ?? await this.options.onConversationScene?.(target, this.turnSource(item), controller.signal);
@@ -1085,6 +1110,17 @@ export class SessionManager {
           ...(groupContext && this.options.onSceneCheck ? { onSceneCheck: async (input: Parameters<NonNullable<AgentTurn['onSceneCheck']>>[0]) => {
             if (!current()) throw new Error('现场检查时原主控轮次已停止。');
             return this.options.onSceneCheck!(groupContext!, input);
+          } } : {}),
+          ...(privateControllerInput ? { onPrivateInputCheck: async () => {
+            if (!current()) throw new Error('私聊补充检查时原主控轮次已停止。');
+            if (privateFinalStarted) return { refreshRequired: false };
+            const update = this.store.claimPrivateRefresh(item.id);
+            if (!update) return { refreshRequired: false };
+            turn.messageIds.push(...update.messages.map(message => message.id));
+            return { refreshRequired: true, input: { version: update.version, messages: update.messages.map(message => ({
+              id: message.id, userId: message.userId, channelId: message.channelId, text: message.text,
+              imagePaths: [...message.imagePaths], source: this.turnSource(message).original,
+            })) } };
           } } : {}),
           ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
           ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: item.text } } : {}),
@@ -1112,10 +1148,17 @@ export class SessionManager {
           onProgress: () => {},
           onPublicMessage: async (text, paths = [], key, targetId, finish = true) => {
             if (!current()) throw new Error('当前主控轮次已经停止');
-            if (finish) this.store.setReplyState(turn.messageIds, 'pending');
+            if (privateControllerInput && finish && targetId && targetId !== 'private')
+              throw new Error('普通私聊的最终回复必须发回原私聊；向其他区域发送请用 finish:false。');
+            const coverage = [...turn.messageIds];
+            if (privateControllerInput && finish) privateFinalStarted = true;
+            if (finish) this.store.setReplyState(coverage, 'pending');
             await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
             if (!finish && current()) supplementaryPublished = true;
-            if (finish && current()) { this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds); }
+            if (finish && current()) {
+              this.store.setReplyState(coverage, 'delivered'); this.markReplyDelivered(coverage);
+              if (privateControllerInput) privateReplyDelivered = true;
+            }
           },
           ...(groupContext ? { onPublicDeliveryComplete: async () => {
             if (!current() || !supplementaryPublished) throw new Error('本轮没有已确认的群公开投递，不能完成交付。');
@@ -1137,6 +1180,7 @@ export class SessionManager {
           || this.store.getMessage(item.id)?.state !== 'completed') continue;
         for (const id of turn.messageIds) this.store.setState(id, 'completed');
         if (result.controlledOutput) {
+          if (privateControllerInput && !privateReplyDelivered) throw new Error('主控尚未完成原私聊的最终回复，本批消息未标记为已答。');
           groupOutcome = silent ? 'silent' : 'completed';
           this.store.setReplyState(turn.messageIds, 'delivered');
           continue;
@@ -1181,6 +1225,11 @@ export class SessionManager {
       } finally {
         turn.executing = false;
         await turn.supplements;
+        if (!this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) {
+          for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') {
+            this.store.setState(id, 'cancelled', '当前账号授权已撤销'); this.store.setReplyState([id], 'cancelled');
+          }
+        }
         if (contextId) this.options.taskRegistry?.closeContext(contextId);
         if (groupContext) await this.options.onGroupTurnFinished?.(groupContext, groupOutcome).catch(() => undefined);
         if (this.running.get(item.userId) === turn) this.running.delete(item.userId);

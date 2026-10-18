@@ -107,6 +107,12 @@ export interface EffortMetadata {
   capability: EffortCapability;
   actual: string | null;
 }
+export interface ControllerActionCheck { name: string; args: Record<string, unknown>; callId: string }
+export interface PrivateInputMessage {
+  id: string; userId: string; channelId: string; text: string; imagePaths: string[]; source?: ChatInputSource;
+}
+export interface PrivateInputBatch { version: number; messages: PrivateInputMessage[] }
+export interface PrivateInputCheckResult { refreshRequired: boolean; input?: PrivateInputBatch }
 export interface AgentTurn {
   conversation: Conversation;
   /** The real source of this input, never the last contacted destination. */
@@ -140,7 +146,9 @@ export interface AgentTurn {
   groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
   onSilent?: () => Promise<void>;
   /** 程序现场检查；返回的增量只是原授权下的证据，不是新用户请求。 */
-  onSceneCheck?: (input: { name: string; args: Record<string, unknown>; callId: string }) => Promise<{ refreshRequired: boolean; scene?: string }>;
+  onSceneCheck?: (input: ControllerActionCheck) => Promise<{ refreshRequired: boolean; scene?: string }>;
+  /** 已验证同一主人在本私聊的新输入；这是新授权，不是群现场只读证据。 */
+  onPrivateInputCheck?: (input: ControllerActionCheck) => Promise<PrivateInputCheckResult>;
   preparing?: boolean;
   /** Disposable evidence-only execution: restricted filesystem tools, no inherited MCP/plugins. */
   readOnly?: boolean;
@@ -195,7 +203,7 @@ export interface ReplySink {
   /** Registered background agents on the latest ordinary message; zero removes the counter. */
   setTaskCount?(message: Pick<BridgeMessage, 'id' | 'channelId'>, count: number): Promise<void>;
   /** Best effort indication on the original messages, after successful reply delivery. */
-  markReplyDelivered?(messages: Pick<BridgeMessage, 'id' | 'channelId'>[]): Promise<void>;
+  markReplyDelivered?(messages: Array<Pick<BridgeMessage, 'id' | 'channelId'> & { text?: string; isGroup?: boolean }>): Promise<void>;
 }
 export interface DiscordAttachment {
   id: string;

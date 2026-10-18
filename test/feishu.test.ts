@@ -166,6 +166,49 @@ test('飞书重启后找回自己的处理中表情，送达失败时保留处�
 });
 
 
+test('主控普通飞书私聊不发收件或完成表情，重启靠持久正文分类；命令与群保持', async t => {
+  const { config, cleanup } = setup(t); config.controllerMode = true; config.groupMode = true; config.features = { reactions: true };
+  const requests: Array<{ path: string; method: string; emoji?: string }> = [], accepted: IncomingDM[] = [];
+  const http = (async (url: any, options: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path.includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    const emoji = options.body ? JSON.parse(options.body).reaction_type?.emoji_type : undefined;
+    requests.push({ path, method: options.method, emoji });
+    return response({ code: 0, data: { reaction_id: 'own-' + path.split('/')[4], items: [], has_more: false } });
+  }) as any;
+  const first = new FeishuTransport(config, async message => { accepted.push(message); }, { fetch: http }); cleanup(() => first.close());
+  await first.receiveEvent(event('om_plain', { content: '{"text":"普通消息"}' }));
+  assert.equal(accepted.length, 1); assert.equal(requests.length, 0);
+  const saved = { id: accepted[0]!.id, channelId: accepted[0]!.channelId, text: accepted[0]!.text, isGroup: false };
+  await first.close();
+  const restored = new FeishuTransport(config, async message => { accepted.push(message); }, { fetch: http }); cleanup(() => restored.close());
+  await restored.markReplyDelivered([saved]); assert.equal(requests.length, 0, '完成出口不依赖进程内收件记录');
+  await restored.receiveEvent(event('om_command'));
+  await restored.markReplyDelivered([{ id: prefix + '1700000000000|om_command', channelId: prefix + 'oc_chat', text: '/status', isGroup: false }]);
+  await restored.receiveEvent(event('om_public', { chat_type: 'group', content: '{"text":"群消息"}' }));
+  await restored.markReplyDelivered([{ id: prefix + '1700000000000|om_public', channelId: prefix + 'oc_chat', text: '群消息', isGroup: true }]);
+  assert.equal(requests.filter(item => item.emoji === 'Status_PrivateMessage').length, 2);
+  assert.equal(requests.filter(item => item.emoji === 'CheckMark').length, 2);
+  assert(requests.every(item => !item.path.includes('om_plain')));
+});
+
+test('飞书直接执行普通私聊与缺正文的旧完成调用保留表情', async t => {
+  const { config, cleanup } = setup(t); config.controllerMode = false; config.features = { reactions: true };
+  const emojis: string[] = [];
+  const bridge = new FeishuTransport(config, async () => {}, { fetch: (async (url: any, options: any) => {
+    if (String(url).includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
+    const emoji = options.body ? JSON.parse(options.body).reaction_type?.emoji_type : undefined;
+    if (emoji) emojis.push(emoji);
+    return response({ code: 0, data: { reaction_id: 'ours', items: [], has_more: false } });
+  }) as any }); cleanup(() => bridge.close());
+  await bridge.receiveEvent(event('om_direct', { content: '{"text":"普通消息"}' }));
+  await bridge.markReplyDelivered([{ id: prefix + '1700000000000|om_direct', channelId: prefix + 'oc_chat', text: '普通消息', isGroup: false }]);
+  assert.deepEqual(emojis, ['Status_PrivateMessage', 'CheckMark']);
+  config.controllerMode = true;
+  await bridge.markReplyDelivered([{ id: prefix + '1700000000000|om_legacy', channelId: prefix + 'oc_chat' }]);
+  assert.equal(emojis.at(-1), 'CheckMark');
+});
+
 test('飞书群入口显式启用后向Host提交全部真人，实体提及和回复链保留原始平台身份', async t => {
   const { config, cleanup } = setup(t); config.groupMode = true;
   const accepted: IncomingDM[] = [], captured: IncomingDM[] = [];

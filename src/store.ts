@@ -4,12 +4,17 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { AgentName, BridgeMessage, Conversation } from './types.js';
 import { validMessageId } from './routing.js';
+import { parseCommand } from './commands.js';
 
 export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
 export interface InboxItem extends BridgeMessage {
   conversationId: string | null;
   state: InboxState;
   replyState: 'pending' | 'delivered' | 'failed' | 'cancelled' | null;
+}
+export interface PrivateInputBatch {
+  rootId: string; conversationId: string; userId: string; channelId: string;
+  version: number; refreshUsed: boolean; messages: InboxItem[];
 }
 export interface DeliveredReply {
   conversationId: string;
@@ -90,6 +95,25 @@ export class SessionStore {
         channel_id TEXT NOT NULL, source_message_id TEXT NOT NULL, outcome TEXT,
         state TEXT NOT NULL DEFAULT 'waiting', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS private_input_boundaries (
+        user_id TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS private_input_barriers (
+        user_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(user_id,id)
+      );
+      CREATE TABLE IF NOT EXISTS private_input_arrivals (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, channel_id TEXT NOT NULL, boundary INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS private_input_arrivals_user ON private_input_arrivals(user_id);
+      CREATE TABLE IF NOT EXISTS private_input_batches (
+        root_id TEXT PRIMARY KEY REFERENCES inbox(id), conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        user_id TEXT NOT NULL, channel_id TEXT NOT NULL, version INTEGER NOT NULL,
+        boundary INTEGER NOT NULL, refresh_used INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS private_input_batch_members (
+        root_id TEXT NOT NULL REFERENCES private_input_batches(root_id), message_id TEXT NOT NULL UNIQUE REFERENCES inbox(id),
+        PRIMARY KEY(root_id,message_id)
+      );
       CREATE TABLE IF NOT EXISTS bot_preferences (
         agent TEXT PRIMARY KEY, model TEXT, model_policy TEXT, effort TEXT
       );
@@ -122,15 +146,125 @@ export class SessionStore {
   }
 
   addMessage(message: BridgeMessage, conversationId: string | null, state: InboxState): boolean {
-    const now = new Date().toISOString();
-    const result = this.db.prepare(`INSERT OR IGNORE INTO inbox
-      (id, user_id, channel_id, text, images_json, conversation_id, state, created_at, updated_at, group_json, source_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      message.id, message.userId, message.channelId, message.text,
-      JSON.stringify(message.imagePaths), conversationId, state, now, now, message.groupContext ? JSON.stringify(message.groupContext) : null,
-      message.source ? JSON.stringify(message.source) : null,
-    );
-    return Number(result.changes) === 1;
+    return this.privateInputAtomic(() => {
+      const now = new Date().toISOString();
+      const result = this.db.prepare(`INSERT OR IGNORE INTO inbox
+        (id, user_id, channel_id, text, images_json, conversation_id, state, created_at, updated_at, group_json, source_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        message.id, message.userId, message.channelId, message.text,
+        JSON.stringify(message.imagePaths), conversationId, state, now, now, message.groupContext ? JSON.stringify(message.groupContext) : null,
+        message.source ? JSON.stringify(message.source) : null,
+      );
+      const inserted = Number(result.changes) === 1;
+      if (inserted && state !== 'command' && this.ordinaryPrivateInput(message)) this.notePrivateInputArrivalInner(message);
+      return inserted;
+    });
+  }
+
+  private privateInputAtomic<T>(action: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try { const result = action(); this.db.exec('COMMIT'); return result; }
+    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  private ordinaryPrivateInput(value: Pick<BridgeMessage, 'groupContext' | 'source' | 'text'>): boolean {
+    return !value.groupContext && !value.source?.space && !parseCommand(value.text)
+      && (value.source?.authorType === undefined || value.source.authorType === 'user');
+  }
+  private validPrivateRoot(row: Row | undefined): row is Row {
+    if (!row || row.state !== 'running' || row.conversation_id === null) return false;
+    const value = inbox(row), active = this.getActive(value.userId);
+    return this.ordinaryPrivateInput(value) && active?.id === value.conversationId && active.userId === value.userId;
+  }
+  private privateBoundary(userId: string): number {
+    return Number(this.db.prepare('SELECT version FROM private_input_boundaries WHERE user_id=?').get(userId)?.version ?? 0);
+  }
+  /** The root and every fresh owner message retain their original source and reply obligations. */
+  startPrivateBatch(rootId: string): { version: number; messages: InboxItem[] } {
+    return this.privateInputAtomic(() => {
+      const row = this.db.prepare('SELECT * FROM inbox WHERE id=?').get(rootId);
+      if (!this.validPrivateRoot(row)) throw new Error('私聊批次需要当前用户、当前会话的普通运行中输入');
+      const value = inbox(row), previous = this.db.prepare('SELECT * FROM private_input_batches WHERE root_id=?').get(rootId);
+      if (previous) {
+        if (previous.conversation_id !== value.conversationId || previous.user_id !== value.userId || previous.channel_id !== value.channelId)
+          throw new Error('私聊批次原始输入绑定已改变');
+      } else {
+        if (this.db.prepare('SELECT 1 FROM private_input_batch_members WHERE message_id=?').get(rootId))
+          throw new Error('此私聊输入已属于另一批次');
+        const arrival = this.db.prepare('SELECT * FROM private_input_arrivals WHERE id=?').get(rootId);
+        if (arrival && (arrival.user_id !== value.userId || arrival.channel_id !== value.channelId))
+          throw new Error('私聊原始到达绑定已改变');
+        this.db.prepare(`INSERT INTO private_input_batches(root_id,conversation_id,user_id,channel_id,version,boundary)
+          VALUES(?,?,?,?,?,?)`).run(rootId, value.conversationId!, value.userId, value.channelId, Number(row.sequence), Number(arrival?.boundary ?? 0));
+        this.db.prepare('INSERT INTO private_input_batch_members(root_id,message_id) VALUES(?,?)').run(rootId, rootId);
+      }
+      const batch = this.privateBatch(rootId)!;
+      return { version: batch.version, messages: batch.messages };
+    });
+  }
+  /** Arrival barriers are durable even before attachment preparation or command persistence finishes. */
+  markPrivateInputBarrier(userId: string, id: string): void {
+    if (!userId.trim() || !id.trim()) throw new Error('私聊边界需要有效用户和输入编号');
+    this.privateInputAtomic(() => this.markPrivateInputBarrierInner(userId, id));
+  }
+  private markPrivateInputBarrierInner(userId: string, id: string): void {
+    const added = this.db.prepare('INSERT OR IGNORE INTO private_input_barriers(user_id,id) VALUES(?,?)').run(userId, id);
+    if (Number(added.changes) === 1) this.db.prepare(`INSERT INTO private_input_boundaries(user_id,version) VALUES(?,1)
+      ON CONFLICT(user_id) DO UPDATE SET version=version+1`).run(userId);
+  }
+  /** Freeze private input order before an asynchronous attachment preparation can overtake a boundary. */
+  notePrivateInputArrival(message: Pick<BridgeMessage, 'id' | 'userId' | 'channelId'>): void {
+    if (!message.id.trim() || !message.userId.trim() || !message.channelId.trim()) throw new Error('私聊到达登记需要有效输入、用户和聊天编号');
+    this.privateInputAtomic(() => this.notePrivateInputArrivalInner(message));
+  }
+  private notePrivateInputArrivalInner(message: Pick<BridgeMessage, 'id' | 'userId' | 'channelId'>): void {
+    const previous = this.db.prepare('SELECT * FROM private_input_arrivals WHERE id=?').get(message.id);
+    if (previous) {
+      if (previous.user_id !== message.userId || previous.channel_id !== message.channelId) throw new Error('私聊原始到达编号被复用于其他用户或聊天');
+      return;
+    }
+    const last = this.db.prepare('SELECT channel_id FROM private_input_arrivals WHERE user_id=? ORDER BY rowid DESC LIMIT 1').get(message.userId);
+    if (last && last.channel_id !== message.channelId) this.markPrivateInputBarrierInner(message.userId, 'private-channel-switch:' + message.id);
+    this.db.prepare('INSERT INTO private_input_arrivals(id,user_id,channel_id,boundary) VALUES(?,?,?,?)')
+      .run(message.id, message.userId, message.channelId, this.privateBoundary(message.userId));
+  }
+  privateBatch(rootId: string): PrivateInputBatch | null {
+    const row = this.db.prepare('SELECT * FROM private_input_batches WHERE root_id=?').get(rootId);
+    if (!row) return null;
+    const messages = this.db.prepare(`SELECT i.* FROM inbox i JOIN private_input_batch_members m ON m.message_id=i.id
+      WHERE m.root_id=? ORDER BY i.sequence`).all(rootId).map(inbox);
+    return { rootId: String(row.root_id), conversationId: String(row.conversation_id), userId: String(row.user_id),
+      channelId: String(row.channel_id), version: Number(row.version), refreshUsed: Number(row.refresh_used) === 1, messages };
+  }
+  /** Claim one strictly contiguous, bounded set of fresh owner inputs; never skip an intervening boundary. */
+  claimPrivateRefresh(rootId: string, limit = 20, maxChars = 12000): { version: number; messages: InboxItem[] } | null {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 1_000_000)
+      throw new Error('私聊补充输入数量或字数上限无效');
+    return this.privateInputAtomic(() => {
+      const row = this.db.prepare('SELECT * FROM inbox WHERE id=?').get(rootId);
+      if (!this.validPrivateRoot(row)) return null;
+      const batch = this.db.prepare('SELECT * FROM private_input_batches WHERE root_id=?').get(rootId);
+      if (!batch || Number(batch.refresh_used) === 1 || batch.conversation_id !== row.conversation_id || batch.user_id !== row.user_id
+        || batch.channel_id !== row.channel_id || Number(batch.boundary) !== this.privateBoundary(String(row.user_id))) return null;
+      const rows = this.db.prepare('SELECT * FROM inbox WHERE user_id=? AND sequence>? ORDER BY sequence LIMIT ?')
+        .all(String(row.user_id), Number(row.sequence), limit);
+      const messages: InboxItem[] = []; let chars = 0, version = Number(batch.version);
+      for (const candidate of rows) {
+        const value = inbox(candidate);
+        if (value.conversationId !== row.conversation_id || value.channelId !== row.channel_id || value.state !== 'queued'
+          || !this.ordinaryPrivateInput(value) || chars + value.text.length > maxChars) break;
+        messages.push(value); chars += value.text.length; version = Number(candidate.sequence);
+      }
+      if (!messages.length) return null;
+      const now = new Date().toISOString();
+      for (const value of messages) {
+        const changed = this.db.prepare("UPDATE inbox SET state='running',updated_at=? WHERE id=? AND state='queued'").run(now, value.id);
+        if (Number(changed.changes) !== 1) throw new Error('私聊补充输入领取状态已改变');
+        this.db.prepare('INSERT INTO private_input_batch_members(root_id,message_id) VALUES(?,?)').run(rootId, value.id);
+        value.state = 'running';
+      }
+      this.db.prepare('UPDATE private_input_batches SET version=?,refresh_used=1 WHERE root_id=?').run(version, rootId);
+      return { version, messages };
+    });
   }
 
   /** Last persisted human message per known DM, used only to seed ingress recovery. */

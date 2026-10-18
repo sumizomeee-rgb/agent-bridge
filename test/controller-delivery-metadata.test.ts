@@ -37,7 +37,9 @@ test('explicit delivery preserves the real private source and does not complete 
       original: { messageId: 'source-one', userId: 'owner', channelId: 'owner-dm', authorType: 'user' } });
     await turn.onPublicMessage!('补充私聊', [], 'supplement-one', 'private', false);
     await gate;
-    await turn.onPublicMessage!('群内最终答复', [], 'final-one', 'group:verified:1:1', true);
+    await turn.onPublicMessage!('群内补充答复', [], 'group-one', 'group:verified:1:1', false);
+    assert.notEqual(f.store.getMessage('source-one')?.replyState, 'delivered');
+    await turn.onPublicMessage!('已在群里答复，原私聊完成。', [], 'final-one', 'private', true);
     return { nativeId: 'native-original', text: 'DONE', controlledOutput: true };
   }, { async onControllerPublish(context, _text, _paths, target, _key, deliver) {
     sources.push({ id: context.source.messageId, channel: context.source.channelId, target, finish: context.finish });
@@ -48,11 +50,12 @@ test('explicit delivery preserves the real private source and does not complete 
   assert.equal(f.marks.length, 0);
   assert.notEqual(f.store.getMessage('source-one')?.replyState, 'delivered');
   release(); await until(() => f.store.getMessage('source-one')?.state === 'completed');
-  assert.deepEqual(f.sent.map(x => x.channel), ['owner-dm', 'verified-group']);
-  assert.deepEqual(f.marks, ['source-one']);
+  assert.deepEqual(f.sent.map(x => x.channel), ['owner-dm', 'verified-group', 'owner-dm']);
+  assert.deepEqual(f.marks, []);
   assert.deepEqual(sources, [
     { id: 'source-one', channel: 'owner-dm', target: 'private', finish: false },
-    { id: 'source-one', channel: 'owner-dm', target: 'group:verified:1:1', finish: true },
+    { id: 'source-one', channel: 'owner-dm', target: 'group:verified:1:1', finish: false },
+    { id: 'source-one', channel: 'owner-dm', target: 'private', finish: true },
   ]);
   assert.equal(f.store.getMessage('source-one')?.channelId, 'owner-dm');
   assert.ok(f.sent.every(x => x.text.startsWith('[Claude · gateway-model ·')));
@@ -79,9 +82,11 @@ test('canonical effort metadata reaches the reply header and a new turn cannot r
 
 test('an explicit target is rejected when the runtime has no authorized delivery resolver', async t => {
   const f = fixture(t, async turn => {
-    await assert.rejects(turn.onPublicMessage!('不能投递', [], 'target-missing', 'group:unknown:1:1'), /目标投递入口/);
+    await assert.rejects(turn.onPublicMessage!('不能投递', [], 'target-missing', 'group:unknown:1:1', false), /目标投递入口/);
+    await turn.onPublicMessage!('仍在原私聊完成回复。', [], 'original-private-final');
     return { nativeId: 'native-original', text: 'DONE', controlledOutput: true };
   });
   await f.send('blocked'); await until(() => f.store.getMessage('blocked')?.state === 'completed');
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1); assert.equal(f.sent[0]!.channel, 'owner-dm');
+  assert.equal(f.store.getMessage('blocked')?.replyState, 'delivered');
 });

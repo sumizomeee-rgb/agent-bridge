@@ -305,6 +305,10 @@ export class HostRuntime {
     if (!group?.enabled && !(command && (command.name === 'group' && command.argument === 'start' || command.name === 'new'))) return;
     const rawId = message.interaction?.id ?? message.id.slice(config.scopePrefix!.length);
     const id = key(spaceId, rawId);
+    if (authorized && group?.enabled) for (const memberId of group.memberBotIds) {
+      const member = this.bots.get(memberId);
+      if (member?.config.ownerUserId) member.manager.privateInputBarrier?.(member.config.ownerUserId, 'group-input:' + id);
+    }
     // Reserve arrival order before any asynchronous proof. Freeze generations now,
     // not when a slow earlier control message finally releases this ingress slot.
     const direct = command ? this.mentionBots(message, botId) : [];
@@ -621,8 +625,8 @@ export class HostRuntime {
     const group = this.store.getGroup(space);
     return !!group?.enabled && group.memberBotIds.includes(botId) && this.store.getBot(botId)?.ownerPrincipalId === group.principalId;
   }
-  private deliverySource(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'>): RoutedDeliverySource {
-    if (turn.signal.aborted || this.closed || this.draining) throw new Error('当前轮次已停止，不能查询或投递。');
+  private deliverySource(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'>, allowDrainingFinal = false): RoutedDeliverySource {
+    if (turn.signal.aborted || this.closed || this.draining && !allowDrainingFinal) throw new Error('当前轮次已停止，不能查询或投递。');
     this.refreshConfiguredPermissions();
     const source = turn.source, bot = this.bots.get(botId), registered = this.store.getBot(botId), controller = registered?.controller;
     if (!source || !bot || !controller || controller.conversationId !== turn.conversation.id || source.userId !== turn.conversation.userId
@@ -876,7 +880,9 @@ export class HostRuntime {
   }
   private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
     text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>, observe = true): Promise<void> {
-    const source = this.deliverySource(botId, turn);
+    const allowDrainingFinal = !turn.groupContext && turn.finish === true && (!targetId || targetId === 'private')
+      && this.bots.get(botId)?.manager.controllerActivity(turn.conversation.id).running === true;
+    const source = this.deliverySource(botId, turn, allowDrainingFinal);
     const collaboration = source.rootId ? this.store.getRoot(source.rootId)?.replyTo : undefined;
     if (collaboration?.collaborationMode === 'internal') {
       if (botId !== collaboration.initiatorBotId) throw new Error('静默协作不能向聊天软件发消息；请 bridge_send_bot 回传发起主控，再 bridge_silent。');
@@ -904,7 +910,7 @@ export class HostRuntime {
     }
     if (source.spaceId) await this.verifyMember(botId, source.spaceId, source.principalId);
     if (target.spaceId && target.spaceId !== source.spaceId) await this.verifyMember(botId, target.spaceId, source.principalId);
-    this.deliverySource(botId, turn);
+    this.deliverySource(botId, turn, allowDrainingFinal);
     return this.serializePublication(source.eventId && target.spaceId ? key(source.eventId, target.id) : null, async () => {
     const id = key('routed-delivery', botId, source.conversationId, source.messageId, messageKey ?? key(text, ...paths));
     const prior = this.store.getRoutedDelivery(id);
@@ -920,7 +926,7 @@ export class HostRuntime {
     if (!this.store.beginRoutedDelivery(id)) { release('released'); throw new Error('投递已登记、未知或被拒绝，未重复发送；请核对原记录。'); }
     let attempted = false;
     try {
-      this.deliverySource(botId, turn); if (turn.signal.aborted) throw new Error('发送前本轮已停止。');
+      this.deliverySource(botId, turn, allowDrainingFinal); if (turn.signal.aborted) throw new Error('发送前本轮已停止。');
       attempted = true; await deliver(target.channelId);
       release('confirmed');
       this.store.finishRoutedDelivery(id, 'delivered', 'platform send acknowledged');
@@ -1176,7 +1182,9 @@ export class HostRuntime {
   }
   async invoke(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>, callId?: string,
     delegate?: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown> {
+    if (this.draining || this.closed) throw new Error('桥正在等待现有轮次结束，暂停新增管理调用。');
     assertBotCommunicationAllowed(this.config.internalBotCommunicationEnabled, name, args);
+    if (!turn.groupContext) this.deliverySource(botId, turn);
     if (name === 'bridge_list_controllers') return this.listControllers(botId, turn, args);
     if (name === 'bridge_start_collaboration') return this.startCollaboration(botId, turn, args, callId);
     if (name === 'bridge_delivery_targets') return this.deliveryTargets(botId, turn);

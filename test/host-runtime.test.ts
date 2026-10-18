@@ -135,7 +135,9 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
   const humanMentions = new Set<string>(), mentionReads: string[] = [];
   const originals = new Map<string, IncomingDM>();
   const ownedGates: ReturnType<typeof gate>[] = [];
-  let handler: TurnHandler = options.run ?? (async (_botId, turn) => { await turn.onSilent?.(); });
+  let handler: TurnHandler = options.run ?? (async (_botId, turn) => {
+    if (turn.groupContext) await turn.onSilent?.(); else await turn.onPublicMessage?.('private fixture ready');
+  });
   let closed = false;
   const sourceIds = new Map<string, string>();
   for (const c of configs) {
@@ -688,7 +690,8 @@ test('private input queries authorized delivery regions and explicitly publishes
   f.run(async (botId, turn) => {
     assert.equal(botId, A); inspected = await f.host.invoke(A, turn, 'bridge_delivery_targets', {});
     const target = inspected.targets.find((target: any) => target.spaceId === G1); assert.ok(target);
-    await turn.onPublicMessage!('private source to selected group', [], 'dm-to-group', target.targetId);
+    await turn.onPublicMessage!('private source to selected group', [], 'dm-to-group', target.targetId, false);
+    await turn.onPublicMessage!('已发到指定群。', [], 'dm-final');
   });
   await f.managers.get(A)!.handle({ id: `${A}|1792180000900|om_dm_choose_group`, userId: owner, channelId: dm, text: 'choose a group', imagePaths: [] }); await f.drain();
   assert.equal(inspected.defaultTargetId, 'private'); assert.deepEqual(inspected.aliases, ['T', '主Bot']); assert.equal(inspected.targets.length, 3);
@@ -696,6 +699,33 @@ test('private input queries authorized delivery regions and explicitly publishes
   const delivery = f.host.store.listRoutedDeliveries()[0]!; assert.equal(delivery.source.channelId, dm); assert.equal(delivery.target.spaceId, G1); assert.equal(delivery.state, 'delivered');
   assert.equal(f.host.store.readPublic(G1, A).some(item => item.text === 'private source to selected group'), true);
   assert.deepEqual(f.host.store.getController(A), original); assert.equal(f.host.store.getRoot(f.host.store.readPublic(G1, A)[0]!.rootId)?.replyTo.channelId, dm);
+});
+
+for (const platform of ['feishu', 'discord'] as const) test(`${platform} draining permits only the running original private FINAL and keeps later inputs queued`, { timeout: 10000 }, async t => {
+  const f = fixture(t, { platform }); await f.activate();
+  const primary = f.ids[0]!, owner = f.configs[0]!.ownerUserId!, dm = `${primary}|owner-private-drain`;
+  let checked = false;
+  f.run(async (botId, turn) => {
+    assert.equal(botId, primary); assert.equal(turn.groupContext, undefined);
+    const regions = await f.host.invoke(primary, turn, 'bridge_delivery_targets', {}) as any;
+    const group = regions.targets.find((target: any) => target.spaceId === G1)!;
+    f.host.beginDrain();
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_delivery_targets', {}), /暂停新增管理调用/);
+    let dispatched = false;
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_start_worker', { title: 'too late', prompt: 'must not run' }, 'drain-work', async () => { dispatched = true; }), /暂停新增管理调用/);
+    assert.equal(dispatched, false);
+    await assert.rejects(turn.onPublicMessage!('no supplement while draining', [], 'drain-supplement', undefined, false), /已停止/);
+    await assert.rejects(turn.onPublicMessage!('no group final while draining', [], 'drain-group', group.targetId), /原私聊/);
+    await f.managers.get(primary)!.handle({ id: 'private-after-drain', userId: owner, channelId: dm, text: 'next request', imagePaths: [] });
+    await turn.onPublicMessage!('已安排重启，完成后继续。', [], 'drain-final'); checked = true;
+  });
+  await f.managers.get(primary)!.handle({ id: 'private-request-restart', userId: owner, channelId: dm, text: 'restart please', imagePaths: [] });
+  await f.drain();
+  assert.equal(checked, true);
+  assert.equal(f.sessions.get(primary)!.getMessage('private-request-restart')!.replyState, 'delivered');
+  assert.equal(f.sessions.get(primary)!.getMessage('private-after-drain')!.state, 'queued');
+  assert.equal(f.replies.filter(reply => reply.text.includes('已安排重启')).length, 1);
+  assert.equal(f.replies.some(reply => reply.text.includes('执行或回复失败')), false);
 });
 
 test('group input can supplement another owned group and owner DM then finish in its original group with unchanged task delivery', { timeout: 10000 }, async t => {

@@ -403,6 +403,58 @@ test('原生斜杠交互不使用消息 reaction，关闭后也不新增反应�
   assert.deepEqual(reactionPaths, []);
 });
 
+test('主控普通 Discord 私聊不发收件或完成表情，重启后仍按持久正文分类', async t => {
+  const received: IncomingDM[] = [], paths: string[] = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, { fetch: async input => {
+    paths.push(decodeURIComponent(new URL(String(input)).pathname)); return new Response(null, { status: 204 });
+  } });
+  f.config.controllerMode = true;
+  await f.transport.start(); f.dispatch({ id: '1101', content: '普通消息' });
+  await eventually(() => received.length === 1);
+  const saved = { id: received[0]!.id, channelId: received[0]!.channelId, text: received[0]!.text, isGroup: false };
+  await f.transport.markReplyDelivered([saved]); assert.equal(paths.length, 0);
+  await f.transport.close();
+  const restored = new DiscordTransport(f.config, async () => {}, { restBaseUrl: f.rest, fetch: async input => {
+    paths.push(decodeURIComponent(new URL(String(input)).pathname)); return new Response(null, { status: 204 });
+  } }); t.after(() => restored.close());
+  await restored.markReplyDelivered([saved]); assert.equal(paths.length, 0, '完成出口不依赖此前进程的收件缓存');
+});
+
+test('主控 Discord 文本命令、控制别名和群消息保留表情', async t => {
+  const received: IncomingDM[] = [], calls: Array<{ path: string; method?: string }> = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, { fetch: async (input, options) => {
+    calls.push({ path: decodeURIComponent(new URL(String(input)).pathname), method: options?.method });
+    return new Response(null, { status: 204 });
+  } });
+  f.config.controllerMode = true; f.config.groupMode = true;
+  await f.transport.start();
+  f.dispatch({ id: '1102', content: '/status' });
+  f.dispatch({ id: '1103', content: '新会话' });
+  f.dispatch({ id: '1104', content: '群消息', guild_id: '333' });
+  await eventually(() => received.length === 3);
+  await f.transport.markReplyDelivered(received.map(item => ({ id: item.id, channelId: item.channelId, text: item.text, isGroup: !!item.space })));
+  assert.equal(calls.filter(item => item.method === 'PUT' && item.path.endsWith('/reactions/⏳/@me')).length, 3);
+  assert.equal(calls.filter(item => item.method === 'PUT' && item.path.endsWith('/reactions/✅/@me')).length, 3);
+});
+
+test('主控 Discord 原生斜杠继续确认交互且不改成消息表情', async t => {
+  const received: IncomingDM[] = [], calls: Array<{ path: string; body?: unknown }> = [];
+  const f = await fixture(t, async dm => { received.push(dm); }, { fetch: async (input, options) => {
+    calls.push({ path: new URL(String(input)).pathname, ...(typeof options?.body === 'string' ? { body: JSON.parse(options.body) } : {}) });
+    return new Response(null, { status: 204 });
+  } });
+  f.config.controllerMode = true;
+  await f.transport.start();
+  f.sockets.at(-1)!.send(JSON.stringify({ op: 0, t: 'INTERACTION_CREATE', s: 10, d: {
+    type: 2, id: '1105', application_id: '999', token: 'fake-local-interaction', channel_id: '222', context: 1,
+    user: { id: '111', bot: false }, data: { name: 'status', type: 1 },
+  } }));
+  await eventually(() => received.length === 1);
+  await f.transport.markReplyDelivered([{ id: '1105', channelId: '222', text: '/status', isGroup: false }]);
+  assert(calls.some(item => item.path.endsWith('/callback') && (item.body as { type?: number })?.type === 5));
+  assert(calls.every(item => !item.path.includes('/reactions/')));
+});
+
 test('登记 Agent 数量按最新值更新、重复值不重发、归零只移除自己的数字', async t => {
   const calls: Array<{ path: string; method: string | undefined }> = [];
   const f = await fixture(t, undefined, {

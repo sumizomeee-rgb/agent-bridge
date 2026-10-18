@@ -11,6 +11,7 @@ import { splitOverviewMessage, type WorkCounts } from './overview.js';
 import { discordPresentationPages } from './presentation.js';
 import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { discordReplyHeader } from './reply.js';
+import { shouldShowMessageReceipts, type ReceiptMessage } from './receipt-policy.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import { historyOptions, historyPage, type ConversationHistoryOptions, type ConversationHistoryPage, type ConversationHistoryMessage } from './group-history.js';
 
@@ -589,8 +590,9 @@ export class DiscordTransport {
   }
 
   /** Final replies are already delivered; reaction updates are best effort and independent. */
-  async markReplyDelivered(messages: ReadonlyArray<Pick<BridgeMessage, 'id' | 'channelId'>>): Promise<void> {
-    const unique = new Map(messages.map(message => [`${message.channelId}:${message.id}`, message]));
+  async markReplyDelivered(messages: ReadonlyArray<ReceiptMessage>): Promise<void> {
+    const unique = new Map(messages.filter(message => shouldShowMessageReceipts(this.config, message))
+      .map(message => [`${message.channelId}:${message.id}`, message]));
     await Promise.all([...unique].map(async ([key, message]) => {
       if (this.closed || !snowflake(message.channelId) || !snowflake(message.id) || this.seenInteractions.has(message.id)) return;
       try {
@@ -903,7 +905,8 @@ export class DiscordTransport {
     if (!message.space) this.knownDMChannels.add(message.channelId);
     // 收件反馈独立发送，不阻塞附件准备、Agent 或 Gateway 心跳。
     const receiptKey = `${data.channel_id}:${data.id}`;
-    const receipt = captured === false || this.config.features?.reactions === false ? Promise.resolve() : this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
+    const receipt = captured === false || this.config.features?.reactions === false || !shouldShowMessageReceipts(this.config, message)
+      ? Promise.resolve() : this.rest(`/channels/${data.channel_id}/messages/${data.id}/reactions/${encodeURIComponent('⏳')}/@me`,
       'PUT', undefined, undefined, undefined, AbortSignal.timeout(5000))
       .then(() => {})
       .catch(() => { if (!this.closed) this.log('收件表情添加失败，消息继续处理。'); });

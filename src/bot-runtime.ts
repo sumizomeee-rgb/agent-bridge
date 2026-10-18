@@ -146,12 +146,14 @@ export class BotRuntime {
     this.ingress = new DurableIngress(config.dataDir, {
       allowedUserIds: config.allowedUserIds, hasMessage: id => this.manager.hasMessage(id), isImmediate: control,
       onQueued: (message, replayOnly) => { const n = (this.revisions.get(message.userId) ?? 0) + (control(message) ? 1 : 0);
+        this.manager.privateInputQueued(message);
         this.revisions.set(message.userId, n); if (!replayOnly) this.stamps.set(message.id, n); },
       handle: async message => {
         try {
           if (!this.ready || this.closed || hooks.isDraining() || hooks.isGroupChannel?.(message.channelId) || !hooks.authorize(message.userId, message.text)) return;
           const current = () => control(message) || this.stamps.get(message.id) === (this.revisions.get(message.userId) ?? 0);
           const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: message.text,
+            source: { messageId: message.id, userId: message.userId, channelId: message.channelId, authorType: 'user' as const, ...message.source },
             imagePaths: current() && !control(message) ? await this.transport.downloadImages(message) : [] };
           if (!current()) { this.manager.discard(prepared); return; }
           await this.manager.handle(prepared, message.interaction ? (text, options) => this.transport.sendInteractionText(message.interaction!, text, options) : undefined);

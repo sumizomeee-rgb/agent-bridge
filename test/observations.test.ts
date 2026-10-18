@@ -70,12 +70,18 @@ test('observations require an existing owned task and bounded identifier', t => 
 class HeldController implements AgentAdapter {
   readonly calls: AgentTurn[] = [];
   readonly pending: Array<(result: AgentResult) => void> = [];
+  private readonly finished = new Set<number>();
   async run(turn: AgentTurn): Promise<AgentResult> {
     this.calls.push(turn); turn.onNativeId?.(turn.conversation.nativeId ?? 'parent-native');
     return new Promise(resolve => this.pending.push(resolve));
   }
-  finish(index: number): void { this.pending[index]!({ nativeId: this.calls[index]!.conversation.nativeId ?? 'parent-native', text: 'DONE', controlledOutput: true }); }
-  async interrupt(): Promise<void> { this.pending.forEach((_value, index) => this.finish(index)); }
+  async finish(index: number): Promise<void> {
+    if (this.finished.has(index)) return;
+    this.finished.add(index); const turn = this.calls[index]!;
+    if (!turn.event && !turn.signal.aborted) await turn.onPublicMessage!('human-final:' + turn.text, [], 'human-final-' + index);
+    this.pending[index]!({ nativeId: turn.conversation.nativeId ?? 'parent-native', text: 'DONE', controlledOutput: true });
+  }
+  async interrupt(): Promise<void> { await Promise.all(this.pending.map((_value, index) => this.finish(index))); }
   async close(): Promise<void> { await this.interrupt(); }
 }
 async function until(condition: () => boolean) {
@@ -103,19 +109,23 @@ test('human messages precede a progress event which resumes the original native 
   await f.manager.handle(f.human('one', 'investigate')); await until(() => f.adapter.calls.length === 1);
   const task = f.register(); await f.manager.handle(f.human('two', 'additional human request'));
   f.registry.observeTask(task.taskId, 'job:tool', 'waiting'); f.manager.completionAvailable();
-  f.adapter.finish(0); await until(() => f.adapter.calls.length === 2);
+  await f.adapter.finish(0); await until(() => f.adapter.calls.length === 2);
   assert.equal(f.adapter.calls[1]!.text, 'additional human request');
-  f.adapter.finish(1); await until(() => f.adapter.calls.length === 3);
+  await f.adapter.finish(1); await until(() => f.adapter.calls.length === 3);
   const turn = f.adapter.calls[2]!; assert.equal(turn.event?.kind, 'worker-progress');
   assert.equal(turn.conversation.nativeId, 'parent-native'); assert.equal(turn.imagePaths.length, 0);
   assert.equal(f.registry.activeCount(turn.conversation.id), 1);
-  assert.equal(f.inspect.getMessage('job:tool'), null); f.adapter.finish(2);
-  await until(() => f.registry.getNextEvent() === null); assert.deepEqual(f.messages, []);
+  assert.equal(f.inspect.getMessage('job:tool'), null); await f.adapter.finish(2);
+  await until(() => f.registry.getNextEvent() === null);
+  assert.equal(f.messages.length, 2);
+  assert(f.messages.some(message => message.includes('human-final:investigate')));
+  assert(f.messages.some(message => message.includes('human-final:additional human request')));
+  assert(f.messages.every(message => message.includes('human-final:')));
 });
 test('direct execution mode consumes a progress observation without generating or sending a completion', async t => {
   const f = managerFixture(t, false);
   await f.manager.handle(f.human('one', 'investigate')); await until(() => f.adapter.calls.length === 1);
-  const task = f.register(); f.adapter.finish(0); await until(() => f.inspect.getMessage('one')?.replyState === 'delivered');
+  const task = f.register(); await f.adapter.finish(0); await until(() => f.inspect.getMessage('one')?.replyState === 'delivered');
   const before = f.messages.length;
   f.registry.observeTask(task.taskId, 'job:tool', 'waiting'); f.manager.completionAvailable();
   await until(() => f.registry.getNextEvent() === null);

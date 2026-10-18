@@ -98,7 +98,7 @@ test('回复全部送达并持久化后，合并及 accepted 补充的原始消�
   release();
   await waitFor(() => completions.length === 1);
   await f.manager.handle(message('merged-a', 'duplicate'));
-  assert.deepEqual(completions, [[
+  assert.deepEqual(completions.map(group => group.map(({ id, channelId }) => ({ id, channelId }))), [[
     { id: 'merged-a', channelId: 'first-channel' },
     { id: 'merged-b', channelId: 'second-channel' },
     { id: 'accepted-c', channelId: 'third-channel' },
