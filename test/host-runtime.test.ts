@@ -842,7 +842,7 @@ test('shared controller fixes each group reply address despite another group and
   assert.equal(new Set(aGroupTurns.map(c => c.turn.conversation.id)).size, 1);
 });
 
-test('public discussion gives each Bot eight acknowledged non-owner replies without cancelling received events', { timeout: 10000 }, async t => {
+test('public discussion gives each Bot twenty acknowledged non-owner replies without cancelling received events', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate();
   f.run(async (_botId, turn) => {
     try { await turn.onPublicMessage!(`public ${f.calls.length}`); }
@@ -854,10 +854,10 @@ test('public discussion gives each Bot eight acknowledged non-owner replies with
   await f.host.receive(A, f.message(A, 'discussion', 'independent opinions please')); await f.drain();
   const event = f.host.store.listEvents()[0]!, root = f.host.store.getRoot(event.rootId)!;
   assert.equal(root.automaticUsed, 0); assert.equal(root.automaticReserved, 0);
-  for (const botId of [A, B]) assert.equal(f.host.store.publicReplySnapshot(botId, G1).count, 8);
+  for (const botId of [A, B]) assert.equal(f.host.store.publicReplySnapshot(botId, G1).count, 20);
   assert.equal(f.host.store.listEvents().some(value => value.error === 'root-budget-exhausted'), false);
   assert.ok(f.replies.filter(reply => reply.text.includes('连续回复非主人消息的可用次数已用完')).length >= 1);
-  assert.ok(f.calls.length > 10);
+  assert.ok(f.calls.length > 40);
 });
 
 test('public reply count ignores silence and duplicate owner delivery; only a new owner message in this group resets it', async t => {

@@ -231,9 +231,9 @@ function publicTurn(store: HostStore, id: string, botId = A, rootId = 'root-1'):
   assert.equal(start(store, botId), id);
 }
 
-test('public reply streak counts confirmed turns once, permits silent intake at eight and resets only on a unique owner receipt', async t => {
+test('public reply streak counts confirmed turns once, permits silent intake at twenty and resets only on a unique owner receipt', async t => {
   const store = open(t, await directory(t)); seed(store); root(store);
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 20; i++) {
     publicTurn(store, `public-${i}`);
     const reservation = store.reservePublicReply(`public-${i}`, SPACE);
     assert.equal(reservation.applicable, true); assert.equal(reservation.alreadyCounted, false);
@@ -243,14 +243,17 @@ test('public reply streak counts confirmed turns once, permits silent intake at 
     store.finishPublicReply(reservation.reservationId!, 'confirmed');
     store.finishEvent(`public-${i}`, 'completed');
   }
-  assert.equal(store.publicReplySnapshot(A, SPACE).count, 8);
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 20);
+  assert.equal(store.publicReplySnapshot(A, SPACE).limit, 20);
+  assert.equal(store.publicReplySnapshot(A, SPACE).remaining, 0);
+  assert.equal(store.publicReplySnapshot(B, SPACE).remaining, 20);
   assert.equal(store.getRoot('root-1')!.automaticUsed, 0);
-  publicTurn(store, 'ninth-still-received');
-  assert.throws(() => store.reservePublicReply('ninth-still-received', SPACE), error => error instanceof HostStateError && error.code === 'public-reply-limit');
-  assert.equal(store.getEvent('ninth-still-received')!.state, 'running');
+  publicTurn(store, 'twenty-first-still-received');
+  assert.throws(() => store.reservePublicReply('twenty-first-still-received', SPACE), error => error instanceof HostStateError && error.code === 'public-reply-limit');
+  assert.equal(store.getEvent('twenty-first-still-received')!.state, 'running');
   assert.equal(store.claimPublicReplyLimitNotice(A, SPACE), true); assert.equal(store.claimPublicReplyLimitNotice(A, SPACE), false);
-  store.markEventDecision('ninth-still-received', 'silent'); store.finishEvent('ninth-still-received', 'silent');
-  assert.equal(store.publicReplySnapshot(A, SPACE).count, 8);
+  store.markEventDecision('twenty-first-still-received', 'silent'); store.finishEvent('twenty-first-still-received', 'silent');
+  assert.equal(store.publicReplySnapshot(A, SPACE).count, 20);
   assert.equal(store.resetPublicReplies(SPACE, P, 'unique-owner-message', 1), true);
   assert.equal(store.resetPublicReplies(SPACE, P, 'unique-owner-message', 1), false);
   assert.equal(store.publicReplySnapshot(A, SPACE).count, 0); assert.equal(store.publicReplySnapshot(B, SPACE).count, 0);

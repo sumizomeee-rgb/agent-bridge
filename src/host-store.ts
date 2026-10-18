@@ -772,7 +772,7 @@ export class HostStore {
     const window = this.publicReplyWindow(spaceId, group.epoch);
     const count = Number(this.one('SELECT count FROM host_public_reply_counts WHERE bot_id=? AND space_id=? AND epoch=? AND window=?', botId, spaceId, group.epoch, window)?.count ?? 0);
     const reserved = Number(this.one("SELECT COUNT(*) AS n FROM host_public_reply_reservations WHERE bot_id=? AND space_id=? AND epoch=? AND window=? AND state IN ('reserved','uncertain')", botId, spaceId, group.epoch, window)!.n);
-    return { limit: 8, count, reserved, remaining: Math.max(0, 8 - count - reserved), window, epoch: group.epoch };
+    return { limit: 20, count, reserved, remaining: Math.max(0, 20 - count - reserved), window, epoch: group.epoch };
   }
   claimPublicReplyLimitNotice(botId: string, spaceId: string): boolean {
     return this.atomic(() => {
