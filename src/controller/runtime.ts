@@ -305,11 +305,14 @@ export class ControllerRuntime {
     }
     return turn.groupContext ? { ...origin, groupContext: { ...turn.groupContext } } : origin;
   }
+  // The per-Bot store owns workers by parent identity; delivery channels are not owners.
+  private workerScope(worker: ControllerWorker, origin: TaskOrigin): boolean {
+    return worker.origin.userId === origin.userId && worker.origin.conversationId === origin.conversationId;
+  }
   private ownedWorker(origin: TaskOrigin, workerId: unknown): ControllerWorker {
     const id = text(workerId, 'workerId', 256);
     const worker = this.store.getWorker(id);
-    if (!worker || worker.origin.userId !== origin.userId || worker.origin.conversationId !== origin.conversationId
-      || worker.origin.channelId !== origin.channelId) throw new Error('子 Agent 不属于当前用户和父会话');
+    if (!worker || !this.workerScope(worker, origin)) throw new Error('子 Agent 不属于当前用户和父会话');
     return worker;
   }
   private scheduleScope(value: ControllerSchedule, origin: TaskOrigin): boolean {
@@ -465,7 +468,7 @@ export class ControllerRuntime {
           && 'status' in previous && (previous.status === 'adopting' || previous.status === 'idle') && 'workerId' in previous && typeof previous.workerId === 'string') {
           const worker = this.store.getWorker(previous.workerId);
           if (!worker?.adoption) throw new Error('此前接管登记已失效，需重新查询会话');
-          if (worker.origin.userId !== origin.userId || worker.origin.conversationId !== origin.conversationId || worker.origin.channelId !== origin.channelId) throw new Error('此前接管不属于当前父会话');
+          if (!this.workerScope(worker, origin)) throw new Error('此前接管不属于当前父会话');
           return this.completeAdoption(previous.workerId);
         }
         return previous;
@@ -500,7 +503,7 @@ export class ControllerRuntime {
       const pending = this.store.workers().find(worker => worker.agent === ref.agent && (worker.target?.id ?? 'local') === targetId
         && worker.nativeId === ref.nativeId && worker.origin.userId === origin.userId && worker.adoption?.status === 'pending');
       if (pending) {
-        if (pending.origin.conversationId !== origin.conversationId || pending.origin.channelId !== origin.channelId) throw new Error('此会话正在其他父会话中接管，请先核对该次接管结果');
+        if (!this.workerScope(pending, origin)) throw new Error('此会话正在其他父会话中接管，请先核对该次接管结果');
         if (pending.adoption!.expectedRevision !== expectedRevision) throw new Error('待确认接管的版本与请求不一致，请先查询原接管结果');
         const result = await this.completeAdoption(pending.id); if (key) this.store.saveCall(key, fingerprint, result); return result;
       }
@@ -515,7 +518,7 @@ export class ControllerRuntime {
         if (worker.blocked || worker.handoffPending || worker.adoption?.status === 'pending' || this.active.has(worker.id)
           || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))) throw new Error('原会话仍忙碌或停止状态未确认，不能接管');
       }
-      const existing = previous.find(worker => worker.origin.conversationId === origin.conversationId && worker.origin.channelId === origin.channelId && worker.ownership !== 'user');
+      const existing = previous.find(worker => this.workerScope(worker, origin) && worker.ownership !== 'user');
       if (existing) {
         const result = this.adoptionResult(existing); if (key) this.store.saveCall(key, fingerprint, result); return result;
       }
@@ -759,8 +762,7 @@ export class ControllerRuntime {
         const args = object(input, ['workerId']);
         const details = args.workerId !== undefined;
         const workers = details ? [this.ownedWorker(origin, args.workerId)] : this.store.workers()
-          .filter(worker => worker.origin.userId === origin.userId && worker.origin.channelId === origin.channelId
-            && worker.origin.conversationId === origin.conversationId);
+          .filter(worker => this.workerScope(worker, origin));
         let previewBytes = 8 * 1024;
         const preview = (value: string): string => {
           const result = listText(value, 256, previewBytes); previewBytes -= Buffer.byteLength(result, 'utf8'); return result;
@@ -782,6 +784,8 @@ export class ControllerRuntime {
             reason: value.reason ? listText(value.reason, 256) : null, reasonTruncated: (value.reason?.length ?? 0) > 256 });
           const lastResultPreview = latest?.result == null ? null : preview(latest.result);
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
+            source: { kind: worker.origin.groupContext ? 'group' : 'private', channelId: worker.origin.channelId,
+              ...(worker.origin.groupContext ? { spaceId: worker.origin.groupContext.spaceId } : {}) },
             target: worker.target ?? null, ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,

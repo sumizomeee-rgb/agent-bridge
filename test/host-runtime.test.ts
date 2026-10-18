@@ -253,6 +253,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
 }
 
 async function holdSceneTurns(f: ReturnType<typeof fixture>, id: string) {
+  const A = f.ids[0]!, B = f.ids[1]!;
   const wait = f.gate(), turns = new Map<string, AgentTurn>();
   f.run(async (botId, turn) => {
     if (!turn.event) { turns.set(botId, turn); await wait.promise; }
@@ -262,6 +263,27 @@ async function holdSceneTurns(f: ReturnType<typeof fixture>, id: string) {
   await eventual(() => turns.has(A) && turns.has(B), 'both controllers received the same owner input');
   return { turns, release: wait.release };
 }
+
+for (const platform of ['feishu', 'discord'] as const) test(`${platform} group dispatch accepts this controller private worker while rejecting foreign parents and preserving its source`, { timeout: 10000 }, async t => {
+  const f = fixture(t, { platform }); const A = f.ids[0]!; await f.activate(); const held = await holdSceneTurns(f, 'cross-region-worker-owner');
+  const turn = held.turns.get(A)!;
+  f.registerExecution(A, turn, 'private-start', 'private-child');
+  const store = f.controllerStores.get(A)!, worker = store.getWorker('private-child')!;
+  worker.origin = { ...worker.origin, channelId: `${A}|owner-dm`, groupContext: undefined }; store.saveWorker(worker);
+  const original = structuredClone(store.getWorker(worker.id)!.origin); let continued = 0;
+  const result = await f.host.invoke(A, turn, 'bridge_continue_worker', { workerId: worker.id, prompt: '群里继续处理' }, 'group-continuation', async () => {
+    continued++; const receipt = { workerId: worker.id, status: 'queued' };
+    store.saveCall(turn.conversation.id + ':group-continuation', 'group-continuation', receipt); return receipt;
+  });
+  assert.equal(continued, 1); assert.equal((result as { workerId: string }).workerId, worker.id);
+  assert.deepEqual(store.getWorker(worker.id)!.origin, original);
+  assert.equal(f.host.store.getTaskForWorker(A, worker.id)!.ownerBotId, A);
+  for (const [id, changed] of [['foreign-parent', { conversationId: 'old-parent' }], ['foreign-owner', { userId: 'another-owner' }]] as const) {
+    store.addWorker({ ...worker, id, origin: { ...original, ...changed } });
+    await assert.rejects(f.host.invoke(A, turn, 'bridge_continue_worker', { workerId: id, prompt: 'forbidden' }, 'reject-' + id, async () => { throw new Error('must not delegate'); }), /不属于当前用户和父会话/);
+  }
+  held.release(); await f.drain();
+});
 
 test('automatic group dispatch needs no claim, replays one atomic receipt and closes only after actual worker stop', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); const held = await holdSceneTurns(f, 'auto-dispatch-owner'), turn = held.turns.get(A)!;

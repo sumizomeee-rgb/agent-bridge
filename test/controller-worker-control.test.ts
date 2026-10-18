@@ -93,6 +93,73 @@ async function adopt(f: ReturnType<typeof setup>, callId?: string): Promise<Hand
   return await f.runtime.invoke(f.turn, 'bridge_adopt_native_session', { ...f.candidate.ref, expectedRevision: 'checked-v1' }, callId) as Handle;
 }
 
+function anotherRegion(f: ReturnType<typeof setup>, channelId: string, group = true): AgentTurn {
+  const conversation = f.turn.conversation;
+  const groupContext: AgentTurn['groupContext'] = group ? { eventId: 'event-' + channelId, rootId: 'root-' + channelId,
+    botId: f.config.platform + ':bot', spaceId: channelId, generation: 1, bindingEpoch: 1, originChannelId: channelId,
+    principalId: 'owner', scene: '{}' } : undefined;
+  const context = f.registry.createContext({ conversationId: conversation.id, userId: conversation.userId, channelId,
+    originMessageId: 'message-' + channelId, nativeId: conversation.nativeId, agent: conversation.agent, cwd: conversation.cwd,
+    ...(groupContext ? { groupContext } : {}) });
+  return { ...f.turn, taskContextPath: context.contextPath, groupContext };
+}
+
+for (const platform of ['feishu', 'discord'] as const) {
+  test(`${platform} one controller can find and stop its private worker from a group without changing existing job delivery`, async () => {
+    const f = setup(); f.config.platform = platform;
+    try {
+      const handle = await launch(f); assert.ok(handle.jobId); await flush();
+      const worker = f.runtime.store.getWorker(handle.workerId)!, original = structuredClone(worker.origin);
+      const group = anotherRegion(f, platform + '-group');
+      f.runtime.store.addWorker({ ...worker, id: 'another-parent', nativeId: null, origin: { ...original, conversationId: 'old-parent' } });
+      f.runtime.store.addWorker({ ...worker, id: 'another-owner', nativeId: null, origin: { ...original, userId: 'someone-else' } });
+      const list = await f.runtime.invoke(group, 'bridge_list_workers', {}) as { workers: Array<{ workerId: string; running: boolean; source: { kind: string; channelId: string } }> };
+      assert.deepEqual(list.workers.map(w => w.workerId), [handle.workerId]);
+      assert.equal(list.workers[0]!.running, true); assert.deepEqual(list.workers[0]!.source, { kind: 'private', channelId: 'dm' });
+      for (const workerId of ['another-parent', 'another-owner']) {
+        await assert.rejects(f.runtime.invoke(group, 'bridge_list_workers', { workerId }), /不属于/);
+        await assert.rejects(f.runtime.invoke(group, 'bridge_cancel_worker', { workerId }), /不属于/);
+        await assert.rejects(f.runtime.invoke(group, 'bridge_continue_worker', { workerId, prompt: 'forbidden' }), /不属于/);
+      }
+      await f.runtime.invoke(group, 'bridge_continue_worker', { workerId: handle.workerId, prompt: 'queued instruction', delivery: 'next' });
+      assert.deepEqual(f.runtime.store.getJob(handle.jobId)!.origin, original);
+      const result = await f.runtime.invoke(group, 'bridge_cancel_worker', { workerId: handle.workerId }) as { stopped: boolean };
+      assert.equal(result.stopped, true); await flush();
+      assert.deepEqual(f.runtime.getGlobalWorkCounts(), { running: 0, queued: 0 });
+      assert.equal(f.codex.turns.length, 1, 'queued work never started after cancellation');
+      assert.equal(f.runtime.store.jobs(handle.workerId).every(j => j.status === 'cancelled'), true);
+      assert.deepEqual(f.runtime.store.getWorker(handle.workerId)!.origin, original);
+      const task = f.registry.getTask(handle.jobId)!; assert.equal(task.status, 'cancelled');
+      const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: handle.workerId }) as { workers: Array<{ running: boolean; queued: number }> };
+      assert.equal(details.workers[0]!.running, false); assert.equal(details.workers[0]!.queued, 0);
+    } finally { await f.cleanup(); }
+  });
+
+  test(`${platform} group workers remain manageable from another group and private chat with native ownership enforced`, async () => {
+    const f = setup(); f.config.platform = platform;
+    try {
+      const groupA = anotherRegion(f, 'group-A'), groupB = anotherRegion(f, 'group-B');
+      const handle = await f.runtime.invoke(groupA, 'bridge_start_worker', { title: 'group task', prompt: 'read only' }) as Handle;
+      assert.ok(handle.jobId); await flush(); const original = structuredClone(f.runtime.store.getJob(handle.jobId)!.origin);
+      f.codex.finish(handle.workerId); await flush();
+      const next = await f.runtime.invoke(groupB, 'bridge_continue_worker', { workerId: handle.workerId, prompt: 'new round' }) as Handle;
+      assert.ok(next.jobId); await flush(); assert.equal(f.codex.turns.length, 2);
+      assert.equal(f.runtime.store.getJob(next.jobId)!.origin.channelId, 'group-B', 'new round keeps its actual instruction source');
+      assert.deepEqual(f.runtime.store.getJob(handle.jobId)!.origin, original, 'historical round remains on its original route');
+      const privateView = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: Array<{ workerId: string; source: { kind: string; spaceId: string } }> };
+      assert.equal(privateView.workers[0]!.source.kind, 'group'); assert.equal(privateView.workers[0]!.source.spaceId, 'group-A');
+      f.codex.finish(handle.workerId); await flush();
+      const handed = await f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: handle.workerId }) as { ownership: string };
+      assert.equal(handed.ownership, 'user');
+      await assert.rejects(f.runtime.invoke(groupB, 'bridge_cancel_worker', { workerId: handle.workerId }), /已交接给用户/);
+      await assert.rejects(f.runtime.invoke(groupA, 'bridge_continue_worker', { workerId: handle.workerId, prompt: 'cannot reclaim' }), /已交接给用户/);
+      const adopted = await adopt(f);
+      const same = await f.runtime.invoke(groupB, 'bridge_adopt_native_session', { ...f.candidate.ref, expectedRevision: 'checked-v1' }) as Handle;
+      assert.equal(same.workerId, adopted.workerId, 'changing chat region must not create a duplicate native owner');
+    } finally { await f.cleanup(); }
+  });
+}
+
 test('conversational non-default dispatch independently selects child model and effort for both engines', async () => {
   const f = setup(); const original = structuredClone(f.turn.conversation);
   try {

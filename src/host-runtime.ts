@@ -1347,8 +1347,8 @@ export class HostRuntime {
     const declared = typeof args.workId === 'string' ? this.store.getTask(args.workId) : null;
     if (workerId && controller?.store) {
       const worker = controller.store.getWorker(workerId);
-      if (!worker || worker.origin.userId !== turn.conversation.userId || worker.origin.conversationId !== turn.conversation.id
-        || worker.origin.channelId !== context.originChannelId) throw new Error('子 Agent 不属于当前用户和父会话，未更改任务资源。');
+      if (!worker || worker.origin.userId !== turn.conversation.userId || worker.origin.conversationId !== turn.conversation.id)
+        throw new Error('子 Agent 不属于当前用户和父会话，未更改任务资源。');
       if (worker.ownership === 'user' || worker.handoffPending || worker.blocked || worker.supersededBy || worker.adoption?.status === 'pending')
         throw new Error('子 Agent 已交还用户或归属／执行状态未确认，未重新占用资源。');
     }
