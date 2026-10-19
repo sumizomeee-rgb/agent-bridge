@@ -29,7 +29,7 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'boolean', name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
     { type: 'boolean', name: 'details', description: '展开完整检查信息；默认简要展示' },
   ] },
-  { name: 'agents', help: '/agents：查看可派发预设的口语别名，一行一条', description: '可派发预设清单与别名速查' },
+  { name: 'presetlist', help: '/presetlist：查看可派发预设的口语别名，一行一条', description: '可派发预设清单与别名速查' },
   { name: 'workers', help: "/workers [history] [all] [details]：默认查看未结束助手；history 查看历史", description: '查看执行中的直属助手，或单独查询历史', options: [
     { type: 'string', name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [
       { name: '当前对话', value: 'current' }, { name: '我的全部对话', value: 'all' },

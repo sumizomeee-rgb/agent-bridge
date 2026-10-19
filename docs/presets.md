@@ -37,6 +37,14 @@
 
 主控工具声明有更新。已有 Codex 主控可能需要用户自行 `/new continue` 才能获得新的工具参数；该命令会取消旧预约。Claude 主控重建 MCP 后应以真实工具调用核实新参数已可用。部署不得擅自重置主控或发送测试消息。
 
+## Claude 预设的模型范围
+
+Claude 预设主模型通过 `--model` 指定，同时在进程环境设置 `ANTHROPIC_MODEL`，并将 `ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_FABLE_MODEL` 都固定为该预设模型。Haiku 映射也用于 CLI 的后台辅助功能。另设 `CLAUDE_CODE_SUBAGENT_MODEL` 与 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`，防止内部子助手定义或调用参数另选模型；强制变量要求 Claude Code 2.1.257 或更新版本。新建、续聊和恢复均重新注入相同策略，不依赖用户物理配置。预设进程关闭自动更新，避免运行期间改动共享 CLI 安装。
+
+这是一预设单模型的策略：辅助任务也使用所选模型，选择较贵模型时不保留小模型的费用和延迟优势。废弃的 `ANTHROPIC_SMALL_FAST_MODEL` 只清除、不沿用。它覆盖已知 CLI 模型入口，不是网络层的任意请求拦截；不能据此保证独立脚本直接调用的 API 或网关底层模型。
+
+官方依据：[模型配置](https://code.claude.com/docs/en/model-config#environment-variables)、[强制内部子助手模型](https://code.claude.com/docs/en/sub-agents#run-every-subagent-on-one-model)。隔离模拟 API 在 CLI 2.1.301 与 2.1.303 上记录请求模型，覆盖三档遗漏 Fable、默认子助手模型被显式定义覆盖、强制选型生效等分支；不把普通 hello 当作全部后台路径的证明。
+
 ## 验证边界
 
 自动化覆盖目录校验、冲突拒绝、认证隔离、线路快照、预约恢复、旧协议拒绝、TLS 原样转发及进程关闭。真实网关冒烟只能确认指定线路接受了相应模型请求和续接；CLI 回报模型名不能独立证明网关底层实际使用的模型。离线电脑须保持停用，待上线后另行验收。

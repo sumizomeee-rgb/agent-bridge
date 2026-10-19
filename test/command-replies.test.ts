@@ -242,12 +242,12 @@ test('预设清单按当前工作区实时读取，一行一项，忙碌时不�
   await writeFile(path, JSON.stringify({ version: 1, presets: entries }));
   await f.manager.handle(message('busy-before-presets', 'do a task')); await until(() => f.adapter.turns.length === 1);
   const replies: string[] = [];
-  await f.manager.handle(message('preset-list', '/agents'), async text => { replies.push(text); });
+  await f.manager.handle(message('preset-list', '/presetlist'), async text => { replies.push(text); });
   assert.match(replies[0]!, /可派发预设 · 别名速查/);
   assert(replies[0]!.split('\n').includes('工位 sol / 工位 6.1 sol · gpt-6.1-sol'));
   assert.doesNotMatch(replies[0]!, /家用 opus|secret-profile/);
   entries[1]!.enabled = true; await writeFile(path, JSON.stringify({ version: 1, presets: entries }));
-  await f.manager.handle(message('preset-list-updated', '/agents'), async text => { replies.push(text); });
+  await f.manager.handle(message('preset-list-updated', '/presetlist'), async text => { replies.push(text); });
   assert.match(replies[1]!, /家用 opus/);
   assert.equal(f.adapter.turns.length, 1); assert.equal(f.sinkReplies.length, 0);
   f.adapter.finish(0, 'original task result'); await until(() => f.sinkReplies.length === 1);
@@ -256,12 +256,12 @@ test('预设清单按当前工作区实时读取，一行一项，忙碌时不�
 
 test('预设清单缺失、错误参数和损坏登记不创建会话或启动模型', async t => {
   const f = await fixture(t), replies: string[] = [];
-  for (const [id, text] of [['empty', '/agents'], ['bad-arg', '/agents all']]) {
+  for (const [id, text] of [['empty', '/presetlist'], ['bad-arg', '/presetlist all']]) {
     await f.manager.handle(message(id!, text!), async text => { replies.push(text); });
   }
   assert.equal(replies[0], '当前工作区暂无已启用的派发预设。'); assert.match(replies[1]!, /用法/);
   await mkdir(join(f.root, 'agent-presets')); await writeFile(join(f.root, 'agent-presets', 'registry.json'), '{broken');
-  await f.manager.handle(message('broken', '/agents'), async text => { replies.push(text); });
+  await f.manager.handle(message('broken', '/presetlist'), async text => { replies.push(text); });
   assert.match(replies[2]!, /读取失败/); assert.equal(f.adapter.turns.length, 0);
   await f.manager.handle(message('still-no-session', '/status'), async text => { replies.push(text); });
   assert.match(replies[3]!, /会话：尚未创建/);

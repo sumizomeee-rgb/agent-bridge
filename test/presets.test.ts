@@ -161,3 +161,37 @@ test('透明CONNECT拒绝其他目的地，保留不透明字节并关闭受控S
     assert.match(await request('gateway.example:443', 'opaque-model-and-auth-bytes'), /opaque-model-and-auth-bytes/); assert.equal(spawns, 1);
   } finally { await relay.close(); }
 });
+
+
+test('Claude预设固定主模型、四档别名和内部子助手，新建与续聊均覆盖继承值且不修改物理配置', async () => {
+  const f = fixture();
+  try {
+    const profile = { ...f.profile, agent: 'claude' as const, model: 'deepseek-v4.1-flash' };
+    writeFileSync(join(f.privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [profile] }));
+    const binding: PresetBinding = { id: 'office-flash', targetId: 'local', ...await f.runtime.describe(profile.id, 1, 'claude', profile.model) };
+    const inherited = { ANTHROPIC_MODEL: 'wrong-main', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'wrong-haiku',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'wrong-sonnet', ANTHROPIC_DEFAULT_OPUS_MODEL: 'wrong-opus', ANTHROPIC_DEFAULT_FABLE_MODEL: 'wrong-fable',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'wrong-child', CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '0',
+      anthropic_default_haiku_model: 'wrong-lowercase', ANTHROPIC_SMALL_FAST_MODEL: 'legacy-wrong', DISABLE_AUTOUPDATER: '0' };
+    let home: string | undefined;
+    const before = readFileSync(join(f.privateRoot, 'profiles.json'), 'utf8');
+    for (const nativeId of [null, 'same-claude-native']) {
+      const prepared = await f.runtime.prepare(binding, 'worker-claude', nativeId, f.command, inherited);
+      try {
+        for (const key of ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+          'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']) assert.equal(prepared.env[key], profile.model);
+        assert.equal(prepared.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '1');
+        assert.equal(prepared.env.DISABLE_AUTOUPDATER, '1');
+        assert.equal(prepared.env.anthropic_default_haiku_model, undefined);
+        assert.equal(prepared.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
+        if (home) assert.equal(prepared.env.CLAUDE_CONFIG_DIR, home); else home = prepared.env.CLAUDE_CONFIG_DIR;
+        assert.equal(prepared.env.ANTHROPIC_API_KEY, 'private-test-key');
+        assert.ok(!JSON.stringify(prepared.command).includes('private-test-key'));
+      } finally { await prepared.close(); }
+    }
+    assert.equal(inherited.ANTHROPIC_MODEL, 'wrong-main');
+    assert.equal(inherited.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '0');
+    assert.equal(readFileSync(join(f.privateRoot, 'profiles.json'), 'utf8'), before);
+    assert.deepEqual(readdirSync(f.user), []);
+  } finally { f.close(); }
+});

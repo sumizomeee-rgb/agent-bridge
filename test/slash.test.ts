@@ -82,7 +82,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
 }
 
 test('native registry contains fourteen supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'computers', 'agents', 'workers', 'stop', 'restart', 'help']);
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'computers', 'presetlist', 'workers', 'stop', 'restart', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);
@@ -500,10 +500,11 @@ test('Discord群原生命令取member.user并标记所选应用，禁用命令�
 
 
 test('预设别名速查仅注册一个私聊入口，旧presets及all菜单已删除', () => {
-  assert(SLASH_COMMANDS.some(command => command.name === 'agents'));
+  assert(SLASH_COMMANDS.some(command => command.name === 'presetlist'));
   assert(!SLASH_COMMANDS.some(command => command.name === 'presets'));
-  assert(!GROUP_SLASH_COMMANDS.some(command => command.name === 'agents'));
-  assert.deepEqual(slashText({ name: 'agents' }), { text: '/agents' });
+  assert(!SLASH_COMMANDS.some(command => command.name === 'agents'));
+  assert(!GROUP_SLASH_COMMANDS.some(command => command.name === 'presetlist'));
+  assert.deepEqual(slashText({ name: 'presetlist' }), { text: '/presetlist' });
   assert('error' in slashText({ name: 'presets' }));
-  assert('error' in slashText({ name: 'agents', options: [{ name: 'all', type: 5, value: true }] }));
+  assert('error' in slashText({ name: 'presetlist', options: [{ name: 'all', type: 5, value: true }] }));
 });

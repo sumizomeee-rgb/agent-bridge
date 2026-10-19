@@ -118,6 +118,12 @@ export class PresetRuntime {
         env.CLAUDE_CONFIG_DIR = home; env.ANTHROPIC_BASE_URL = profile.baseUrl;
         env[credential.authToken ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY'] = key;
         env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+        env.DISABLE_AUTOUPDATER = '1';
+        env.ANTHROPIC_MODEL = binding.model;
+        // Main selection alone does not pin background work or family aliases.
+        for (const family of ['HAIKU', 'SONNET', 'OPUS', 'FABLE']) env[`ANTHROPIC_DEFAULT_${family}_MODEL`] = binding.model;
+        env.CLAUDE_CODE_SUBAGENT_MODEL = binding.model;
+        env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
         command.args.push('--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}');
       }
       return { command, env, close: async () => { await relay?.close(); } };

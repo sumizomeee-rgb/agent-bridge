@@ -854,8 +854,8 @@ export class SessionManager {
       case 'resume': {
         await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 交接当前 Bot 的最新上下文；/new 新建，/chats 只读查看历史。'); return;
       }
-      case 'agents': {
-        if (argument) { await reply('用法：/agents；直接查看可派发预设的全部口语别名。'); return; }
+      case 'presetlist': {
+        if (argument) { await reply('用法：/presetlist；直接查看可派发预设的全部口语别名。'); return; }
         let entries: Awaited<ReturnType<typeof listPresets>>;
         try { entries = await listPresets(this.config.contextWorkspace ?? this.config.workspace); }
         catch { await reply('预设清单读取失败，请检查工作区的预设登记文件。'); return; }
