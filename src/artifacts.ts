@@ -15,6 +15,8 @@ export interface CollectedAttachments extends CollectedImages { files: OutgoingF
 interface ImageMarker { start: number; end: number; destination: string; description: string; image: boolean }
 type CodeContainer = { kind: 'quote' } | { kind: 'list'; width: number };
 
+/** Local preparation failed before any attachment bytes were submitted for delivery. */
+export class AttachmentPreparationError extends Error {}
 class ArtifactReadError extends Error {}
 function failed(reason: string): Error { return new ArtifactReadError(reason); }
 
@@ -292,9 +294,9 @@ export async function collectOutgoingImages(finalText: string, rootDirectory: st
 
 function attachmentFailure(error: unknown, signal: AbortSignal | undefined, label: string): never {
   if (signal?.aborted) throw error;
-  if (error instanceof ArtifactReadError) throw new Error(`${label}：${error.message}`);
+  if (error instanceof ArtifactReadError) throw new AttachmentPreparationError(`${label}：${error.message}`);
   const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '未知文件错误';
-  throw new Error(`${label}：无法读取明确声明的附件（${code}），未上传任何附件。请确认绝对路径指向本机可读取的物理文件。`);
+  throw new AttachmentPreparationError(`${label}：无法读取明确声明的附件（${code}），未上传任何附件。请确认绝对路径指向本机可读取的物理文件。`);
 }
 
 /** Controller attachments are explicit tool arguments, never inferred from message prose. */

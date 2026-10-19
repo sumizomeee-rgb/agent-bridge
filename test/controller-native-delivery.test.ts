@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NativeControllerAdapter } from '../src/controller/native.js';
+import { AttachmentPreparationError, collectOutgoingPaths } from '../src/artifacts.js';
 import type { AgentName, AgentTurn } from '../src/types.js';
 import type { JsonObject, RpcTransport } from '../src/agents/process.js';
 
@@ -154,4 +155,38 @@ for (const agent of ['codex', 'claude'] as const) {
     assert.equal((await f.protocol.call('bridge_send_message', { targetId: TARGET, text: '有效最终发送', finish: true })).ok, true);
     f.protocol.complete(); assert.equal((await running).controlledOutput, true); assert.deepEqual(f.sends, [{ text: '有效最终发送', target: TARGET, finish: true }]);
   });
+}
+
+
+for (const agent of ['codex', 'claude'] as const) {
+  for (const name of ['bridge_send_user', 'bridge_send_message', 'bridge_send_private']) {
+    test(`${agent} ${name}缺失附件只拒绝本次发送，允许同轮修正且不重派任务`, { timeout: 10000 }, async t => {
+      const f = groupFixture(t, agent); let prepared = 0;
+      f.turn.onPublicMessage = async (text, paths = [], _id, target, finish) => {
+        prepared++;
+        await collectOutgoingPaths(paths, f.turn.conversation.cwd, 1024);
+        f.sends.push({ text, target, finish });
+      };
+      const running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+      const args = name === 'bridge_send_private' ? { principalId: 'verified-owner-principal' } : name === 'bridge_send_message' ? { targetId: 'private' } : {};
+      assert.equal((await f.protocol.call(name, { ...args, text: '附上图片', attachmentPaths: [join(f.turn.conversation.cwd, 'missing-directory', 'missing.png')] })).ok, false);
+      assert.equal(f.protocol.stopped, false); assert.deepEqual(f.sends, []);
+      assert.equal((await f.protocol.call('bridge_list_workers', {})).ok, true);
+      assert.equal((await f.protocol.call(name, { ...args, text: '图片文件缺失，本次只发送已核实的文字结果。' })).ok, true);
+      f.protocol.complete(); assert.equal((await running).controlledOutput, true);
+      assert.equal(prepared, 2); assert.equal(f.sends.length, 1); assert.deepEqual(f.invoked, ['bridge_list_workers']);
+    });
+  }
+  for (const marked of [false, true]) {
+    test(`${agent} 最终发送${marked ? '带未知标记的准备错误' : '普通网络错误'}仍停止本轮且不重发`, { timeout: 10000 }, async t => {
+      const f = fixture(t, agent); let attempts = 0;
+      f.turn.onPublicMessage = async () => {
+        attempts++;
+        throw marked ? Object.assign(new AttachmentPreparationError('delivery uncertain'), { deliveryUncertain: true }) : new Error('delivery uncertain');
+      };
+      const running = f.adapter.run(f.turn), rejected = assert.rejects(running, /delivery uncertain/); await until(() => f.protocol.started);
+      assert.equal((await f.protocol.call('bridge_send_user', { text: '结果' })).ok, false);
+      await rejected; assert.equal(f.protocol.stopped, true); assert.equal(attempts, 1); assert.deepEqual(f.invoked, []);
+    });
+  }
 }

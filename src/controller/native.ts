@@ -8,6 +8,7 @@ import { createServer, type Server } from 'node:http';
 import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentName, AgentResult, AgentTurn, AgentInput, PrivateInputBatch, EffortConfiguration, EffortCapability } from '../types.js';
 import { claudeEffortConfiguration } from '../agents/claude-effort.js';
+import { AttachmentPreparationError } from '../artifacts.js';
 import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
 
@@ -473,6 +474,13 @@ export class NativeControllerAdapter implements AgentAdapter {
       try { await active.turn.onPublicMessage!(args.text as string, paths as string[] | undefined, callId, args.targetId as string | undefined, true); }
       catch (error) {
         const paused = this.pauseGroupReply(active, error, callId, args.targetId as string | undefined); if (paused) return paused;
+        if (error instanceof AttachmentPreparationError && !('deliveryUncertain' in error)) {
+          // No upload/send happened. Let the model correct this declaration in this
+          // same turn; never replay earlier successful management calls for it.
+          active.sealed = false;
+          active.publicationPromise = undefined;
+          throw error;
+        }
         // A failed publication can have reached the chat platform. Preserve that failure;
         // never turn it into a successful sealed turn or retry under a new ID.
         active.completed.reject(error); throw error;
