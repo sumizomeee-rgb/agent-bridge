@@ -36,6 +36,8 @@ export interface NativeLegacyOwnership extends NativeSessionOwnership { busy: bo
 interface LeaseRow extends NativeSessionOwnership { adopted: boolean }
 interface RecordInfo { ref: NativeSessionRef; path: string; cwd: string; title: string; model: string | null; actualModel?: string | null; effort: string | null; provider: string | null; version?: string }
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
+// Host-scoped principals contain a pipe; native session IDs never do.
+const userIdPattern = /^[A-Za-z0-9][A-Za-z0-9_.:|\-]{0,199}$/;
 function validRef(ref: NativeSessionRef): void {
   if (!ref || !['codex', 'claude'].includes(ref.agent) || ref.profile !== 'default' || !idPattern.test(ref.nativeId)) throw new Error('原生会话引用无效。');
 }
@@ -237,7 +239,7 @@ export class NativeSessionService {
   }
   private records(agent: AgentName): RecordInfo[] { if (!this.engines[agent]) throw new Error('此电脑未登记所选引擎。'); return agent === 'codex' ? this.codexRecords() : this.claudeRecords(); }
   async list(query: NativeSessionQuery): Promise<NativeSessionPage> {
-    if (!idPattern.test(query.userId)) throw new Error('用户编号无效。');
+    if (typeof query.userId !== 'string' || !userIdPattern.test(query.userId)) throw new Error('用户编号无效。');
     if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit < 1) || query.cwd !== undefined && (typeof query.cwd !== 'string' || !isAbsolute(query.cwd)) || query.query !== undefined && (typeof query.query !== 'string' || query.query.length > 240)) throw new Error('原生会话查询参数无效。');
     const limit = Math.min(50, Math.max(1, query.limit ?? 20));
     const offset = query.cursor ? Number(query.cursor) : 0; if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2000) throw new Error('会话分页游标无效。');
@@ -329,7 +331,7 @@ export class NativeSessionService {
   private async adoptOnce(userId: string, args: NativeSessionAdoptArgs): Promise<NativeSessionAdoption> {
     let verifiedNoReceipt = false, claiming = false;
     try {
-    if (!idPattern.test(userId) || !idPattern.test(args.workerId) || !idPattern.test(args.adoptionId)) throw new Error('接管来源编号无效。');
+    if (typeof userId !== 'string' || !userIdPattern.test(userId) || !idPattern.test(args.workerId) || !idPattern.test(args.adoptionId)) throw new Error('接管来源编号无效。');
     validRef(args.ref); const hash = fingerprint({ userId, ...args }), saved = this.leases.previous(args.adoptionId, hash); if (saved) return saved;
     verifiedNoReceipt = true;
     const record = this.records(args.ref.agent).find(item => item.ref.nativeId === args.ref.nativeId); if (!record) throw new Error('原生会话未在可信 profile 中找到。');

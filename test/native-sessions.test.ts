@@ -255,3 +255,18 @@ test('remote catalog forwards native list/read/adopt over the existing authentic
   await assert.rejects(daemon.handle('sessions/read', { userId: 'other', ref }), /其他用户/);
   await assert.rejects(daemon.handle('sessions/list', { userId: 'other', agent: 'codex', query: { userId: 'owner' } }).then(value => { assert.equal((value as any).sessions.length, 0); throw new Error('checked-empty'); }), /checked-empty/);
 });
+
+
+test('host-scoped Feishu owners can discover native sessions while owner isolation and native IDs remain strict', async t => {
+  const f = fixture(t), service = f.make(), owner = 'feishu:cli_fixture|ou_owner';
+  const page = await service.list({ agent: 'codex', userId: owner }); assert.equal(page.sessions.length, 1);
+  const before = await service.read(owner, ref);
+  await service.adopt(owner, { ref, workerId: 'scoped-owner-worker', adoptionId: 'scoped-owner-adoption', expectedRevision: before.revision });
+  assert.equal((await service.list({ agent: 'codex', userId: owner })).sessions.length, 1);
+  assert.equal((await service.list({ agent: 'codex', userId: 'feishu:cli_other|ou_owner' })).sessions.length, 0);
+  await assert.rejects(service.read('feishu:cli_other|ou_owner', ref), /其他用户/);
+  await assert.rejects(service.read(owner, { ...ref, nativeId: 'native|invalid' }), /引用无效/);
+  for (const userId of ['', 'owner\nforged', '../owner', 'x'.repeat(201)]) {
+    await assert.rejects(service.list({ agent: 'codex', userId }), /用户编号无效/);
+  }
+});
