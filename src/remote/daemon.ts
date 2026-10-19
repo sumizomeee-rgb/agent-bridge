@@ -6,6 +6,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { PresetRuntime, PresetAgentAdapter, assertPresetBinding } from '../presets/runtime.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
 import { JsonLineProcess, safeError, isObject } from '../agents/process.js';
@@ -100,8 +101,10 @@ export class RemoteDaemon {
   private nativeClosing = false;
   private readonly nativeOperations = new Set<Promise<unknown>>();
   private token: string;
+  private readonly presetRuntime: PresetRuntime;
   constructor(readonly root: string, readonly config: RemoteDaemonConfig, private readonly options: RemoteDaemonOptions = {}) {
     if (hostname().toLowerCase() !== config.expectedHostname.toLowerCase()) throw new Error('远端电脑名称与登记不一致，拒绝启动。');
+    this.presetRuntime = new PresetRuntime(join(root, '.local', 'agent-presets'), remoteDataDirectory(root));
     this.dataDirectory = remoteDataDirectory(root); this.store = new RemoteStore(this.dataDirectory);
     this.nativeSessions = new NativeSessionService(this.dataDirectory, config.engines, { ...options.nativeSessionOptions, env: this.environment(), leaseStore: this.store.nativeLeases, legacyOwnership: ref => this.store.nativeOwnership(ref), rebind: (ref, userId, workerId, cwd) => this.store.adoptSession(ref, userId, workerId, cwd) });
     const tokenFile = join(this.dataDirectory, 'ipc-token');
@@ -168,7 +171,12 @@ export class RemoteDaemon {
   private respond(socket: Socket, response: RemoteResponse): void { if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`); }
   async handle(method: string, raw: unknown): Promise<unknown> {
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
-    if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
+    if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, presetDispatch: 1, cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
+    if (method === 'preset/pin') {
+      assertPresetBinding(raw.preset); this.agent(raw.preset.agent);
+      await this.presetRuntime.pin(raw.preset, identifier(raw.workerId, '助手编号'), raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号')); return { pinned: true };
+    }
+    if (method === 'preset/describe') return this.presetRuntime.describe(String(raw.profileId), Number(raw.revision), this.agent(raw.agent), String(raw.model));
     if (method.startsWith('sessions/') && this.nativeClosing) throw new Error('远端会话服务正在关闭。');
     if (method === 'sessions/list') return this.nativeOperation(this.nativeSessions.list({ ...(isObject(raw.query) ? raw.query : {}), agent: this.agent(raw.agent), userId: principal(raw.userId) }));
     if (method === 'sessions/read') return this.nativeOperation(this.nativeSessions.read(principal(raw.userId), raw.ref as NativeSessionRef, isObject(raw.options) ? raw.options : {}));
@@ -191,9 +199,11 @@ export class RemoteDaemon {
     if (method === 'handoff') return this.handoff(raw);
     if (method === 'models') {
       const agent = this.agent(raw.agent); const engine = this.config.engines[agent]!;
-      const cwd = await this.directory(raw.cwd ?? engine.defaultCwd); const adapter = this.makeAdapter(agent, { agentCommand: engine.agentCommand } as RemoteDispatch, 'metadata');
+      const cwd = await this.directory(raw.cwd ?? engine.defaultCwd);
+      if (raw.preset) { assertPresetBinding(raw.preset); if (raw.preset.agent !== agent) throw new Error('模型目录后端与预设不符。'); }
+      const adapter = this.makeAdapter(agent, { agentCommand: engine.agentCommand, ...(raw.preset ? { preset: raw.preset } : {}) } as RemoteDispatch, 'metadata');
       this.metadataAdapters.add(adapter);
-      try { if (!adapter.getModelInfo) throw new Error('该远端引擎不支持模型查询。'); return await adapter.getModelInfo(cwd); }
+      try { if (!adapter.getModelInfo) throw new Error('该远端引擎不支持模型查询。'); return await adapter.getModelInfo(cwd, raw.preset && isObject(raw.context) ? { id: identifier(raw.context.id, '助手编号'), nativeId: raw.context.nativeId == null ? null : identifier(raw.context.nativeId, '原生会话编号') } : undefined); }
       finally { await adapter.close(); this.metadataAdapters.delete(adapter); }
     }
     throw new Error('未知远端协议操作。');
@@ -233,12 +243,25 @@ export class RemoteDaemon {
     if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain'))) throw new Error('同一子会话尚在执行或结果未知，拒绝并发续接。');
     const nativeId = raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号');
     const userId = principal(raw.userId);
-    if (nativeId) { await this.nativeSessions.assertRunOwnership({ agent, profile: 'default', nativeId }, userId, workerId); this.store.bindSession(nativeId, workerId, agent, cwd, userId); }
+    const priorWorker = this.store.jobs().filter(job => job.workerId === workerId).map(job => this.store.request(job.dispatchId)).find(Boolean);
+    if (priorWorker && fingerprint(priorWorker.preset ?? null) !== fingerprint(raw.preset ?? null)) throw new Error('已有助手不能新增、移除或更换预设线路。');
+    if (raw.preset) {
+      assertPresetBinding(raw.preset);
+      if (raw.preset.agent !== agent || raw.preset.model !== raw.model) throw new Error('预设与派发后端或模型不匹配。');
+      await this.presetRuntime.validate(raw.preset, workerId, nativeId);
+      const previous = this.store.jobs().filter(job => job.workerId === workerId).map(job => this.store.request(job.dispatchId)).find(Boolean);
+      if (previous && fingerprint(previous.preset ?? null) !== fingerprint(raw.preset)) throw new Error('已有助手不能更换预设线路。');
+    }
+    if (nativeId) {
+      if (raw.preset) { const owner = this.store.session(nativeId); if (!owner || owner.worker !== workerId || owner.userId !== userId || owner.agent !== agent || owner.cwd !== cwd || owner.ownership !== 'bridge') throw new Error('预设原生会话归属不符。'); }
+      else await this.nativeSessions.assertRunOwnership({ agent, profile: 'default', nativeId }, userId, workerId);
+      this.store.bindSession(nativeId, workerId, agent, cwd, userId);
+    }
     if (raw.model != null && (typeof raw.model !== 'string' || !isModelId(raw.model))) throw new Error('模型选择无效。');
     if (raw.effort != null && (typeof raw.effort !== 'string' || raw.effort.length > 50)) throw new Error('推理强度无效。');
     if (!Array.isArray(raw.imagePaths) || raw.imagePaths.length > 32 || typeof raw.acceptSupplements !== 'boolean') throw new Error('图片或补充选项无效。');
     const imagePaths = await Promise.all(raw.imagePaths.map(path => this.uploadedPath(path)));
-    const request: RemoteDispatch = { dispatchId: id, workerId, userId, agent, agentCommand: engine.agentCommand, cwd,
+    const request: RemoteDispatch = { ...(raw.preset ? { preset: raw.preset as import('../presets/types.js').PresetBinding } : {}), dispatchId: id, workerId, userId, agent, agentCommand: engine.agentCommand, cwd,
       nativeId, text: text(raw.text, '任务文字'), imagePaths, model: raw.model as string | null,
       ...(raw.effort != null ? { effort: raw.effort as string } : {}), acceptSupplements: raw.acceptSupplements,
       ...(raw.input !== undefined ? { input: await this.input(raw.input) } : {}) };
@@ -264,6 +287,8 @@ export class RemoteDaemon {
     };
     if (this.options.adapterFactory) return this.options.adapterFactory(agent, request, track);
     const factory = (command: RemoteDispatch['agentCommand'], args: string[], cwd: string, env: NodeJS.ProcessEnv) => { const child = new JsonLineProcess(command, args, cwd, env); track(child); return child; };
+    if (request.preset) return new PresetAgentAdapter(this.presetRuntime, request.preset, request.agentCommand, this.environment(),
+      (command, env) => agent === 'codex' ? new CodexAdapter(command, env, factory) : new ClaudeAdapter(command, env, factory));
     return agent === 'codex' ? new CodexAdapter(request.agentCommand, this.environment(), factory) : new ClaudeAdapter(request.agentCommand, this.environment(), factory);
   }
   private start(request: RemoteDispatch): void {
@@ -301,9 +326,10 @@ export class RemoteDaemon {
         terminal = { status: abort.signal.aborted ? 'cancelled' : 'completed', nativeId: result.nativeId,
           result: { ...result, text: captured.text }, artifacts, ready: false, stopped: true };
       } catch (error) {
-        const uncertain = Boolean(error && typeof error === 'object' && 'processStillRunning' in error);
+        const processUnknown = Boolean(error && typeof error === 'object' && 'processStillRunning' in error);
+        const uncertain = processUnknown || Boolean(error && typeof error === 'object' && 'resultUncertain' in error);
         terminal = { status: uncertain ? 'uncertain' : abort.signal.aborted ? 'cancelled' : 'failed', ready: false,
-          error: safeError(error instanceof Error ? error.message : '', '远端任务失败'), stopped: !uncertain };
+          error: safeError(error instanceof Error ? error.message : '', '远端任务失败'), stopped: !processUnknown };
       }
       this.store.update(request.dispatchId, { ready: false });
       try { await adapter.close(); }
@@ -355,6 +381,7 @@ export class RemoteDaemon {
     const nativeId = identifier(raw.nativeId, '原生会话编号'); const agent = this.agent(raw.agent); const cwd = text(raw.cwd, '工作目录', 4000);
     const session = this.store.session(nativeId);
     if (!session || session.agent !== agent || session.cwd !== cwd) throw new Error('远端会话不存在或引擎/工作目录不符。');
+    if (this.store.jobs().some(job => job.nativeId === nativeId && this.store.request(job.dispatchId)?.preset)) throw new Error('预设会话不能通过默认目录交接。');
     for (const job of this.store.jobs().filter(item => item.nativeId === nativeId)) if (job.status === 'running' || job.status === 'uncertain') await this.interrupt(job.dispatchId);
     this.store.handoff(nativeId); return { stopped: true, nativeId };
   }

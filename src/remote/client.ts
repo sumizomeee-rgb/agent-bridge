@@ -4,6 +4,7 @@ import { mkdtemp, readFile, unlink, rmdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
 import { request as httpRequest } from 'node:http';
+import { startTunnelProcess, type TunnelProcess } from './tunnel-process.js';
 import { JsonLineProcess, isObject } from '../agents/process.js';
 import type { ExecutionTargetBinding, RemoteClient } from './types.js';
 import type { AgentCommand } from '../types.js';
@@ -51,15 +52,15 @@ export interface SshRemoteClientOptions {
   requestHttp?: typeof requestRemoteHttp;
 }
 export class SshRemoteClient implements RemoteClient {
-  private transport: JsonLineProcess | null = null;
-  private metadataCopy: JsonLineProcess | null = null;
+  private transport: TunnelProcess | null = null;
+  private metadataCopy: TunnelProcess | null = null;
   private endpoint: Endpoint | null = null;
   private port = 0;
   private startup: Promise<void> | null = null;
   private closed = false;
   constructor(private readonly binding: ExecutionTargetBinding, private readonly cwd: string, private readonly timeoutMs = 20_000, private readonly options: SshRemoteClientOptions = {}) {}
-  private process(command: AgentCommand): JsonLineProcess {
-    return this.options.createProcess?.(command, this.cwd) ?? new JsonLineProcess(command, [], this.cwd, {});
+  private process(command: AgentCommand): TunnelProcess {
+    return this.options.createProcess?.(command, this.cwd) ?? startTunnelProcess(command, this.cwd);
   }
   private async clearConnection(): Promise<void> {
     const copy = this.metadataCopy, transport = this.transport;

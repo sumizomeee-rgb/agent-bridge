@@ -155,10 +155,16 @@ export class ControllerRuntime {
   }
   private adapter(worker: ControllerWorker): AgentAdapter {
     if (worker.target && this.callbacks.targetCatalog) return this.callbacks.targetCatalog.adapterFor(worker.target);
+    if (worker.target?.preset) throw new Error('预设执行目标服务未配置，拒绝改为普通配置执行');
     if (worker.target?.transport === 'ssh') throw new Error('远端执行目标服务未配置，拒绝改为本机执行');
     return this.adapters[worker.agent];
   }
   private async validateWorkerSelection(worker: ControllerWorker, execution: NonNullable<ControllerJob['execution']> = { model: worker.model, effort: worker.effort, ...(worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {}) }): Promise<void> {
+    if (worker.target?.preset) {
+      const adapter = this.adapter(worker);
+      if (!adapter.preparePreset) throw new Error('当前执行器未支持预设快照，未派发。');
+      await adapter.preparePreset(worker.id, worker.nativeId);
+    }
     if (!execution.effort) return;
     const target: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent,
       nativeId: worker.nativeId, model: execution.model, effort: execution.effort, cwd: worker.cwd,
@@ -553,12 +559,17 @@ export class ControllerRuntime {
       });
     }
     if (name === 'bridge_list_targets') {
-      const args = object(input, ['refresh']);
+      const args = object(input, ['refresh', 'targetId', 'agent', 'query', 'includePresets']);
       if (args.refresh !== undefined && typeof args.refresh !== 'boolean') throw new Error('refresh 必须是布尔值');
       const result = { targets: this.callbacks.targetCatalog ? await this.callbacks.targetCatalog.listTargets(this.config.contextWorkspace ?? this.config.workspace, args.refresh !== false)
         : [{ id: 'local', label: '本机', transport: 'local', engines: ['codex', 'claude'], availability: 'local' }] };
-      if (key) this.store.saveCall(key, fingerprint, result);
-      return result;
+      if (args.agent !== undefined && args.agent !== 'codex' && args.agent !== 'claude') throw new Error('agent 无效');
+      if (args.includePresets !== undefined && typeof args.includePresets !== 'boolean') throw new Error('includePresets 必须是布尔值');
+      const view = { ...result, presets: args.includePresets === false ? [] : await this.callbacks.targetCatalog?.listPresets?.(this.config.contextWorkspace ?? this.config.workspace,
+        { ...(args.targetId === undefined ? {} : { targetId: text(args.targetId, '执行目标', 256) }), ...(args.agent === undefined ? {} : { agent: args.agent as AgentName }),
+          ...(args.query === undefined ? {} : { query: text(args.query, '预设查询', 200) }) }) ?? [] };
+      if (key) this.store.saveCall(key, fingerprint, view);
+      return view;
     }
     if (name === 'bridge_handoff_worker') {
       const args = object(input, ['workerId']);
@@ -633,6 +644,7 @@ export class ControllerRuntime {
       const unsettled = active && this.store.getJob(active.job.id)?.status === 'running';
       // A subsequent queued round inherits the latest queued selection; a current-round supplement uses the active selection.
       const inherited = args.delivery === 'next' || !unsettled ? this.store.jobs(worker.id).filter(job => job.status === 'queued').at(-1)?.execution : undefined;
+      if (worker.target?.preset && args.model !== undefined && args.model !== worker.target.preset.model) throw new Error('预设助手不能更换模型；请明确新建另一个预设助手。');
       const execution = { model: args.model === 'default' ? await this.defaultWorkerModel(turn, worker.agent)
           : this.selectedWorkerModel(args.model, inherited?.model === undefined ? worker.model : inherited.model),
         effort: this.selectedWorkerEffort(args.effort, worker.agent, inherited?.effort === undefined ? worker.effort : inherited.effort),
@@ -715,15 +727,21 @@ export class ControllerRuntime {
     let target: ExecutionTargetBinding | undefined;
     let preparedWorker: ControllerWorker | undefined;
     if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
-      const agent = args.agent === undefined ? turn.conversation.agent : args.agent;
+      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
+      const presetTarget = args.presetId === undefined ? undefined : await (async () => {
+        if (!this.callbacks.targetCatalog?.resolvePreset) throw new Error('当前执行器未支持预设派发。');
+        return this.callbacks.targetCatalog.resolvePreset(this.config.contextWorkspace ?? this.config.workspace, text(args.presetId, '预设 ID', 96), args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
+      })();
+      if (presetTarget && (!presetTarget.preset || (args.targetId !== undefined && args.targetId !== presetTarget.id)
+        || (args.agent !== undefined && args.agent !== presetTarget.agent) || (args.model !== undefined && args.model !== presetTarget.preset.model))) throw new Error('预设与显式电脑、后端或模型参数冲突，未派发。');
+      const agent = presetTarget?.agent ?? (args.agent === undefined ? turn.conversation.agent : args.agent);
       if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
-      target = await this.resolveTarget(turn.conversation.cwd, args.targetId === undefined ? 'local' : text(args.targetId, '执行目标', 256), agent,
+      target = presetTarget ?? await this.resolveTarget(turn.conversation.cwd, args.targetId === undefined ? 'local' : text(args.targetId, '执行目标', 256), agent,
         args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
-      if (target.agent !== agent || target.id !== (args.targetId ?? 'local')) throw new Error('执行目标服务返回的电脑或引擎与请求不一致');
+      if (target.agent !== agent || target.id !== (presetTarget?.id ?? args.targetId ?? 'local')) throw new Error('执行目标服务返回的电脑或引擎与请求不一致');
       if (target.transport === 'local' && (!isAbsolute(target.cwd) || /[\r\n]/.test(target.cwd) || !statSync(target.cwd).isDirectory())) throw new Error('工作目录必须是本机已有目录的绝对路径');
-      const model = args.model === undefined || args.model === 'default' ? await this.defaultWorkerModel(turn, agent) : this.selectedWorkerModel(args.model, null);
-      const effort = this.selectedWorkerEffort(args.effort, agent, agent === turn.conversation.agent
+      const model = presetTarget?.preset?.model ?? (args.model === undefined || args.model === 'default' ? await this.defaultWorkerModel(turn, agent) : this.selectedWorkerModel(args.model, null));
+      const effort = this.selectedWorkerEffort(args.effort, agent, !presetTarget && agent === turn.conversation.agent
         ? turn.effort ?? turn.conversation.effort ?? turn.conversation.actualEffort ?? null : null);
       preparedWorker = { id: randomUUID(), origin, agent, model, actualModel: null, target, ownership: 'bridge',
         effort, cwd: target.cwd, title: text(args.title, '任务名称', 1024), nativeId: null,
@@ -738,7 +756,7 @@ export class ControllerRuntime {
     const result = this.store.transaction(() => {
       let result: unknown;
       if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
+        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
         const worker = preparedWorker!;
         const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), worker.imagePaths);
         if (name === 'bridge_schedule_worker') {
@@ -979,7 +997,8 @@ export class ControllerRuntime {
     } catch (error) {
       await this.settleSupplements(state);
       const current = this.store.getJob(job.id)!;
-      if (stopUnconfirmed(error)) {
+      if (error && typeof error === 'object' && 'resultUncertain' in error) await this.finish(worker, current, 'uncertain', error instanceof Error ? error.message : '预设结果未知，未重放。');
+      else if (stopUnconfirmed(error)) {
         this.unconfirmedStops.add(worker.id);
         await this.finish(worker, current, 'uncertain',
           '执行子 Agent 的进程退出尚未确认，可能仍在运行。请核对进程和已发生的操作；本轮未自动重做，也不能宣称已停止。');

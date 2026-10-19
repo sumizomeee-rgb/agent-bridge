@@ -5,6 +5,10 @@ import { isObject } from '../agents/process.js';
 import type { AgentAdapter, AgentCommand, AgentName, BridgeConfig } from '../types.js';
 import type { ExecutionTargetBinding, RemoteHandoff, RemoteTargetRegistration, TargetSummary } from './types.js';
 import { RemoteAgentAdapter, type RemoteAdapterOptions } from './adapter.js';
+import { listPresets } from '../presets/registry.js';
+import { PresetRuntime, PresetAgentAdapter } from '../presets/runtime.js';
+import { agentEnvironment } from '../config.js';
+import type { PresetFilter } from '../presets/types.js';
 import { fingerprint } from './store.js';
 import { NativeSessionService, type NativeSessionAdoptArgs, type NativeSessionAdoption, type NativeSessionPage, type NativeSessionQuery, type NativeSessionRead, type NativeSessionReadOptions, type NativeSessionRef } from '../native-sessions.js';
 import type { ComputerOverview } from '../overview.js';
@@ -51,9 +55,12 @@ export class TargetCatalogService {
   private readonly cache = new Map<string, RemoteTargetRegistration[]>();
   private readonly remote = new Map<string, RemoteAgentAdapter>();
   private readonly local = new Map<AgentName, AgentAdapter>();
+  private readonly presets = new Map<string, PresetAgentAdapter>();
+  private readonly presetRuntime: PresetRuntime;
   private readonly overviewCache = new Map<string, ComputerOverview[]>();
   private readonly nativeSessions: NativeSessionService;
   constructor(private readonly config: BridgeConfig, private readonly localAdapters: Record<AgentName, AgentAdapter>, private readonly options: RemoteAdapterOptions & { nativeSessions?: NativeSessionService } = {}) {
+    this.presetRuntime = new PresetRuntime(join(config.contextWorkspace ?? config.workspace, 'agent-presets', 'private'), config.dataDir);
     this.nativeSessions = options.nativeSessions ?? new NativeSessionService(config.dataDir, {
       codex: { agentCommand: config.commands.codex, defaultCwd: config.workspace }, claude: { agentCommand: config.commands.claude, defaultCwd: config.workspace },
     });
@@ -85,7 +92,22 @@ export class TargetCatalogService {
       sshConfig: registration.sshConfig, alias: registration.alias, remoteRoot: registration.remoteRoot, nodePath: registration.nodePath,
       agent, agentCommand: engine.agentCommand, cwd: remoteCwd };
   }
+  async listPresets(workspace: string, filter: PresetFilter = {}) { return listPresets(workspace, filter); }
+  async resolvePreset(workspace: string, id: string, cwd?: string): Promise<ExecutionTargetBinding> {
+    const preset = (await this.listPresets(workspace)).find(value => value.id === id);
+    if (!preset || !preset.enabled) throw new Error('预设不存在或尚未启用，未回退普通派发。');
+    const target = await this.resolveTarget(workspace, preset.targetId, preset.agent, cwd);
+    const description = target.transport === 'ssh'
+      ? await (this.adapterFor(target) as RemoteAgentAdapter).describePreset(preset.profileId, preset.revision, preset.agent, preset.model)
+      : await this.presetRuntime.describe(preset.profileId, preset.revision, preset.agent, preset.model);
+    return { ...target, preset: { id: preset.id, targetId: target.id, ...description } };
+  }
   adapterFor(binding: ExecutionTargetBinding): AgentAdapter {
+    if (binding.preset && binding.transport === 'local') {
+      const key = fingerprint(binding); let adapter = this.presets.get(key);
+      if (!adapter) { adapter = new PresetAgentAdapter(this.presetRuntime, binding.preset, binding.agentCommand, agentEnvironment(this.config)); this.presets.set(key, adapter); }
+      return adapter;
+    }
     if (binding.transport === 'local') {
       let wrapper = this.local.get(binding.agent); if (wrapper) return wrapper;
       const adapter = this.localAdapters[binding.agent], service = this.nativeSessions, agent = binding.agent;
@@ -145,6 +167,7 @@ export class TargetCatalogService {
     this.overviewCache.set(workspace, results); return results;
   }
   async handoff(binding: ExecutionTargetBinding, nativeId: string, cwd: string, agent: AgentName): Promise<RemoteHandoff> {
+    if (binding.preset) throw new Error('预设助手需要保留私有运行目录和线路，当前不提供默认 CLI 的人工接管命令。');
     if (binding.agent !== agent || binding.cwd !== cwd || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(nativeId)) throw new Error('交接的会话或目标与登记不一致。');
     if (binding.transport === 'ssh') await (this.adapterFor(binding) as RemoteAgentAdapter).handoff(nativeId, cwd);
     else this.nativeSessions.leases.release({ agent, profile: 'default', nativeId });
@@ -155,5 +178,5 @@ export class TargetCatalogService {
     return { targetId: binding.id, nativeId, cwd, agent, resumeCommand, stopped: true };
   }
   /** Only local SSH clients close; target-native daemons and their tasks remain independent. */
-  async close(): Promise<void> { const adapters = [...this.remote.values()]; this.remote.clear(); await Promise.all(adapters.map(adapter => adapter.close())); this.nativeSessions.close(); }
+  async close(): Promise<void> { const adapters = [...this.remote.values()]; this.remote.clear(); await Promise.all([...adapters, ...this.presets.values()].map(adapter => adapter.close())); this.presets.clear(); this.nativeSessions.close(); }
 }

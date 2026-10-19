@@ -1,7 +1,9 @@
+import type { PresetBinding } from '../presets/types.js';
 import type { AgentCommand, AgentInput, AgentName, AgentResult, AgentSupplement, AgentModelInfo, SteerResult, AgentExecutionProgress, EffortConfiguration, EffortMetadata } from '../types.js';
 
 /** Non-secret snapshot. Native homes, provider credentials and history stay on the target. */
 export interface ExecutionTargetBinding {
+  preset?: PresetBinding;
   id: string;
   label: string;
   transport: 'local' | 'ssh';
@@ -31,6 +33,7 @@ export interface RemoteDaemonConfig {
   engines: Partial<Record<AgentName, TargetEngine>>;
 }
 export interface RemoteDispatch {
+  preset?: PresetBinding;
   dispatchId: string; workerId: string; userId: string; agent: AgentName; agentCommand: AgentCommand;
   nativeId: string | null; cwd: string; text: string; imagePaths: string[]; input?: AgentInput[];
   model: string | null; effort?: string; acceptSupplements: boolean;

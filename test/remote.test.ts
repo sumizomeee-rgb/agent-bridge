@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
@@ -10,6 +10,7 @@ import { RemoteDaemon, remoteEndpoint } from '../src/remote/daemon.js';
 import { RemoteAgentAdapter } from '../src/remote/adapter.js';
 import { RemoteDispatchUncertain, RemoteArtifactTransferError, type ExecutionTargetBinding, type RemoteClient, type RemoteDaemonConfig, type RemoteDispatch, type RemoteJob } from '../src/remote/types.js';
 import { RemoteStore } from '../src/remote/store.js';
+import { PresetRuntime } from '../src/presets/runtime.js';
 import { collectOutgoingAttachments } from '../src/artifacts.js';
 
 const tick = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
@@ -335,4 +336,40 @@ test('remote launch configuration survives storage and polling separately from n
     assert.deepEqual(configurations, [{ value: 'high', source: 'user-settings' }]);
     assert.deepEqual(actual, ['medium']);
   } finally { await f.daemon.close(); }
+});
+
+
+test('remote preset binding is durable, cannot be removed or moved, and rejects default-home handoff before interruption', async () => {
+  const f = fixture();
+  try {
+    const privateRoot = join(f.root, '.local', 'agent-presets'); mkdirSync(privateRoot, { recursive: true });
+    const profile = { id: 'gateway-sol', revision: 1, agent: 'codex' as const, model: 'gpt-6.1-sol', baseUrl: 'https://gateway.example', credentialId: 'gateway', transport: { kind: 'direct' } };
+    writeFileSync(join(privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [profile] }));
+    writeFileSync(join(privateRoot, 'credentials.json'), JSON.stringify({ version: 1, credentials: { gateway: { apiKey: 'fixture-secret' } } }));
+    const descriptor = await f.daemon.handle('preset/describe', { profileId: profile.id, revision: 1, agent: profile.agent, model: profile.model }) as { fingerprint: string };
+    const preset = { id: 'office-sol', targetId: 'station', profileId: profile.id, revision: 1, agent: profile.agent, model: profile.model, fingerprint: descriptor.fingerprint };
+    const a = f.request({ preset, model: preset.model });
+    // The native test seam skips launching; create the persistent home as the real wrapper does.
+    const runtime = new PresetRuntime(privateRoot, f.daemon.dataDirectory, join(f.root, 'isolated-user'));
+    await (await runtime.prepare(preset, a.workerId, null, a.agentCommand, {})).close();
+    await f.daemon.handle('dispatch', a); await tick();
+    assert.deepEqual(f.daemon.store.request(a.dispatchId)!.preset, preset);
+    const nativeId = f.natives[0]!.nativeId;
+    await assert.rejects(f.daemon.handle('handoff', { nativeId, agent: a.agent, cwd: a.cwd }), /预设/);
+    assert.equal(f.natives[0]!.interrupts, 0); f.natives[0]!.finish(); await tick(); await tick();
+    await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId, model: preset.model })), /预设线路/);
+    await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId, model: preset.model, preset: { ...preset, id: 'other' } })), /预设线路/);
+    profile.baseUrl = 'https://new.example'; writeFileSync(join(privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [profile] }));
+    const next = f.request({ workerId: a.workerId, nativeId, preset, model: preset.model });
+    await f.daemon.handle('dispatch', next); await tick(); assert.equal(f.natives[1]!.turn!.conversation.nativeId, nativeId);
+    f.natives[1]!.finish(); await tick(); await tick();
+    await assert.rejects(f.daemon.handle('dispatch', f.request({ preset, model: preset.model })), /配置已改变/);
+  } finally { await f.daemon.close(); }
+});
+test('old executors reject preset discovery and dispatch instead of silently running a default model', async () => {
+  const f = fixture(), calls: string[] = [];
+  const binding = { ...f.binding, preset: { id: 'sol', targetId: 'station', profileId: 'sol', revision: 1, agent: 'codex' as const, model: 'gpt-6.1-sol', fingerprint: 'a'.repeat(64) } };
+  const adapter = new RemoteAgentAdapter(binding, f.config, { clientFactory: () => ({ request: async <T>(method: string) => { calls.push(method); return { version: 1, hostname: hostname(), engines: ['codex'] } as T; }, close: async () => {} }) });
+  try { await assert.rejects(adapter.getModelInfo(f.root), /不支持预设协议/); assert.deepEqual(calls, ['hello']); }
+  finally { await adapter.close(); await f.daemon.close(); }
 });

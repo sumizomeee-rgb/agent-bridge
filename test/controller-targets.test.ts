@@ -22,6 +22,7 @@ class ExecutionAdapter implements AgentAdapter {
     { id: 'unknown', displayName: 'Unknown' },
   ] }; }
 
+  preparePreset?: (workerId: string, nativeId: string | null) => Promise<void>;
   turns: AgentTurn[] = [];
   interrupts: string[] = [];
   supplements: AgentSupplement[] = [];
@@ -386,4 +387,73 @@ test('safe restart registers immediately on genuine origin, drains running work 
     await next.start(); await flush(); assert.equal(f.remote.turns.length, 2); f.remote.finish(a.workerId); await flush();
     assert.equal(next.store.schedules()[0]!.status, 'pending');
   } finally { await next?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+
+function installPreset(f: ReturnType<typeof fixture>) {
+  const preset = { id: 'office-sol', aliases: ['工位 sol'], targetId: 'office', agent: 'codex' as const, model: 'gpt-6.1-sol', profileId: 'gateway-sol', revision: 1, enabled: true };
+  let queries = 0, resolutions = 0;
+  f.remote.preparePreset = async () => {};
+  f.catalog.listPresets = async (_workspace, filter) => { queries++; return !filter?.query || preset.aliases.some(alias => alias.includes(filter.query!)) ? [preset] : []; };
+  f.catalog.resolvePreset = async (_workspace, id) => {
+    resolutions++; if (id !== preset.id || !preset.enabled) throw new Error('预设不可用');
+    return { ...f.binding, preset: { id: preset.id, profileId: preset.profileId, targetId: preset.targetId, agent: preset.agent, model: preset.model, revision: preset.revision, fingerprint: 'a'.repeat(64) } };
+  };
+  return { preset, queries: () => queries, resolutions: () => resolutions };
+}
+test('presets are discovered only on request, fix the selected route/model, and reject conflicting fields before dispatch', async () => {
+  const f = fixture(), p = installPreset(f);
+  try {
+    assert.equal(p.queries(), 0);
+    const view = await f.runtime.invoke(f.turn, 'bridge_list_targets', { query: '工位 sol' }) as { presets: unknown[] };
+    assert.equal(view.presets.length, 1); assert.equal(p.queries(), 1);
+    for (const conflict of [{ targetId: 'local' }, { agent: 'claude' }, { model: 'default' }]) {
+      await assert.rejects(launch(f, { presetId: p.preset.id, ...conflict }), /冲突/);
+    }
+    assert.equal(f.runtime.store.workers().length, 0);
+    const a = await launch(f, { presetId: p.preset.id }); await flush();
+    const worker = f.runtime.store.getWorker(a.workerId)!;
+    assert.equal(worker.model, 'gpt-6.1-sol'); assert.equal(worker.effort, null, '不继承主控强度');
+    assert.equal(worker.target!.preset!.id, p.preset.id); assert.equal(p.queries(), 1);
+    f.remote.finish(a.workerId); await flush();
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续', model: 'default' }), /预设/);
+    p.preset.enabled = false;
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '仍用旧线路' }); await flush();
+    assert.equal(f.adapters.at(-1)!.preset!.fingerprint, 'a'.repeat(64)); f.remote.finish(a.workerId); await flush();
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+test('scheduled preset snapshot survives restart and registration edits without resolving again', async () => {
+  const f = fixture(), p = installPreset(f); let now = Date.now(), next: ControllerRuntime | undefined;
+  f.callbacks.now = () => now;
+  try {
+    await f.runtime.invoke(f.turn, 'bridge_schedule_worker', { title: '稍后核对', prompt: '授权任务', presetId: p.preset.id, afterSeconds: 30 });
+    const schedule = f.runtime.store.schedules()[0]!; assert.equal(schedule.worker!.target!.preset!.revision, 1);
+    p.preset.revision = 2; p.preset.enabled = false; await f.runtime.close();
+    next = new ControllerRuntime(f.config, { codex: f.local, claude: f.local }, f.registry, f.callbacks);
+    now += 31_000; await next.start(); await next.poll(); await flush();
+    assert.equal(p.resolutions(), 1); assert.equal(f.remote.turns.length, 1); assert.equal(f.adapters.at(-1)!.preset!.revision, 1);
+    f.remote.finish(schedule.worker!.id); await flush();
+    await next.poll(); assert.equal(f.remote.turns.length, 1);
+  } finally { await next?.close(); await f.runtime.close(); f.registry.close(); }
+});
+test('lost preset result blocks queued work but a confirmed stopped process allows a safe restart', async () => {
+  const f = fixture(), p = installPreset(f);
+  try {
+    const a = await launch(f, { presetId: p.preset.id }); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '不能重放', delivery: 'next' });
+    f.remote.reject(a.workerId, Object.assign(new Error('结果未知'), { resultUncertain: true })); await flush();
+    assert.equal(f.runtime.store.getJob(a.jobId)!.status, 'uncertain'); assert.equal(f.runtime.store.getWorker(a.workerId)!.blocked, true);
+    assert.equal(f.runtime.isIdle(), true); assert.equal(f.remote.turns.length, 1);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '不能自动重做' }), /结果未知/);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('a restored preset never falls back to the ordinary local adapter if its catalog is unavailable', async () => {
+  const f = fixture(), p = installPreset(f);
+  try {
+    const a = await launch(f, { presetId: p.preset.id }); await flush(); f.remote.finish(a.workerId); await flush();
+    f.callbacks.targetCatalog = undefined;
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '续接' }), /预设执行目标服务未配置/);
+    assert.equal(f.local.turns.length, 0); assert.equal(f.remote.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
 });

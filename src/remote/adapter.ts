@@ -2,9 +2,11 @@ import { normalizeEffortCapability, selectedEffort } from '../effort.js';
 import { readFile, lstat, mkdir, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
-import type { AgentAdapter, AgentInput, AgentModelInfo, AgentResult, AgentSupplement, AgentTurn, BridgeConfig, SteerResult } from '../types.js';
+import type { Conversation, AgentAdapter, AgentInput, AgentModelInfo, AgentResult, AgentSupplement, AgentTurn, AgentName, BridgeConfig, SteerResult } from '../types.js';
 import type { ExecutionTargetBinding, RemoteClient, RemoteDispatch, RemoteJob } from './types.js';
 import { RemoteDispatchUncertain, RemoteArtifactTransferError } from './types.js';
+import { PresetResultUnknown } from '../presets/runtime.js';
+import type { PresetBinding } from '../presets/types.js';
 import { SshRemoteClient } from './client.js';
 import type { NativeSessionAdoption, NativeSessionAdoptArgs, NativeSessionPage, NativeSessionQuery, NativeSessionRead, NativeSessionReadOptions, NativeSessionRef } from '../native-sessions.js';
 
@@ -24,7 +26,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
   private async validate(allowPreparingRecovery = false, retry = true): Promise<void> {
     if (retry && this.reconnecting) await this.reconnecting;
     const client = this.connection();
-    let hello: { hostname: string; version: number; engines: string[] };
+    let hello: { hostname: string; version: number; engines: string[]; presetDispatch?: number };
     try { hello = await client.request('hello', {}); }
     catch (error) {
       const idle = this.jobs.size === 0 || (allowPreparingRecovery && this.jobs.size === 1 && [...this.jobs.values()].every(job => !job.submitted));
@@ -32,8 +34,12 @@ export class RemoteAgentAdapter implements AgentAdapter {
       if (!retry || !idle || this.knownRejection(error)) throw error;
       await this.reconnect(client); return;
     }
+    if (this.binding.preset && hello.presetDispatch !== 1) throw Object.assign(new Error('目标执行器不支持预设协议，未忽略预设或回退。'), { code: 'REMOTE_REJECTED' });
     if (hello.version !== 1 || typeof hello.hostname !== 'string' || hello.hostname.toLowerCase() !== this.binding.expectedHostname!.toLowerCase()
       || !Array.isArray(hello.engines) || !hello.engines.includes(this.binding.agent)) throw Object.assign(new Error('目标电脑名称、协议版本或引擎与登记不一致。'), { code: 'REMOTE_REJECTED' });
+  }
+  async describePreset(profileId: string, revision: number, agent: AgentName, model: string): Promise<Pick<PresetBinding, 'profileId' | 'revision' | 'agent' | 'model' | 'fingerprint'>> {
+    await this.validate(); return this.connection().request('preset/describe', { profileId, revision, agent, model });
   }
   async probeEntries(): Promise<{ cliEntries?: Record<string, 'ready' | 'unavailable'> }> {
     await this.validate(); return this.connection().request('hello', {});
@@ -120,6 +126,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
         if (turn.signal.aborted || execution.cancelled) throw Object.assign(new Error('远端任务尚未派发，已取消。'), { name: 'AbortError' });
         const imagePaths: string[] = []; for (const path of turn.imagePaths) imagePaths.push(await this.image(path));
         const request: RemoteDispatch = { dispatchId: turn.dispatchId, workerId: turn.conversation.id, userId: turn.conversation.userId,
+          ...(this.binding.preset ? { preset: this.binding.preset } : {}),
           agent: this.binding.agent, agentCommand: this.binding.agentCommand, nativeId: turn.conversation.nativeId, cwd: this.binding.cwd,
           text: turn.text, imagePaths, model: turn.conversation.model ?? null, acceptSupplements: turn.acceptSupplements === true,
           ...(turn.effort ? { effort: turn.effort } : {}), ...(turn.input ? { input: await this.inputs(turn.input) } : {}) };
@@ -153,13 +160,13 @@ export class RemoteAgentAdapter implements AgentAdapter {
           try { return await this.download(job); }
           catch (error) { throw new RemoteArtifactTransferError(job.result, error instanceof Error ? error.message : '产物传输错误'); }
         }
-        if (job.status === 'uncertain') throw new RemoteDispatchUncertain(job.error);
+        if (job.status === 'uncertain') { if (this.binding.preset && job.stopped === true) throw new PresetResultUnknown(); throw new RemoteDispatchUncertain(job.error); }
         if (job.status === 'cancelled') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端取消已登记，CLI 退出尚未确认。'); throw Object.assign(new Error('目标电脑上的 CLI 已停止。'), { name: 'AbortError' }); }
         if (job.status === 'failed') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端任务失败，CLI 退出尚未确认。'); throw Object.assign(new Error(job.error ?? '远端任务失败。'), { code: 'REMOTE_JOB_FAILED' }); }
         await new Promise<void>(resolveValue => setTimeout(resolveValue, this.options.pollMs ?? 750));
       }
     } catch (error) {
-      if (error instanceof RemoteDispatchUncertain || error instanceof RemoteArtifactTransferError) throw error;
+      if (error instanceof RemoteDispatchUncertain || error instanceof RemoteArtifactTransferError || error instanceof PresetResultUnknown) throw error;
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
       const name = error instanceof Error ? error.name : '';
       if (execution.submitted && name !== 'AbortError' && !['REMOTE_REJECTED', 'DISPATCH_NOT_FOUND', 'REMOTE_JOB_FAILED'].includes(code)) throw new RemoteDispatchUncertain(error instanceof Error ? error.message : undefined);
@@ -210,7 +217,11 @@ export class RemoteAgentAdapter implements AgentAdapter {
     }
     catch (error) { throw new RemoteDispatchUncertain(error instanceof Error ? error.message : '远端停止未确认。'); }
   }
-  async getModelInfo(cwd: string): Promise<AgentModelInfo> { await this.validate(); return this.connection().request<AgentModelInfo>('models', { agent: this.binding.agent, cwd }); }
+  async preparePreset(workerId: string, nativeId: string | null): Promise<void> {
+    if (!this.binding.preset) return;
+    await this.validate(); await this.connection().request('preset/pin', { preset: this.binding.preset, workerId, nativeId });
+  }
+  async getModelInfo(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo> { await this.validate(); return this.connection().request<AgentModelInfo>('models', { agent: this.binding.agent, cwd, ...(this.binding.preset ? { preset: this.binding.preset, context } : {}) }); }
   async confirmStopped(conversationId: string): Promise<boolean> {
     const dispatchId = this.lastDispatch.get(conversationId); if (!dispatchId || this.closed) return false;
     try {

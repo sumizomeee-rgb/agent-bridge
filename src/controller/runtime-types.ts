@@ -45,6 +45,8 @@ export interface ControllerSchedule {
   worker?: ControllerWorker; job?: ControllerJob; error?: string;
 }
 export interface ControllerTargetCatalog {
+  listPresets?(workspace: string, filter?: import('../presets/types.js').PresetFilter): Promise<import('../presets/types.js').DispatchPreset[]>;
+  resolvePreset?(workspace: string, presetId: string, cwd?: string): Promise<ExecutionTargetBinding>;
   listTargets(workspace: string, refresh?: boolean): Promise<TargetSummary[]>;
   resolveTarget(workspace: string, targetId: string, agent: AgentName, cwd?: string): Promise<ExecutionTargetBinding>;
   adapterFor(binding: ExecutionTargetBinding): AgentAdapter;

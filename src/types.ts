@@ -173,7 +173,9 @@ export interface AgentAdapter {
   confirmStopped?(conversationId: string): Promise<boolean>;
   close(): Promise<void>;
   /** Metadata only: never sends a user prompt or starts a generated turn. */
-  getModelInfo?(cwd: string): Promise<AgentModelInfo>;
+  getModelInfo?(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo>;
+  /** Persist the target-owned preset snapshot before scheduling or starting work. */
+  preparePreset?(workerId: string, nativeId: string | null): Promise<void>;
 }
 export interface BridgeMessage {
   /** Actual platform sender and region, separate from the owner's internal authorization route. */

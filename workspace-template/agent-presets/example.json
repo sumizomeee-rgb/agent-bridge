@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "id": "local-sol",
+      "aliases": ["本机 sol", "本机 6.1 sol"],
+      "targetId": "local",
+      "agent": "codex",
+      "model": "gpt-6.1-sol",
+      "profileId": "gateway-sol",
+      "revision": 1,
+      "enabled": false,
+      "reason": "示例；目标机私有启动配置和认证尚未登记并验收"
+    }
+  ]
+}

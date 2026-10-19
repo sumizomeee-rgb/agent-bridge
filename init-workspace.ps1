@@ -37,7 +37,7 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms\lark.md', 'chat-platforms\discord.md')
+    $files = @('MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms\lark.md', 'chat-platforms\discord.md')
     # 不在旧登记仍位于根目录时生成空表，以免真实配置被静默忽略。
     foreach ($legacy in @('agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')) {
         if (Test-Path -LiteralPath (Join-Path $workspace $legacy)) {
@@ -45,7 +45,7 @@ try {
         }
     }
     # 先检查父目录及完整清单，避免碰撞时只生成一部分模板。
-    $directories = @('chat-platforms', 'remote-agents', 'capabilities', '.local', '.local\tmp', '.local\deliveries')
+    $directories = @('chat-platforms', 'remote-agents', 'agent-presets', 'capabilities', '.local', '.local\tmp', '.local\deliveries')
     foreach ($name in $directories) {
         $directory = Join-Path $workspace $name
         if ([IO.File]::Exists($directory)) {

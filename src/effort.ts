@@ -44,7 +44,7 @@ ${capability.resolvedModel ? `别名解析：${capability.resolvedModel}；` : '
 
 export async function validateEffort(adapter: AgentAdapter, target: Conversation, effort: string): Promise<EffortCapability> {
   if (!isEffortLevel(effort)) throw new Error(`${target.agent} 不支持强度 ${effort}。`);
-  const info = await adapter.getModelInfo?.(target.cwd);
+  const info = await adapter.getModelInfo?.(target.cwd, target);
   const capability = modelEffortCapability(info ?? { models: [], defaultModel: null }, target);
   if (capability.status === 'unknown') {
     // Claude 允许传入 CLI 支持的值；模型兼容性及实际执行强度仍保持未知。
