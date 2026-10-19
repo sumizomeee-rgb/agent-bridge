@@ -416,6 +416,8 @@ test('presets are discovered only on request, fix the selected route/model, and 
     assert.equal(worker.model, 'gpt-6.1-sol'); assert.equal(worker.effort, null, '不继承主控强度');
     assert.equal(worker.target!.preset!.id, p.preset.id); assert.equal(p.queries(), 1);
     f.remote.finish(a.workerId); await flush();
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: a.workerId }), /人工接管/);
+    assert.equal(f.runtime.store.getWorker(a.workerId)!.blocked, false); assert.equal(f.handoffs.length, 0);
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续', model: 'default' }), /预设/);
     p.preset.enabled = false;
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '仍用旧线路' }); await flush();

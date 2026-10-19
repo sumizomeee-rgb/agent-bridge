@@ -579,6 +579,7 @@ export class ControllerRuntime {
         || this.store.supplements().some(value => value.workerId === worker.id && ['pending', 'steering'].includes(value.status))) {
         throw new Error('只能交接已确认空闲的子 Agent；活动、排队或未知任务需要先处理');
       }
+      if (worker.target?.preset) throw new Error('预设会话尚未提供保留私有目录的人工接管，桥内续聊仍可用。');
       if (!worker.nativeId) throw new Error('子 Agent 尚未建立真实原生会话，不能交接');
       if (!this.callbacks.targetCatalog) throw new Error('桥尚未配置会话交接服务');
       const binding = worker.target ?? await this.resolveTarget(worker.cwd, 'local', worker.agent, worker.cwd);
