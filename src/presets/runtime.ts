@@ -94,8 +94,11 @@ export class PresetRuntime {
     const key = binding.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey;
     if (typeof key !== 'string' || !key || /[\r\n\0]/.test(key)) throw new Error('目标机预设认证材料无效。');
     const env: NodeJS.ProcessEnv = { ...process.env, ...baseEnv };
-    for (const name of Object.keys(env)) if (/^(ANTHROPIC_|CLAUDE_CODE_OAUTH_TOKEN$)/.test(name)
-      || ['CODEX_HOME', 'CODEX_SQLITE_HOME', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'CLAUDE_CONFIG_DIR', 'NO_PROXY', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'].includes(name)) env[name] = undefined;
+    const cleared = new Set(['CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_API_KEY', 'CLAUDE_CONFIG_DIR', 'BRIDGE_PRESET_API_KEY', 'NO_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
+    for (const name of Object.keys(env)) {
+      const key = name.toUpperCase();
+      if (/^(ANTHROPIC_|CLAUDE_CODE_|OPENAI_)/.test(key) || cleared.has(key)) env[name] = undefined;
+    }
     const home = this.home(workerId, binding), command = { command: original.command, args: [...original.args] };
     let relay: Awaited<ReturnType<typeof startPresetConnect>> | undefined;
     try {

@@ -76,9 +76,10 @@ test('独立配置覆盖继承环境，凭据只在子进程环境，快照不�
   const f = fixture();
   try {
     const binding = await f.binding();
-    const prepared = await f.runtime.prepare(binding, 'worker-A', null, f.command, { OPENAI_API_KEY: 'wrong', ANTHROPIC_AUTH_TOKEN: 'wrong', HTTP_PROXY: 'http://wrong', CODEX_HOME: 'wrong-home' });
+    const prepared = await f.runtime.prepare(binding, 'worker-A', null, f.command, { openai_api_key: 'wrong-lowercase', anthropic_auth_token: 'wrong-lowercase', CLAUDE_CODE_USE_BEDROCK: '1', OPENAI_API_KEY: 'wrong', ANTHROPIC_AUTH_TOKEN: 'wrong', HTTP_PROXY: 'http://wrong', CODEX_HOME: 'wrong-home' });
     try {
       assert.equal(prepared.env.OPENAI_API_KEY, undefined); assert.equal(prepared.env.ANTHROPIC_AUTH_TOKEN, undefined); assert.equal(prepared.env.HTTP_PROXY, undefined);
+      assert.equal(prepared.env.openai_api_key, undefined); assert.equal(prepared.env.anthropic_auth_token, undefined); assert.equal(prepared.env.CLAUDE_CODE_USE_BEDROCK, undefined);
       assert.equal(prepared.env.BRIDGE_PRESET_API_KEY, 'private-test-key');
       assert.ok(prepared.command.args.includes('model_provider="bridge_preset"'));
       assert.ok(!JSON.stringify(prepared.command).includes('private-test-key'));
