@@ -854,18 +854,16 @@ export class SessionManager {
       case 'resume': {
         await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 交接当前 Bot 的最新上下文；/new 新建，/chats 只读查看历史。'); return;
       }
-      case 'presets': {
-        if (argument && argument !== 'all') { await reply('用法：/presets [all]；all 包含停用项。'); return; }
+      case 'agents': {
+        if (argument) { await reply('用法：/agents；直接查看可派发预设的全部口语别名。'); return; }
         let entries: Awaited<ReturnType<typeof listPresets>>;
         try { entries = await listPresets(this.config.contextWorkspace ?? this.config.workspace); }
         catch { await reply('预设清单读取失败，请检查工作区的预设登记文件。'); return; }
-        if (!entries.length) { await reply('尚未登记派发预设。'); return; }
-        const enabled = entries.filter(item => item.enabled).length;
-        const shown = argument === 'all' ? entries : entries.filter(item => item.enabled);
-        await reply([`派发预设 · 已启用 ${enabled} / 共 ${entries.length}`,
-          ...shown.map(item => `${item.enabled ? '' : '停用 · '}${item.aliases[0]} · ${item.model}`),
-          ...(!shown.length ? ['暂无已启用预设。'] : []),
-          '按别名称呼即可；启用不代表在线。' + (argument !== 'all' && enabled < entries.length ? ' /presets all 查看停用项。' : ''),
+        const available = entries.filter(item => item.enabled);
+        if (!available.length) { await reply('当前工作区暂无已启用的派发预设。'); return; }
+        await reply(['可派发预设 · 别名速查',
+          ...available.map(item => `${item.aliases.join(' / ')} · ${item.model}`),
+          `用法示例：用“${available[0]!.aliases[0]}”处理任务。`,
         ].join('\n')); return;
       }
       case 'computers': {

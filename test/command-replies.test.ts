@@ -236,21 +236,19 @@ test('预设清单按当前工作区实时读取，一行一项，忙碌时不�
   await mkdir(join(workspace, 'agent-presets'), { recursive: true });
   const path = join(workspace, 'agent-presets', 'registry.json');
   const entries = [
-    { id: 'office-sol', aliases: ['工位 sol'], targetId: 'office', agent: 'codex', model: 'gpt-6.1-sol', profileId: 'secret-profile', revision: 1, enabled: true },
+    { id: 'office-sol', aliases: ['工位 sol', '工位 6.1 sol'], targetId: 'office', agent: 'codex', model: 'gpt-6.1-sol', profileId: 'secret-profile', revision: 1, enabled: true },
     { id: 'home-opus', aliases: ['家用 opus'], targetId: 'home', agent: 'claude', model: 'claude-opus-5.5', profileId: 'secret-profile', revision: 1, enabled: false },
   ];
   await writeFile(path, JSON.stringify({ version: 1, presets: entries }));
   await f.manager.handle(message('busy-before-presets', 'do a task')); await until(() => f.adapter.turns.length === 1);
   const replies: string[] = [];
-  await f.manager.handle(message('preset-list', '/presets'), async text => { replies.push(text); });
-  assert.match(replies[0]!, /已启用 1 \/ 共 2/);
-  assert(replies[0]!.split('\n').includes('工位 sol · gpt-6.1-sol'));
+  await f.manager.handle(message('preset-list', '/agents'), async text => { replies.push(text); });
+  assert.match(replies[0]!, /可派发预设 · 别名速查/);
+  assert(replies[0]!.split('\n').includes('工位 sol / 工位 6.1 sol · gpt-6.1-sol'));
   assert.doesNotMatch(replies[0]!, /家用 opus|secret-profile/);
-  await f.manager.handle(message('preset-list-all', '/presets all'), async text => { replies.push(text); });
-  assert(replies[1]!.split('\n').includes('停用 · 家用 opus · claude-opus-5.5'));
   entries[1]!.enabled = true; await writeFile(path, JSON.stringify({ version: 1, presets: entries }));
-  await f.manager.handle(message('preset-list-updated', '/presets'), async text => { replies.push(text); });
-  assert.match(replies[2]!, /已启用 2 \/ 共 2/); assert.match(replies[2]!, /家用 opus/);
+  await f.manager.handle(message('preset-list-updated', '/agents'), async text => { replies.push(text); });
+  assert.match(replies[1]!, /家用 opus/);
   assert.equal(f.adapter.turns.length, 1); assert.equal(f.sinkReplies.length, 0);
   f.adapter.finish(0, 'original task result'); await until(() => f.sinkReplies.length === 1);
   assert(f.sinkReplies[0]!.text.endsWith('original task result'));
@@ -258,12 +256,12 @@ test('预设清单按当前工作区实时读取，一行一项，忙碌时不�
 
 test('预设清单缺失、错误参数和损坏登记不创建会话或启动模型', async t => {
   const f = await fixture(t), replies: string[] = [];
-  for (const [id, text] of [['empty', '/presets'], ['bad-arg', '/presets launch']]) {
+  for (const [id, text] of [['empty', '/agents'], ['bad-arg', '/agents all']]) {
     await f.manager.handle(message(id!, text!), async text => { replies.push(text); });
   }
-  assert.equal(replies[0], '尚未登记派发预设。'); assert.match(replies[1]!, /用法/);
+  assert.equal(replies[0], '当前工作区暂无已启用的派发预设。'); assert.match(replies[1]!, /用法/);
   await mkdir(join(f.root, 'agent-presets')); await writeFile(join(f.root, 'agent-presets', 'registry.json'), '{broken');
-  await f.manager.handle(message('broken', '/presets'), async text => { replies.push(text); });
+  await f.manager.handle(message('broken', '/agents'), async text => { replies.push(text); });
   assert.match(replies[2]!, /读取失败/); assert.equal(f.adapter.turns.length, 0);
   await f.manager.handle(message('still-no-session', '/status'), async text => { replies.push(text); });
   assert.match(replies[3]!, /会话：尚未创建/);

@@ -57,7 +57,6 @@ export function slashText(data: unknown, context: 'dm' | 'group' = 'dm'): { text
     case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };
     case 'cwd': return { text: `/cwd ${values.get('path')}` };
     case 'computers': return { text: `/computers${values.has('refresh') ? values.get('refresh') ? ' refresh' : ' cached' : ''}${values.get('details') ? ' details' : ''}` };
-    case 'presets': return { text: `/presets${values.get('all') ? ' all' : ''}` };
     case 'workers': return { text: `/workers${values.get('history') ? ' history' : ''}${values.has('scope') ? ` ${values.get('scope')}` : ''}${values.get('details') ? ' details' : ''}` };
     case 'model': {
       const name = values.get('name');
