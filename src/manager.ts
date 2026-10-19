@@ -9,6 +9,7 @@ import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview
 import { commandHelp, parseCommand as command, parseNewArguments } from './commands.js';
 import { presentationText, type BridgePresentation } from './presentation.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
+import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
@@ -852,6 +853,20 @@ export class SessionManager {
       }
       case 'resume': {
         await reply('/resume 已停用，不会切换会话。请用 /agent codex 或 /agent claude 交接当前 Bot 的最新上下文；/new 新建，/chats 只读查看历史。'); return;
+      }
+      case 'presets': {
+        if (argument && argument !== 'all') { await reply('用法：/presets [all]；all 包含停用项。'); return; }
+        let entries: Awaited<ReturnType<typeof listPresets>>;
+        try { entries = await listPresets(this.config.contextWorkspace ?? this.config.workspace); }
+        catch { await reply('预设清单读取失败，请检查工作区的预设登记文件。'); return; }
+        if (!entries.length) { await reply('尚未登记派发预设。'); return; }
+        const enabled = entries.filter(item => item.enabled).length;
+        const shown = argument === 'all' ? entries : entries.filter(item => item.enabled);
+        await reply([`派发预设 · 已启用 ${enabled} / 共 ${entries.length}`,
+          ...shown.map(item => `${item.enabled ? '' : '停用 · '}${item.aliases[0]} · ${item.model}`),
+          ...(!shown.length ? ['暂无已启用预设。'] : []),
+          '按别名称呼即可；启用不代表在线。' + (argument !== 'all' && enabled < entries.length ? ' /presets all 查看停用项。' : ''),
+        ].join('\n')); return;
       }
       case 'computers': {
         const args = argument.split(/\s+/).filter(Boolean);
