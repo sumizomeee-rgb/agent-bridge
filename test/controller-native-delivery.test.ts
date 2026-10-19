@@ -40,7 +40,8 @@ class DeliveryProtocol implements RpcTransport {
     try {
       const response = await fetch(this.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(5000),
         body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) });
-      return { ok: response.status === 200, value: await response.json() };
+      const value = await response.json() as { error?: unknown; result?: { isError?: boolean } };
+      return { ok: response.status === 200 && !value.error && value.result?.isError !== true, value };
     } catch (error) { if (this.stopped) return { ok: false, value: String(error) }; throw error; }
   }
   complete() {

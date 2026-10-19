@@ -84,14 +84,19 @@ test('capabilities distinguish supported/unsupported/unknown and trust only expl
   await assert.rejects(validateEffort(adapter, target, 'high'), /不支持可调/);
   await assert.rejects(validateEffort(adapter, target, 'xhigh'), /不支持可调/);
   adapter.getModelInfo = async () => ({ defaultModel: 'haiku', models: [] });
-  await assert.rejects(validateEffort(adapter, target, 'high'), /不能确认兼容性/);
+  for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    const capability = await validateEffort(adapter, { ...target, model: 'deepseek-v4.1-flash' }, effort);
+    assert.equal(capability.status, 'unknown'); assert.deepEqual(capability.levels, []);
+  }
+  await assert.rejects(validateEffort(adapter, target, 'ultra'), /Claude CLI 不支持/);
+  await assert.rejects(validateEffort(adapter, { ...target, agent: 'codex' }, 'high'), /不能确认兼容性/);
 });
 
 test('Claude filters invalid external persisted effort without mutating source settings', () => {
-  const settings = { model: 'haiku', effortLevel: 'xhigh', alwaysThinkingEnabled: false };
+  const settings = { model: 'haiku', effortLevel: 'ultra', alwaysThinkingEnabled: false };
   assert.deepEqual(claudeModelSettings(settings), { model: 'haiku', alwaysThinkingEnabled: false });
-  assert.equal(settings.effortLevel, 'xhigh');
-  for (const effortLevel of ['low', 'medium', 'high']) assert.equal(claudeModelSettings({ effortLevel }).effortLevel, effortLevel);
+  assert.equal(settings.effortLevel, 'ultra');
+  for (const effortLevel of ['low', 'medium', 'high', 'xhigh']) assert.equal(claudeModelSettings({ effortLevel }).effortLevel, effortLevel);
   assert.deepEqual(claudeModelSettings({ effortLevel: 'max' }), {});
 });
 

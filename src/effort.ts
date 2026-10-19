@@ -46,7 +46,16 @@ export async function validateEffort(adapter: AgentAdapter, target: Conversation
   if (!isEffortLevel(effort)) throw new Error(`${target.agent} 不支持强度 ${effort}。`);
   const info = await adapter.getModelInfo?.(target.cwd);
   const capability = modelEffortCapability(info ?? { models: [], defaultModel: null }, target);
-  if (capability.status === 'unknown') throw new Error('CLI 未提供该模型的有效强度元数据，不能确认兼容性；请使用 effort=default 或选择有元数据的模型。');
+  if (capability.status === 'unknown') {
+    // Claude 允许传入 CLI 支持的值；模型兼容性及实际执行强度仍保持未知。
+    if (target.agent === 'claude') {
+      if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
+        throw new Error(`Claude CLI 不支持强度 ${effort}；可用值：low、medium、high、xhigh、max。`);
+      }
+      return capability;
+    }
+    throw new Error('CLI 未提供该模型的有效强度元数据，不能确认兼容性；请使用 effort=default 或选择有元数据的模型。');
+  }
   if (capability.status !== 'supported') throw new Error('该模型不支持可调 effort；请使用 effort=default。');
   if (!capability.levels.includes(effort)) throw new Error(`该模型不支持 ${effort}；支持值：${capability.levels.join('、')}。`);
   return capability;
@@ -60,10 +69,10 @@ export async function resolveDefaultModel(adapter: AgentAdapter, turn: AgentTurn
   return { ...turn, conversation: { ...turn.conversation, model: info.defaultModel } };
 }
 
-/** Claude 2.1.x persists low/medium/high; max is a session-only flag. */
+/** Claude 2.1.111+ 支持持久化 xhigh；max 仍通过会话参数传入。 */
 export function claudeModelSettings(settings: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(['model', 'effortLevel', 'alwaysThinkingEnabled'].filter(key => key in settings
-    && (key !== 'effortLevel' || ['low', 'medium', 'high'].includes(String(settings[key])))).map(key => [key, settings[key]]));
+    && (key !== 'effortLevel' || ['low', 'medium', 'high', 'xhigh'].includes(String(settings[key])))).map(key => [key, settings[key]]));
 }
 
 /** Values are protocol tokens. Which values a model supports is supplied by its own adapter. */

@@ -553,6 +553,39 @@ test('Claude maps parallel same-name MCP calls by exact arguments and closes MCP
   } finally { await adapter.close().catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('Claude MCP 工具失败返回原请求回执并允许下一次调用', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-mcp-error-'));
+  const transport = new FakeTransport(); let url = ''; let invoked = 0;
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, {
+    agent: 'claude', dataDir: dir, userHome: dir,
+    invokeTool: async () => { invoked++; if (invoked === 1) throw new Error('测试工具执行失败'); return { recovered: true }; },
+    createTransport: (_command, args) => { url = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url; return transport; },
+  });
+  transport.write = message => { transport.written.push(message); if (message.type === 'user') transport.emit({ type: 'system', subtype: 'init', session_id: 'mcp-error-native', tools: [] }); };
+  const turn: AgentTurn = { conversation: { id: 'mcp-error-c', userId: 'u', agent: 'claude', nativeId: null, title: '', cwd: dir, createdAt: '', updatedAt: '' },
+    text: '', imagePaths: [], event: { kind: 'wake', text: '测试' }, signal: new AbortController().signal, onProgress() {} };
+  const running = adapter.run(turn); void running.catch(() => {});
+  try {
+    await until(() => transport.written.some(message => message.type === 'user'));
+    const call = async (id: number) => {
+      const args = { title: '测试任务', prompt: '仅在测试中执行' };
+      transport.emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'native-' + id, name: 'mcp__bridge_controller__bridge_start_worker', input: args }] } });
+      const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(3000),
+        body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'bridge_start_worker', arguments: args } }) });
+      assert.equal(response.status, 200); return response.json() as Promise<JsonObject>;
+    };
+    const failed = await call(41);
+    assert.equal(failed.jsonrpc, '2.0'); assert.equal(failed.id, 41); assert.equal(failed.error, undefined);
+    const result = failed.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true); assert.match(result.content[0]!.text, /测试工具执行失败/);
+    const recovered = await call(42); assert.equal(recovered.id, 42);
+    assert.equal((recovered.result as JsonObject).isError, undefined); assert.equal(invoked, 2);
+    const malformed = await fetch(url, { method: 'POST', body: '{', signal: AbortSignal.timeout(3000) });
+    assert.equal(malformed.status, 400); const invalid = await malformed.json() as JsonObject;
+    assert.equal(invalid.jsonrpc, '2.0'); assert.equal(invalid.id, null); assert.equal((invalid.error as JsonObject).code, -32700);
+    transport.emit({ type: 'result', subtype: 'success', session_id: 'mcp-error-native', result: 'DONE' }); await running;
+  } finally { await adapter.close(); await running.catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
+});
 test('controller effort changes resume original native thread and read CLI settings without guessing', async () => {
   const s = setup(); try {
     const turn = s.makeTurn(); const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
@@ -590,17 +623,17 @@ test('Claude controller filters invalid external effort in settings and preserve
     title: '', cwd: dir, createdAt: '', updatedAt: '' }, text: '', imagePaths: [],
     event: { kind: 'wake', text: 'fixture' }, signal: new AbortController().signal, onProgress: () => {} };
   try {
-    for (const effortLevel of ['xhigh', 'high']) {
+    for (const effortLevel of ['ultra', 'xhigh', 'high']) {
       const bytes = Buffer.from(JSON.stringify({ model: 'sonnet', effortLevel, alwaysThinkingEnabled: true }) + '\r\n');
       writeFileSync(source, bytes); await adapter.run(turn);
       const args = launches.at(-1)!;
       const settings = JSON.parse(args[args.indexOf('--settings') + 1]!);
-      assert.equal(settings.effortLevel, effortLevel === 'high' ? 'high' : undefined);
+      assert.equal(settings.effortLevel, effortLevel === 'ultra' ? undefined : effortLevel);
       assert.equal(settings.model, 'sonnet'); assert.equal(settings.alwaysThinkingEnabled, true);
       assert.equal(args.includes('--effort'), false);
       assert.deepEqual(readFileSync(source), bytes);
     }
-    assert.equal(launches.length, 2);
+    assert.equal(launches.length, 3);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

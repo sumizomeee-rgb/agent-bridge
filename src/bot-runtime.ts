@@ -114,7 +114,7 @@ export class BotRuntime {
     const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke) ?? {
       codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir,
         internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
-      claude: new NativeControllerAdapter(config.commands.claude, env, { agent: 'claude', dataDir: config.dataDir,
+      claude: new NativeControllerAdapter(config.commands.claude, { ...env, CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' }, { agent: 'claude', dataDir: config.dataDir,
         internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.claude, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
     } : this.execution;
     this.controllerAdapters = adapters;

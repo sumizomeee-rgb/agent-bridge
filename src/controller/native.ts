@@ -1,6 +1,6 @@
 import { claudeModelSettings, createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, lstatSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, lstatSync, statSync, appendFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve, join, dirname, basename } from 'node:path';
@@ -610,19 +610,33 @@ export class NativeControllerAdapter implements AgentAdapter {
   private async openClaude(turn: AgentTurn, signature: string, home: string): Promise<ControllerSession> {
     let session: ControllerSession;
     const token = randomUUID();
+    const diagnosticPath = join(this.options.dataDir, 'mcp-diagnostic.jsonl');
+    const diagnostic = (value: JsonObject): void => {
+      try { appendFileSync(diagnosticPath, JSON.stringify({ at: new Date().toISOString(), ...value }) + '\n'); } catch { /* 诊断失败不影响工具执行。 */ }
+    };
     const server = createServer(async (req, res) => {
+      const started = Date.now(), requestKey = randomUUID();
+      let method: string | undefined, name: string | undefined, phase = 'received';
+      let requestId: string | number | null = null;
+      diagnostic({ requestKey, event: 'received', httpMethod: req.method, bytes: req.headers['content-length'] ?? null });
+      req.once('aborted', () => diagnostic({ requestKey, event: 'aborted', phase }));
+      res.once('close', () => diagnostic({ requestKey, event: 'closed', phase, method, name, status: res.statusCode, complete: res.writableFinished, ms: Date.now() - started }));
       if (req.url !== `/${token}` || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
       try {
         let bytes = 0; const chunks: Buffer[] = [];
         for await (const chunk of req) { bytes += chunk.length; if (bytes > 256 * 1024) throw new Error('MCP 请求超过限制。'); chunks.push(chunk as Buffer); }
         const request: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         if (!isObject(request)) throw new Error('MCP 请求格式无效。');
+        requestId = typeof request.id === 'string' || typeof request.id === 'number' ? request.id : null;
+        method = typeof request.method === 'string' ? request.method : undefined;
+        phase = 'parsed';
         if (request.id == null) { res.writeHead(202); res.end(); return; }
         let result: unknown;
         if (request.method === 'initialize') result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'bridge_controller', version: '1' } };
         else if (request.method === 'tools/list') result = { tools: controllerToolsForCommunication(this.options.internalBotCommunicationEnabled) };
         else if (request.method === 'tools/call') {
           const params = isObject(request.params) ? request.params : {};
+          name = typeof params.name === 'string' ? params.name : undefined; phase = 'tool-matching';
           if (!session?.active || typeof params.name !== 'string' || !isObject(params.arguments)) throw new Error('没有当前主控轮次或参数无效。');
           // The assistant/partial event carries the stable model tool-use ID. The MCP
           // request number alone restarts at zero on process restart and is insufficient.
@@ -632,11 +646,23 @@ export class NativeControllerAdapter implements AgentAdapter {
           for (let attempt = 0; index < 0 && attempt < 25; attempt++) { await new Promise(resolve => setTimeout(resolve, 20)); index = active.pendingClaudeTools.findIndex(matches); }
           const nativeTool = index < 0 ? null : active.pendingClaudeTools.splice(index, 1)[0];
           if (!nativeTool) throw new Error('Claude 工具调用缺少原生调用标识，未执行派发。');
+          phase = 'invoking';
           result = { content: [{ type: 'text', text: JSON.stringify(await this.invoke(active, params.name, params.arguments, nativeTool.id)) }] };
+          phase = 'invoked';
         } else result = {};
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));
-      } catch (error) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: safeError(error instanceof Error ? error.message : error, 'MCP 请求失败') })); }
+      } catch (error) {
+        diagnostic({ requestKey, event: 'error', phase, method, name, errorType: error instanceof Error ? error.name : 'unknown' });
+        const message = safeError(error instanceof Error ? error.message : error, 'MCP 请求失败');
+        // 工具失败是可供模型处理的结果，不能伪装成 HTTP 传输失败。
+        const toolError = method === 'tools/call' && requestId !== null;
+        res.writeHead(toolError ? 200 : 400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: requestId, ...(toolError
+          ? { result: { isError: true, content: [{ type: 'text', text: message }] } }
+          : { error: { code: error instanceof SyntaxError ? -32700 : -32600, message } }) }));
+      }
     });
+    server.on('clientError', (error, socket) => { diagnostic({ event: 'client-error', errorType: error.name, code: (error as NodeJS.ErrnoException).code ?? null }); socket.destroy(); });
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('无法启动主控 MCP。');
     let settingsEnv: JsonObject = {}, modelSettings: JsonObject = {}, sourceSettings: JsonObject = {};
