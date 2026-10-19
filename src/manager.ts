@@ -1399,7 +1399,11 @@ export class SessionManager {
           this.store.saveNativeId(target.id, nativeId);
         } : undefined,
         onPublicMessage: async (text, paths = [], key, targetId, finish = true) => {
-          if (introductionRequested && (!finish || targetId)) throw new Error('初始化介绍只允许通过原入口完成一次最终回复');
+          if (introductionRequested) {
+            if (!finish || targetId !== undefined && targetId !== 'private' && targetId !== event.channelId) throw new Error('初始化介绍只允许通过原入口完成一次最终回复');
+            // Explicit private and the verified original address mean the same destination.
+            targetId = undefined;
+          }
           if (!introductionRequested) return this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
           if (introductionSent) throw new Error('初始化介绍已发送。');
           this.store.prepareWorkspaceNotice(target.id, 'ready');

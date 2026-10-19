@@ -897,3 +897,35 @@ test('an unfinished private handoff still rejects a different group entrance and
   assert(!f.initializationStates.includes('ready')); assert.equal(readFileSync(manifestPath, 'utf8'), manifest);
   assert.equal(JSON.parse(readFileSync(join(f.config.dataDir, 'workspace-initialization', target.id + '.json'), 'utf8')).outcome, 'request-failed');
 });
+
+
+for (const destination of [undefined, 'private', 'dm']) {
+  test(`initialization accepts the original private final destination ${destination ?? 'default'} without changing the reply address`, async t => {
+    const f = fixture(t);
+    f.controller.contextHook = async turn => {
+      const publish = turn.onPublicMessage!;
+      turn.onPublicMessage = (text, paths, key) => publish(text, paths, key, destination, true);
+    };
+    await f.send('explicit-private-new', '/new'); await until(() => f.children.turns.length === 1);
+    const parent = f.inspect.getActive('user')!;
+    f.children.finish(0); await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
+    assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, 'ready');
+    assert.equal(initializationReceipts(f).length, 1); assert.equal(initializationReceipts(f)[0]!.channelId, 'dm');
+    assert.equal(f.children.turns.length, 1); assert.equal(f.controller.turns.length, 1);
+  });
+}
+for (const [destination, finish] of [['group:other', true], ['private', false], ['other-private-chat', true]] as const) {
+  test(`initialization rejects foreign/supplementary delivery ${destination} finish=${finish} before publishing`, async t => {
+    const f = fixture(t);
+    f.controller.contextHook = async turn => {
+      const publish = turn.onPublicMessage!;
+      turn.onPublicMessage = (text, paths, key) => publish(text, paths, key, destination, finish);
+    };
+    await f.send('invalid-initialization-new', '/new'); await until(() => f.children.turns.length === 1);
+    const parent = f.inspect.getActive('user')!;
+    f.children.finish(0); await until(() => f.inspect.workspaceNotice(parent.id)!.state === 'delivered' && f.manager.isIdle());
+    assert.equal(f.inspect.workspaceNotice(parent.id)!.outcome, 'load-failed');
+    assert.equal(f.replies.filter(reply => reply.text.includes('你好，我是这个工作区的主控')).length, 0);
+    assert.equal(f.replies.filter(reply => reply.channelId !== 'dm').length, 0);
+  });
+}
