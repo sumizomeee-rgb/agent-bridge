@@ -8,6 +8,7 @@ import { RemoteAgentAdapter, type RemoteAdapterOptions } from './adapter.js';
 import { listPresets } from '../presets/registry.js';
 import { PresetRuntime, PresetAgentAdapter } from '../presets/runtime.js';
 import { agentEnvironment } from '../config.js';
+import { WorkerSessionAdapter, WorkerSessionRuntime } from '../agents/worker-session.js';
 import type { PresetFilter } from '../presets/types.js';
 import { fingerprint } from './store.js';
 import { NativeSessionService, type NativeSessionAdoptArgs, type NativeSessionAdoption, type NativeSessionPage, type NativeSessionQuery, type NativeSessionRead, type NativeSessionReadOptions, type NativeSessionRef } from '../native-sessions.js';
@@ -54,12 +55,14 @@ export function parseTargetRegistry(raw: unknown): RemoteTargetRegistration[] {
 export class TargetCatalogService {
   private readonly cache = new Map<string, RemoteTargetRegistration[]>();
   private readonly remote = new Map<string, RemoteAgentAdapter>();
-  private readonly local = new Map<AgentName, AgentAdapter>();
+  private readonly local = new Map<string, AgentAdapter>();
+  private readonly workerSessions: WorkerSessionRuntime;
   private readonly presets = new Map<string, PresetAgentAdapter>();
   private readonly presetRuntime: PresetRuntime;
   private readonly overviewCache = new Map<string, ComputerOverview[]>();
   private readonly nativeSessions: NativeSessionService;
   constructor(private readonly config: BridgeConfig, private readonly localAdapters: Record<AgentName, AgentAdapter>, private readonly options: RemoteAdapterOptions & { nativeSessions?: NativeSessionService } = {}) {
+    this.workerSessions = new WorkerSessionRuntime(config.dataDir);
     this.presetRuntime = new PresetRuntime(join(config.contextWorkspace ?? config.workspace, 'agent-presets', 'private'), config.dataDir);
     this.nativeSessions = options.nativeSessions ?? new NativeSessionService(config.dataDir, {
       codex: { agentCommand: config.commands.codex, defaultCwd: config.workspace }, claude: { agentCommand: config.commands.claude, defaultCwd: config.workspace },
@@ -105,12 +108,15 @@ export class TargetCatalogService {
   adapterFor(binding: ExecutionTargetBinding): AgentAdapter {
     if (binding.preset && binding.transport === 'local') {
       const key = fingerprint(binding); let adapter = this.presets.get(key);
-      if (!adapter) { adapter = new PresetAgentAdapter(this.presetRuntime, binding.preset, binding.agentCommand, agentEnvironment(this.config)); this.presets.set(key, adapter); }
+      if (!adapter) { adapter = new PresetAgentAdapter(this.presetRuntime, binding.preset, binding.agentCommand, agentEnvironment(this.config), undefined, binding.sessionVisibility); this.presets.set(key, adapter); }
       return adapter;
     }
     if (binding.transport === 'local') {
-      let wrapper = this.local.get(binding.agent); if (wrapper) return wrapper;
-      const adapter = this.localAdapters[binding.agent], service = this.nativeSessions, agent = binding.agent;
+      const key = `${binding.agent}:${binding.sessionVisibility ?? 'legacy'}`;
+      let wrapper = this.local.get(key); if (wrapper) return wrapper;
+      const adapter = binding.sessionVisibility === undefined ? this.localAdapters[binding.agent]
+        : new WorkerSessionAdapter(this.workerSessions, binding.agent, binding.sessionVisibility, binding.agentCommand, agentEnvironment(this.config));
+      const service = this.nativeSessions, agent = binding.agent;
       wrapper = {
         run: async turn => {
           if (turn.conversation.nativeId) await service.assertRunOwnership({ agent, profile: 'default', nativeId: turn.conversation.nativeId }, turn.conversation.userId, turn.conversation.id);
@@ -121,9 +127,9 @@ export class TargetCatalogService {
         interrupt: id => adapter.interrupt(id), close: () => adapter.close(),
         ...(adapter.steer ? { steer: (id, message) => adapter.steer!(id, message) } : {}),
         ...(adapter.confirmStopped ? { confirmStopped: id => adapter.confirmStopped!(id) } : {}),
-        ...(adapter.getModelInfo ? { getModelInfo: cwd => adapter.getModelInfo!(cwd) } : {}),
+        ...(adapter.getModelInfo ? { getModelInfo: (cwd, context) => adapter.getModelInfo!(cwd, context) } : {}),
       };
-      this.local.set(agent, wrapper); return wrapper;
+      this.local.set(key, wrapper); return wrapper;
     }
     const key = fingerprint(binding); let adapter = this.remote.get(key);
     if (!adapter) { adapter = new RemoteAgentAdapter(binding, this.config, this.options); this.remote.set(key, adapter); } return adapter;
@@ -167,7 +173,8 @@ export class TargetCatalogService {
     this.overviewCache.set(workspace, results); return results;
   }
   async handoff(binding: ExecutionTargetBinding, nativeId: string, cwd: string, agent: AgentName): Promise<RemoteHandoff> {
-    if (binding.preset) throw new Error('预设助手需要保留私有运行目录和线路，当前不提供默认 CLI 的人工接管命令。');
+    if (binding.sessionVisibility === 'hidden') throw new Error('隐藏会话不能通过默认 CLI 交接。');
+    if (binding.preset && binding.sessionVisibility !== 'visible') throw new Error('预设助手需要保留私有运行目录和线路，当前不提供默认 CLI 的人工接管命令。');
     if (binding.agent !== agent || binding.cwd !== cwd || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(nativeId)) throw new Error('交接的会话或目标与登记不一致。');
     if (binding.transport === 'ssh') await (this.adapterFor(binding) as RemoteAgentAdapter).handoff(nativeId, cwd);
     else this.nativeSessions.leases.release({ agent, profile: 'default', nativeId });
@@ -178,5 +185,5 @@ export class TargetCatalogService {
     return { targetId: binding.id, nativeId, cwd, agent, resumeCommand, stopped: true };
   }
   /** Only local SSH clients close; target-native daemons and their tasks remain independent. */
-  async close(): Promise<void> { const adapters = [...this.remote.values()]; this.remote.clear(); await Promise.all([...adapters, ...this.presets.values()].map(adapter => adapter.close())); this.presets.clear(); this.nativeSessions.close(); }
+  async close(): Promise<void> { const adapters = [...this.remote.values()]; this.remote.clear(); await Promise.all([...adapters, ...this.presets.values(), ...[...this.local.entries()].filter(([key]) => !key.endsWith(':legacy')).map(([, adapter]) => adapter)].map(adapter => adapter.close())); this.presets.clear(); this.nativeSessions.close(); }
 }

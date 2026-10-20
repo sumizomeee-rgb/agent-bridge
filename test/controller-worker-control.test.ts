@@ -139,7 +139,7 @@ for (const platform of ['feishu', 'discord'] as const) {
     const f = setup(); f.config.platform = platform;
     try {
       const groupA = anotherRegion(f, 'group-A'), groupB = anotherRegion(f, 'group-B');
-      const handle = await f.runtime.invoke(groupA, 'bridge_start_worker', { title: 'group task', prompt: 'read only' }) as Handle;
+      const handle = await f.runtime.invoke(groupA, 'bridge_start_worker', { title: 'group task', prompt: 'read only', sessionVisibility: 'visible' }) as Handle;
       assert.ok(handle.jobId); await flush(); const original = structuredClone(f.runtime.store.getJob(handle.jobId)!.origin);
       f.codex.finish(handle.workerId); await flush();
       const next = await f.runtime.invoke(groupB, 'bridge_continue_worker', { workerId: handle.workerId, prompt: 'new round' }) as Handle;

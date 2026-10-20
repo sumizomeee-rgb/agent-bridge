@@ -1,8 +1,10 @@
 import type { PresetBinding } from '../presets/types.js';
-import type { AgentCommand, AgentInput, AgentName, AgentResult, AgentSupplement, AgentModelInfo, SteerResult, AgentExecutionProgress, EffortConfiguration, EffortMetadata } from '../types.js';
+import type { SessionVisibility, AgentCommand, AgentInput, AgentName, AgentResult, AgentSupplement, AgentModelInfo, SteerResult, AgentExecutionProgress, EffortConfiguration, EffortMetadata } from '../types.js';
 
 /** Non-secret snapshot. Native homes, provider credentials and history stay on the target. */
 export interface ExecutionTargetBinding {
+  /** Frozen at worker creation. Absent preserves existing native session locations. */
+  sessionVisibility?: SessionVisibility;
   preset?: PresetBinding;
   id: string;
   label: string;
@@ -33,6 +35,7 @@ export interface RemoteDaemonConfig {
   engines: Partial<Record<AgentName, TargetEngine>>;
 }
 export interface RemoteDispatch {
+  sessionVisibility?: SessionVisibility;
   preset?: PresetBinding;
   dispatchId: string; workerId: string; userId: string; agent: AgentName; agentCommand: AgentCommand;
   nativeId: string | null; cwd: string; text: string; imagePaths: string[]; input?: AgentInput[];

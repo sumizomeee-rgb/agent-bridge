@@ -1,4 +1,5 @@
 export type AgentName = 'codex' | 'claude';
+export type SessionVisibility = 'hidden' | 'visible';
 export type BridgePlatform = 'discord' | 'feishu';
 export interface Conversation {
   id: string;

@@ -26,7 +26,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
   private async validate(allowPreparingRecovery = false, retry = true): Promise<void> {
     if (retry && this.reconnecting) await this.reconnecting;
     const client = this.connection();
-    let hello: { hostname: string; version: number; engines: string[]; presetDispatch?: number };
+    let hello: { hostname: string; version: number; engines: string[]; presetDispatch?: number; sessionVisibility?: number };
     try { hello = await client.request('hello', {}); }
     catch (error) {
       const idle = this.jobs.size === 0 || (allowPreparingRecovery && this.jobs.size === 1 && [...this.jobs.values()].every(job => !job.submitted));
@@ -34,6 +34,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
       if (!retry || !idle || this.knownRejection(error)) throw error;
       await this.reconnect(client); return;
     }
+    if (this.binding.sessionVisibility !== undefined && hello.sessionVisibility !== 1) throw Object.assign(new Error('目标执行器未支持会话可见性协议，未忽略参数或回退。'), { code: 'REMOTE_REJECTED' });
     if (this.binding.preset && hello.presetDispatch !== 1) throw Object.assign(new Error('目标执行器不支持预设协议，未忽略预设或回退。'), { code: 'REMOTE_REJECTED' });
     if (hello.version !== 1 || typeof hello.hostname !== 'string' || hello.hostname.toLowerCase() !== this.binding.expectedHostname!.toLowerCase()
       || !Array.isArray(hello.engines) || !hello.engines.includes(this.binding.agent)) throw Object.assign(new Error('目标电脑名称、协议版本或引擎与登记不一致。'), { code: 'REMOTE_REJECTED' });
@@ -127,6 +128,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
         const imagePaths: string[] = []; for (const path of turn.imagePaths) imagePaths.push(await this.image(path));
         const request: RemoteDispatch = { dispatchId: turn.dispatchId, workerId: turn.conversation.id, userId: turn.conversation.userId,
           ...(this.binding.preset ? { preset: this.binding.preset } : {}),
+          ...(this.binding.sessionVisibility ? { sessionVisibility: this.binding.sessionVisibility } : {}),
           agent: this.binding.agent, agentCommand: this.binding.agentCommand, nativeId: turn.conversation.nativeId, cwd: this.binding.cwd,
           text: turn.text, imagePaths, model: turn.conversation.model ?? null, acceptSupplements: turn.acceptSupplements === true,
           ...(turn.effort ? { effort: turn.effort } : {}), ...(turn.input ? { input: await this.inputs(turn.input) } : {}) };
@@ -219,9 +221,9 @@ export class RemoteAgentAdapter implements AgentAdapter {
   }
   async preparePreset(workerId: string, nativeId: string | null): Promise<void> {
     if (!this.binding.preset) return;
-    await this.validate(); await this.connection().request('preset/pin', { preset: this.binding.preset, workerId, nativeId });
+    await this.validate(); await this.connection().request('preset/pin', { preset: this.binding.preset, workerId, nativeId, ...(this.binding.sessionVisibility ? { sessionVisibility: this.binding.sessionVisibility } : {}) });
   }
-  async getModelInfo(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo> { await this.validate(); return this.connection().request<AgentModelInfo>('models', { agent: this.binding.agent, cwd, ...(this.binding.preset ? { preset: this.binding.preset, context } : {}) }); }
+  async getModelInfo(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo> { await this.validate(); return this.connection().request<AgentModelInfo>('models', { agent: this.binding.agent, cwd, ...(this.binding.preset ? { preset: this.binding.preset } : {}), ...(this.binding.sessionVisibility ? { sessionVisibility: this.binding.sessionVisibility } : {}), ...(context ? { context } : {}) }); }
   async confirmStopped(conversationId: string): Promise<boolean> {
     const dispatchId = this.lastDispatch.get(conversationId); if (!dispatchId || this.closed) return false;
     try {

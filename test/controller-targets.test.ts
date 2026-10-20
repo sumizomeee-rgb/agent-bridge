@@ -337,7 +337,7 @@ test('only an idle real native session may hand off; durable user ownership reje
   const f = fixture();
   let next: ControllerRuntime | undefined;
   try {
-    const a = await launch(f); await flush();
+    const a = await launch(f, { sessionVisibility: 'visible' }); await flush();
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: a.workerId }), /空闲/);
     assert.equal(f.handoffs.length, 0);
     f.remote.finish(a.workerId); await flush();
@@ -358,7 +358,7 @@ test('only an idle real native session may hand off; durable user ownership reje
 test('a mismatched handoff proof stays uncertain and blocked rather than inventing a successful local takeover', async () => {
   const f = fixture(); f.setBadProof();
   try {
-    const a = await launch(f); await flush(); f.remote.finish(a.workerId); await flush();
+    const a = await launch(f, { sessionVisibility: 'visible' }); await flush(); f.remote.finish(a.workerId); await flush();
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: a.workerId }, 'handoff'), /证明/);
     const worker = f.runtime.store.getWorker(a.workerId)!;
     assert.equal(worker.ownership, 'bridge'); assert.equal(worker.handoffPending, true); assert.equal(worker.blocked, true);
@@ -416,7 +416,7 @@ test('presets are discovered only on request, fix the selected route/model, and 
     assert.equal(worker.model, 'gpt-6.1-sol'); assert.equal(worker.effort, null, '不继承主控强度');
     assert.equal(worker.target!.preset!.id, p.preset.id); assert.equal(p.queries(), 1);
     f.remote.finish(a.workerId); await flush();
-    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: a.workerId }), /人工接管/);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: a.workerId }), /隐藏/);
     assert.equal(f.runtime.store.getWorker(a.workerId)!.blocked, false); assert.equal(f.handoffs.length, 0);
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '继续', model: 'default' }), /预设/);
     p.preset.enabled = false;
@@ -457,5 +457,38 @@ test('a restored preset never falls back to the ordinary local adapter if its ca
     f.callbacks.targetCatalog = undefined;
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '续接' }), /预设执行目标服务未配置/);
     assert.equal(f.local.turns.length, 0); assert.equal(f.remote.turns.length, 1);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+
+test('new workers default hidden; visible selection survives continuation, invalid changes and scheduled restart', async () => {
+  const f = fixture(); let next: ControllerRuntime | undefined; let now = Date.now(); f.callbacks.now = () => now;
+  try {
+    await assert.rejects(launch(f, { sessionVisibility: true }), /sessionVisibility/);
+    assert.equal(f.runtime.store.workers().length, 0);
+    const hidden = await launch(f); await flush();
+    assert.equal(f.runtime.store.getWorker(hidden.workerId)!.target!.sessionVisibility, 'hidden');
+    f.remote.finish(hidden.workerId); await flush();
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: hidden.workerId }), /隐藏/);
+    assert.equal(f.runtime.store.getWorker(hidden.workerId)!.blocked, false);
+    const visible = await launch(f, { sessionVisibility: 'visible' }); await flush(); f.remote.finish(visible.workerId); await flush();
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: visible.workerId, prompt: 'switch', sessionVisibility: 'hidden' }), /未知字段/);
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: visible.workerId, prompt: 'continue' }); await flush();
+    assert.equal(f.adapters.at(-1)!.sessionVisibility, 'visible'); f.remote.finish(visible.workerId); await flush();
+    await f.runtime.invoke(f.turn, 'bridge_schedule_worker', { title: 'later', prompt: 'same setting', targetId: 'office', afterSeconds: 30, sessionVisibility: 'visible' });
+    const plan = f.runtime.store.schedules()[0]!; assert.equal(plan.worker!.target!.sessionVisibility, 'visible');
+    await f.runtime.close(); next = new ControllerRuntime(f.config, { codex: f.local, claude: f.local }, f.registry, f.callbacks);
+    now += 31_000; await next.start(); await next.poll(); await flush();
+    assert.equal(f.adapters.at(-1)!.sessionVisibility, 'visible'); f.remote.finish(plan.worker!.id); await flush();
+  } finally { await next?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+test('a visible preset supports an idle user handoff without changing its preset binding', async () => {
+  const f = fixture(), p = installPreset(f);
+  try {
+    const a = await launch(f, { presetId: p.preset.id, sessionVisibility: 'visible' }); await flush(); f.remote.finish(a.workerId); await flush();
+    const result = await f.runtime.invoke(f.turn, 'bridge_handoff_worker', { workerId: a.workerId }) as { ownership: string };
+    assert.equal(result.ownership, 'user'); assert.equal(f.runtime.store.getWorker(a.workerId)!.target!.preset!.id, p.preset.id);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: 'cannot race user' }), /已交接/);
   } finally { await f.runtime.close(); f.registry.close(); }
 });

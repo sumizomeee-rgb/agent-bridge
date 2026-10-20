@@ -9,6 +9,7 @@ import { resolveDefaultModel, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
+import { sessionVisibility } from '../agents/worker-session.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
@@ -579,7 +580,8 @@ export class ControllerRuntime {
         || this.store.supplements().some(value => value.workerId === worker.id && ['pending', 'steering'].includes(value.status))) {
         throw new Error('只能交接已确认空闲的子 Agent；活动、排队或未知任务需要先处理');
       }
-      if (worker.target?.preset) throw new Error('预设会话尚未提供保留私有目录的人工接管，桥内续聊仍可用。');
+      if (worker.target?.sessionVisibility === 'hidden') throw new Error('该助手创建时设为隐藏，不能通过用户默认 CLI 交接；需要原生历史可见时请明确新建 visible 助手。');
+      if (worker.target?.preset && worker.target.sessionVisibility !== 'visible') throw new Error('预设会话尚未提供保留私有目录的人工接管，桥内续聊仍可用。');
       if (!worker.nativeId) throw new Error('子 Agent 尚未建立真实原生会话，不能交接');
       if (!this.callbacks.targetCatalog) throw new Error('桥尚未配置会话交接服务');
       const binding = worker.target ?? await this.resolveTarget(worker.cwd, 'local', worker.agent, worker.cwd);
@@ -685,7 +687,7 @@ export class ControllerRuntime {
       }
       const job = this.makeJob(latest, origin, prompt, images, execution);
       const result = { workerId: worker.id, jobId: job.id, status: 'queued', delivery: 'next', nativeId: worker.nativeId,
-        agent: worker.agent, model: execution.model, effort: execution.effort, target: worker.target ?? null, ownership: worker.ownership ?? 'bridge' };
+        agent: worker.agent, model: execution.model, effort: execution.effort, target: worker.target ?? null, sessionVisibility: worker.target?.sessionVisibility ?? 'legacy', ownership: worker.ownership ?? 'bridge' };
       this.store.transaction(() => {
         latest.imagePaths = [...new Set([...latest.imagePaths, ...images])]; latest.updatedAt = this.timestamp();
         this.store.saveWorker(latest); this.store.addJob(job); if (key) this.store.saveCall(key, fingerprint, result);
@@ -728,7 +730,7 @@ export class ControllerRuntime {
     let target: ExecutionTargetBinding | undefined;
     let preparedWorker: ControllerWorker | undefined;
     if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
+      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
       const presetTarget = args.presetId === undefined ? undefined : await (async () => {
         if (!this.callbacks.targetCatalog?.resolvePreset) throw new Error('当前执行器未支持预设派发。');
         return this.callbacks.targetCatalog.resolvePreset(this.config.contextWorkspace ?? this.config.workspace, text(args.presetId, '预设 ID', 96), args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
@@ -739,6 +741,7 @@ export class ControllerRuntime {
       if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
       target = presetTarget ?? await this.resolveTarget(turn.conversation.cwd, args.targetId === undefined ? 'local' : text(args.targetId, '执行目标', 256), agent,
         args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
+      target = { ...target, sessionVisibility: sessionVisibility(args.sessionVisibility) ?? 'hidden' };
       if (target.agent !== agent || target.id !== (presetTarget?.id ?? args.targetId ?? 'local')) throw new Error('执行目标服务返回的电脑或引擎与请求不一致');
       if (target.transport === 'local' && (!isAbsolute(target.cwd) || /[\r\n]/.test(target.cwd) || !statSync(target.cwd).isDirectory())) throw new Error('工作目录必须是本机已有目录的绝对路径');
       const model = presetTarget?.preset?.model ?? (args.model === undefined || args.model === 'default' ? await this.defaultWorkerModel(turn, agent) : this.selectedWorkerModel(args.model, null));
@@ -757,7 +760,7 @@ export class ControllerRuntime {
     const result = this.store.transaction(() => {
       let result: unknown;
       if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
+        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
         const worker = preparedWorker!;
         const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), worker.imagePaths);
         if (name === 'bridge_schedule_worker') {
@@ -769,7 +772,7 @@ export class ControllerRuntime {
           job.scheduleId = value.id; this.store.addSchedule(value); result = this.scheduleView(value, true);
         } else {
           this.store.addWorker(worker); this.store.addJob(job); workerToStart = worker.id;
-          result = { workerId: worker.id, jobId: job.id, status: 'queued', agent: worker.agent, model: worker.model, effort: worker.effort, nativeId: worker.nativeId, target: worker.target, ownership: worker.ownership };
+          result = { workerId: worker.id, jobId: job.id, status: 'queued', agent: worker.agent, model: worker.model, effort: worker.effort, nativeId: worker.nativeId, target: worker.target, ownership: worker.ownership, sessionVisibility: worker.target?.sessionVisibility ?? 'legacy' };
         }
       } else if (name === 'bridge_schedule_controller') {
         const args = object(input, ['afterSeconds', 'dueAt', 'title', 'text']);
@@ -805,7 +808,7 @@ export class ControllerRuntime {
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
             source: { kind: worker.origin.groupContext ? 'group' : 'private', channelId: worker.origin.channelId,
               ...(worker.origin.groupContext ? { spaceId: worker.origin.groupContext.spaceId } : {}) },
-            target: worker.target ?? null, ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
+            target: worker.target ?? null, sessionVisibility: worker.target?.sessionVisibility ?? 'legacy', ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,

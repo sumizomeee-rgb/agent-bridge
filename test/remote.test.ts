@@ -373,3 +373,23 @@ test('old executors reject preset discovery and dispatch instead of silently run
   try { await assert.rejects(adapter.getModelInfo(f.root), /不支持预设协议/); assert.deepEqual(calls, ['hello']); }
   finally { await adapter.close(); await f.daemon.close(); }
 });
+
+
+test('remote visibility is transported and frozen; malformed input and old executors cannot silently ignore it', async () => {
+  const f = fixture();
+  try {
+    assert.equal((await f.daemon.handle('hello', {}) as { sessionVisibility: number }).sessionVisibility, 1);
+    await assert.rejects(f.daemon.handle('dispatch', { ...f.request(), sessionVisibility: false }), /sessionVisibility/);
+    const a = f.request({ sessionVisibility: 'hidden' }); await f.daemon.handle('dispatch', a); await tick(); f.natives[0]!.finish(); await tick(); await tick();
+    assert.equal(f.daemon.store.request(a.dispatchId)!.sessionVisibility, 'hidden');
+    await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId: f.daemon.store.job(a.dispatchId)!.nativeId, sessionVisibility: 'visible' })), /不能更换会话可见性/);
+    await assert.rejects(f.daemon.handle('handoff', { nativeId: f.daemon.store.job(a.dispatchId)!.nativeId, agent: a.agent, cwd: a.cwd }), /隐藏/);
+    const calls: string[] = [];
+    const old: RemoteClient = { request: async <T>(method: string) => { calls.push(method); return { version: 1, hostname: hostname(), engines: ['codex'], presetDispatch: 1 } as T; }, close: async () => {} };
+    const adapter = new RemoteAgentAdapter({ ...f.binding, sessionVisibility: 'hidden' }, f.config, { clientFactory: () => old });
+    try { await assert.rejects(adapter.run(f.turn()), /未支持会话可见性协议/); assert.deepEqual(calls, ['hello']); } finally { await adapter.close(); }
+    const turn = f.turn(); f.binding.sessionVisibility = 'visible'; const run = f.adapter.run(turn);
+    while (f.natives.length < 2) await tick();
+    assert.equal(f.daemon.store.request(turn.dispatchId!)!.sessionVisibility, 'visible'); f.natives[1]!.finish(); await run;
+  } finally { await f.daemon.close(); }
+});

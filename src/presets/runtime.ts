@@ -6,8 +6,9 @@ import { isObject, abortError } from '../agents/process.js';
 import { isModelId } from '../config.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
-import type { Conversation, AgentAdapter, AgentCommand, AgentName, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
+import type { Conversation, AgentAdapter, SessionVisibility, AgentCommand, AgentName, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { presetId, readPrivateJson } from './registry.js';
+import { exposeCodexHistory, pinSessionLocation } from '../agents/worker-session.js';
 import { startPresetConnect } from './connect.js';
 import type { LaunchProfile, PresetBinding } from './types.js';
 
@@ -62,7 +63,10 @@ export class PresetRuntime {
     return { profileId, revision, agent, model, fingerprint: profileFingerprint(profile) };
   }
   private home(workerId: string, binding: PresetBinding): string { return join(this.dataRoot, 'preset-homes', binding.agent, presetId(workerId)); }
-  async pin(binding: PresetBinding, workerId: string, nativeId: string | null): Promise<void> { await this.profile(binding, workerId, nativeId, true); }
+  async pin(binding: PresetBinding, workerId: string, nativeId: string | null, visibility?: SessionVisibility, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+    await this.profile(binding, workerId, nativeId, true);
+    pinSessionLocation(this.home(workerId, binding), binding.agent, visibility, nativeId, env, this.userHome);
+  }
   async validate(binding: PresetBinding, workerId?: string, nativeId?: string | null): Promise<void> { await this.profile(binding, workerId, nativeId, false); }
   private async profile(binding: PresetBinding, workerId?: string, nativeId?: string | null, pin = false): Promise<LaunchProfile> {
     assertPresetBinding(binding);
@@ -86,8 +90,9 @@ export class PresetRuntime {
     }
     return profile;
   }
-  async prepare(binding: PresetBinding, workerId: string, nativeId: string | null, original: AgentCommand, baseEnv: NodeJS.ProcessEnv): Promise<PreparedPreset> {
+  async prepare(binding: PresetBinding, workerId: string, nativeId: string | null, original: AgentCommand, baseEnv: NodeJS.ProcessEnv, visibility?: SessionVisibility): Promise<PreparedPreset> {
     const profile = await this.profile(binding, workerId, nativeId, true);
+    const location = pinSessionLocation(this.home(workerId, binding), binding.agent, visibility, nativeId, { ...process.env, ...baseEnv }, this.userHome);
     const raw = await readPrivateJson(join(this.privateRoot, 'credentials.json'));
     if (!isObject(raw) || raw.version !== 1 || !isObject(raw.credentials) || !isObject(raw.credentials[profile.credentialId])) throw new Error('目标机预设凭据引用不可用。');
     const credential = raw.credentials[profile.credentialId] as Record<string, unknown>;
@@ -108,6 +113,7 @@ export class PresetRuntime {
       }
       if (binding.agent === 'codex') {
         env.CODEX_HOME = home; env.CODEX_SQLITE_HOME = home; env.BRIDGE_PRESET_API_KEY = key;
+        if (location?.visibility === 'visible') { exposeCodexHistory(home, location); env.CODEX_SQLITE_HOME = location.sqliteHome; }
         const provider = 'bridge_preset';
         const values: Record<string, unknown> = { model_provider: provider, model: binding.model,
           [`model_providers.${provider}.name`]: 'Explicit bridge preset', [`model_providers.${provider}.base_url`]: profile.baseUrl,
@@ -115,7 +121,8 @@ export class PresetRuntime {
           [`model_providers.${provider}.wire_api`]: 'responses', check_for_update_on_startup: false };
         for (const [name, value] of Object.entries(values)) command.args.push('-c', `${name}=${JSON.stringify(value)}`);
       } else {
-        env.CLAUDE_CONFIG_DIR = home; env.ANTHROPIC_BASE_URL = profile.baseUrl;
+        env.CLAUDE_CONFIG_DIR = location?.visibility === 'visible' ? location.profileHome : home; env.ANTHROPIC_BASE_URL = profile.baseUrl;
+        if (location?.visibility === 'visible') { mkdirSync(location.profileHome, { recursive: true }); env.CLAUDE_CODE_ENTRYPOINT = 'local-agent'; }
         env[credential.authToken ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY'] = key;
         env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
         env.DISABLE_AUTOUPDATER = '1';
@@ -137,12 +144,13 @@ export class PresetAgentAdapter implements AgentAdapter {
   private closed = false;
   constructor(private readonly runtime: PresetRuntime, readonly binding: PresetBinding, private readonly command: AgentCommand,
     private readonly env: NodeJS.ProcessEnv, private readonly factory: (command: AgentCommand, env: NodeJS.ProcessEnv) => AgentAdapter =
-      (command, env) => binding.agent === 'codex' ? new CodexAdapter(command, env) : new ClaudeAdapter(command, env)) {}
-  async preparePreset(workerId: string, nativeId: string | null): Promise<void> { await this.runtime.pin(this.binding, workerId, nativeId); }
+      (command, env) => binding.agent === 'codex' ? new CodexAdapter(command, env) : new ClaudeAdapter(command, env),
+    private readonly visibility?: SessionVisibility) {}
+  async preparePreset(workerId: string, nativeId: string | null): Promise<void> { await this.runtime.pin(this.binding, workerId, nativeId, this.visibility, this.env); }
   async getModelInfo(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>) {
     if (this.closed) throw abortError();
     const key = createHash('sha256').update(JSON.stringify(this.binding)).digest('hex').slice(0, 24);
-    const prepared = await this.runtime.prepare(this.binding, context?.id ?? `metadata-${key}`, context?.nativeId ?? null, this.command, this.env);
+    const prepared = await this.runtime.prepare(this.binding, context?.id ?? `metadata-${key}-${this.visibility ?? 'legacy'}`, context?.nativeId ?? null, this.command, this.env, this.visibility);
     const adapter = this.factory(prepared.command, prepared.env);
     this.metadata.add(adapter);
     try { if (this.closed) throw abortError(); if (!adapter.getModelInfo) throw new Error('预设后端缺少模型目录接口。'); return await adapter.getModelInfo(cwd); }
@@ -155,7 +163,7 @@ export class PresetAgentAdapter implements AgentAdapter {
     const state: { stopped: boolean; adapter?: AgentAdapter } = { stopped: false }; this.active.set(id, state);
     let prepared: PreparedPreset | undefined;
     try {
-      prepared = await this.runtime.prepare(this.binding, id, turn.conversation.nativeId, this.command, this.env);
+      prepared = await this.runtime.prepare(this.binding, id, turn.conversation.nativeId, this.command, this.env, this.visibility);
       if (this.closed || state.stopped || turn.signal.aborted) throw abortError();
       state.adapter = this.factory(prepared.command, prepared.env);
       let ready = false;
