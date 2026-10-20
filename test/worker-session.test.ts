@@ -91,6 +91,7 @@ test('worker metadata and execution share the same persistent home; unconfirmed 
   const adapter = new WorkerSessionAdapter(f.runtime, 'codex', 'hidden', f.command, {}, factory);
   const turn: AgentTurn = { conversation: { id: 'worker-A', userId: 'owner', agent: 'codex', nativeId: null, title: '', cwd: f.root, createdAt: '', updatedAt: '' }, text: 'hello', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
   try {
+    assert.equal(await adapter.confirmStopped('worker-A'), false, 'a fresh adapter has no exit proof for an earlier process');
     await adapter.getModelInfo(f.root, turn.conversation);
     await assert.rejects(adapter.run(turn), /not stopped/);
     assert.equal(homes[0], homes[1]); assert.equal(await adapter.confirmStopped('worker-A'), false);

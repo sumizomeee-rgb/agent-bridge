@@ -99,6 +99,7 @@ export class WorkerSessionAdapter implements AgentAdapter {
   private readonly active = new Map<string, AgentAdapter>();
   private readonly metadata = new Set<AgentAdapter>();
   private readonly unconfirmed = new Set<string>();
+  private readonly stopped = new Set<string>();
   private closed = false;
   constructor(private readonly runtime: WorkerSessionRuntime, private readonly agent: AgentName, private readonly visibility: SessionVisibility,
     private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
@@ -116,22 +117,23 @@ export class WorkerSessionAdapter implements AgentAdapter {
     const id = turn.conversation.id;
     if (this.active.has(id)) throw new Error('该助手会话仍在执行。');
     const env = this.runtime.prepare(this.agent, id, turn.conversation.nativeId, this.visibility, this.env);
-    const adapter = this.factory(this.command, env); this.active.set(id, adapter);
+    const adapter = this.factory(this.command, env); this.active.set(id, adapter); this.stopped.delete(id);
     try { return await adapter.run(turn); }
     catch (error) {
       if (error && typeof error === 'object' && 'processStillRunning' in error) this.unconfirmed.add(id);
       throw error;
     } finally {
       try { await adapter.close(); }
-      catch (error) { this.unconfirmed.add(id); throw error; }
+      catch (error) { this.unconfirmed.add(id); throw Object.assign(new Error('助手 CLI 退出未确认。'), { processStillRunning: true, cause: error }); }
       finally { this.active.delete(id); }
+      if (!this.unconfirmed.has(id)) this.stopped.add(id);
     }
   }
   async steer(id: string, message: AgentSupplement): Promise<SteerResult> {
     return await this.active.get(id)?.steer?.(id, message) ?? { status: 'queued', unsupported: true, reason: '助手尚未就绪。' };
   }
   async interrupt(id: string): Promise<void> { await this.active.get(id)?.interrupt(id); }
-  async confirmStopped(id: string): Promise<boolean> { return !this.active.has(id) && !this.unconfirmed.has(id); }
+  async confirmStopped(id: string): Promise<boolean> { return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id); }
   async close(): Promise<void> {
     this.closed = true; await Promise.all([...this.active.keys()].map(id => this.interrupt(id)));
     await Promise.all([...this.metadata].map(adapter => adapter.close()));
