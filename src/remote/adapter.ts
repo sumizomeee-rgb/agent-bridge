@@ -224,8 +224,8 @@ export class RemoteAgentAdapter implements AgentAdapter {
     await this.validate(); await this.connection().request('preset/pin', { preset: this.binding.preset, workerId, nativeId, ...(this.binding.sessionVisibility ? { sessionVisibility: this.binding.sessionVisibility } : {}) });
   }
   async getModelInfo(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo> { await this.validate(); return this.connection().request<AgentModelInfo>('models', { agent: this.binding.agent, cwd, ...(this.binding.preset ? { preset: this.binding.preset } : {}), ...(this.binding.sessionVisibility ? { sessionVisibility: this.binding.sessionVisibility } : {}), ...(context ? { context } : {}) }); }
-  async confirmStopped(conversationId: string): Promise<boolean> {
-    const dispatchId = this.lastDispatch.get(conversationId); if (!dispatchId || this.closed) return false;
+  async confirmStopped(conversationId: string, dispatchId = this.lastDispatch.get(conversationId)): Promise<boolean> {
+    if (!dispatchId || this.closed) return false;
     try {
       // A single read, no dispatch, cancellation or long reconnect loop.
       const job = await this.connection().request<RemoteJob>('query', { dispatchId });

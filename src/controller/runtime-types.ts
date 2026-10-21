@@ -15,6 +15,8 @@ export interface ControllerWorker {
   target?: ExecutionTargetBinding; ownership?: 'bridge' | 'user'; handoffPending?: boolean;
   wakeAllowed: boolean; blocked?: boolean; createdAt: string; updatedAt: string;
   supersededBy?: string;
+  /** Explicit cancellation with confirmed exit; archival never resolves business effects or unlocks continuation. */
+  archivedAt?: string; archiveReason?: string;
   adoption?: { id: string; ref: NativeSessionRef; expectedRevision: string; status: 'pending' | 'adopted'; previousWorkers: string[]; callKey?: string };
 }
 export interface ControllerJob {

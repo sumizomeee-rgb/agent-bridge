@@ -128,6 +128,20 @@ export class ControllerStore {
   saveWorker(value: ControllerWorker): void {
     this.db.prepare('UPDATE controller_workers SET value_json=? WHERE id=?').run(JSON.stringify(value), value.id);
   }
+  /** Only an explicit cancellation may call this; no report, reconciliation lock or job status is discarded. */
+  archiveStoppedWorker(id: string, reason: string): ControllerWorker | null {
+    if (!reason.trim()) throw new Error('归档原因不能为空');
+    return this.transaction(() => {
+      const value = this.getWorker(id), jobs = this.jobs(id);
+      const uncertain = jobs.filter(job => job.status === 'uncertain');
+      if (!value?.blocked || value.ownership === 'user' || value.supersededBy || value.handoffPending || value.adoption?.status === 'pending'
+        || jobs.some(job => job.status === 'queued' || job.status === 'running') || !uncertain.length
+        || uncertain.some(job => job.processStopped !== true)) return null;
+      if (value.archivedAt) return value;
+      value.archivedAt = new Date().toISOString(); value.archiveReason = reason.trim(); value.updatedAt = value.archivedAt;
+      this.saveWorker(value); return value;
+    });
+  }
   getWorker(id: string): ControllerWorker | null {
     const row = this.db.prepare('SELECT * FROM controller_workers WHERE id=?').get(id); return row ? worker(row) : null;
   }

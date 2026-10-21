@@ -16,14 +16,14 @@ export interface WorkerOverview {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
   running: boolean; queued: number; startedAt: string | null; endedAt?: string | null;
   blocked?: boolean; ownership?: 'bridge' | 'user'; statusReason?: string;
-  resultKnown?: boolean; processStopped?: boolean;
+  resultKnown?: boolean; processStopped?: boolean; archivedAt?: string; archiveReason?: string;
   lastResultPreview?: string | null; unresolvedSupplements?: number;
 }
 
 export type WorkerView = 'active' | 'history';
-/** 未确认结束或交接的助手仍留在当前列表，避免把待处理状态藏进历史。 */
+/** 明确归档且已确认停止的异常会话转入历史；运行或未确认状态仍可见。 */
 export const isActiveWorker = (item: WorkerOverview): boolean => item.running || item.queued > 0
-  || ['queued', 'running', 'uncertain', 'handoff-pending'].includes(item.status);
+  || (!(item.archivedAt && item.processStopped === true) && ['queued', 'running', 'uncertain', 'handoff-pending'].includes(item.status));
 
 const clean = (value: string, limit = 120): string => {
   const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();
@@ -128,11 +128,12 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
     blocks: sorted.length ? sorted.map((item, index) => {
       const model = item.model ? clean(item.model, 60).replace(/^gpt-/i, '') : '模型未知';
       const effort = workerEffort(item);
-      const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
+      const status = item.archivedAt && item.processStopped === true && !item.running && !item.queued ? '📁 已归档' : ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
       const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? '尚未开始' : '耗时未回报';
       const lines = [`${index + 1}. ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
         `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
       if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
+      if (item.archivedAt) lines.push(`归档：${clean(item.archiveReason ?? '已确认停止，保留异常历史', 80)}`);
       if (item.blocked || workerReviewEvidence(item) || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`需核对：${workerReviewEvidence(item) ?? clean(item.statusReason ?? '任务已阻塞', 80)}`);
       return { kind: 'entry', text: lines.join('\n') };
     }) : [{ kind: 'text', text: view === 'history' ? `${label}没有历史助手。` : `${label}没有正在执行、排队或待核对的助手。` }], footer: view === 'history' ? '/workers 查看未结束助手 · /workers history details 查看历史详情。' : '/workers history 查看历史 · /workers details 查看完整 ID 与回执。' };
@@ -178,6 +179,7 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
     if (configuration) lines.push(`启动配置：${clean(configuration.value, 30)} · 来源：${configuration.source}${configuration.applied === false ? ` · 未采用${configuration.reason ? `：${clean(configuration.reason, 100)}` : ''}` : ''}`);
     if (metadata) lines.push(`强度能力：${metadata.capability.status === 'unsupported' ? '不支持可调强度' : metadata.capability.status === 'supported' ? metadata.capability.levels.map(value => clean(value, 32)).join('、') : '未提供证据'} · 来源：${clean(metadata.capability.source, 80)}`);
     if (scope === 'all') lines.push(`主控对话：${clean(item.conversationTitle ?? item.conversationId, 80)}`);
+    if (item.archivedAt) lines.push(`归档：${clean(item.archiveReason ?? '已确认停止，保留异常历史', 80)}`);
     if (item.blocked) lines.push('阻塞：' + (workerReviewEvidence(item) ?? '已阻塞，需先核对结果与进程'));
     if (item.ownership) lines.push(`拥有权：${item.ownership === 'user' ? '用户' : '桥'}`);
     if (item.statusReason || workerReviewEvidence(item)) lines.push(`状态说明：${workerReviewEvidence(item) ?? clean(item.statusReason!, 140)}`);

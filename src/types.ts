@@ -171,7 +171,7 @@ export interface AgentAdapter {
   steer?(conversationId: string, supplement: AgentSupplement): Promise<SteerResult>;
   interrupt(conversationId: string): Promise<void>;
   /** Read-only reconciliation; true only after target-native exit was confirmed. */
-  confirmStopped?(conversationId: string): Promise<boolean>;
+  confirmStopped?(conversationId: string, dispatchId?: string): Promise<boolean>;
   close(): Promise<void>;
   /** Metadata only: never sends a user prompt or starts a generated turn. */
   getModelInfo?(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo>;

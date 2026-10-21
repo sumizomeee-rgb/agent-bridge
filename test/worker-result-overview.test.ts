@@ -33,3 +33,16 @@ test('旧助手无新证据时保留原核对原因，正常结果不引入核�
   assert.match(text, /✅ 已完成/);
   assert(!text.includes('结果待核对'));
 });
+
+test('已确认停止且明确归档的异常助手进入历史，保留报告和核对锁', () => {
+  const archived = { ...blocked, processStopped: true, archivedAt: '2026-10-21T15:00:00Z', archiveReason: '已取消，保留历史' };
+  assert.equal(isActiveWorker(archived), false);
+  const history = presentationText(workerOverview([archived], 'current', Date.now(), false, 'history'));
+  assert.match(history, /已归档/);
+  assert.match(history, /退出已确认，结果待核对/);
+  assert(!history.includes('✅ 已完成'));
+  assert.equal(archived.blocked, true);
+  assert.equal(isActiveWorker({ ...archived, processStopped: false }), true);
+  assert.equal(isActiveWorker({ ...archived, running: true }), true);
+  assert.equal(isActiveWorker({ ...archived, queued: 1 }), true);
+});

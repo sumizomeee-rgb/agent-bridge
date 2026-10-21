@@ -278,6 +278,7 @@ export class ControllerRuntime {
         effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId,
         resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped,
         blocked: worker.blocked === true, ownership: worker.ownership ?? 'bridge',
+        ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
         ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
           : latest?.cancelReason ? { statusReason: latest.cancelReason } : {}),
@@ -632,8 +633,10 @@ export class ControllerRuntime {
       const initial = { workerId: worker.id, status: 'cancelling', stopped: false, scope, target: worker.target ?? null, nativeId: worker.nativeId };
       this.store.transaction(() => { this.requestCancellation(worker.id, reason); if (key) this.store.saveCall(key, fingerprint, initial); });
       const stopped = await this.stopWorker(worker.id, reason);
+      const archived = stopped ? this.store.archiveStoppedWorker(worker.id, reason) : null;
       await this.workCountsChanged();
       const result = { workerId: worker.id, status: stopped ? 'cancelled' : 'uncertain', stopped, scope, target: worker.target ?? null, nativeId: worker.nativeId,
+        ...(archived ? { archivedAt: archived.archivedAt, archiveReason: archived.archiveReason } : {}),
         remoteEffects: '远端自行启动的后台进程或已发生的改动需要另行核对' };
       if (key) this.store.updateCall(key, result);
       return result;
@@ -819,6 +822,7 @@ export class ControllerRuntime {
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped,
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
+            ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
             startedAt: currentJob?.startedAt ?? null,
             progress: details ? { ...progressSummary, lastActivity: progress?.lastActivity ?? null, lastTool: progress?.lastTool ?? null, activeTools: progress?.activeTools ?? [] } : progressSummary,
@@ -1086,7 +1090,18 @@ export class ControllerRuntime {
           return true;
         } catch (error) { this.error(error); return false; }
       }
-      return this.store.jobs(workerId).findLast(job => job.status === 'uncertain')?.processStopped === true || worker.blocked !== true;
+      if (!worker.blocked) return true;
+      const uncertain = this.store.jobs(workerId).filter(job => job.status === 'uncertain');
+      if (!uncertain.length) return false;
+      for (const job of uncertain.filter(job => job.processStopped !== true)) {
+        // A restarted remote adapter has no in-memory dispatch map. Read the durable job ID only; never submit or interrupt it.
+        if (worker.target?.transport !== 'ssh') return false;
+        try {
+          if (await this.adapter(worker).confirmStopped?.(workerId, job.id) !== true) return false;
+          this.store.setJob(job.id, job.status, { processStopped: true });
+        } catch (error) { this.error(error); return false; }
+      }
+      return true;
     }
     active.cancelReason = reason; active.abort.abort(reason);
     // interrupt may finish before run's finally; wait for both before claiming the process is stopped.
