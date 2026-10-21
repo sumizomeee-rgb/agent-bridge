@@ -326,7 +326,14 @@ for (const failure of ['generation', 'delivery'] as const) {
     await waitFor(() => f.codex.calls.length === 2);
     if (failure === 'generation') f.codex.fail(1);
     else { f.sink.failSummary = true; f.codex.finish(1, 'parent summary'); }
-    await waitFor(() => f.sink.replies.some(item => item.text.includes('未自动重做或重新派发')));
+    await waitFor(() => f.sink.replies.some(item => item.options?.presentation?.title === (failure === 'delivery' ? '【桥】汇报发送待核对' : '【桥】汇总失败')));
+    const failureNotice = f.sink.replies.find(item => item.options?.presentation?.tone === 'error')!;
+    assert(failureNotice.text.length < 100, '程序提示保持简短');
+    assert.equal(failureNotice.options?.presentation?.title, failure === 'delivery' ? '【桥】汇报发送待核对' : '【桥】汇总失败');
+    if (failure === 'delivery') {
+      assert.equal(f.inspect.turnResult(event.id)?.result.text, 'parent summary');
+      assert(f.sink.replies.find(item => item.text.includes('parent summary'))?.options?.deliveryKey);
+    }
     assert.equal(f.registry.eventState(event.id), 'uncertain');
     const notices = f.sink.replies.length;
     await f.manager.close(); f.restart(); await f.manager.recover();
@@ -364,9 +371,9 @@ test('processing 状态重启仅提示结果未知一次，不重复生成模型
   await f.manager.close(); f.restart(); await f.manager.recover();
   assert.equal(f.registry.eventState(event.id), 'uncertain');
   assert.equal(f.codex.calls.length, 1);
-  assert.equal(f.sink.replies.filter(item => item.text.includes('上次汇总或发送结果未知')).length, 1);
+  assert.equal(f.sink.replies.filter(item => item.options?.presentation?.title === '【桥】汇总中断').length, 1);
   await f.manager.close(); f.restart(); await f.manager.recover();
-  assert.equal(f.sink.replies.filter(item => item.text.includes('上次汇总或发送结果未知')).length, 1);
+  assert.equal(f.sink.replies.filter(item => item.options?.presentation?.title === '【桥】汇总中断').length, 1);
 });
 
 test('原生父 Session 改变则仅提示，不自动新建或污染新绑定', async t => {
@@ -382,7 +389,7 @@ test('原生父 Session 改变则仅提示，不自动新建或污染新绑定',
   await waitFor(() => f.registry.eventState(event.id) === 'uncertain');
   assert.equal(f.codex.calls.length, 1);
   assert.equal(f.inspect.getConversation(event.conversationId)?.nativeId, 'different-native-id');
-  assert(f.sink.replies.some(item => item.text.includes('父会话身份无法确认')));
+  assert(f.sink.replies.some(item => item.options?.presentation?.title === '【桥】汇总未执行'));
 });
 
 test('伪造用户/channel 的任务来源不能投递到其他用户私聊', async t => {
@@ -455,7 +462,7 @@ test('恢复通知网络等待期间不能提前启动完成汇总并被标成�
   let release!: () => void;
   const delayed = new Promise<void>(resolve => { release = resolve; });
   f.sink.sendText = async (channelId, text, options) => {
-    if (text.startsWith('会话 ') && text.includes('未自动重做')) { waiting = true; await delayed; }
+    if (options?.presentation?.title === '【桥】本轮中断') { waiting = true; await delayed; }
     await send(channelId, text, options);
   };
   const recovering = f.manager.recover();

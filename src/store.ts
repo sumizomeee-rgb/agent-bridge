@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import type { AgentName, BridgeMessage, Conversation } from './types.js';
+import type { AgentName, AgentResult, BridgeMessage, Conversation } from './types.js';
 import { validMessageId } from './routing.js';
 import { parseCommand } from './commands.js';
 
@@ -86,6 +86,10 @@ export class SessionStore {
         channel_id TEXT NOT NULL, content_hash TEXT NOT NULL, state TEXT NOT NULL,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS turn_results (
+        source_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, native_id TEXT NOT NULL,
+        result_json TEXT NOT NULL, exit_error TEXT, saved_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS workspace_initialization_notices (
         conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), user_id TEXT NOT NULL,
         channel_id TEXT NOT NULL, source_message_id TEXT NOT NULL, outcome TEXT,
@@ -135,6 +139,7 @@ export class SessionStore {
     if (!inboxColumns.has('reply_state')) this.db.exec('ALTER TABLE inbox ADD COLUMN reply_state TEXT');
     const publicColumns = new Set(this.db.prepare('PRAGMA table_info(controller_public_messages)').all().map(row => String(row.name)));
     if (!publicColumns.has('text')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN text TEXT');
+    if (!publicColumns.has('error')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN error TEXT');
   }
 
   hasMessage(id: string): boolean {
@@ -306,9 +311,21 @@ export class SessionStore {
       VALUES (?,?,?,?,?,?,'pending',?,?)`).run(id, conversationId, nativeId, channelId, contentHash, text ?? null, now, now);
     return 'send';
   }
-  finishPublicMessage(id: string, state: 'delivered' | 'uncertain'): void {
-    this.db.prepare('UPDATE controller_public_messages SET state=?,updated_at=? WHERE id=?')
-      .run(state, new Date().toISOString(), id);
+  finishPublicMessage(id: string, state: 'delivered' | 'uncertain', error: string | null = null): void {
+    this.db.prepare('UPDATE controller_public_messages SET state=?,error=?,updated_at=? WHERE id=?')
+      .run(state, error, new Date().toISOString(), id);
+  }
+
+  /** Native completion and process cleanup are independent facts; neither triggers a replay. */
+  saveTurnResult(sourceId: string, conversationId: string, result: AgentResult, exitError: string | null = null): void {
+    this.db.prepare(`INSERT INTO turn_results(source_id,conversation_id,native_id,result_json,exit_error,saved_at)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET result_json=excluded.result_json,
+      exit_error=excluded.exit_error,saved_at=excluded.saved_at WHERE turn_results.conversation_id=excluded.conversation_id
+      AND turn_results.native_id=excluded.native_id`).run(sourceId, conversationId, result.nativeId, JSON.stringify(result), exitError, new Date().toISOString());
+  }
+  turnResult(sourceId: string): { result: AgentResult; exitError: string | null } | null {
+    const row = this.db.prepare('SELECT result_json,exit_error FROM turn_results WHERE source_id=?').get(sourceId);
+    return row ? { result: JSON.parse(String(row.result_json)) as AgentResult, exitError: row.exit_error == null ? null : String(row.exit_error) } : null;
   }
 
   /** Genuine inputs and confirmed public replies, confined to this user's exact conversation and chat. */

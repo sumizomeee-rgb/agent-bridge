@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { WorkerSessionAdapter, WorkerSessionRuntime } from '../src/agents/worker-session.js';
-import { PresetRuntime } from '../src/presets/runtime.js';
+import { PresetRuntime, PresetAgentAdapter } from '../src/presets/runtime.js';
+import { AgentProcessStopError, completedResultFromError } from '../src/agents/process.js';
 import type { AgentAdapter, AgentCommand, AgentTurn } from '../src/types.js';
 
 function fixture(t: test.TestContext) {
@@ -122,4 +123,36 @@ test('worker metadata and execution share the same persistent home; unconfirmed 
     await assert.rejects(adapter.run(turn), /not stopped/);
     assert.equal(homes[0], homes[1]); assert.equal(await adapter.confirmStopped('worker-A'), false);
   } finally { await adapter.close(); }
+});
+
+
+for (const preset of [false, true]) for (const completedThroughError of [false, true]) {
+  test(`${preset ? 'preset' : 'ordinary'} worker preserves a report across nested close failures (${completedThroughError})`, async t => {
+    const f = fixture(t), report = { nativeId: 'completed-native', text: '已交报告；测试尚未完成' };
+    let refuse = true, runs = 0;
+    const factory = (): AgentAdapter => ({
+      run: async () => { runs++; if (completedThroughError) throw new AgentProcessStopError(123, report); return report; },
+      interrupt: async () => {}, close: async () => { if (refuse) throw new Error('nested close failed'); },
+    });
+    const runtime = new PresetRuntime(f.privateRoot, f.data, f.user);
+    const binding = { id: 'test', targetId: 'local', ...await runtime.describe('test-codex', 1, 'codex', 'gpt-6-luna') };
+    const adapter = preset ? new PresetAgentAdapter(runtime, binding, f.command, {}, factory, 'hidden')
+      : new WorkerSessionAdapter(f.runtime, 'codex', 'hidden', f.command, {}, factory);
+    const turn: AgentTurn = { conversation: { id: 'nested-worker', userId: 'owner', agent: 'codex', model: 'gpt-6-luna', nativeId: null,
+      title: '', cwd: f.root, createdAt: '', updatedAt: '' }, text: 'hello', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
+    try {
+      await assert.rejects(adapter.run(turn), error => { assert.deepEqual(completedResultFromError(error), report); return true; });
+      assert.equal(await adapter.confirmStopped('nested-worker'), false);
+      await assert.rejects(adapter.run(turn), /仍在执行/); assert.equal(runs, 1);
+      refuse = false; await adapter.interrupt('nested-worker');
+      assert.equal(await adapter.confirmStopped('nested-worker'), true);
+    } finally { refuse = false; await adapter.close(); }
+  });
+}
+
+test('completed report reader validates serialized native results without trusting a forged error shape', () => {
+  assert.deepEqual(completedResultFromError({ nativeResult: { nativeId: 'serialized-native', text: 'retained' } }),
+    { nativeId: 'serialized-native', text: 'retained' });
+  for (const value of [null, 'failure', { nativeResult: null }, { nativeResult: { nativeId: '', text: 'x' } },
+    { nativeResult: { nativeId: 'native', text: 1 } }]) assert.equal(completedResultFromError(value), undefined);
 });

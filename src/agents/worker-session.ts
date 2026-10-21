@@ -2,10 +2,10 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSy
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
-import type { AgentAdapter, AgentCommand, AgentName, AgentSupplement, AgentTurn, Conversation, SessionVisibility, SteerResult } from '../types.js';
+import type { AgentAdapter, AgentCommand, AgentName, AgentResult, AgentSupplement, AgentTurn, Conversation, SessionVisibility, SteerResult } from '../types.js';
 import { CodexAdapter } from './codex.js';
 import { ClaudeAdapter } from './claude.js';
-import { abortError, isObject } from './process.js';
+import { abortError, completedResultFromError, isObject, processStopFailure } from './process.js';
 
 export function sessionVisibility(value: unknown): SessionVisibility | undefined {
   if (value === undefined) return undefined;
@@ -145,21 +145,28 @@ export class WorkerSessionAdapter implements AgentAdapter {
     if (this.active.has(id)) throw new Error('该助手会话仍在执行。');
     const env = this.runtime.prepare(this.agent, id, turn.conversation.nativeId, this.visibility, this.env);
     const adapter = this.factory(this.command, env); this.active.set(id, adapter); this.stopped.delete(id);
-    try { return await adapter.run(turn); }
+    let nativeResult: AgentResult | undefined;
+    try { nativeResult = await adapter.run(turn); return nativeResult; }
     catch (error) {
+      nativeResult = completedResultFromError(error);
       if (error && typeof error === 'object' && 'processStillRunning' in error) this.unconfirmed.add(id);
       throw error;
     } finally {
       try { await adapter.close(); }
-      catch (error) { this.unconfirmed.add(id); throw Object.assign(new Error('助手 CLI 退出未确认。'), { processStillRunning: true, cause: error }); }
-      finally { this.active.delete(id); }
+      catch (error) { this.unconfirmed.add(id); throw processStopFailure(error, nativeResult); }
+      finally { if (!this.unconfirmed.has(id)) this.active.delete(id); }
       if (!this.unconfirmed.has(id)) this.stopped.add(id);
     }
   }
   async steer(id: string, message: AgentSupplement): Promise<SteerResult> {
     return await this.active.get(id)?.steer?.(id, message) ?? { status: 'queued', unsupported: true, reason: '助手尚未就绪。' };
   }
-  async interrupt(id: string): Promise<void> { await this.active.get(id)?.interrupt(id); }
+  async interrupt(id: string): Promise<void> {
+    const adapter = this.active.get(id); await adapter?.interrupt(id);
+    if (adapter && this.unconfirmed.has(id)) {
+      await adapter.close(); this.active.delete(id); this.unconfirmed.delete(id); this.stopped.add(id);
+    }
+  }
   async confirmStopped(id: string): Promise<boolean> { return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id); }
   async close(): Promise<void> {
     this.closed = true; await Promise.all([...this.active.keys()].map(id => this.interrupt(id)));

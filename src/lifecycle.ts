@@ -2,10 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import type { BridgeConfig } from './types.js';
+import { BRIDGE_NOTICE_PREFIX } from './notices.js';
 
 export type BridgeLifecyclePhase = 'draining' | 'recovering' | 'ready' | 'failed';
 /** 平台共用生命周期文案；适配器只决定状态栏或卡片展示。 */
-export const BRIDGE_LIFECYCLE_COPY = { ready: '已就绪', restart: '已重启', draining: '准备重启', recovering: '恢复中', failed: '重启失败', continuation: '可以继续。' } as const;
+export const BRIDGE_LIFECYCLE_COPY = { ready: BRIDGE_NOTICE_PREFIX + '已就绪', restart: BRIDGE_NOTICE_PREFIX + '已重启',
+  draining: BRIDGE_NOTICE_PREFIX + '准备重启', recovering: BRIDGE_NOTICE_PREFIX + '恢复中', failed: BRIDGE_NOTICE_PREFIX + '重启失败', continuation: '可以继续。' } as const;
 export interface BridgeLifecycleEvent {
   phase: BridgeLifecyclePhase;
   reason?: 'start' | 'restart';

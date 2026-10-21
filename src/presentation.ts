@@ -7,7 +7,8 @@ export interface BridgePresentation {
   footer?: string;
 }
 export const presentationText = (view: BridgePresentation): string =>
-  [view.title, ...view.blocks.map(block => block.text), ...(view.footer ? [view.footer] : [])].join('\n\n');
+  [view.tone === 'error' && !view.title.startsWith('❌') ? '❌ ' + view.title : view.title,
+    ...view.blocks.map(block => block.text), ...(view.footer ? [view.footer] : [])].join('\n\n');
 export function mapPresentation(view: BridgePresentation, transform: (text: string) => string): BridgePresentation {
   return { ...view, title: transform(view.title), blocks: view.blocks.map(block => ({ ...block, text: transform(block.text) })),
     ...(view.footer ? { footer: transform(view.footer) } : {}) };
@@ -65,7 +66,7 @@ export function markdownParts(text: string, maxBytes = 8000): string[] {
   return parts;
 }
 export function feishuPresentationCards(view: BridgePresentation): Record<string, unknown>[] {
-  const template = view.purpose === 'reply' ? 'green' : 'orange';
+  const template = view.tone === 'error' ? 'red' : view.tone === 'warning' ? 'orange' : view.purpose === 'reply' ? 'green' : 'orange';
   const make = (elements: unknown[], index?: number): Record<string, unknown> => ({ schema: '2.0', config: { wide_screen_mode: true },
     header: { template, title: { tag: 'plain_text', content: titleText(view.title) + (index ? ` · ${index}` : '') } }, body: { elements } });
   const cards: Record<string, unknown>[] = []; let elements: unknown[] = [];

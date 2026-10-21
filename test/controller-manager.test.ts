@@ -12,7 +12,7 @@ async function until(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 5000;
   while (!predicate()) { if (Date.now() > deadline) throw new Error('condition timeout'); await delay(5); }
 }
-function fixture(t: TestContext, run: (turn: AgentTurn) => Promise<AgentResult>) {
+function fixture(t: TestContext, run: (turn: AgentTurn) => Promise<AgentResult>, sending?: (text: string) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'bridge-controller-manager-'));
   const config: BridgeConfig = { token: '', allowedUserIds: ['user'], defaultAgent: 'codex', workspace: root,
     proxyUrl: null, commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } },
@@ -27,7 +27,7 @@ function fixture(t: TestContext, run: (turn: AgentTurn) => Promise<AgentResult>)
     turn.onReasoningEffort?.('medium'); turn.onReady?.(); return run(turn);
   }, async steer() { steering++; return { status: 'accepted' }; }, async interrupt() {}, async close() {} };
   const manager = new SessionManager(config, { codex: adapter, claude: adapter }, {
-    async sendText(_channel, text, options) { replies.push({ text, ...(options ? { options } : {}) }); },
+    async sendText(_channel, text, options) { replies.push({ text, ...(options ? { options } : {}) }); await sending?.(text); },
     async markReplyDelivered(messages) { marks.push(...messages.map(x => x.id)); },
   });
   const inspect = new SessionStore(config.dataDir);
@@ -118,4 +118,67 @@ test('public-message ledger survives reopen and does not retry uncertain deliver
   store.finishPublicMessage('key', 'delivered');
   assert.equal(store.claimPublicMessage('key', 'conversation', 'native', 'channel', 'hash'), 'delivered');
   assert.throws(() => store.claimPublicMessage('key', 'conversation', 'native', 'channel', 'changed'));
+});
+
+test('completed native report survives a process cleanup error without replay or losing a confirmed public reply', async t => {
+  const f = fixture(t, async turn => {
+    await turn.onPublicMessage!('已确认送达的结果', [], 'final-once');
+    throw Object.assign(new Error('cleanup did not confirm exit'), { processStillRunning: true,
+      nativeResult: { nativeId: 'controller-native', text: '完整报告，业务仍待验收', controlledOutput: true } });
+  });
+  await f.send('one', '继续核查');
+  await until(() => f.replies.some(reply => reply.options?.presentation?.title === '【桥】退出待确认'));
+  assert.equal(f.inspect.getMessage('one')?.state, 'completed');
+  assert.equal(f.inspect.getMessage('one')?.replyState, 'delivered');
+  assert.equal(f.inspect.turnResult('one')?.result.text, '完整报告，业务仍待验收');
+  assert(f.inspect.turnResult('one')?.exitError);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.replies.filter(reply => reply.text.includes('已确认送达的结果')).length, 1);
+  assert(f.replies[0]?.options?.deliveryKey?.includes('final-once'));
+  const reopened = new SessionStore(join(f.root, 'data'));
+  try { assert.equal(reopened.turnResult('one')?.result.text, '完整报告，业务仍待验收'); } finally { reopened.close(); }
+});
+
+test('main controller failures use a short structured bridge error and keep provider details out of public copy', async t => {
+  const f = fixture(t, async () => { throw new Error('provider failure SECRET_DEBUG_DETAIL'); });
+  await f.send('one', '执行任务');
+  await until(() => f.replies.some(reply => reply.options?.presentation?.tone === 'error'));
+  const notice = f.replies.find(reply => reply.options?.presentation?.tone === 'error')!;
+  assert.match(notice.text, /【桥】/);
+  assert(!notice.text.includes('SECRET_DEBUG_DETAIL'));
+  assert(notice.text.length < 80);
+  assert.equal(f.inspect.getMessage('one')?.state, 'failed');
+});
+
+test('stop during cleanup retains the completed report without publishing it into the cancelled turn', async t => {
+  let reject!: (error: Error) => void;
+  let nativeTurn: AgentTurn | undefined;
+  const pending = new Promise<AgentResult>((_resolve, fail) => { reject = fail; });
+  const f = fixture(t, async turn => { nativeTurn = turn; return pending; });
+  await f.send('one', '执行');
+  await until(() => !!nativeTurn);
+  const stopping = f.send('stop', '/stop');
+  await until(() => nativeTurn!.signal.aborted);
+  reject(Object.assign(new Error('cleanup interrupted'), { processStillRunning: true,
+    nativeResult: { nativeId: 'controller-native', text: '取消时仍须保存的报告' } }));
+  await stopping;
+  await until(() => !!f.inspect.turnResult('one'));
+  assert.equal(f.inspect.turnResult('one')?.result.text, '取消时仍须保存的报告');
+  assert(!f.replies.some(reply => reply.text.includes('取消时仍须保存的报告')));
+  assert.equal(f.calls.length, 1);
+});
+
+test('an uncertain publication seals this turn even when a caller tries a new tool call ID', async t => {
+  const f = fixture(t, async turn => {
+    await assert.rejects(turn.onPublicMessage!('可能已送达', [], 'call-one', undefined, false),
+      error => !!error && typeof error === 'object' && 'deliveryUncertain' in error);
+    await assert.rejects(turn.onPublicMessage!('再次发送同一内容', [], 'call-two', undefined, false),
+      error => !!error && typeof error === 'object' && 'deliveryUncertain' in error);
+    return { nativeId: 'controller-native', text: '', controlledOutput: true };
+  }, async text => { if (text.includes('可能已送达')) throw new TypeError('lost acknowledgement'); });
+  await f.send('one', '执行');
+  await until(() => f.inspect.getMessage('one')?.replyState === 'failed');
+  assert.equal(f.replies.filter(reply => reply.text.includes('可能已送达')).length, 1);
+  assert(!f.replies.some(reply => reply.text.includes('再次发送同一内容')));
+  assert.equal(f.calls.length, 1);
 });

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ownTemporaryDirectory } from './temp-directory.js';
+import { AgentProcessStopError } from '../src/agents/process.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
 import { SessionHandoffs } from '../src/controller/handoff.js';
 import { ControllerStore } from '../src/controller/store.js';
@@ -652,7 +653,7 @@ test('an unconfirmed process stop never reports stopped=true or a successful can
     const handle = await launch(f.runtime, f.turn); await flush();
     const result = await f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: handle.workerId }) as { stopped: boolean };
     assert.equal(result.stopped, false); assert.equal(f.runtime.store.getJob(handle.jobId)?.status, 'uncertain');
-    assert.equal(f.events[0]?.status, 'failed'); assert.match(f.events[0]!.text, /不能宣称已停止/);
+    assert.equal(f.events[0]?.status, 'failed'); assert.match(f.events[0]!.text, /【桥】CLI 退出待核对，结果未知/);
     assert.doesNotMatch(f.events[0]!.text, /CLI 进程已结束/);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
@@ -1162,4 +1163,33 @@ test('damaged handoff ownership at restart isolates the uncertain job without bl
     const ordinary = await launch(second, f.turn); await flush(); assert.equal(adapter.turns.length, 1);
     adapter.finish(ordinary.workerId); await flush(); assert.equal(second.store.getJob(ordinary.jobId)!.status, 'completed');
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
+
+test('a completed report survives cleanup uncertainty; confirming a stop updates evidence without unlocking or replaying', async () => {
+  const f = fixture();
+  try {
+    const handle = await launch(f.runtime, f.turn); await flush();
+    const report = { nativeId: `native-${handle.workerId}`, text: '实现已保存；验收仍需核对' };
+    f.codex.pending.get(handle.workerId)!.reject(new AgentProcessStopError(123, report)); f.codex.pending.delete(handle.workerId);
+    await flush(); await flush();
+    const job = f.runtime.store.getJob(handle.jobId)!;
+    assert.equal(job.status, 'uncertain'); assert.equal(job.processStopped, false); assert.deepEqual(job.nativeResult, report);
+    assert.match(job.result!, /实现已保存；验收仍需核对/); assert.match(job.result!, /【桥】CLI 退出待核对/);
+    assert.equal(f.runtime.store.getWorker(handle.workerId)!.blocked, true);
+    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: Array<{ resultKnown: boolean; processStopped: boolean }> };
+    assert.equal(listed.workers[0]!.resultKnown, true); assert.equal(listed.workers[0]!.processStopped, false);
+    assert.equal(f.runtime.queryWorkerOverview(f.turn.conversation)[0]!.resultKnown, true);
+    const cancelled = await f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: handle.workerId }) as { stopped: boolean };
+    assert.equal(cancelled.stopped, true); assert.equal(f.runtime.store.getJob(handle.jobId)!.processStopped, true);
+    assert.deepEqual(f.runtime.store.getJob(handle.jobId)!.nativeResult, report);
+    const repeated = await f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: handle.workerId }) as { stopped: boolean };
+    assert.equal(repeated.stopped, true); assert.equal(f.runtime.queryWorkerOverview(f.turn.conversation)[0]!.processStopped, true);
+    assert.equal(f.runtime.store.getJob(handle.jobId)!.status, 'uncertain'); assert.equal(f.runtime.store.getWorker(handle.workerId)!.blocked, true);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '不可盲续' }), /报告已保存，会话待核对/);
+    assert.equal(f.codex.turns.length, 1);
+    const persisted = new ControllerStore(f.dir);
+    try { assert.equal(persisted.getJob(handle.jobId)!.processStopped, true); assert.deepEqual(persisted.getJob(handle.jobId)!.nativeResult, report); }
+    finally { persisted.close(); }
+  } finally { await f.runtime.close(); f.registry.close(); }
 });

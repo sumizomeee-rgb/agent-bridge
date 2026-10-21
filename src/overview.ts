@@ -16,6 +16,7 @@ export interface WorkerOverview {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
   running: boolean; queued: number; startedAt: string | null; endedAt?: string | null;
   blocked?: boolean; ownership?: 'bridge' | 'user'; statusReason?: string;
+  resultKnown?: boolean; processStopped?: boolean;
   lastResultPreview?: string | null; unresolvedSupplements?: number;
 }
 
@@ -103,6 +104,14 @@ export function computerOverview(items: readonly ComputerOverview[], details = f
     })] : [{ kind: 'text', text: '当前工作区没有登记的电脑。' }],
     footer: '✅ 表示连接与 CLI 入口就绪，模型需实际调用确认。/computers details 查看检查时间和详情。' };
 }
+/** 已收报告与程序退出分别展示；核对锁仍由运行时管理。 */
+function workerReviewEvidence(item: WorkerOverview): string | undefined {
+  if (!item.blocked && item.status !== 'uncertain') return undefined;
+  if (item.resultKnown) return '报告已保存；' + (item.processStopped === true ? '退出已确认，结果待核对' : '退出待确认');
+  if (item.processStopped === true) return '退出已确认，结果待核对';
+  return undefined;
+}
+
 export function workerOverview(items: readonly WorkerOverview[], scope: 'current' | 'all', now = Date.now(), details = false, view: WorkerView = 'active'): BridgePresentation {
   const label = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length, queued = items.reduce((sum, item) => sum + item.queued, 0);
@@ -124,7 +133,7 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
       const lines = [`${index + 1}. ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
         `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
       if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
-      if (item.blocked || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`需核对：${clean(item.statusReason ?? '任务已阻塞', 80)}`);
+      if (item.blocked || workerReviewEvidence(item) || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`需核对：${workerReviewEvidence(item) ?? clean(item.statusReason ?? '任务已阻塞', 80)}`);
       return { kind: 'entry', text: lines.join('\n') };
     }) : [{ kind: 'text', text: view === 'history' ? `${label}没有历史助手。` : `${label}没有正在执行、排队或待核对的助手。` }], footer: view === 'history' ? '/workers 查看未结束助手 · /workers history details 查看历史详情。' : '/workers history 查看历史 · /workers details 查看完整 ID 与回执。' };
 }
@@ -169,9 +178,9 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
     if (configuration) lines.push(`启动配置：${clean(configuration.value, 30)} · 来源：${configuration.source}${configuration.applied === false ? ` · 未采用${configuration.reason ? `：${clean(configuration.reason, 100)}` : ''}` : ''}`);
     if (metadata) lines.push(`强度能力：${metadata.capability.status === 'unsupported' ? '不支持可调强度' : metadata.capability.status === 'supported' ? metadata.capability.levels.map(value => clean(value, 32)).join('、') : '未提供证据'} · 来源：${clean(metadata.capability.source, 80)}`);
     if (scope === 'all') lines.push(`主控对话：${clean(item.conversationTitle ?? item.conversationId, 80)}`);
-    if (item.blocked) lines.push('阻塞：已阻塞，需先核对结果与进程');
+    if (item.blocked) lines.push('阻塞：' + (workerReviewEvidence(item) ?? '已阻塞，需先核对结果与进程'));
     if (item.ownership) lines.push(`拥有权：${item.ownership === 'user' ? '用户' : '桥'}`);
-    if (item.statusReason) lines.push(`状态说明：${clean(item.statusReason, 140)}`);
+    if (item.statusReason || workerReviewEvidence(item)) lines.push(`状态说明：${workerReviewEvidence(item) ?? clean(item.statusReason!, 140)}`);
     if (item.lastResultPreview != null) lines.push(`最近回执：${clean(item.lastResultPreview, 180)}`);
     if (item.unresolvedSupplements) lines.push(`未确认补充回执：${item.unresolvedSupplements}条`);
     lines.push(`${status} · 本轮耗时：${elapsed} · 等待${item.queued}轮`);

@@ -155,7 +155,7 @@ test('命令执行异常通过同一交互回调反馈，失败不会发普通�
   await f.manager.handle(message('bad-cwd-command', `/cwd "${join(f.root, 'missing directory')}"`),
     async text => { commandReplies.push(text); });
   assert.equal(commandReplies.length, 1);
-  assert.match(commandReplies[0]!, /^命令失败：/);
+  assert.match(commandReplies[0]!, /^❌ 【桥】命令失败/);
   assert.deepEqual(f.sinkReplies, []);
   const inspect = new SessionStore(f.config.dataDir);
   try { assert.equal(inspect.getMessage('bad-cwd-command')!.state, 'failed'); }
@@ -167,7 +167,7 @@ test('模型元数据命令异常也使用交互回调', async t => {
   f.adapter.metadataError = new Error('fixture metadata unavailable');
   const replies: string[] = [];
   await f.manager.handle(message('failed-model-command', '/model list'), async text => { replies.push(text); });
-  assert.deepEqual(replies, ['命令失败：fixture metadata unavailable']);
+  assert.deepEqual(replies, ['❌ 【桥】命令失败\n\n请核对命令或查看本地记录。']);
   assert.deepEqual(f.sinkReplies, []);
   assert.equal(f.adapter.turns.length, 0);
 });
@@ -192,7 +192,7 @@ test('命令回复失败仍通过原交互 callback 报错，不退回普通消�
     if (attempted.length === 1) throw new Error('fixture interaction unavailable');
   });
   assert.equal(attempted.length, 2);
-  assert.equal(attempted[1], '命令失败：fixture interaction unavailable');
+  assert.equal(attempted[1], '❌ 【桥】命令失败\n\n请核对命令或查看本地记录。');
   assert.deepEqual(f.sinkReplies, []);
 });
 

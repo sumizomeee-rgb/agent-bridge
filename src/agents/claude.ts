@@ -3,7 +3,7 @@ import { createEffortReporter, effortCapabilityForModel, normalizeEffortCapabili
 import { readFile } from 'node:fs/promises';
 import { claudeEffortConfiguration } from './claude-effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
-import { abortError, deferred, isObject, JsonLineProcess, safeError, type JsonObject } from './process.js';
+import { abortError, deferred, isObject, JsonLineProcess, processStopFailure, safeError, type JsonObject } from './process.js';
 
 function imageMediaType(bytes: Buffer): string {
   if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
@@ -113,6 +113,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const completed = deferred<AgentResult>();
     let nativeId = turn.conversation.nativeId;
     let cancelled = false;
+    let runFinished = false;
     let cancelling: Promise<void> | null = null;
     let inputSent = false;
     let initialized = false;
@@ -229,8 +230,10 @@ export class ClaudeAdapter implements AgentAdapter {
       if (cancelling) return cancelling;
       cancelled = true;
       completed.reject(abortError());
-      cancelling = transport.stop(false);
-      return cancelling;
+      const operation = transport.stop(false);
+      cancelling = operation;
+      void operation.then(() => { if (runFinished) this.active.delete(conversationId); }, () => { if (cancelling === operation) cancelling = null; });
+      return operation;
     };
     if (turn.acceptSupplements) this.supplements.set(conversationId, async message => {
       if (cancelled || resultSeen || completed.settled || !nativeId) return { status: 'queued' };
@@ -254,28 +257,34 @@ export class ClaudeAdapter implements AgentAdapter {
     const onAbort = () => { void cancel().catch(() => {}); };
     turn.signal.addEventListener('abort', onAbort, { once: true });
     let success = false;
+    let nativeResult: AgentResult | undefined;
     try {
       if (turn.signal.aborted) { await cancel(); throw abortError(); }
       transport.write({ type: 'user', session_id: nativeId ?? '', parent_tool_use_id: null, message: { role: 'user', content } });
       inputSent = true;
       if (initialized && turn.acceptSupplements) turn.onReady?.();
       if (!turn.acceptSupplements) transport.endInput();
-      const result = await completed.promise;
+      nativeResult = await completed.promise;
       success = true;
-      return result;
+      return nativeResult;
     } catch (error) {
       if (cancelled) throw abortError();
       throw error;
     } finally {
       turn.signal.removeEventListener('abort', onAbort);
-      if (success) await Promise.all([...pendingInputs.values()].map(value => value.done.promise));
-      if (cancelling) await cancelling;
-      else await transport.stop(success);
-      removeMessage(); removeFailure();
-      for (const value of pendingInputs.values()) value.done.resolve({ status: 'uncertain', reason: 'Claude 轮次已关闭，补充接收未确认；不能重发。' });
-      this.supplements.delete(conversationId);
-      this.active.delete(conversationId);
-      readonly?.cleanup();
+      try {
+        if (success) await Promise.all([...pendingInputs.values()].map(value => value.done.promise));
+        if (cancelling) await cancelling;
+        else await transport.stop(success);
+        this.active.delete(conversationId);
+      } catch (error) { throw processStopFailure(error, nativeResult); }
+      finally {
+        removeMessage(); removeFailure();
+        for (const value of pendingInputs.values()) value.done.resolve({ status: 'uncertain', reason: 'Claude 轮次已关闭，补充接收未确认；不能重发。' });
+        this.supplements.delete(conversationId);
+        runFinished = true;
+        readonly?.cleanup();
+      }
     }
   }
 

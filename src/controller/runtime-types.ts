@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentName, AgentExecutionProgress, AgentToolActivity, EffortConfiguration, EffortMetadata } from '../types.js';
+import type { AgentAdapter, AgentName, AgentResult, AgentExecutionProgress, AgentToolActivity, EffortConfiguration, EffortMetadata } from '../types.js';
 import type { TaskCompletionEvent, TaskOrigin } from '../tasks.js';
 import type { ExecutionTargetBinding, RemoteHandoff, TargetSummary } from '../remote/types.js';
 import type { NativeSessionAdoptArgs, NativeSessionAdoption, NativeSessionPage, NativeSessionRead, NativeSessionReadOptions, NativeSessionRef } from '../native-sessions.js';
@@ -21,6 +21,9 @@ export interface ControllerJob {
   id: string; workerId: string; origin: TaskOrigin; prompt: string; imagePaths: string[];
   scheduleId?: string;
   status: ControllerJobStatus; taskId: string | null; result: string | null; cancelReason: string | null;
+  /** A completed turn report and process exit proof are independent of reconciliation status. */
+  nativeResult?: AgentResult;
+  processStopped?: boolean;
   /** Optional metadata keeps old JSON rows compatible; no native payloads are stored. */
   progress?: AgentExecutionProgress;
   /** Stable per-tool notices survive remote reconnect and bridge restart. */

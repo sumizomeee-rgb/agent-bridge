@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { executionErrorEvidence as errorEvidence } from './delivery-errors.js';
 import { join } from 'node:path';
 import { collectOutgoingPaths } from './artifacts.js';
 import { assertBotCommunicationAllowed } from './bot-communication.js';
@@ -944,7 +945,7 @@ export class HostRuntime {
             publicCursor: publicMessage.sequence, payload: { text: '群内有新的公开进展。结合最新现场判断是否补充、调查、咨询或静默。' } });
         }
       }
-    } catch (error) { release(attempted ? 'uncertain' : 'released'); if (this.store.getRoutedDelivery(id)?.state === 'sending') this.store.finishRoutedDelivery(id, 'uncertain', String(error));
+    } catch (error) { release(attempted ? 'uncertain' : 'released'); if (this.store.getRoutedDelivery(id)?.state === 'sending') this.store.finishRoutedDelivery(id, 'uncertain', errorEvidence(error, [...this.configurations.values()].flatMap(config => [config.token, config.appSecret ?? ''])));
       throw Object.assign(error instanceof Error ? error : new Error(String(error)), { deliveryUncertain: true }); }
     });
   }
@@ -1047,7 +1048,7 @@ export class HostRuntime {
           sourceBotId: context.botId, causeEventId: context.eventId, publicCursor: pub.sequence,
           payload: { text: '群内有新的公开进展。结合最新现场判断是否补充、调查、咨询或静默。' } });
       }
-    } catch (error) { release('uncertain'); if (this.store.getOutbox(id)?.state === 'sending') this.store.finishOutbox(id, 'uncertain', String(error)); throw error; }
+    } catch (error) { release('uncertain'); if (this.store.getOutbox(id)?.state === 'sending') this.store.finishOutbox(id, 'uncertain', errorEvidence(error, [...this.configurations.values()].flatMap(config => [config.token, config.appSecret ?? '']))); throw error; }
     });
   }
   private async completion(botId: string, event: TaskCompletionEvent): Promise<'queued' | 'retain'> {
@@ -1243,7 +1244,7 @@ export class HostRuntime {
         await bot.send(route.channelId, text, { signal: turn.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}), ...(outgoing.files.length ? { files: outgoing.files } : {}) });
         this.store.finishOutbox(id, 'delivered', 'platform private send acknowledged');
         return { delivered: true, audience: { kind: 'private', principalId: context.principalId }, originalDeliveryUnchanged: true };
-      } catch (error) { this.store.finishOutbox(id, 'uncertain', String(error)); throw Object.assign(error instanceof Error ? error : new Error(String(error)), { deliveryUncertain: true }); }
+      } catch (error) { this.store.finishOutbox(id, 'uncertain', errorEvidence(error, [...this.configurations.values()].flatMap(config => [config.token, config.appSecret ?? '']))); throw Object.assign(error instanceof Error ? error : new Error(String(error)), { deliveryUncertain: true }); }
     }
     if (name === 'bridge_propose_handoff') {
       const taskId = bounded(args.taskId, 'taskId', 200); this.confirmStopped(taskId, botId);

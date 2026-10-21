@@ -10,6 +10,7 @@ import { parseLaunchProfiles, PresetRuntime, PresetAgentAdapter, PresetResultUnk
 import { startPresetConnect } from '../src/presets/connect.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig } from '../src/types.js';
 import type { PresetBinding } from '../src/presets/types.js';
+import { completedResultFromError } from '../src/agents/process.js';
 import { TargetCatalogService } from '../src/remote/catalog.js';
 
 function fixture() {
@@ -194,4 +195,21 @@ test('Claude预设固定主模型、四档别名和内部子助手，新建与�
     assert.equal(readFileSync(join(f.privateRoot, 'profiles.json'), 'utf8'), before);
     assert.deepEqual(readdirSync(f.user), []);
   } finally { f.close(); }
+});
+
+
+test('preset error conversion retains an already completed native report after clean shutdown', async () => {
+  const f = fixture(); let runs = 0;
+  const report = { nativeId: 'preset-local-report', text: '报告已保存，结果仍待核对' };
+  const adapter = new PresetAgentAdapter(f.runtime, await f.binding(), f.command, {}, () => ({
+    run: async current => { runs++; current.onReady?.(); throw Object.assign(new Error('report requires reconciliation'), { nativeResult: report }); },
+    interrupt: async () => {}, close: async () => {},
+  }));
+  try {
+    await assert.rejects(adapter.run(turn(f.root, f.profile.model)), error => {
+      assert(error instanceof PresetResultUnknown); assert.equal(error.resultUncertain, true);
+      assert.deepEqual(completedResultFromError(error), report); assert.equal('processStillRunning' in error, false); return true;
+    });
+    assert.equal(await adapter.confirmStopped('worker-A'), true); assert.equal(runs, 1);
+  } finally { await adapter.close(); f.close(); }
 });

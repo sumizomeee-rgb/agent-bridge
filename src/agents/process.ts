@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import type { AgentCommand } from '../types.js';
+import type { AgentCommand, AgentResult } from '../types.js';
 
 export type JsonObject = Record<string, unknown>;
 export const isObject = (value: unknown): value is JsonObject =>
@@ -48,10 +48,22 @@ async function within(promise: Promise<unknown>, milliseconds: number): Promise<
 
 export class AgentProcessStopError extends Error {
   readonly processStillRunning = true;
-  constructor(readonly pid: number | undefined) {
-    super('未确认 Agent 进程已经结束，停止结果未知。');
+  constructor(readonly pid: number | undefined, readonly nativeResult?: AgentResult, options?: ErrorOptions) {
+    super('【桥】CLI 退出待核对。', options);
     this.name = 'AgentProcessStopError';
   }
+}
+
+/** A completed native turn stays available even when transport shutdown fails. */
+export function completedResultFromError(error: unknown): AgentResult | undefined {
+  if (!isObject(error) || !isObject(error.nativeResult)) return undefined;
+  const result = error.nativeResult;
+  return typeof result.nativeId === 'string' && result.nativeId.length > 0 && typeof result.text === 'string'
+    ? { nativeId: result.nativeId, text: result.text, ...(result.controlledOutput === true ? { controlledOutput: true } : {}) } : undefined;
+}
+
+export function processStopFailure(error: unknown, result = completedResultFromError(error)): AgentProcessStopError {
+  return new AgentProcessStopError(isObject(error) && typeof error.pid === 'number' ? error.pid : undefined, result, { cause: error });
 }
 
 /** Newline-delimited JSON transport. Never log raw stdout or stderr. */
@@ -142,6 +154,7 @@ export class JsonLineProcess {
 
   /** EOF is graceful after success; cancellation forcefully stops the process tree. */
   stop(graceful = false): Promise<void> {
+    if (this.closed.settled) return Promise.resolve();
     this.stopping ??= this.stopOnce(graceful);
     return this.stopping;
   }

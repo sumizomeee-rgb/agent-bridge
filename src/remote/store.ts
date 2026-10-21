@@ -101,5 +101,10 @@ export class RemoteStore {
     return (this.db.prepare('SELECT * FROM processes WHERE job=? AND closed=0').all(job) as { job: string; pid: number; identity: string | null; closed: number }[])
       .map(row => ({ dispatchId: row.job, pid: row.pid, identity: row.identity, closed: row.closed === 1 }));
   }
+  /** Complete tracked history distinguishes confirmed exits from missing process evidence. */
+  processRecords(job: string): ProcessRecord[] {
+    return (this.db.prepare('SELECT * FROM processes WHERE job=?').all(job) as { job: string; pid: number; identity: string | null; closed: number }[])
+      .map(row => ({ dispatchId: row.job, pid: row.pid, identity: row.identity, closed: row.closed === 1 }));
+  }
   close(): void { this.db.close(); }
 }

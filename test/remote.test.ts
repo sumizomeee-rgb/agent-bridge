@@ -9,8 +9,9 @@ import type { AgentAdapter, AgentResult, AgentSupplement, AgentTurn, BridgeConfi
 import { RemoteDaemon, remoteEndpoint } from '../src/remote/daemon.js';
 import { RemoteAgentAdapter } from '../src/remote/adapter.js';
 import { RemoteDispatchUncertain, RemoteArtifactTransferError, type ExecutionTargetBinding, type RemoteClient, type RemoteDaemonConfig, type RemoteDispatch, type RemoteJob } from '../src/remote/types.js';
+import { AgentProcessStopError, completedResultFromError } from '../src/agents/process.js';
 import { RemoteStore } from '../src/remote/store.js';
-import { PresetRuntime } from '../src/presets/runtime.js';
+import { PresetRuntime, PresetResultUnknown } from '../src/presets/runtime.js';
 import { collectOutgoingAttachments } from '../src/artifacts.js';
 
 const tick = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
@@ -220,6 +221,7 @@ test('terminal completion is not visible until native close confirms exit', asyn
     const request = f.request(); await f.daemon.handle('dispatch', request); await tick(); f.natives[0]!.close = async () => closed;
     f.natives[0]!.finish('生成完成'); await tick(); await tick();
     assert.equal(f.daemon.store.job(request.dispatchId)!.status, 'running'); assert.notEqual(f.daemon.store.job(request.dispatchId)!.stopped, true);
+    assert.equal(f.daemon.store.job(request.dispatchId)!.result?.text, '生成完成', 'save report before waiting for close');
     release(); await tick(); await tick(); assert.equal(f.daemon.store.job(request.dispatchId)!.status, 'completed'); assert.equal(f.daemon.store.job(request.dispatchId)!.stopped, true);
   } finally { release(); await f.daemon.close(); }
 });
@@ -230,6 +232,7 @@ test('a native close failure preserves uncertain result and blocks further conti
     const request = f.request(); await f.daemon.handle('dispatch', request); await tick(); f.natives[0]!.close = async () => { throw new Error('CLI still alive'); };
     f.natives[0]!.finish(); await tick(); await tick(); const old = f.daemon.store.job(request.dispatchId)!;
     assert.equal(old.status, 'uncertain'); assert.equal(old.stopped, false);
+    assert.equal(old.result?.text, '完成'); assert.equal(old.result?.nativeId, f.natives[0]!.nativeId);
     await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: request.workerId, nativeId: old.nativeId })), /结果未知/);
   } finally { await f.daemon.close(); }
 });
@@ -280,6 +283,9 @@ test('confirmStopped only reads the last dispatch and releases no unknown or mis
     const before = f.calls.length; assert.equal(await f.adapter.confirmStopped(turn.conversation.id), false);
     assert.deepEqual(f.calls.slice(before), ['query']); assert.equal(f.natives[0]!.interrupts, 0);
     f.natives[0]!.finish(); await pending; assert.equal(await f.adapter.confirmStopped(turn.conversation.id), true);
+    f.daemon.store.update(turn.dispatchId!, { status: 'uncertain', stopped: true });
+    const proofStart = f.calls.length; assert.equal(await f.adapter.confirmStopped(turn.conversation.id), true);
+    assert.deepEqual(f.calls.slice(proofStart), ['query']); assert.equal(f.daemon.store.job(turn.dispatchId!)!.status, 'uncertain');
     assert.equal(await f.adapter.confirmStopped('someone-else'), false);
     f.disconnect(); assert.equal(await f.adapter.confirmStopped(turn.conversation.id), false); assert.equal(f.natives[0]!.interrupts, 0);
   } finally { await f.adapter.close(); await f.daemon.close(); }
@@ -392,4 +398,88 @@ test('remote visibility is transported and frozen; malformed input and old execu
     while (f.natives.length < 2) await tick();
     assert.equal(f.daemon.store.request(turn.dispatchId!)!.sessionVisibility, 'visible'); f.natives[1]!.finish(); await run;
   } finally { await f.daemon.close(); }
+});
+
+
+test('remote shutdown errors retain completed reports in durable storage and the controller-side error', async () => {
+  const f = fixture(), turn = f.turn(); let refuse = true;
+  const pending = f.adapter.run(turn); const outcome = pending.catch(error => error);
+  try {
+    await tick(); await tick();
+    const native = f.natives[0]!; native.close = async () => { if (refuse) throw new Error('second shutdown failure'); };
+    const report = { nativeId: native.nativeId, text: '代码已落盘；业务验收未完成' };
+    native.reject(new AgentProcessStopError(123, report));
+    const error = await outcome;
+    assert(error instanceof RemoteDispatchUncertain); assert.deepEqual(completedResultFromError(error), report);
+    const saved = f.daemon.store.job(turn.dispatchId!)!;
+    assert.equal(saved.status, 'uncertain'); assert.equal(saved.stopped, false); assert.deepEqual(saved.result, report);
+    assert.equal(f.calls.filter(method => method === 'dispatch').length, 1);
+    await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: turn.conversation.id, nativeId: report.nativeId })), /结果未知/);
+    const reread = new RemoteStore(f.daemon.dataDirectory);
+    try { assert.deepEqual(reread.job(turn.dispatchId!)?.result, report); } finally { reread.close(); }
+  } finally { refuse = false; await f.adapter.close(); await f.daemon.close(); }
+});
+
+
+test('recovered uncertain jobs reconcile complete closed process history without discarding the report or unlocking the session', async () => {
+  const f = fixture(); const request = f.request();
+  const report = { nativeId: 'native-history-proof', text: '旧报告已保存，业务效果仍待核对' };
+  f.daemon.store.create(request);
+  f.daemon.store.update(request.dispatchId, { nativeId: report.nativeId, result: report, stopped: false });
+  f.daemon.store.process({ dispatchId: request.dispatchId, pid: 123456789, identity: null, closed: true });
+  f.daemon.store.process({ dispatchId: request.dispatchId, pid: 123456790, identity: null, closed: true });
+  await f.daemon.close();
+  const recovered = new RemoteDaemon(f.root, f.daemon.config, { adapterFactory: () => { throw new Error('must not restart native work'); } });
+  try {
+    await recovered.listen(); assert.equal(recovered.store.job(request.dispatchId)!.status, 'uncertain');
+    assert.deepEqual(recovered.store.processes(request.dispatchId), []);
+    assert.equal(recovered.store.processRecords(request.dispatchId).length, 2);
+    assert.deepEqual(await recovered.handle('interrupt', { dispatchId: request.dispatchId }), { stopped: true });
+    assert.deepEqual(await recovered.handle('interrupt', { dispatchId: request.dispatchId }), { stopped: true });
+    const saved = recovered.store.job(request.dispatchId)!;
+    assert.equal(saved.stopped, true); assert.equal(saved.status, 'uncertain'); assert.deepEqual(saved.result, report);
+    await assert.rejects(recovered.handle('dispatch', { ...request, dispatchId: randomUUID(), nativeId: report.nativeId }), /结果未知/);
+  } finally { await recovered.close(); }
+});
+
+test('closed history reconciliation never interrupts another live dispatch and missing history still refuses stop proof', async () => {
+  const f = fixture(); const liveTurn = f.turn(); const pending = f.adapter.run(liveTurn);
+  try {
+    await tick(); await tick(); const old = f.request(); f.daemon.store.create(old);
+    f.daemon.store.update(old.dispatchId, { status: 'uncertain', stopped: false });
+    await assert.rejects(f.daemon.handle('interrupt', { dispatchId: old.dispatchId }), /没有可靠的远端进程记录/);
+    assert.equal(f.daemon.store.job(old.dispatchId)!.stopped, false);
+    f.daemon.store.process({ dispatchId: old.dispatchId, pid: 123456789, identity: null, closed: true });
+    assert.deepEqual(await f.daemon.handle('interrupt', { dispatchId: old.dispatchId }), { stopped: true });
+    assert.equal(f.natives[0]!.interrupts, 0); assert.equal(f.daemon.store.job(liveTurn.dispatchId!)!.status, 'running');
+    f.natives[0]!.finish('仍由原任务完成'); assert.equal((await pending).text, '仍由原任务完成');
+    assert.equal(f.calls.filter(method => method === 'dispatch').length, 1);
+  } finally { await f.adapter.close(); await f.daemon.close(); }
+});
+
+
+test('a stopped uncertain preset dispatch retains its report without dispatching or resuming native work', async () => {
+  const f = fixture(), turn = f.turn(); turn.recovering = true;
+  const report = { nativeId: 'preset-completed-native', text: '预设报告已交，现场仍待核对' };
+  const preset = { id: 'preset-report', targetId: f.binding.id, profileId: 'profile-report', revision: 1,
+    agent: 'codex' as const, model: 'gpt-6.1-sol', fingerprint: 'a'.repeat(64) };
+  const methods: string[] = [];
+  const job: RemoteJob = { dispatchId: turn.dispatchId!, workerId: turn.conversation.id, status: 'uncertain', stopped: true,
+    nativeId: report.nativeId, result: report, ready: false, createdAt: 'now', updatedAt: 'now' };
+  const adapter = new RemoteAgentAdapter({ ...f.binding, preset }, f.config, { clientFactory: () => ({
+    request: async <T>(method: string) => {
+      methods.push(method);
+      if (method === 'hello') return { hostname: hostname(), version: 1, engines: ['codex'], presetDispatch: 1 } as T;
+      if (method === 'query') return job as T;
+      throw new Error('must only inspect an existing dispatch');
+    }, close: async () => {},
+  }) });
+  try {
+    await assert.rejects(adapter.run(turn), error => {
+      assert(error instanceof PresetResultUnknown); assert.equal(error.resultUncertain, true);
+      assert.deepEqual(completedResultFromError(error), report); assert.equal('processStillRunning' in error, false); return true;
+    });
+    assert.equal(await adapter.confirmStopped(turn.conversation.id), true);
+    assert.deepEqual(methods, ['hello', 'query', 'query']); assert.equal(f.natives.length, 0);
+  } finally { await adapter.close(); await f.daemon.close(); }
 });

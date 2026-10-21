@@ -1,6 +1,6 @@
 import { feishuPresentationCards, type BridgePresentation } from './presentation.js';
 import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, writeFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fetch, FormData, ProxyAgent, type Dispatcher } from 'undici';
@@ -12,6 +12,8 @@ import { historyOptions, historyPage, type ConversationHistoryOptions, type Conv
 import { compareMessageIds } from './routing.js';
 import { shouldShowMessageReceipts, type ReceiptMessage } from './receipt-policy.js';
 import { groupMessagePayloadHash, type GroupMentionView } from './group-mentions.js';
+import { FeishuOutbox } from './feishu-outbox.js';
+import { deliveryDiagnostic, errorEvidence, FeishuRequestError, type DeliveryDiagnostic } from './delivery-errors.js';
 
 type Json = Record<string, any>;
 export interface FeishuOptions {
@@ -28,6 +30,7 @@ export class FeishuTransport {
   private readonly dispatcher?: Dispatcher;
   private readonly http: typeof fetch;
   private readonly apiBase: string;
+  private readonly outbox: FeishuOutbox;
   private socket?: Pick<WSClient, 'start' | 'close'>;
   private readonly sends = new Map<string, Promise<void>>();
   private readonly receipts = new Map<string, Promise<void>>();
@@ -38,6 +41,7 @@ export class FeishuTransport {
     private readonly options: FeishuOptions = {}) {
     this.http = options.fetch ?? fetch;
     this.apiBase = options.apiBase ?? 'https://open.feishu.cn/open-apis';
+    this.outbox = new FeishuOutbox(config.dataDir);
     this.dispatcher = config.proxyUrl ? new ProxyAgent(config.proxyUrl) : undefined;
   }
   private log(message: string): void { this.options.logger?.(message); }
@@ -45,31 +49,43 @@ export class FeishuTransport {
     if (this.token && Date.now() < this.expires) return this.token;
     if (this.obtaining) return this.obtaining;
     this.obtaining = (async () => {
-      const response = await this.http(`${this.apiBase}/auth/v3/tenant_access_token/internal`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ app_id: this.config.applicationId, app_secret: this.config.appSecret }),
-        signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(15_000)]), ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
-      });
-      const data = await response.json() as Json;
-      if (!response.ok || data.code !== 0 || typeof data.tenant_access_token !== 'string') throw new Error(`飞书鉴权失败（HTTP ${response.status}，code=${data.code ?? 'unknown'}）。`);
+      const data = await this.request('/auth/v3/tenant_access_token/internal', 'POST', { app_id: this.config.applicationId, app_secret: this.config.appSecret }, undefined, undefined, 'auth');
+      if (typeof data.tenant_access_token !== 'string') throw this.requestError('飞书鉴权失败。', 'auth', 'POST', '/auth/v3/tenant_access_token/internal', new Error());
       this.token = data.tenant_access_token; this.expires = Date.now() + Math.max(1, Number(data.expire ?? 7200) - 60) * 1000;
       return this.token;
     })();
     try { return await this.obtaining; } finally { this.obtaining = undefined; }
   }
-  private async api(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<Json> {
+  private requestError(message: string, stage: DeliveryDiagnostic['stage'], method: string, path: string, error: unknown,
+    details: { code?: unknown; httpStatus?: number; requestId?: unknown } = {}, retryable = false): FeishuRequestError {
+    const wrapped = new FeishuRequestError(message, deliveryDiagnostic(stage, method, path, error, details), retryable);
+    return wrapped;
+  }
+  private async request(path: string, method: string, body?: unknown, signal?: AbortSignal, token?: string, stage: 'auth' | 'request' = 'request'): Promise<Json> {
     if (this.closed) throw new Error('飞书通信已关闭。');
-    const token = await this.tenantToken();
     const form = body instanceof FormData;
-    const response = await this.http(this.apiBase + path, { method,
-      headers: { Authorization: `Bearer ${token}`, ...(!form && body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
-      ...(body === undefined ? {} : { body: form ? body : JSON.stringify(body) }),
-      signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]),
-      ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
-    });
-    const data = await response.json() as Json;
-    if (!response.ok || data.code !== 0) throw new Error(`飞书请求失败（HTTP ${response.status}，code=${data.code ?? 'unknown'}）；未自动重发。`);
-    return data.data ?? data;
+    const combinedSignal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(stage === 'auth' ? 15_000 : 30_000), ...(signal ? [signal] : [])]);
+    let response: Awaited<ReturnType<typeof fetch>>;
+    try {
+      response = await this.http(this.apiBase + path, { method,
+        headers: { ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(!form && body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body === undefined ? {} : { body: form ? body : typeof body === 'string' ? body : JSON.stringify(body) }),
+        signal: combinedSignal, ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}) });
+    } catch (error) {
+      throw this.requestError(stage === 'auth' ? '飞书鉴权连接失败。' : '飞书发送连接失败。', stage, method, path, error, {}, !combinedSignal.aborted);
+    }
+    const requestId = response.headers.get('x-tt-logid') ?? response.headers.get('x-request-id');
+    let data: Json;
+    try { data = await response.json() as Json; if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(); }
+    catch (error) { throw this.requestError('飞书返回格式异常。', stage === 'auth' ? 'auth' : 'response', method, path, error,
+      { code: 'INVALID_JSON', httpStatus: response.status, requestId }, !combinedSignal.aborted); }
+    if (!response.ok || data.code !== 0) throw this.requestError((stage === 'auth' ? '飞书鉴权失败' : '飞书请求失败') + '（HTTP ' + response.status + '，code=' + (typeof data.code === 'number' ? data.code : 'unknown') + '）；未自动重发。',
+      stage, method, path, new Error(), { code: typeof data.code === 'number' ? data.code : undefined, httpStatus: response.status, requestId },
+      !combinedSignal.aborted && (response.status === 429 || response.status >= 500) && (data.code === undefined || data.code === 0));
+    return stage === 'auth' ? data : data.data ?? data;
+  }
+  private async api(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<Json> {
+    return this.request(path, method, body, signal, await this.tenantToken());
   }
   async verifyIdentity(): Promise<string> {
     const data = await this.api('/bot/v3/info');
@@ -395,25 +411,48 @@ export class FeishuTransport {
       if (!text.startsWith(prefix)) throw new Error('回复头与正文不一致。');
       view = { title: options.repeatHeader.startsWith('[') && options.repeatHeader.endsWith(']') ? options.repeatHeader.slice(1, -1) : options.repeatHeader, tone: 'success', purpose: 'reply', blocks: [{ kind: 'text', text: text.slice(prefix.length) }] };
     }
-    if (view) for (const card of feishuPresentationCards(view)) {
-      await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', { receive_id: channelId, msg_type: 'interactive', uuid: randomUUID(), content: JSON.stringify(card) }, options?.signal);
-    } else for (const chunk of splitUtf8(text, 24 * 1024)) {
-      await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', { receive_id: channelId, msg_type: 'text', uuid: randomUUID(), content: JSON.stringify({ text: chunk }) }, options?.signal);
+    const messages = view ? feishuPresentationCards(view).map(card => ({ receive_id: channelId, msg_type: 'interactive', content: JSON.stringify(card) }))
+      : splitUtf8(text, 24 * 1024).map(chunk => ({ receive_id: channelId, msg_type: 'text', content: JSON.stringify({ text: chunk }) }));
+    const fingerprint = createHash('sha256').update(JSON.stringify([messages, [...images, ...files].map(item => [images.includes(item as any) ? 'image' : 'file', item.filename, item.contentType, createHash('sha256').update(item.data).digest('hex')])])).digest('hex');
+    let batch: { id: string; delivered: boolean };
+    try { batch = this.outbox.begin(channelId, options?.deliveryKey ?? randomUUID(), fingerprint); }
+    catch (error) { throw this.requestError(error instanceof Error ? error.message : '飞书投递登记失败。', 'outbox', 'POST', '/im/v1/messages', error); }
+    if (batch.delivered) return;
+    let index = 0;
+    try {
+      for (const message of messages) await this.sendMessage(batch.id, index++, message, options?.signal);
+      for (const item of [...images, ...files]) {
+        const isImage = images.includes(item as any);
+        const form = new FormData(); const fileName = item.filename.replace(/[\\/\x00-\x1f]/g, '_').slice(0, 180);
+        form.set(isImage ? 'image_type' : 'file_type', isImage ? 'message' : 'stream');
+        if (!isImage) form.set('file_name', fileName);
+        form.set(isImage ? 'image' : 'file', new Blob([Uint8Array.from(item.data)], { type: item.contentType }), fileName);
+        const uploaded = await this.api(isImage ? '/im/v1/images' : '/im/v1/files', 'POST', form, options?.signal);
+        const key = uploaded[isImage ? 'image_key' : 'file_key'];
+        if (typeof key !== 'string' || !key) throw new Error('飞书未返回上传资源标识。');
+        await this.sendMessage(batch.id, index++, { receive_id: channelId, msg_type: isImage ? 'image' : 'file',
+          content: JSON.stringify({ [isImage ? 'image_key' : 'file_key']: key }) }, options?.signal);
+      }
+      this.outbox.complete(batch.id);
+    } catch (error) { this.outbox.fail(batch.id, errorEvidence(error)); throw error; }
+  }
+  private async sendMessage(batch: string, index: number, body: Json, signal?: AbortSignal): Promise<void> {
+    const part = this.outbox.register(batch, index, body);
+    while (this.outbox.claim(part)) {
+      try {
+        const data = await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', part.payload, signal);
+        this.outbox.ack(part, typeof data.message_id === 'string' ? data.message_id : undefined); return;
+      } catch (error) {
+        if (error instanceof FeishuRequestError && error.retryable && part.attempts < 2 && !this.shutdown.signal.aborted && !signal?.aborted) {
+          this.log('FEISHU_SEND_RETRY ' + errorEvidence(error)); await new Promise(resolve => setTimeout(resolve, 250));
+          if (this.shutdown.signal.aborted || signal?.aborted) { this.outbox.fail(batch, errorEvidence(error), part); throw error; }
+          continue;
+        }
+        this.log('FEISHU_REQUEST_FAILED ' + errorEvidence(error)); this.outbox.fail(batch, errorEvidence(error), part); throw error;
+      }
     }
-    for (const item of [...images, ...files]) {
-      const isImage = images.includes(item as any);
-      const max = isImage ? Math.min(this.config.maxImageBytes, 10 * 1024 * 1024) : this.config.maxFileBytes ?? 20 * 1024 * 1024;
-      if (!item.data.length || item.data.length > max) throw new Error('回传附件为空或超过限额；未重新运行 Agent。');
-      const form = new FormData(); const fileName = item.filename.replace(/[\\/\x00-\x1f]/g, '_').slice(0, 180);
-      form.set(isImage ? 'image_type' : 'file_type', isImage ? 'message' : 'stream');
-      if (!isImage) form.set('file_name', fileName);
-      form.set(isImage ? 'image' : 'file', new Blob([Uint8Array.from(item.data)], { type: item.contentType }), fileName);
-      const uploaded = await this.api(isImage ? '/im/v1/images' : '/im/v1/files', 'POST', form, options?.signal);
-      const key = uploaded[isImage ? 'image_key' : 'file_key'];
-      if (typeof key !== 'string' || !key) throw new Error('飞书未返回上传资源标识。');
-      await this.api('/im/v1/messages?receive_id_type=chat_id', 'POST', { receive_id: channelId, msg_type: isImage ? 'image' : 'file', uuid: randomUUID(),
-        content: JSON.stringify({ [isImage ? 'image_key' : 'file_key']: key }) }, options?.signal);
-    }
+    const error = this.requestError('飞书投递重试窗口已结束。', 'outbox', 'POST', '/im/v1/messages', new Error());
+    this.outbox.fail(batch, errorEvidence(error), part); throw error;
   }
   /** 回执只表示持久收件与回复送达；更新失败不影响任务，串行避免完成后留下处理中表情。 */
   private receipt(message: Pick<BridgeMessage, 'id' | 'channelId'>, update: (id: string) => Promise<void>): Promise<void> {
@@ -468,7 +507,7 @@ export class FeishuTransport {
   async close(): Promise<void> {
     if (this.closed) return; this.closed = true; this.shutdown.abort(); this.socket?.close({ force: true });
     await Promise.allSettled([...this.sends.values(), ...this.receipts.values()]); this.processingReactions.clear(); this.seenMessages.clear(); this.token = ''; this.expires = 0;
-    await this.dispatcher?.close();
+    await this.dispatcher?.close(); this.outbox.close();
   }
 }
 export function splitUtf8(text: string, maxBytes: number): string[] {

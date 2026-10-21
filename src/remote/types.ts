@@ -62,7 +62,7 @@ export interface RemoteClient {
 export interface RemoteHandoff { targetId: string; nativeId: string; cwd: string; agent: AgentName; resumeCommand: string; stopped: true }
 export class RemoteDispatchUncertain extends Error {
   readonly processStillRunning = true;
-  constructor(message = '远端执行连接断开，任务结果未知；禁止重新派发或续接。') { super(message); this.name = 'RemoteDispatchUncertain'; }
+  constructor(message = '远端执行连接断开，任务结果未知；禁止重新派发或续接。', readonly nativeResult?: AgentResult) { super(message); this.name = 'RemoteDispatchUncertain'; }
 }
 export class RemoteArtifactTransferError extends Error {
   readonly nativeStopped = true;

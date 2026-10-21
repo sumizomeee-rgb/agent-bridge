@@ -158,11 +158,11 @@ export class RemoteAgentAdapter implements AgentAdapter {
           turn.onActivity?.({ ...job.progress.lastActivity, snapshot: job.progress });
         }
         if (job.status === 'completed' && job.result) {
-          if (job.stopped !== true) throw new RemoteDispatchUncertain('原生结果已产生，但目标 CLI 退出尚未确认。');
+          if (job.stopped !== true) throw new RemoteDispatchUncertain('【桥】报告已保存，CLI 退出待核对。', job.result);
           try { return await this.download(job); }
           catch (error) { throw new RemoteArtifactTransferError(job.result, error instanceof Error ? error.message : '产物传输错误'); }
         }
-        if (job.status === 'uncertain') { if (this.binding.preset && job.stopped === true) throw new PresetResultUnknown(); throw new RemoteDispatchUncertain(job.error); }
+        if (job.status === 'uncertain') { if (this.binding.preset && job.stopped === true) throw new PresetResultUnknown(job.result); throw new RemoteDispatchUncertain(job.error, job.result); }
         if (job.status === 'cancelled') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端取消已登记，CLI 退出尚未确认。'); throw Object.assign(new Error('目标电脑上的 CLI 已停止。'), { name: 'AbortError' }); }
         if (job.status === 'failed') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端任务失败，CLI 退出尚未确认。'); throw Object.assign(new Error(job.error ?? '远端任务失败。'), { code: 'REMOTE_JOB_FAILED' }); }
         await new Promise<void>(resolveValue => setTimeout(resolveValue, this.options.pollMs ?? 750));
@@ -229,7 +229,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
     try {
       // A single read, no dispatch, cancellation or long reconnect loop.
       const job = await this.connection().request<RemoteJob>('query', { dispatchId });
-      return job.dispatchId === dispatchId && job.workerId === conversationId && job.stopped === true && ['completed', 'failed', 'cancelled'].includes(job.status);
+      return job.dispatchId === dispatchId && job.workerId === conversationId && job.stopped === true && ['completed', 'failed', 'cancelled', 'uncertain'].includes(job.status);
     } catch {
       // A later scheduled check gets a fresh SSH connection; do not poison it forever.
       const previous = this.client; this.client = null; void previous?.close().catch(() => {}); return false;

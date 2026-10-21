@@ -1,7 +1,7 @@
 import { readOnlyRuntime } from './readonly.js';
 import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
-import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, safeError, type JsonObject, type RpcTransport } from './process.js';
+import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, processStopFailure, safeError, type JsonObject, type RpcTransport } from './process.js';
 
 /** App-server v2 stdio protocol, verified against Codex rust-v0.160.0. */
 export class CodexAdapter implements AgentAdapter {
@@ -98,6 +98,7 @@ export class CodexAdapter implements AgentAdapter {
     let nativeId = turn.conversation.nativeId;
     let turnId: string | null = null;
     let cancelled = false;
+    let runFinished = false;
     let cancelling: Promise<void> | null = null;
 
     const collect = (value: unknown) => {
@@ -154,14 +155,16 @@ export class CodexAdapter implements AgentAdapter {
       if (cancelling) return cancelling;
       cancelled = true;
       completed.reject(abortError());
-      cancelling = (async () => {
+      const operation = (async () => {
         if (nativeId && turnId) {
           try { await rpc.request('turn/interrupt', { threadId: nativeId, turnId }, 1000); }
           catch { /* Always stop the process tree even if the RPC channel failed. */ }
         }
         await transport.stop(false);
       })();
-      return cancelling;
+      cancelling = operation;
+      void operation.then(() => { if (runFinished) this.active.delete(conversationId); }, () => { if (cancelling === operation) cancelling = null; });
+      return operation;
     };
     // 0.160.0 generate-ts：TurnSteerParams / TurnSteerResponse，非实验协议。
     this.supplements.set(conversationId, async message => {
@@ -185,6 +188,7 @@ export class CodexAdapter implements AgentAdapter {
     turn.signal.addEventListener('abort', onAbort, { once: true });
 
     let success = false;
+    let nativeResult: AgentResult | undefined;
     try {
       if (turn.signal.aborted) { await cancel(); throw abortError(); }
       await rpc.request('initialize', {
@@ -261,20 +265,25 @@ export class CodexAdapter implements AgentAdapter {
       turnId = started.turn.id;
       if (cancelled) throw abortError();
       if (!completed.settled) turn.onReady?.();
-      const result = await completed.promise;
+      nativeResult = await completed.promise;
       success = true;
-      return result;
+      return nativeResult;
     } catch (error) {
       if (cancelled) throw abortError();
       throw error;
     } finally {
       turn.signal.removeEventListener('abort', onAbort);
-      if (cancelling) await cancelling;
-      else await transport.stop(success);
-      removeMessage(); removeFailure(); rpc.close();
-      this.supplements.delete(conversationId);
-      this.active.delete(conversationId);
-      readonly?.cleanup();
+      try {
+        if (cancelling) await cancelling;
+        else await transport.stop(success);
+        this.active.delete(conversationId);
+      } catch (error) { throw processStopFailure(error, nativeResult); }
+      finally {
+        removeMessage(); removeFailure(); rpc.close();
+        this.supplements.delete(conversationId);
+        runFinished = true;
+        readonly?.cleanup();
+      }
     }
   }
 

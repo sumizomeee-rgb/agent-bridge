@@ -30,15 +30,15 @@ function fixture(t: TestContext) {
 
 test('presence 使用运行助手与等待轮数，0、无效计数、重启覆盖和合并保持原语义', async t => {
   const f = fixture(t);
-  f.transport.setPresence('idle'); assert.equal(f.state(), '已重启');
+  f.transport.setPresence('idle'); assert.equal(f.state(), '【桥】已重启');
   f.transport.setWorkCounts({ running: 1, queued: 2 });
   f.transport.setWorkCounts({ running: 3, queued: 4 });
-  await delay(10); assert.equal(f.state(), '已重启 · 运行助手3 · 等待4轮');
+  await delay(10); assert.equal(f.state(), '【桥】已重启 · 运行助手3 · 等待4轮');
   for (const count of [-1, 0.5, NaN, Infinity]) f.transport.setWorkCounts({ running: count, queued: 0 });
-  await delay(5); assert.equal(f.state(), '已重启 · 运行助手3 · 等待4轮');
-  f.transport.setPresence('draining'); assert.equal(f.state(), '准备重启');
-  f.transport.setWorkCounts({ running: 2, queued: 0 }); await delay(5); assert.equal(f.state(), '准备重启');
-  f.transport.setPresence('idle'); assert.equal(f.state(), '已重启 · 运行助手2');
+  await delay(5); assert.equal(f.state(), '【桥】已重启 · 运行助手3 · 等待4轮');
+  f.transport.setPresence('draining'); assert.equal(f.state(), '【桥】准备重启');
+  f.transport.setWorkCounts({ running: 2, queued: 0 }); await delay(5); assert.equal(f.state(), '【桥】准备重启');
+  f.transport.setPresence('idle'); assert.equal(f.state(), '【桥】已重启 · 运行助手2');
   Reflect.set(f.transport, 'restartNotice', false);
   f.transport.setWorkCounts({ running: 0, queued: 0 }); await delay(30); assert.equal(f.state(), '空闲');
   f.transport.setWorkCounts({ running: 0, queued: 5 }); await delay(30); assert.equal(f.state(), '等待5轮');

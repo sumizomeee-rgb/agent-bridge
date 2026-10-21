@@ -8,6 +8,9 @@ import { agentDisplayName, replyHeader } from './reply.js';
 import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview, type WorkerOverview } from './overview.js';
 import { commandHelp, parseCommand as command, parseNewArguments } from './commands.js';
 import { presentationText, type BridgePresentation } from './presentation.js';
+import { bridgeNotice, type BridgeNoticeCode } from './notices.js';
+import { executionErrorEvidence as errorEvidence } from './delivery-errors.js';
+import { completedResultFromError } from './agents/process.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
@@ -34,6 +37,7 @@ interface AgentSwitchJournal {
   executing: boolean;
   supplements: Promise<void>;
   completionEventId?: string;
+  publicationUncertain?: boolean;
 }
 export type GroupTurnContext = NonNullable<AgentTurn['groupContext']>;
 export interface SessionManagerOptions {
@@ -357,7 +361,8 @@ export class SessionManager {
       } catch (error) {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
-        await reply(`命令失败：${error instanceof Error ? error.message : String(error)}`);
+        const view = bridgeNotice('commandFailed');
+        await reply(presentationText(view), { presentation: view });
       } finally {
         this.activeCommands--; finish(); this.commandReplies.delete(message.id);
         if (resetting) {
@@ -414,8 +419,7 @@ export class SessionManager {
         const key = `${item.channelId}:${item.conversationId}`;
         if (notices.has(key)) continue;
         notices.add(key);
-        await this.sink.sendText(item.channelId,
-          `会话 ${item.conversationId?.slice(0, 8) ?? ''} 上次执行或回复因桥重启而中断，未自动重做。请先确认执行结果，再决定继续。`)
+        await this.sendBridgeNotice(item.channelId, 'turnInterrupted', undefined, `interrupted:${item.id}`)
           .catch(() => undefined);
       }
       if (this.closed) return;
@@ -440,8 +444,7 @@ export class SessionManager {
           continue;
         }
         try {
-          await this.sink.sendText(event.channelId,
-            `后台任务「${event.title}」（原会话 ${event.conversationId.slice(0, 8)}）上次汇总或发送结果未知，未自动重做或重新派发任务。结果已保留，请先核对。`);
+          await this.sendBridgeNotice(event.channelId, 'summaryInterrupted', event.title, `recovery:${event.id}`);
           this.options.taskRegistry?.markUncertainNotified(event.id);
         } catch { /* Keep the one-time notice pending for a later recovery, never replay the model turn. */ }
       }
@@ -1013,11 +1016,18 @@ export class SessionManager {
     void worker.catch(() => undefined);
   }
 
+  private sendBridgeNotice(channelId: string, code: BridgeNoticeCode, taskTitle?: string, deliveryKey?: string): Promise<void> {
+    const view = bridgeNotice(code, { taskTitle });
+    return this.sink.sendText(channelId, presentationText(view), { presentation: view, ...(deliveryKey ? { deliveryKey } : {}) });
+  }
+
   /** Explicit coordinating output never treats prose file citations as upload requests. */
   private async publishControlled(target: Conversation, route: { id: string; userId: string; channelId: string; groupContext?: GroupTurnContext },
     text: string, paths: string[], messageKey: string | undefined, signal: AbortSignal,
     current: () => boolean, model: string | null, effort: string | null, effortMetadata: EffortMetadata | null = null, targetId?: string, finish = true): Promise<void> {
     if (!current()) throw new Error('当前主控轮次已经停止');
+    if (this.running.get(route.userId)?.publicationUncertain)
+      throw Object.assign(new Error('本轮投递待核对，未重复发送。'), { deliveryUncertain: true, publicationFailed: true });
     if (typeof text !== 'string' || text.length > 64 * 1024 || !Array.isArray(paths)
       || paths.length > 10 || paths.some(path => typeof path !== 'string' || !isAbsolute(path)
         || path.length > 4096 || /[\r\n\0<>]/.test(path))) throw new Error('公开回复或附件声明无效');
@@ -1027,7 +1037,8 @@ export class SessionManager {
     const hash = createHash('sha256').update(JSON.stringify([text, paths, targetId ?? null, finish])).digest('hex');
     const claim = this.store.claimPublicMessage(key, target.id, nativeId, route.channelId, hash, text);
     if (claim === 'delivered') return;
-    if (claim === 'uncertain') throw new Error('这条回复的投递状态未知，已保留，未重复发送');
+    if (claim === 'uncertain') throw Object.assign(new Error('这条回复的投递状态未知，已保留，未重复发送'), { deliveryUncertain: true, publicationFailed: true });
+    let attempted = false;
     try {
       const outgoing = await collectOutgoingPaths(paths,
         [target.cwd, join(this.config.dataDir, 'outgoing')], this.config.maxImageBytes, this.config.maxFileBytes, signal);
@@ -1036,10 +1047,10 @@ export class SessionManager {
       const header = replyHeader(identity, this.store.getLastDelivery(route.userId, route.channelId), model, effort, effortMetadata);
       const fallback = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '';
       if (!text.trim() && !fallback) throw new Error('公开回复不能为空');
-      const deliver = (channelId = route.channelId) => this.sink.sendText(channelId, `${header}\n\n${text || fallback}`, {
-        repeatHeader: header, signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
+      const deliver = (channelId = route.channelId) => { attempted = true; return this.sink.sendText(channelId, `${header}\n\n${text || fallback}`, {
+        repeatHeader: header, signal, deliveryKey: key, ...(outgoing.images.length ? { images: outgoing.images } : {}),
         ...(outgoing.files.length ? { files: outgoing.files } : {}),
-      });
+      }); };
       if (this.options.onControllerPublish) await this.options.onControllerPublish({ conversation: target, source: { messageId: route.id, userId: route.userId, channelId: route.channelId }, groupContext: route.groupContext, signal, finish }, text, paths, targetId, messageKey, deliver);
       else {
         if (targetId) throw new Error('当前运行模式未提供已授权的目标投递入口');
@@ -1048,7 +1059,12 @@ export class SessionManager {
       if (!current()) throw new Error('主控轮次在投递期间停止');
       this.store.finishPublicMessage(key, 'delivered');
       if (!targetId) this.store.saveDelivery(route.userId, route.channelId, identity);
-    } catch (error) { this.store.finishPublicMessage(key, 'uncertain'); throw error; }
+    } catch (error) {
+      this.store.finishPublicMessage(key, 'uncertain', errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
+      const uncertain = attempted || !!(error && typeof error === 'object' && 'deliveryUncertain' in error);
+      if (uncertain) { const turn = this.running.get(route.userId); if (turn) turn.publicationUncertain = true; }
+      throw Object.assign(error instanceof Error ? error : new Error('回复发送失败'), { publicationFailed: true, ...(uncertain ? { deliveryUncertain: true } : {}) });
+    }
   }
 
   private async processQueue(conversationId: string): Promise<void> {
@@ -1175,6 +1191,7 @@ export class SessionManager {
             this.store.setReplyState(turn.messageIds, 'delivered'); this.markReplyDelivered(turn.messageIds);
           } } : {}),
         });
+        this.store.saveTurnResult(item.id, target.id, result);
         turn.executing = false;
         if (current()) {
           if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
@@ -1190,7 +1207,7 @@ export class SessionManager {
           || this.store.getMessage(item.id)?.state !== 'completed') continue;
         for (const id of turn.messageIds) this.store.setState(id, 'completed');
         if (result.controlledOutput) {
-          if (privateControllerInput && !privateReplyDelivered) throw new Error('主控尚未完成原私聊的最终回复，本批消息未标记为已答。');
+          if (privateControllerInput && !privateReplyDelivered) throw Object.assign(new Error('主控尚未完成原私聊的最终回复，本批消息未标记为已答。'), { finalReplyMissing: true });
           groupOutcome = silent ? 'silent' : 'completed';
           this.store.setReplyState(turn.messageIds, 'delivered');
           continue;
@@ -1207,7 +1224,7 @@ export class SessionManager {
         const header = replyHeader(identity, this.store.getLastDelivery(item.userId, item.channelId), actualModel, actualEffort, effortMetadata);
         const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : '本轮完成（没有文本输出）。';
         const deliver = () => this.sink.sendText(item.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
-          { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
+          { repeatHeader: header, signal: controller.signal, deliveryKey: `reply:${target.id}:${item.id}`, ...(outgoing.images.length ? { images: outgoing.images } : {}),
             ...(outgoing.files.length ? { files: outgoing.files } : {}) });
         if (groupContext && this.options.onGroupPublish) await this.options.onGroupPublish(groupContext, outgoing.text || attachmentText, [], deliver); else await deliver();
         if (!delivering()) continue;
@@ -1219,18 +1236,24 @@ export class SessionManager {
       } catch (error) {
         turn.executing = false;
         await turn.supplements;
+        const retained = completedResultFromError(error);
+        if (retained) this.store.saveTurnResult(item.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
           for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') this.store.setState(id, 'cancelled');
           this.store.setReplyState(turn.messageIds, 'cancelled');
         } else {
-          // A completed model turn is never retried merely because reply delivery failed.
-          for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') this.store.setState(id, 'failed', String(error));
-          this.store.setReplyState(turn.messageIds, 'failed');
+          // Preserve an already completed native report even when its process cleanup failed.
+          if (retained && (!target.nativeId || target.nativeId === retained.nativeId)) this.store.saveNativeId(target.id, retained.nativeId);
+          for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running')
+            this.store.setState(id, retained ? 'completed' : 'failed', errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
+          const unanswered = turn.messageIds.filter(id => this.store.getMessage(id)?.replyState !== 'delivered');
+          this.store.setReplyState(unanswered, 'failed');
           const handled = groupContext && this.options.onGroupTurnError
             ? await this.options.onGroupTurnError(groupContext).catch(() => true) : false;
-          if (!handled) await this.sink.sendText(item.channelId,
-            `执行或回复失败：${error instanceof Error ? error.message : String(error)}`)
-            .catch(() => undefined);
+          if (!handled) await this.sendBridgeNotice(item.channelId, retained ? 'processExitUnconfirmed'
+            : error instanceof Error && 'finalReplyMissing' in error ? 'controllerReplyMissing'
+            : this.store.turnResult(item.id) || error instanceof Error && 'publicationFailed' in error ? 'controllerReplyFailed' : 'controllerFailed',
+            undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
         }
       } finally {
         turn.executing = false;
@@ -1368,7 +1391,7 @@ export class SessionManager {
         this.store.prepareWorkspaceNotice(target.id, 'unknown'); await this.reportInitializationState(target, 'unknown', this.store.getMessage(event.originMessageId) ?? undefined); await this.sendWorkspaceNotice(target);
         registry.markUncertainNotified(event.id); return;
       }
-      await this.sink.sendText(event.channelId, `${notice}\n父会话身份无法确认，未自动汇总。结果已保留，请先核对。`)
+      await this.sendBridgeNotice(event.channelId, 'parentBindingChanged', event.title, `binding:${event.id}`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
       return;
     }
@@ -1382,6 +1405,9 @@ export class SessionManager {
     let actualEffort: string | null = null;
     let effortMetadata: EffortMetadata | null = null;
     let contextId: string | undefined;
+    let publicationFailed = false;
+    let replyPreparationStarted = false;
+    let deliveryStarted = false;
     try {
       const source = workspaceContext ? this.store.latestMessage(target.id) : null;
       const hasHumanSource = source?.conversationId === target.id && source.userId === event.userId
@@ -1426,7 +1452,11 @@ export class SessionManager {
             // Explicit private and the verified original address mean the same destination.
             targetId = undefined;
           }
-          if (!introductionRequested) return this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
+          if (!introductionRequested) {
+            try { await this.publishControlled(target, event, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish); }
+            catch (error) { publicationFailed = true; throw error; }
+            return;
+          }
           if (introductionSent) throw new Error('初始化介绍已发送。');
           this.store.prepareWorkspaceNotice(target.id, 'ready');
           await this.commandReplies.get(event.originMessageId)?.done;
@@ -1441,6 +1471,7 @@ export class SessionManager {
         onReasoningEffort: effort => { if (current()) { actualEffort = effort; target.actualEffort = effort; this.store.saveActualEffort(target.id, effort); } },
         onEffortMetadata: metadata => { if (current()) { effortMetadata = metadata; actualEffort = metadata.actual; target.actualEffort = metadata.actual; this.store.saveActualEffort(target.id, metadata.actual); } },
       });
+      this.store.saveTurnResult(event.id, target.id, result);
       turn.executing = false;
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
       if (!result.nativeId || (boundNativeId && result.nativeId !== boundNativeId)) throw new Error('CLI 返回了不同父会话，未投递结果');
@@ -1456,26 +1487,32 @@ export class SessionManager {
         return;
       }
       if (result.controlledOutput || observation) { registry.markDelivered(event.id); return; }
+      replyPreparationStarted = true;
       const outgoing = await collectOutgoingAttachments(result.text, [target.cwd, join(this.config.dataDir, 'outgoing')],
         this.config.maxImageBytes, this.config.maxFileBytes, controller.signal);
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
       const identity = { conversationId: target.id, agent: target.agent, nativeId: result.nativeId };
       const header = replyHeader(identity, this.store.getLastDelivery(event.userId, event.channelId), actualModel, actualEffort, effortMetadata);
       const attachmentText = outgoing.files.length ? '文件已附上。' : outgoing.images.length ? '图片已附上。' : notice;
+      deliveryStarted = true;
       await this.sink.sendText(event.channelId, `${header}\n\n${outgoing.text || attachmentText}`,
-        { repeatHeader: header, signal: controller.signal, ...(outgoing.images.length ? { images: outgoing.images } : {}),
+        { repeatHeader: header, signal: controller.signal, deliveryKey: `completion:${event.id}`, ...(outgoing.images.length ? { images: outgoing.images } : {}),
           ...(outgoing.files.length ? { files: outgoing.files } : {}) });
       if (!current()) throw new Error('汇总投递期间父会话已停止或切换');
       this.store.saveDelivery(event.userId, event.channelId, identity);
       registry.markDelivered(event.id);
     } catch (error) {
-      registry.markUncertain(event.id, String(error));
+      const retained = completedResultFromError(error);
+      if (retained) this.store.saveTurnResult(event.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
+      registry.markUncertain(event.id, JSON.stringify({ stage: retained ? 'process-exit' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : 'summary', evidence: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']) }));
       if (workspaceContext) {
         if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.reportInitializationState(target, 'load-failed').catch(() => undefined); await this.sendWorkspaceNotice(target); }
         registry.markUncertainNotified(event.id);
       } else if (observation) registry.markUncertainNotified(event.id);
-      else if (!this.closed) await this.sink.sendText(event.channelId,
-        `${notice}\n自动汇总或投递${controller.signal.aborted ? '已停止' : '失败'}，未自动重做或重新派发任务。结果已保留。`)
+      else if (!this.closed) await this.sendBridgeNotice(event.channelId, controller.signal.aborted ? 'summaryStopped'
+        : retained ? 'processExitUnconfirmed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
+        : replyPreparationStarted ? 'resultPreparationFailed' : 'summaryFailed',
+        event.title, `completion-error:${event.id}`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
     } finally {
       turn.executing = false;

@@ -8,7 +8,8 @@ import WebSocket from 'ws';
 import type { BridgeConfig, BridgeMessage, DiscordAttachment, IncomingDM, OutgoingFile, OutgoingImage, ReplyOptions, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
 import { SLASH_COMMANDS, GROUP_SLASH_COMMANDS, slashText, type SlashInteraction } from './slash.js';
 import { splitOverviewMessage, type WorkCounts } from './overview.js';
-import { discordPresentationPages } from './presentation.js';
+import { discordPresentationPages, presentationText } from './presentation.js';
+import { bridgeNotice } from './notices.js';
 import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { discordReplyHeader } from './reply.js';
 import { shouldShowMessageReceipts, type ReceiptMessage } from './receipt-policy.js';
@@ -917,7 +918,8 @@ export class DiscordTransport {
     void this.deliverInOrder(message).catch(async () => {
       this.log('私聊消息处理失败。');
       if (!this.closed) {
-        await this.sendText(message.channelId, '这条消息处理失败，请稍后再试。').catch(() => this.log('错误反馈发送失败。'));
+        const view = bridgeNotice('messageFailed');
+        await this.sendText(message.channelId, presentationText(view), { presentation: view }).catch(() => this.log('错误反馈发送失败。'));
       }
     });
   }
@@ -989,8 +991,11 @@ export class DiscordTransport {
     try { await delivered; }
     catch {
       this.log('斜杠命令执行失败。');
-      if (!this.closed) await this.sendInteractionText(interaction, '这条命令处理失败，请稍后重试。')
-        .catch(() => this.log('斜杠命令错误反馈发送失败。'));
+      if (!this.closed) {
+        const view = bridgeNotice('commandFailed');
+        await this.sendInteractionText(interaction, presentationText(view), { presentation: view })
+          .catch(() => this.log('斜杠命令错误反馈发送失败。'));
+      }
     }
   }
 

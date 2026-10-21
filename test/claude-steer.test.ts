@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ClaudeAdapter } from '../src/agents/claude.js';
+import { completedResultFromError } from '../src/agents/process.js';
 import type { JsonObject } from '../src/agents/process.js';
 import type { AgentSupplement, AgentTurn } from '../src/types.js';
 
@@ -137,4 +138,22 @@ test('Claude observes actual tool_use/tool_result lifecycle, excluding partial a
     assert.equal((activities[2] as { status: string }).status, 'failed');
     assert.equal(JSON.stringify(activities).includes('PRIVATE'), false); assert.equal(JSON.stringify(activities).includes('SECRET'), false);
   } finally { await f.adapter.close(); }
+});
+
+
+test('Claude retains its completed report while a failed shutdown still blocks the native session', async () => {
+  const f = await fixture(); let refuse = true;
+  f.transport.stop = async () => { if (refuse) throw new Error('close failed after result'); };
+  try {
+    f.transport.emit({ type: 'result', subtype: 'success', is_error: false, session_id: 'claude-session', result: '调查已返回，目标仍未验收' });
+    await assert.rejects(f.run, error => {
+      assert(error instanceof Error && 'processStillRunning' in error);
+      assert.deepEqual(completedResultFromError(error), { nativeId: 'claude-session', text: '调查已返回，目标仍未验收' });
+      return true;
+    });
+    assert.equal(f.transport.messages.size, 0); assert.equal(f.transport.failures.size, 0);
+    await assert.rejects(f.adapter.run(f.turn), /仍在执行/);
+    assert.equal(f.transport.writes.filter(value => value.type === 'user').length, 1);
+    refuse = false; await f.adapter.interrupt('bridge-claude');
+  } finally { refuse = false; await f.adapter.close(); }
 });

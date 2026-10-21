@@ -200,7 +200,7 @@ export interface OutgoingFile {
   data: Uint8Array;
   description?: string;
 }
-export interface ReplyOptions { presentation?: import('./presentation.js').BridgePresentation; repeatHeader?: string; images?: OutgoingImage[]; files?: OutgoingFile[]; signal?: AbortSignal }
+export interface ReplyOptions { deliveryKey?: string; presentation?: import('./presentation.js').BridgePresentation; repeatHeader?: string; images?: OutgoingImage[]; files?: OutgoingFile[]; signal?: AbortSignal }
 export interface ReplySink {
   sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void>;
   /** Registered background agents on the latest ordinary message; zero removes the counter. */

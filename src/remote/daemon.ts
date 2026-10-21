@@ -10,7 +10,7 @@ import { WorkerSessionAdapter, WorkerSessionRuntime, sessionVisibility } from '.
 import { PresetRuntime, PresetAgentAdapter, assertPresetBinding } from '../presets/runtime.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
-import { JsonLineProcess, safeError, isObject } from '../agents/process.js';
+import { JsonLineProcess, safeError, isObject, completedResultFromError } from '../agents/process.js';
 import { collectOutgoingAttachments } from '../artifacts.js';
 import { isModelId } from '../config.js';
 import type { AgentAdapter, AgentName, AgentTurn, AgentInput, AgentSupplement, SteerResult } from '../types.js';
@@ -322,6 +322,7 @@ export class RemoteDaemon {
       try {
         const result = await adapter.run(turn);
         this.store.bindSession(result.nativeId, request.workerId, request.agent, request.cwd, request.userId);
+        this.store.update(request.dispatchId, { nativeId: result.nativeId, result, ready: false, stopped: false });
         const captured = await collectOutgoingAttachments(result.text, request.cwd, 10 * 1024 * 1024, MAX_BYTES);
         const artifacts: RemoteArtifact[] = [];
         for (const attachment of [...captured.images.map(item => ({ ...item, image: true })), ...captured.files.map(item => ({ ...item, image: false }))]) {
@@ -335,12 +336,18 @@ export class RemoteDaemon {
       } catch (error) {
         const processUnknown = Boolean(error && typeof error === 'object' && 'processStillRunning' in error);
         const uncertain = processUnknown || Boolean(error && typeof error === 'object' && 'resultUncertain' in error);
+        const nativeResult = completedResultFromError(error) ?? this.store.job(request.dispatchId)?.result;
+        if (nativeResult) {
+          this.store.bindSession(nativeResult.nativeId, request.workerId, request.agent, request.cwd, request.userId);
+          this.store.update(request.dispatchId, { nativeId: nativeResult.nativeId, result: nativeResult });
+        }
         terminal = { status: uncertain ? 'uncertain' : abort.signal.aborted ? 'cancelled' : 'failed', ready: false,
+          ...(nativeResult ? { nativeId: nativeResult.nativeId, result: nativeResult } : {}),
           error: safeError(error instanceof Error ? error.message : '', '远端任务失败'), stopped: !processUnknown };
       }
       this.store.update(request.dispatchId, { ready: false });
       try { await adapter.close(); }
-      catch (error) { terminal = { status: 'uncertain', stopped: false, ready: false, error: safeError(error instanceof Error ? error.message : '', 'CLI 退出未确认') }; }
+      catch (error) { terminal = { ...terminal, status: 'uncertain', stopped: false, ready: false, error: safeError(error instanceof Error ? error.message : '', 'CLI 退出未确认') }; }
       // Native transport closure is part of completion, not a best-effort postscript.
       this.store.update(request.dispatchId, terminal);
       this.active.delete(request.dispatchId);
@@ -373,14 +380,15 @@ export class RemoteDaemon {
       await active.adapter.interrupt(job.workerId); active.abort.abort(); await active.done;
       if (this.store.job(dispatchId)?.stopped !== true) throw new Error('未确认目标电脑上的 CLI 已停止。');
       this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
-    } else if (job.status === 'uncertain') {
-      const processes = this.store.processes(dispatchId);
+    } else if (job.status === 'uncertain' && job.stopped !== true) {
+      const processes = this.store.processRecords(dispatchId);
       if (!processes.length) throw new Error('没有可靠的远端进程记录，停止结果未知。');
-      for (const record of processes) {
+      for (const record of processes.filter(record => !record.closed)) {
         if (!(await stopPersisted(record))) throw new Error('未确认目标电脑上的原生进程已结束。');
         this.store.process({ ...record, closed: true });
       }
-      this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
+      // Exit proof does not resolve the unknown task result or authorize native-session reuse.
+      this.store.update(dispatchId, { ready: false, stopped: true });
     } else if (job.stopped !== true) throw new Error('远端停止结果尚未确认。');
     return { stopped: true };
   }

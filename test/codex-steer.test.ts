@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CodexAdapter } from '../src/agents/codex.js';
+import { completedResultFromError } from '../src/agents/process.js';
 import type { JsonObject, RpcTransport } from '../src/agents/process.js';
 import type { AgentTurn } from '../src/types.js';
 
@@ -128,4 +129,25 @@ test('Codex reports native item lifecycle only, without deltas, commands or othe
     assert.equal((activities[2] as { status: string }).status, 'failed');
     assert.equal(JSON.stringify(activities).includes('PRIVATE'), false); assert.equal(JSON.stringify(activities).includes('SECRET'), false);
   } finally { await f.adapter.close(); }
+});
+
+
+test('Codex retains the final report and releases subscriptions when CLI shutdown is unconfirmed', async () => {
+  const f = await fixture(); let refuse = true;
+  f.transport.stop = async () => { if (refuse) throw new Error('cleanup did not confirm exit'); };
+  try {
+    f.transport.emit({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1',
+      item: { id: 'report', type: 'agentMessage', phase: 'final_answer', text: '已保存修改，验收仍待核对' } } });
+    f.transport.complete();
+    await assert.rejects(f.run, error => {
+      assert(error instanceof Error && 'processStillRunning' in error);
+      assert.deepEqual(completedResultFromError(error), { nativeId: 'thread-1', text: '已保存修改，验收仍待核对' });
+      return true;
+    });
+    assert.equal(f.transport.messages.size, 0); assert.equal(f.transport.failures.size, 0);
+    assert.deepEqual(await f.adapter.steer('bridge-1', f.supplement), { status: 'queued' });
+    await assert.rejects(f.adapter.run(f.turn), /仍在执行/);
+    assert.equal(f.transport.writes.filter(value => value.method === 'turn/start').length, 1);
+    refuse = false; await f.adapter.interrupt('bridge-1');
+  } finally { refuse = false; await f.adapter.close(); }
 });

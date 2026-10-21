@@ -4,7 +4,7 @@
 
 `/status` 只查询状态，不创建会话或调用模型。没有会话时也显示平台、机器人、Profile、模式、默认 Agent、目录和排队数量；模型选择与 CLI 实际回报分开，未回报不伪装为已生效。第一次发送普通文字或图片会自动新建该 bot 下的独立会话。
 
-核心使用 `BridgePresentation` 描述标题、语义色、正文或条目及说明；不生成 ANSI 或平台卡片 JSON。Discord 渲染器保留绿色回复头、黄色电脑／助手总览。飞书使用 JSON 2.0 卡片，只有模型回复（包括新会话介绍）使用绿色标题，其余系统通知、命令、状态、帮助和总览统一使用橙黄色标题；正文支持 Markdown 和代码块，长回复分页重复标题，条目和元数据按文字展示，不触发提及。图片、文件仍作为附件按顺序发送。总览和状态字段在飞书使用原生 `plain_text` 组件保留换行，不把内部字段拼成 Markdown 段落。
+核心使用 `BridgePresentation` 描述标题、语义色、正文或条目及说明；不生成 ANSI 或平台卡片 JSON。Discord 渲染器保留绿色回复头、黄色电脑／助手总览。飞书使用 JSON 2.0 卡片，模型回复（包括新会话介绍）使用绿色标题，错误使用红色标题，警告及其余系统通知、命令、状态、帮助和总览使用橙黄色标题；正文支持 Markdown 和代码块，长回复分页重复标题，条目和元数据按文字展示，不触发提及。图片、文件仍作为附件按顺序发送。总览和状态字段在飞书使用原生 `plain_text` 组件保留换行，不把内部字段拼成 Markdown 段落。
 
 `/computers` 默认按就绪程度排序，逐行标记各 Agent 的可派发、不可用和待确认；检查证据用 `/computers details` 展开。`/workers` 默认仅列执行、排队或待核对的助手，简要显示电脑／Agent／模型／强度／短编号、状态与耗时、任务名；`/workers history` 单独查看已结束或空闲的历史，可组合 `all`、`details`。完整 ID 和回执用 `/workers details` 展开。`all` 仍只访问当前 bot 下本用户的会话。
 
@@ -18,11 +18,15 @@
 
 每轮主控输入和后台事件都附带简短的程序运行信息：后端、模型选择、实际回报、强度和助手默认规则。派工程序负责确定模型，主控不需要读源码或靠记忆猜工具默认值。更新后重启桥即可让已有会话受益；无需为模型修复另行 new。
 
-`BridgeLifecycleEvent` 描述 draining、recovering、ready、failed。ready 只在平台连接、会话恢复及服务初始化完成后发布一次；长连接重连不触发它。生命周期标题来自共用文案：启动为“已就绪”，重启为“已重启”。Discord 通过在线状态显示“已重启”及汇总数量。飞书在 ready 时向当前实际 bot 最近收到消息的一个白名单用户发送黄框卡片，正文仅为“可以继续。”，已有会话保留；找不到联系人则不发送，不广播，也不跨 bot 借用联系人。
+`BridgeLifecycleEvent` 描述 draining、recovering、ready、failed。ready 只在平台连接、会话恢复及服务初始化完成后发布一次；长连接重连不触发它。生命周期标题来自共用文案：启动为“【桥】已就绪”，重启为“【桥】已重启”。Discord 通过在线状态显示“已重启”及汇总数量。飞书在 ready 时向当前实际 bot 最近收到消息的一个白名单用户发送黄框卡片，正文仅为“可以继续。”，已有会话保留；找不到联系人则不发送，不广播，也不跨 bot 借用联系人。
 
 生命周期投递在 `.local/data/lifecycle.sqlite` 中记录。发送前记 attempted，成功记 delivered，失败或结果不确定记 uncertain；同一进程不会重复尝试，重连也不补发。通知失败不阻止桥继续处理消息。启动成功只代表连接与恢复完成，不代表模型提供方已通过实测。
 
 飞书结构参照[卡片 JSON 2.0](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-json-v2-structure)及[Markdown 组件](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-json-v2-components/content-components/rich-text)。
+
+程序错误和恢复提示统一由 `src/notices.ts` 生成，标题带 `【桥】` 短前缀，正文只给必要状态；Discord 使用红色标题，飞书使用红色错误卡片，无颜色的文本回退带 `❌`。CLI 完成报告与进程退出证明分开保存：退出失败不能覆盖报告，确认退出也不等于业务已验收，不自动解除核对锁或重做任务。
+
+飞书每次公开投递在本 bot 的 `feishu-outbox.sqlite` 保存冻结内容、各条实际消息的 UUID、首次尝试时间和平台回执；网络失败最多补发一次，使用同一 UUID 和正文，且限定在首次尝试后 55 分钟内。已确认投递跳过，旧未确认投递不在重启后自动重发，也不重跑主控或助手。错误阶段、HTTP 状态和网络原因留在本地脱敏记录，聊天只显示短提示。
 
 ## 当前平台差异
 

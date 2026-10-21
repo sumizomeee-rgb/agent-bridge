@@ -157,11 +157,11 @@ test('Presence仅op3自定义state，去重并重连恢复当前状态，READY/R
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
   const first = f.packets.find(packet => packet.op === 3)!.d as Record<string, unknown>;
   assert.equal(first.status, 'online');
-  assert.deepEqual(first.activities, [{ name: 'Bridge', type: 4, state: '已重启' }]);
+  assert.deepEqual(first.activities, [{ name: 'Bridge', type: 4, state: '【桥】已重启' }]);
   f.sockets.at(-1)!.terminate();
   await eventually(() => f.packets.some(packet => packet.op === 6) && f.packets.filter(packet => packet.op === 3).length === 3);
   const restored = f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
-  assert.equal(restored.status, 'idle'); assert.deepEqual(restored.activities, [{ name: 'Bridge', type: 4, state: '准备重启' }]);
+  assert.equal(restored.status, 'idle'); assert.deepEqual(restored.activities, [{ name: 'Bridge', type: 4, state: '【桥】准备重启' }]);
   assert.equal(f.posts.length, 0);
 });
 
@@ -172,10 +172,10 @@ test('重启提示保留至获准用户输入，后台发送和未授权消息�
     const packet = f.packets.filter(packet => packet.op === 3).at(-1);
     return packet ? ((packet.d as Record<string, unknown>).activities as Array<{ state: string }>)[0]!.state : undefined;
   };
-  f.transport.setPresence('idle'); await f.transport.start(); await eventually(() => state() === '已重启');
-  f.transport.setWorkCounts({ running: 1, queued: 0 }); await eventually(() => state() === '已重启 · 运行助手1');
-  await f.transport.sendText('222', '后台结果。'); assert.equal(state(), '已重启 · 运行助手1');
-  f.dispatch({ author: { id: '444', bot: false } }); await delay(20); assert.equal(state(), '已重启 · 运行助手1');
+  f.transport.setPresence('idle'); await f.transport.start(); await eventually(() => state() === '【桥】已重启');
+  f.transport.setWorkCounts({ running: 1, queued: 0 }); await eventually(() => state() === '【桥】已重启 · 运行助手1');
+  await f.transport.sendText('222', '后台结果。'); assert.equal(state(), '【桥】已重启 · 运行助手1');
+  f.dispatch({ author: { id: '444', bot: false } }); await delay(20); assert.equal(state(), '【桥】已重启 · 运行助手1');
   f.dispatch(); await eventually(() => received.length === 1 && state() === '运行助手1');
   f.transport.setWorkCounts({ running: 0, queued: 0 }); await eventually(() => state() === '空闲');
   f.sockets.at(-1)!.terminate(); await eventually(() => f.packets.some(packet => packet.op === 6));
@@ -191,17 +191,17 @@ test('全桥数量合并、完整文字去重，重启阶段覆盖数字，恢�
   f.transport.setWorkCounts({ running: 2, queued: 3 });
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
   const state = () => ((f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>).activities as Array<{ state: string }>)[0]!.state;
-  assert.equal(state(), '已重启 · 运行助手2 · 等待3轮');
+  assert.equal(state(), '【桥】已重启 · 运行助手2 · 等待3轮');
   f.transport.setWorkCounts({ running: 2, queued: 3 }); await delay(25);
   assert.equal(f.packets.filter(packet => packet.op === 3).length, 2);
   f.transport.setPresence('draining');
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 3);
   f.transport.setWorkCounts({ running: 9, queued: 8 }); await delay(25);
-  assert.equal(state(), '准备重启');
+  assert.equal(state(), '【桥】准备重启');
   assert.equal(f.packets.filter(packet => packet.op === 3).length, 3);
   f.transport.setPresence('idle');
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 4);
-  assert.equal(state(), '已重启 · 运行助手9 · 等待8轮');
+  assert.equal(state(), '【桥】已重启 · 运行助手9 · 等待8轮');
   assert.equal(f.posts.length, 0);
 });
 
@@ -220,12 +220,12 @@ test('全桥数量同阶段限流只保留最新值，重连强制发布，错�
   t.mock.timers.tick(101);
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 6);
   const latest = () => f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
-  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行助手6 · 等待3轮' }]);
+  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '【桥】已重启 · 运行助手6 · 等待3轮' }]);
   for (const count of [-1, 0.5, NaN, Infinity]) f.transport.setWorkCounts({ running: count, queued: 0 });
   await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 6);
   f.sockets.at(-1)!.terminate();
   await eventually(() => f.packets.some(packet => packet.op === 6) && f.packets.filter(packet => packet.op === 3).length === 7);
-  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '已重启 · 运行助手6 · 等待3轮' }]);
+  assert.deepEqual(latest().activities, [{ name: 'Bridge', type: 4, state: '【桥】已重启 · 运行助手6 · 等待3轮' }]);
   assert.equal(f.posts.length, 0);
 });
 
@@ -235,12 +235,12 @@ test('恢复和失败状态优先于全桥计数，关闭后不会继续发布',
   await f.transport.start();
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 1);
   assert.deepEqual((f.packets.find(packet => packet.op === 3)!.d as Record<string, unknown>).activities,
-    [{ name: 'Bridge', type: 4, state: '恢复中' }]);
+    [{ name: 'Bridge', type: 4, state: '【桥】恢复中' }]);
   f.transport.setPresence('failed');
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 2);
   const failed = f.packets.filter(packet => packet.op === 3).at(-1)!.d as Record<string, unknown>;
   assert.equal(failed.status, 'dnd');
-  assert.deepEqual(failed.activities, [{ name: 'Bridge', type: 4, state: '重启失败' }]);
+  assert.deepEqual(failed.activities, [{ name: 'Bridge', type: 4, state: '【桥】重启失败' }]);
   f.transport.setPresence('idle');
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 3);
   f.transport.setWorkCounts({ running: 4, queued: 0 });
@@ -258,7 +258,7 @@ test('Presence每个窗口最多5次，超限合并到最新状态，不发送�
   await delay(10); assert.equal(f.packets.filter(packet => packet.op === 3).length, 5);
   await eventually(() => f.packets.filter(packet => packet.op === 3).length === 6);
   const packet = f.packets.filter(item => item.op === 3).at(-1)!.d as Record<string, unknown>;
-  assert.deepEqual(packet.activities, [{ name: 'Bridge', type: 4, state: '准备重启' }]);
+  assert.deepEqual(packet.activities, [{ name: 'Bridge', type: 4, state: '【桥】准备重启' }]);
   assert.equal(f.posts.length, 0);
 });
 
@@ -676,7 +676,7 @@ test('callback failures send one generic safe feedback without echoing secrets',
   await f.transport.start();
   f.dispatch({ id: '201' }); f.dispatch({ id: '201' });
   await eventually(() => f.posts.length === 1);
-  assert.equal(f.posts[0]!.content, '这条消息处理失败，请稍后再试。');
+  assert.match(f.posts[0]!.content as string, /\u001b\[31m【桥】消息处理失败/);
   assert.deepEqual(f.posts[0]!.allowed_mentions, { parse: [] });
 });
 
