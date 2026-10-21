@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgentCommand, AgentName, BridgeConfig } from './types.js';
@@ -168,16 +168,10 @@ export function loadHostConfig(argv = process.argv.slice(2), createDirectories =
       principals.push({ id: record.id, accounts: map });
     }
   }
-  const paths = new Set<string>();
   const configs = profiles.map((profile, index) => {
     const botId = identities[index]!;
     const key = join(profile.platform, profile.applicationId!);
     const workspace = resolve(projectRoot, profile.workspace ?? resolve(workspaceRoot, key));
-    const canonical = (path: string): string => existsSync(path) ? realpathSync(path) : dirname(path) === path ? path : join(canonical(dirname(path)), path.slice(dirname(path).length + 1));
-    const actualWorkspace = canonical(workspace);
-    const pathKey = process.platform === 'win32' ? actualWorkspace.toLowerCase() : actualWorkspace;
-    if ([...paths].some(path => pathKey === path || pathKey.startsWith(path + '/') || pathKey.startsWith(path + '\\') || path.startsWith(pathKey + '/') || path.startsWith(pathKey + '\\'))) throw new Error('不同 Bot 不能复用或嵌套同一个上下文工作区。');
-    paths.add(pathKey);
     const dataDir = resolve(rootDataDir, 'bots', key);
     const config = buildConfig({ ...raw, workspace, dataDir, attachmentsDir: resolve(dataDir, 'attachments'), logsDir: resolve(rootDataDir, '..', 'logs', key) }, profile, portOverride);
     const owner = profile.ownerPrincipalId == null ? undefined : principals.find(principal => principal.id === profile.ownerPrincipalId);

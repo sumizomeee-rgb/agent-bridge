@@ -1,6 +1,6 @@
 # Profile、Bot 与宿主迁移
 
-桥项目名称为 `agent-bridge`。正式入口读取 `version: 3` 配置，一个宿主启动同一聊天平台的多个 Bot；各 Bot 独立维护账号绑定、当前主控、上下文工作区和运行数据，宿主协调工作群、公开进展和跨 Bot 交接。
+桥项目名称为 `agent-bridge`。正式入口读取 `version: 3` 配置，一个宿主启动同一聊天平台的多个 Bot；各 Bot 独立维护账号绑定、当前主控和运行数据；用户上下文工作区由配置决定，可以共用，宿主协调工作群、公开进展和跨 Bot 交接。
 
 ## 身份与启动集合
 
@@ -35,11 +35,11 @@ profiles/discord.example.json               # Git：Discord Bot 模板
 .local/backups/                             # 私有迁移备份
 ```
 
-公共配置使用 `workspaceRoot` 指定默认上下文根目录、`workingCwd` 指定默认工程执行目录；Profile 可用 `workspace`、`workingCwd` 分别覆盖。初始化、长期记忆、远程电脑和能力登记始终从该 Bot 固定的上下文工作区读取，执行任务在所选工程目录工作。`/cwd` 改工程目录并新建主控，不会把其他工程目录当成新的长期记忆入口。不同 Bot 的上下文目录不能相同或互相嵌套。
+公共配置使用 `workspaceRoot` 指定默认上下文根目录、`workingCwd` 指定默认工程执行目录；Profile 可用 `workspace`、`workingCwd` 分别覆盖。初始化、长期记忆、远程电脑和能力登记始终从该 Bot 固定的上下文工作区读取，执行任务在所选工程目录工作。`/cwd` 改工程目录并新建主控，不会把其他工程目录当成新的长期记忆入口。多个 Bot 可以把 `workspace` 配置为同一个用户目录，共用 README、MEMORY、平台指南和能力／预设登记；会话、任务、认证副本、附件与日志仍按 Bot ID 隔离。共享目录由用户明确配置，不复制用户记忆或按 Bot 自动分叉。
 
 Profile 还可设置 `defaultAgent: "codex"` 或 `defaultAgent: "claude"`；未设置时继承公共 `defaultAgent`，公共配置也未设置时使用 Codex。例如 Bot1 保持 Codex、Bot2 初始使用 Claude，只需在 Bot2 的 Profile 写入 `"defaultAgent": "claude"`。这个默认值只用于尚无当前主控的初始化，不会切换已有会话、清除原生上下文或覆盖该 Bot 已保存的模型与推理力度偏好；模型默认仍使用公共 `defaultModels`。
 
-凭据、白名单、实际路径、聊天、任务、认证副本和备份均不提交 Git。模板、校验、启动代码和说明提交 Git。新增 Bot 时复制相应模板，填入真实应用身份、凭据与白名单，生成它独立的工作区，再把 Profile 加进启动集合。飞书白名单使用该应用下的用户 Open ID，不同应用的 Open ID 不能互换。
+凭据、白名单、实际路径、聊天、任务、认证副本和备份均不提交 Git。模板、校验、启动代码和说明提交 Git。新增 Bot 时复制相应模板，填入真实应用身份、凭据与白名单，指定共用或独立的用户工作区，再把 Profile 加进启动集合。飞书白名单使用该应用下的用户 Open ID，不同应用的 Open ID 不能互换。
 
 ## 操作者与群地址登记
 

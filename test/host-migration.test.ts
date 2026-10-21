@@ -85,15 +85,49 @@ test('host internal Bot communication flag defaults on, accepts explicit boolean
   }
 });
 
-test('host rejects old semantics, duplicate real bots, mixed platforms, shared workspace and ambiguous principals', t => {
+test('host rejects old semantics, duplicate real bots, mixed platforms and ambiguous principals', t => {
   const f = fixture(t); writeConfig(f, { version: 2 }); assert.throws(() => loadHostConfig(['--config', f.config], false), /离线宿主迁移/);
   const a = join(f.local, 'bots', 'feishu', 'a.json'), b = join(f.local, 'bots', 'feishu', 'b.json'), rawA = JSON.parse(readFileSync(a, 'utf8')), rawB = JSON.parse(readFileSync(b, 'utf8'));
   writeFileSync(b, JSON.stringify(rawA)); writeConfig(f, {}); assert.throws(() => loadHostConfig(['--config', f.config], false), /同一个真实 Bot/);
-  writeFileSync(b, JSON.stringify({ ...rawB, workspace: join(f.root, 'shared') })); writeFileSync(a, JSON.stringify({ ...rawA, workspace: join(f.root, 'shared') })); assert.throws(() => loadHostConfig(['--config', f.config], false), /不能复用/);
+  writeFileSync(b, JSON.stringify({ ...rawB, workspace: join(f.root, 'shared') })); writeFileSync(a, JSON.stringify({ ...rawA, workspace: join(f.root, 'shared') }));
+  const shared = loadHostConfig(['--config', f.config], false);
+  assert.equal(shared.configs[0]!.contextWorkspace, shared.configs[1]!.contextWorkspace);
+  assert.notEqual(shared.configs[0]!.dataDir, shared.configs[1]!.dataDir);
   writeFileSync(a, JSON.stringify(rawA)); writeFileSync(b, JSON.stringify(rawB));
   writeConfig(f, { principals: [{ id: 'one', accounts: { [botA]: userA } }, { id: 'two', accounts: { [botA]: userA } }] }); assert.throws(() => loadHostConfig(['--config', f.config], false), /多个 principal/);
   mkdirSync(join(f.local, 'bots', 'discord')); writeFileSync(join(f.local, 'bots', 'discord', 'd.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private', allowedUserIds: ['234567890123456789'] }));
   writeConfig(f, { startupProfiles: ['feishu/a', 'discord/d'] }); assert.throws(() => loadHostConfig(['--config', f.config], false), /同一平台/);
+});
+
+test('shared user workspace survives host migration while native Bot sessions stay isolated', async t => {
+  const f = fixture(t, 2), workspace = join(f.root, 'shared'); mkdirSync(workspace);
+  writeFileSync(join(workspace, 'README.md'), '# Shared user guidance\n');
+  writeFileSync(join(workspace, 'MEMORY.md'), '# Shared preferences\nKeep this user memory.\n');
+  for (const alias of ['a', 'b']) {
+    const path = join(f.local, 'bots', 'feishu', alias + '.json'), raw = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(path, JSON.stringify({ ...raw, workspace }));
+  }
+  writeFileSync(join(f.data, 'disabled'), '');
+  const source = new SessionStore(f.data);
+  const sessions = [[botA, userA], [botB, userB]].map(([botId, user]) => {
+    const conversation = source.createConversation(botId + '|' + user, 'codex', workspace);
+    source.saveNativeId(conversation.id, 'native-' + botId); source.setActive(conversation.userId, conversation.id);
+    return { botId, id: conversation.id, nativeId: 'native-' + botId };
+  });
+  source.close();
+  await migrateHostConfig(f.config, { dryRun: false, startupProfiles: ['feishu/a', 'feishu/b'] });
+  const host = loadHostConfig(['--config', f.config], false); ensureHostSemanticData(host);
+  assert.equal(new Set(host.configs.map(config => config.dataDir)).size, 2);
+  for (const config of host.configs) {
+    assert.equal(config.contextWorkspace, workspace);
+    const store = new SessionStore(config.dataDir);
+    try {
+      for (const session of sessions) assert.equal(store.getConversation(session.id)?.nativeId ?? null,
+        session.botId === config.botId ? session.nativeId : null);
+    } finally { store.close(); }
+  }
+  assert.equal(readFileSync(join(workspace, 'README.md'), 'utf8'), '# Shared user guidance\n');
+  assert.equal(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), '# Shared preferences\nKeep this user memory.\n');
 });
 
 test('dry run is read-only and multiple active owners require an explicit choice', async t => {

@@ -55,7 +55,6 @@ function legacy(configPath: string, options: HostMigrationOptions): Legacy {
   const active = databaseRows(dataDir, 'bridge.sqlite', 'active_conversations');
   const tasks = databaseRows(dataDir, 'tasks.sqlite', 'tasks');
   const schedules = databaseRows(dataDir, 'controller.sqlite', 'controller_schedules');
-  const workspaceSet = new Set<string>();
   const bots = profiles.map((profile, index): MigratedBot => {
     const botId = ids[index]!, scope = profileScope(profile), owned = conversations.filter(row => String(row.user_id).startsWith(scope));
     const current = active.filter(row => String(row.user_id).startsWith(scope));
@@ -68,8 +67,6 @@ function legacy(configPath: string, options: HostMigrationOptions): Legacy {
     if (principalId != null && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(principalId)) throw new Error('迁移 principal id 无效。');
     const original = raw.startupProfile === profile.name;
     const contextWorkspace = local(project, profile.workspace ?? (original ? raw.workspace : undefined), join('.local', 'workspaces', profile.platform, profile.applicationId!));
-    const key = process.platform === 'win32' ? contextWorkspace.toLowerCase() : contextWorkspace;
-    if (workspaceSet.has(key)) throw new Error('多个 Bot 的上下文工作区不能复用。'); workspaceSet.add(key);
     return { botId, profile: profile.name, ownerPrincipalId: principalId, ownerUserId,
       activeConversationId: current.find(row => row.user_id === ownerUserId)?.conversation_id as string | undefined ?? null,
       dataDir: join(dataDir, 'bots', profile.platform, profile.applicationId!), contextWorkspace,
