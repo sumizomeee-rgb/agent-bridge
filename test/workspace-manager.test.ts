@@ -801,7 +801,7 @@ test('/new continue freezes parent selection, uses one initializer, persists a b
   await until(() => f.manager.isIdle() && f.inspect.workspaceNotice(parent.id)!.state === 'delivered');
   const event = f.controller.turns.find(turn => turn.conversation.id === parent.id && turn.event);
   assert.ok(event); assert.match(event.text, /WORKSPACE_CONTEXT/); assert.match(event.text, /不能保留数据重装/);
-  assert.match(event.text, /关键纠正和真正待办/);
+  assert.match(event.text, /3\. 续接理解/);
   assert.match(readFileSync(join(directory, 'context.md'), 'utf8'), /不能保留数据重装/);
   await f.restart(); await delay(30);
   assert.equal(f.children.turns.length, 2);
