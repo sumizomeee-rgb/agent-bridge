@@ -221,7 +221,7 @@ test('运行期间可查询直属数据，查询失败只回当前交互且不�
   const replies: string[] = [];
   await f.manager.handle(message('during-turn', '/workers'), async text => { replies.push(text); });
   await f.manager.handle(message('failed-computers', '/computers'), async text => { replies.push(text); });
-  assert.match(replies[0]!, /运行1个/); assert.equal(replies[1], '命令失败：电脑清单检查失败，请稍后重试。');
+  assert.match(replies[0]!, /运行1个/); assert.equal(replies[1], '❌ 【桥】命令失败\n\n请核对命令或查看本地记录。');
   assert(!replies.join('').includes('credential-sensitive'));
   assert.equal(f.adapter.turns.length, 1); assert.deepEqual(f.replies, []);
 });
