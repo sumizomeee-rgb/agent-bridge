@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { ClaudeAdapter } from '../src/agents/claude.js';
+import { AgentProcessStopError, stopEvidenceFromError } from '../src/agents/process.js';
 import { CodexAdapter } from '../src/agents/codex.js';
 import type { AgentAdapter, AgentName, AgentTurn } from '../src/types.js';
 
@@ -118,7 +119,7 @@ async function fixture(agent: AgentName, mode = 'success') {
     }
     throw new Error('fake turn did not start');
   };
-  const cleanup = async () => { await adapter.close(); await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 }); };
+  const cleanup = async () => { try { await adapter.close(); } finally { await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 }); } };
   return { adapter, controller, turn, progress, nativeIds, traces, waitStarted, cleanup, image, env, command };
 }
 
@@ -233,8 +234,14 @@ for (const agent of ['codex', 'claude'] as const) {
 
   test(`${agent} 意外进程断线不会返回成功或永久等待`, async () => {
     const f = await fixture(agent, 'disconnect');
-    try { await assert.rejects(f.adapter.run(f.turn), /进程已断开/); }
-    finally { await f.cleanup(); }
+    try {
+      await assert.rejects(f.adapter.run(f.turn), error => {
+        assert(error instanceof AgentProcessStopError); const evidence = stopEvidenceFromError(error)!;
+        assert.equal(evidence.exitObserved, true); assert.equal(evidence.exitCode, 7);
+        assert.equal(evidence.taskkillAttempted, false); assert.equal(evidence.completion, 'unconfirmed'); return true;
+      });
+      assert.equal(await f.adapter.confirmStopped?.(f.turn.conversation.id), false);
+    } finally { await assert.rejects(f.cleanup(), AgentProcessStopError); }
   });
 
   test(`${agent} Agent 失败结果传播，错误文本不暴露 bearer`, async () => {

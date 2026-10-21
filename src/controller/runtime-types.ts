@@ -3,6 +3,7 @@ import type { TaskCompletionEvent, TaskOrigin } from '../tasks.js';
 import type { ExecutionTargetBinding, RemoteHandoff, TargetSummary } from '../remote/types.js';
 import type { NativeSessionAdoptArgs, NativeSessionAdoption, NativeSessionPage, NativeSessionRead, NativeSessionReadOptions, NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts } from '../overview.js';
+import type { AgentStopEvidence } from '../agents/process.js';
 
 export type ControllerJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain';
 export interface ControllerWorker {
@@ -26,6 +27,8 @@ export interface ControllerJob {
   /** A completed turn report and process exit proof are independent of reconciliation status. */
   nativeResult?: AgentResult;
   processStopped?: boolean;
+  stopEvidence?: AgentStopEvidence;
+  executionError?: string; cleanupError?: string;
   /** Optional metadata keeps old JSON rows compatible; no native payloads are stored. */
   progress?: AgentExecutionProgress;
   /** Stable per-tool notices survive remote reconnect and bridge restart. */

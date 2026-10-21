@@ -10,13 +10,14 @@ import { WorkerSessionAdapter, WorkerSessionRuntime, sessionVisibility } from '.
 import { PresetRuntime, PresetAgentAdapter, assertPresetBinding } from '../presets/runtime.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
-import { JsonLineProcess, safeError, isObject, completedResultFromError } from '../agents/process.js';
+import { JsonLineProcess, safeError, isObject, completedResultFromError, stopEvidenceFromError } from '../agents/process.js';
 import { collectOutgoingAttachments } from '../artifacts.js';
 import { isModelId } from '../config.js';
-import type { AgentAdapter, AgentName, AgentTurn, AgentInput, AgentSupplement, SteerResult } from '../types.js';
+import type { AgentAdapter, AgentName, AgentTurn, AgentInput, AgentSupplement, SteerResult, AgentResult } from '../types.js';
 import type { RemoteArtifact, RemoteDaemonConfig, RemoteDispatch, RemoteJob, RemoteRequest, RemoteResponse } from './types.js';
 import { RemoteStore, fingerprint, type ProcessRecord } from './store.js';
 import { observeActivity } from '../agents/activity.js';
+import { executionErrorEvidence } from '../delivery-errors.js';
 import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
 
 const CHUNK = 192 * 1024;
@@ -93,6 +94,8 @@ export class RemoteDaemon {
   readonly nativeSessions: NativeSessionService;
   private readonly active = new Map<string, { adapter: AgentAdapter; abort: AbortController; done: Promise<void> }>();
   private readonly operations = new Map<string, Promise<SteerResult>>();
+  private readonly pendingExits = new Map<string, { adapter: AgentAdapter; abort: AbortController }>();
+  private readonly trackedProcesses = new Map<string, Array<{ transport: JsonLineProcess; record: ProcessRecord }>>();
   private readonly dispatches = new Map<string, { fingerprint: string; promise: Promise<RemoteJob> }>();
   private readonly metadataAdapters = new Set<AgentAdapter>();
   private readonly sockets = new Set<Socket>();
@@ -187,7 +190,21 @@ export class RemoteDaemon {
     if (method === 'query') {
       const id = identifier(raw.dispatchId, '派发编号');
       const pending = this.dispatches.get(id); if (pending) await pending.promise;
-      const job = this.store.job(id); if (!job) throw Object.assign(new Error('此派发编号未在目标电脑登记，未自动重新执行。'), { code: 'DISPATCH_NOT_FOUND' }); return job;
+      const job = this.store.job(id); if (!job) throw Object.assign(new Error('此派发编号未在目标电脑登记，未自动重新执行。'), { code: 'DISPATCH_NOT_FOUND' });
+      const pendingExit = this.pendingExits.get(id);
+      if (pendingExit && !this.active.has(id)) {
+        try {
+          if (await pendingExit.adapter.confirmStopped?.(job.workerId, id) === true) {
+            await pendingExit.adapter.close(); this.pendingExits.delete(id);
+            this.store.update(id, { stopped: true, ready: false });
+          }
+        } catch {}
+      }
+      // A query may reconcile positive exit evidence, but never sends a signal or resolves task effects.
+      if (job.status !== 'running' && job.stopped !== true && !this.active.has(id) && this.trackedExitConfirmed(id))
+        return this.store.update(id, { stopped: true, ready: false });
+      this.releaseTracked(id);
+      return this.store.job(id)!;
     }
     if (method === 'upload') return this.upload(raw);
     if (method === 'artifact') return this.artifact(raw);
@@ -286,9 +303,14 @@ export class RemoteDaemon {
     const track = (transport: JsonLineProcess): void => {
       const pid = transport.child.pid; if (!pid || id === 'metadata') return;
       const record: ProcessRecord = { dispatchId: id, pid, identity: null, closed: false }; this.store.process(record);
-      let closed = false;
-      transport.child.once('close', () => { closed = true; if (!this.closing) this.store.process({ ...record, closed: true }); });
-      void processIdentity(pid).then(identity => { if (!this.closing) this.store.process({ ...record, identity, closed }); });
+      const tracked = this.trackedProcesses.get(id) ?? []; tracked.push({ transport, record }); this.trackedProcesses.set(id, tracked);
+      let removeStopped = () => {};
+      removeStopped = transport.onStopped(() => {
+        record.closed = true;
+        if (!this.closing) { this.store.process(record); this.store.update(id, { stopEvidence: transport.stopEvidence }); }
+        removeStopped();
+      });
+      void processIdentity(pid).then(identity => { record.identity = identity; if (!this.closing) this.store.process(record); });
     };
     if (this.options.adapterFactory) return this.options.adapterFactory(agent, request, track);
     const factory = (command: RemoteDispatch['agentCommand'], args: string[], cwd: string, env: NodeJS.ProcessEnv) => { const child = new JsonLineProcess(command, args, cwd, env); track(child); return child; };
@@ -297,6 +319,31 @@ export class RemoteDaemon {
     if (request.sessionVisibility) return new WorkerSessionAdapter(this.workerSessions, agent, request.sessionVisibility, request.agentCommand, this.environment(),
       (command, env) => agent === 'codex' ? new CodexAdapter(command, env, factory) : new ClaudeAdapter(command, env, factory));
     return agent === 'codex' ? new CodexAdapter(request.agentCommand, this.environment(), factory) : new ClaudeAdapter(request.agentCommand, this.environment(), factory);
+  }
+  private trackedExitConfirmed(dispatchId: string): boolean {
+    for (const { transport, record } of this.trackedProcesses.get(dispatchId) ?? []) {
+      if (transport.confirmStopped()) { const saved = this.store.processRecords(dispatchId).find(value => value.pid === record.pid);
+        if (saved && !saved.closed) { record.closed = true; this.store.process({ ...saved, closed: true }); } }
+    }
+    const records = this.store.processRecords(dispatchId);
+    return records.length > 0 && records.every(record => record.closed);
+  }
+  private releaseTracked(dispatchId: string): void {
+    const job = this.store.job(dispatchId);
+    if (job?.stopped === true && !this.active.has(dispatchId) && !this.pendingExits.has(dispatchId) && this.trackedExitConfirmed(dispatchId))
+      this.trackedProcesses.delete(dispatchId);
+  }
+  private async captureResult(request: RemoteDispatch, result: AgentResult): Promise<Pick<RemoteJob, 'result' | 'artifacts'>> {
+    const captured = await collectOutgoingAttachments(result.text, request.cwd, 10 * 1024 * 1024, MAX_BYTES);
+    const artifacts: RemoteArtifact[] = [];
+    for (const attachment of [...captured.images.map(item => ({ ...item, image: true })), ...captured.files.map(item => ({ ...item, image: false }))]) {
+      const id = randomUUID(); const directory = join(this.dataDirectory, 'artifacts', request.dispatchId); mkdirSync(directory, { recursive: true });
+      await writeFile(join(directory, id), attachment.data, { flag: 'wx', mode: 0o600 });
+      artifacts.push({ id, filename: attachment.filename, description: attachment.description, image: attachment.image, size: attachment.data.length,
+        sha256: createHash('sha256').update(attachment.data).digest('hex') });
+    }
+
+    return { result: { ...result, text: captured.text }, artifacts };
   }
   private start(request: RemoteDispatch): void {
     const adapter = this.makeAdapter(request.agent, request, request.dispatchId); const abort = new AbortController();
@@ -319,38 +366,64 @@ export class RemoteDaemon {
     // Deferring keeps the handle durable before native execution starts.
     const done = Promise.resolve().then(async () => {
       let terminal: Partial<RemoteJob>;
+      let stopOnlyReport: AgentResult | undefined;
       try {
         const result = await adapter.run(turn);
         this.store.bindSession(result.nativeId, request.workerId, request.agent, request.cwd, request.userId);
         this.store.update(request.dispatchId, { nativeId: result.nativeId, result, ready: false, stopped: false });
-        const captured = await collectOutgoingAttachments(result.text, request.cwd, 10 * 1024 * 1024, MAX_BYTES);
-        const artifacts: RemoteArtifact[] = [];
-        for (const attachment of [...captured.images.map(item => ({ ...item, image: true })), ...captured.files.map(item => ({ ...item, image: false }))]) {
-          const id = randomUUID(); const directory = join(this.dataDirectory, 'artifacts', request.dispatchId); mkdirSync(directory, { recursive: true });
-          await writeFile(join(directory, id), attachment.data, { flag: 'wx', mode: 0o600 });
-          artifacts.push({ id, filename: attachment.filename, description: attachment.description, image: attachment.image, size: attachment.data.length,
-            sha256: createHash('sha256').update(attachment.data).digest('hex') });
-        }
         terminal = { status: abort.signal.aborted ? 'cancelled' : 'completed', nativeId: result.nativeId,
-          result: { ...result, text: captured.text }, artifacts, ready: false, stopped: true };
+          ...await this.captureResult(request, result), ready: false, stopped: true };
       } catch (error) {
         const processUnknown = Boolean(error && typeof error === 'object' && 'processStillRunning' in error);
         const uncertain = processUnknown || Boolean(error && typeof error === 'object' && 'resultUncertain' in error);
-        const nativeResult = completedResultFromError(error) ?? this.store.job(request.dispatchId)?.result;
+        const completedReport = completedResultFromError(error);
+        if (processUnknown && !(error && typeof error === 'object' && 'resultUncertain' in error)) stopOnlyReport = completedReport;
+        const nativeResult = completedReport ?? this.store.job(request.dispatchId)?.result;
         if (nativeResult) {
           this.store.bindSession(nativeResult.nativeId, request.workerId, request.agent, request.cwd, request.userId);
           this.store.update(request.dispatchId, { nativeId: nativeResult.nativeId, result: nativeResult });
         }
         terminal = { status: uncertain ? 'uncertain' : abort.signal.aborted ? 'cancelled' : 'failed', ready: false,
           ...(nativeResult ? { nativeId: nativeResult.nativeId, result: nativeResult } : {}),
+          ...(stopEvidenceFromError(error) ? { stopEvidence: stopEvidenceFromError(error) } : {}),
+          executionError: isObject(error) && typeof error.executionError === 'string' ? error.executionError : executionErrorEvidence(error),
+          ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanupError: error.cleanupError } : {}),
           error: safeError(error instanceof Error ? error.message : '', '远端任务失败'), stopped: !processUnknown };
       }
       this.store.update(request.dispatchId, { ready: false });
-      try { await adapter.close(); }
-      catch (error) { terminal = { ...terminal, status: 'uncertain', stopped: false, ready: false, error: safeError(error instanceof Error ? error.message : '', 'CLI 退出未确认') }; }
-      // Native transport closure is part of completion, not a best-effort postscript.
+      let canClose = !stopOnlyReport;
+      if (stopOnlyReport) { try { canClose = await adapter.confirmStopped?.(request.workerId, request.dispatchId) === true; } catch {} }
+      if (canClose) { try { await adapter.close(); }
+      catch (error) { terminal = { ...terminal, status: 'uncertain', stopped: false, ready: false,
+        ...(stopEvidenceFromError(error) ? { stopEvidence: stopEvidenceFromError(error) } : {}),
+        cleanupError: executionErrorEvidence(error),
+        error: safeError(error instanceof Error ? error.message : '', 'CLI 退出未确认') }; } }
+      else this.pendingExits.set(request.dispatchId, { adapter, abort });
+      // Successful close alone is not exit evidence for every wrapper. Accept only an explicit native proof or complete tracked history.
+      if (terminal.stopped !== true) {
+        let confirmed = this.trackedExitConfirmed(request.dispatchId);
+        if (!confirmed) { try { confirmed = await adapter.confirmStopped?.(request.workerId, request.dispatchId) === true; } catch {} }
+        if (confirmed) terminal = { ...terminal, stopped: true };
+      }
+      if (terminal.stopped === true && this.pendingExits.has(request.dispatchId)) {
+        try {
+          if (await adapter.confirmStopped?.(request.workerId, request.dispatchId) === true) {
+            await adapter.close(); this.pendingExits.delete(request.dispatchId);
+          }
+        } catch (error) { terminal = { ...terminal, cleanupError: executionErrorEvidence(error) }; }
+      }
+      if (stopOnlyReport && terminal.stopped === true && abort.signal.aborted) terminal = { ...terminal, status: 'cancelled' };
+      if (stopOnlyReport && terminal.stopped === true && !abort.signal.aborted && !this.nativeClosing && !this.closing) {
+        try {
+          terminal = { ...terminal, status: 'completed', error: undefined,
+            ...await this.captureResult(request, stopOnlyReport) };
+        } catch (error) {
+          terminal = { ...terminal, status: 'failed', error: safeError(error instanceof Error ? error.message : '', '产物整理失败') };
+        }
+      }
+      // Other uncertainty is preserved; native turn completion never implies business acceptance.
       this.store.update(request.dispatchId, terminal);
-      this.active.delete(request.dispatchId);
+      this.active.delete(request.dispatchId); this.releaseTracked(request.dispatchId);
     });
     this.active.set(request.dispatchId, { adapter, abort, done });
   }
@@ -375,11 +448,22 @@ export class RemoteDaemon {
   }
   private async interrupt(dispatchId: string): Promise<{ stopped: true }> {
     const job = this.store.job(dispatchId); if (!job) throw new Error('远端任务不存在。');
-    const active = this.active.get(dispatchId);
-    if (active) {
+    const active = this.active.get(dispatchId), pendingExit = this.pendingExits.get(dispatchId);
+    if (!active && pendingExit && job.status === 'completed' && job.stopped === true) {
+      if (await pendingExit.adapter.confirmStopped?.(job.workerId, dispatchId) === true) {
+        await pendingExit.adapter.close(); this.pendingExits.delete(dispatchId); this.releaseTracked(dispatchId);
+      }
+      return { stopped: true };
+    }
+    if (!active && pendingExit) {
+      await pendingExit.adapter.interrupt(job.workerId); pendingExit.abort.abort(); await pendingExit.adapter.close();
+      if (await pendingExit.adapter.confirmStopped?.(job.workerId, dispatchId) !== true && !this.trackedExitConfirmed(dispatchId))
+        throw new Error('未确认目标电脑上的 CLI 已停止。');
+      this.pendingExits.delete(dispatchId); this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
+    } else if (active) {
       await active.adapter.interrupt(job.workerId); active.abort.abort(); await active.done;
       if (this.store.job(dispatchId)?.stopped !== true) throw new Error('未确认目标电脑上的 CLI 已停止。');
-      this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
+      this.pendingExits.delete(dispatchId); this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
     } else if (job.status === 'uncertain' && job.stopped !== true) {
       const processes = this.store.processRecords(dispatchId);
       if (!processes.length) throw new Error('没有可靠的远端进程记录，停止结果未知。');
@@ -390,7 +474,7 @@ export class RemoteDaemon {
       // Exit proof does not resolve the unknown task result or authorize native-session reuse.
       this.store.update(dispatchId, { ready: false, stopped: true });
     } else if (job.stopped !== true) throw new Error('远端停止结果尚未确认。');
-    return { stopped: true };
+    this.releaseTracked(dispatchId); return { stopped: true };
   }
   private async handoff(raw: Record<string, unknown>): Promise<{ stopped: true; nativeId: string }> {
     const nativeId = identifier(raw.nativeId, '原生会话编号'); const agent = this.agent(raw.agent); const cwd = text(raw.cwd, '工作目录', 4000);
@@ -441,7 +525,7 @@ export class RemoteDaemon {
     if (this.closing) return;
     this.nativeClosing = true;
     await Promise.allSettled([...this.nativeOperations]);
-    for (const id of [...this.active.keys()]) await this.interrupt(id);
+    for (const id of new Set([...this.active.keys(), ...this.pendingExits.keys()])) await this.interrupt(id);
     // Metadata queries own native CLI transports too. Keep any failed close tracked for retry.
     for (const adapter of [...this.metadataAdapters]) { await adapter.close(); this.metadataAdapters.delete(adapter); }
     this.closing = true;

@@ -1,10 +1,11 @@
 import { normalizeEffortCapability, selectedEffort } from '../effort.js';
+import { stopEvidenceFromError } from '../agents/process.js';
 import { readFile, lstat, mkdir, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Conversation, AgentAdapter, AgentInput, AgentModelInfo, AgentResult, AgentSupplement, AgentTurn, AgentName, BridgeConfig, SteerResult } from '../types.js';
 import type { ExecutionTargetBinding, RemoteClient, RemoteDispatch, RemoteJob } from './types.js';
-import { RemoteDispatchUncertain, RemoteArtifactTransferError } from './types.js';
+import { RemoteDispatchUncertain, RemoteArtifactTransferError, RemoteResultUncertain } from './types.js';
 import { PresetResultUnknown } from '../presets/runtime.js';
 import type { PresetBinding } from '../presets/types.js';
 import { SshRemoteClient } from './client.js';
@@ -158,17 +159,23 @@ export class RemoteAgentAdapter implements AgentAdapter {
           turn.onActivity?.({ ...job.progress.lastActivity, snapshot: job.progress });
         }
         if (job.status === 'completed' && job.result) {
-          if (job.stopped !== true) throw new RemoteDispatchUncertain('【桥】报告已保存，CLI 退出待核对。', job.result);
+          if (job.stopped !== true) throw new RemoteDispatchUncertain('【桥】报告已保存，CLI 退出待核对。', job.result, stopEvidenceFromError(job), job.executionError, job.cleanupError);
           try { return await this.download(job); }
           catch (error) { throw new RemoteArtifactTransferError(job.result, error instanceof Error ? error.message : '产物传输错误'); }
         }
-        if (job.status === 'uncertain') { if (this.binding.preset && job.stopped === true) throw new PresetResultUnknown(job.result); throw new RemoteDispatchUncertain(job.error, job.result); }
+        if (job.status === 'uncertain') {
+          if (job.stopped === true) {
+            if (this.binding.preset) throw new PresetResultUnknown(job.result, stopEvidenceFromError(job), job.executionError, job.cleanupError);
+            throw new RemoteResultUncertain(job.error, job.result, stopEvidenceFromError(job), job.executionError, job.cleanupError);
+          }
+          throw new RemoteDispatchUncertain(job.error, job.result, stopEvidenceFromError(job), job.executionError, job.cleanupError);
+        }
         if (job.status === 'cancelled') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端取消已登记，CLI 退出尚未确认。'); throw Object.assign(new Error('目标电脑上的 CLI 已停止。'), { name: 'AbortError' }); }
         if (job.status === 'failed') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端任务失败，CLI 退出尚未确认。'); throw Object.assign(new Error(job.error ?? '远端任务失败。'), { code: 'REMOTE_JOB_FAILED' }); }
         await new Promise<void>(resolveValue => setTimeout(resolveValue, this.options.pollMs ?? 750));
       }
     } catch (error) {
-      if (error instanceof RemoteDispatchUncertain || error instanceof RemoteArtifactTransferError || error instanceof PresetResultUnknown) throw error;
+      if (error instanceof RemoteDispatchUncertain || error instanceof RemoteArtifactTransferError || error instanceof RemoteResultUncertain || error instanceof PresetResultUnknown) throw error;
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
       const name = error instanceof Error ? error.name : '';
       if (execution.submitted && name !== 'AbortError' && !['REMOTE_REJECTED', 'DISPATCH_NOT_FOUND', 'REMOTE_JOB_FAILED'].includes(code)) throw new RemoteDispatchUncertain(error instanceof Error ? error.message : undefined);

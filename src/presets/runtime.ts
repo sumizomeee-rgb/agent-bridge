@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
+import { executionErrorEvidence } from '../delivery-errors.js';
 import { existsSync, lstatSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
 import { join, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { isObject, abortError, completedResultFromError, processStopFailure } from '../agents/process.js';
+import { isObject, abortError, completedResultFromError, processStopFailure, stopEvidenceFromError, type AgentStopEvidence } from '../agents/process.js';
 import { isModelId } from '../config.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
@@ -44,7 +45,7 @@ export function assertPresetBinding(raw: unknown): asserts raw is PresetBinding 
 }
 export class PresetResultUnknown extends Error {
   readonly resultUncertain = true;
-  constructor(readonly nativeResult?: AgentResult) { super('预设请求已开始，但未取得完整结果；原会话已保留，禁止自动重放。'); this.name = 'PresetResultUnknown'; }
+  constructor(readonly nativeResult?: AgentResult, readonly stopEvidence?: AgentStopEvidence, readonly executionError?: string, readonly cleanupError?: string) { super('预设请求已开始，但未取得完整结果；原会话已保留，禁止自动重放。'); this.name = 'PresetResultUnknown'; }
 }
 function matches(profile: LaunchProfile, binding: PresetBinding): boolean {
   return profile.id === binding.profileId && profile.revision === binding.revision && profile.agent === binding.agent
@@ -139,9 +140,10 @@ export class PresetRuntime {
 }
 
 export class PresetAgentAdapter implements AgentAdapter {
-  private readonly active = new Map<string, { stopped: boolean; adapter?: AgentAdapter }>();
+  private readonly active = new Map<string, { stopped: boolean; adapter?: AgentAdapter; prepared?: PreparedPreset }>();
   private readonly metadata = new Set<AgentAdapter>();
   private readonly unconfirmed = new Set<string>();
+  private readonly stopped = new Set<string>();
   private closed = false;
   constructor(private readonly runtime: PresetRuntime, readonly binding: PresetBinding, private readonly command: AgentCommand,
     private readonly env: NodeJS.ProcessEnv, private readonly factory: (command: AgentCommand, env: NodeJS.ProcessEnv) => AgentAdapter =
@@ -161,29 +163,33 @@ export class PresetAgentAdapter implements AgentAdapter {
     if (this.closed || turn.signal.aborted) throw abortError();
     if (turn.conversation.agent !== this.binding.agent || turn.conversation.model !== this.binding.model) throw new Error('预设助手的引擎或模型不匹配。');
     const id = turn.conversation.id; if (this.active.has(id)) throw new Error('预设助手仍在执行。');
-    const state: { stopped: boolean; adapter?: AgentAdapter } = { stopped: false }; this.active.set(id, state);
+    const state: { stopped: boolean; adapter?: AgentAdapter; prepared?: PreparedPreset } = { stopped: false }; this.active.set(id, state); this.stopped.delete(id);
     let prepared: PreparedPreset | undefined;
     let nativeResult: AgentResult | undefined;
+    let stopOnlyReport = false, resultUncertain = false, executionError: string | undefined;
     try {
-      prepared = await this.runtime.prepare(this.binding, id, turn.conversation.nativeId, this.command, this.env, this.visibility);
+      prepared = await this.runtime.prepare(this.binding, id, turn.conversation.nativeId, this.command, this.env, this.visibility); state.prepared = prepared;
       if (this.closed || state.stopped || turn.signal.aborted) throw abortError();
       state.adapter = this.factory(prepared.command, prepared.env);
       let ready = false;
       try { nativeResult = await state.adapter.run({ ...turn, onReady: () => { ready = true; turn.onReady?.(); } }); return nativeResult; }
       catch (error) {
         nativeResult = completedResultFromError(error);
+        executionError = executionErrorEvidence(error);
+        resultUncertain = isObject(error) && 'resultUncertain' in error;
+        stopOnlyReport = !!nativeResult && isObject(error) && error.processStillRunning === true && !('resultUncertain' in error);
         if (error && typeof error === 'object' && 'processStillRunning' in error) this.unconfirmed.add(id);
-        if (ready && !turn.signal.aborted && !state.stopped && !(error && typeof error === 'object' && 'processStillRunning' in error)) throw new PresetResultUnknown(nativeResult);
+        if (ready && !turn.signal.aborted && !state.stopped && !(error && typeof error === 'object' && 'processStillRunning' in error)) { resultUncertain = true; throw new PresetResultUnknown(nativeResult, stopEvidenceFromError(error), executionError); }
         throw error;
       }
     } finally {
-      let cleanupError: unknown;
-      try { await state.adapter?.close(); }
-      catch (error) { cleanupError = error; }
-      try { await prepared?.close(); }
-      catch (error) { cleanupError ??= error; }
-      if (cleanupError !== undefined) { this.unconfirmed.add(id); throw processStopFailure(cleanupError, nativeResult); }
-      if (!this.unconfirmed.has(id)) this.active.delete(id);
+      let cleanupError: unknown, confirmed = false;
+      if (stopOnlyReport) { try { confirmed = await state.adapter?.confirmStopped?.(id) === true; } catch {} }
+      if (!stopOnlyReport || confirmed) { try { await state.adapter?.close(); } catch (error) { cleanupError = error; } }
+      if (!stopOnlyReport || confirmed) { try { await prepared?.close(); } catch (error) { cleanupError ??= error; } }
+      if (confirmed && cleanupError === undefined && !turn.signal.aborted && !state.stopped && !this.closed) { this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id); return nativeResult!; }
+      if (cleanupError !== undefined) { this.unconfirmed.add(id); throw Object.assign(processStopFailure(cleanupError, nativeResult), { executionError, cleanupError: executionErrorEvidence(cleanupError) }, resultUncertain ? { resultUncertain: true } : {}); }
+      if (!this.unconfirmed.has(id)) { this.active.delete(id); this.stopped.add(id); }
     }
   }
   async steer(id: string, input: AgentSupplement): Promise<SteerResult> { return await this.active.get(id)?.adapter?.steer?.(id, input) ?? { status: 'queued', unsupported: true, reason: '预设后端尚未就绪，未投递。' }; }
@@ -191,9 +197,16 @@ export class PresetAgentAdapter implements AgentAdapter {
     const state = this.active.get(id);
     if (state) {
       state.stopped = true; await state.adapter?.interrupt(id);
-      if (this.unconfirmed.has(id)) { await state.adapter?.close(); this.active.delete(id); this.unconfirmed.delete(id); }
+      if (this.unconfirmed.has(id)) { await state.adapter?.close(); await state.prepared?.close(); this.active.delete(id); this.unconfirmed.delete(id); this.stopped.add(id); }
     }
   }
-  async confirmStopped(id: string): Promise<boolean> { return !this.active.has(id) && !this.unconfirmed.has(id); }
+  async confirmStopped(id: string): Promise<boolean> {
+    if (this.unconfirmed.has(id)) {
+      try { const state = this.active.get(id); if (await state?.adapter?.confirmStopped?.(id) === true) {
+        await state?.adapter?.close(); await state?.prepared?.close(); this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id);
+      } } catch {}
+    }
+    return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id);
+  }
   async close(): Promise<void> { this.closed = true; await Promise.all([...this.active.keys()].map(id => this.interrupt(id))); await Promise.all([...this.metadata].map(adapter => adapter.close())); }
 }

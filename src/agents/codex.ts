@@ -6,6 +6,9 @@ import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpc
 /** App-server v2 stdio protocol, verified against Codex rust-v0.160.0. */
 export class CodexAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
+  private readonly executions = new Map<string, RpcTransport>();
+  private readonly retirements = new Set<string>();
+  private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
   private readonly metadataProcesses = new Set<RpcTransport>();
@@ -77,6 +80,7 @@ export class CodexAdapter implements AgentAdapter {
       readonly?.env ?? { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) }); }
     catch (error) { readonly?.cleanup(); throw error; }
     const rpc = new JsonRpcClient(transport);
+    this.executions.set(conversationId, transport); this.stopped.delete(conversationId);
     const completed = deferred<AgentResult>();
     const replies = new Map<string, { text: string; phase: unknown }>();
     const observedItems = new Set<string>();
@@ -98,6 +102,7 @@ export class CodexAdapter implements AgentAdapter {
     let nativeId = turn.conversation.nativeId;
     let turnId: string | null = null;
     let cancelled = false;
+    let terminalReceipt = false;
     let runFinished = false;
     let cancelling: Promise<void> | null = null;
 
@@ -135,6 +140,7 @@ export class CodexAdapter implements AgentAdapter {
       } else if (message.method === 'turn/completed' && isObject(params.turn)) {
         const result = params.turn;
         if (turnId && typeof result.id === 'string' && result.id !== turnId) return;
+        terminalReceipt = true; this.retirements.add(conversationId);
         if (cancelled || result.status === 'interrupted') { completed.reject(abortError()); return; }
         if (result.status !== 'completed') {
           const error = isObject(result.error) ? result.error : {};
@@ -163,7 +169,7 @@ export class CodexAdapter implements AgentAdapter {
         await transport.stop(false);
       })();
       cancelling = operation;
-      void operation.then(() => { if (runFinished) this.active.delete(conversationId); }, () => { if (cancelling === operation) cancelling = null; });
+      void operation.then(() => { this.stopped.add(conversationId); if (runFinished) { this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId); } }, () => { if (cancelling === operation) cancelling = null; });
       return operation;
     };
     // 0.160.0 generate-ts：TurnSteerParams / TurnSteerResponse，非实验协议。
@@ -266,6 +272,7 @@ export class CodexAdapter implements AgentAdapter {
       if (cancelled) throw abortError();
       if (!completed.settled) turn.onReady?.();
       nativeResult = await completed.promise;
+      this.retirements.add(conversationId);
       success = true;
       return nativeResult;
     } catch (error) {
@@ -275,8 +282,9 @@ export class CodexAdapter implements AgentAdapter {
       turn.signal.removeEventListener('abort', onAbort);
       try {
         if (cancelling) await cancelling;
-        else await transport.stop(success);
-        this.active.delete(conversationId);
+        else await transport.stop(success || terminalReceipt);
+        this.active.delete(conversationId); this.stopped.add(conversationId);
+        this.executions.delete(conversationId); this.retirements.delete(conversationId);
       } catch (error) { throw processStopFailure(error, nativeResult); }
       finally {
         removeMessage(); removeFailure(); rpc.close();
@@ -291,10 +299,17 @@ export class CodexAdapter implements AgentAdapter {
     return this.supplements.get(conversationId)?.(message) ?? { status: 'queued' };
   }
 
+  async confirmStopped(conversationId: string): Promise<boolean> {
+    if (this.executions.get(conversationId)?.confirmStopped?.()) {
+      this.stopped.add(conversationId); this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId);
+    }
+    return this.stopped.has(conversationId);
+  }
+
   async interrupt(conversationId: string): Promise<void> { await this.active.get(conversationId)?.(); }
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.values()].map((cancel) => cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
   }
 }

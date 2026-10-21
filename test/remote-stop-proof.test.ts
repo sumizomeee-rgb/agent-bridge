@@ -27,3 +27,25 @@ test('a fresh remote adapter confirms a supplied persisted dispatch only by matc
     assert.ok(calls.every(call => call.method === 'query')); assert.equal(job.status, 'uncertain');
   } finally { await adapter.close(); }
 });
+test('ordinary stopped uncertain results preserve native reports without claiming the process still runs', async () => {
+  const { RemoteResultUncertain } = await import('../src/remote/types.js');
+  const { completedResultFromError } = await import('../src/agents/process.js');
+  const report = { nativeId: 'complete-native', text: 'Original report; feature acceptance remains incomplete.' }, methods: string[] = [];
+  const adapter = new RemoteAgentAdapter({ ...binding, expectedHostname: 'test-host' }, config, { clientFactory: () => ({
+    async request<T>(method: string) {
+      methods.push(method);
+      if (method === 'hello') return { hostname: 'test-host', version: 1, engines: ['codex'] } as T;
+      assert.equal(method, 'query');
+      return { dispatchId: 'old-dispatch', workerId: 'old-worker', status: 'uncertain', stopped: true, result: report } as T;
+    }, async close() {},
+  }) });
+  try {
+    await assert.rejects(adapter.run({ recovering: true, dispatchId: 'old-dispatch', conversation: { id: 'old-worker', userId: 'owner', agent: 'codex',
+      nativeId: report.nativeId, title: 'old', cwd: '.', createdAt: '', updatedAt: '' }, text: 'must not submit', imagePaths: [],
+      signal: new AbortController().signal, onProgress() {} }), error => {
+      assert(error instanceof RemoteResultUncertain); assert.equal(error.resultUncertain, true); assert.equal('processStillRunning' in error, false);
+      assert.deepEqual(completedResultFromError(error), report); return true;
+    });
+    assert.deepEqual(methods, ['hello', 'query']);
+  } finally { await adapter.close(); }
+});

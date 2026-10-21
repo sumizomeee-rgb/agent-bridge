@@ -46,9 +46,45 @@ async function within(promise: Promise<unknown>, milliseconds: number): Promise<
   } finally { clearTimeout(timeout); }
 }
 
+export interface AgentStopEvidence {
+  pid?: number;
+  graceful: boolean;
+  exitObserved: boolean;
+  exitCode: number | null;
+  signalCode: string | null;
+  closeObserved: boolean;
+  taskkillAttempted: boolean;
+  taskkillExitCode: number | null;
+  durationMs: number;
+  phaseMs: Partial<Record<'gracefulWait' | 'treeKill' | 'exitWait' | 'stdioDrain', number>>;
+  completion: 'pending' | 'graceful-exit' | 'tree-stop' | 'transport-closed' | 'not-started' | 'unconfirmed';
+}
+
+/** Copy only diagnostic metadata, never commands, environment or output. */
+export function stopEvidenceFromError(error: unknown): AgentStopEvidence | undefined {
+  if (!isObject(error) || !isObject(error.stopEvidence)) return undefined;
+  const value = error.stopEvidence;
+  const number = (candidate: unknown) => typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0;
+  const code = (candidate: unknown) => candidate === null || typeof candidate === 'number' && Number.isInteger(candidate);
+  if (typeof value.graceful !== 'boolean' || typeof value.exitObserved !== 'boolean' || typeof value.closeObserved !== 'boolean'
+    || typeof value.taskkillAttempted !== 'boolean' || !number(value.durationMs)
+    || !code(value.exitCode) || !code(value.taskkillExitCode)
+    || !(value.signalCode === null || typeof value.signalCode === 'string')
+    || !['pending', 'graceful-exit', 'tree-stop', 'transport-closed', 'not-started', 'unconfirmed'].includes(String(value.completion))) return undefined;
+  const phaseMs: AgentStopEvidence['phaseMs'] = {};
+  for (const key of ['gracefulWait', 'treeKill', 'exitWait', 'stdioDrain'] as const) {
+    if (isObject(value.phaseMs) && number(value.phaseMs[key])) phaseMs[key] = value.phaseMs[key] as number;
+  }
+  return { ...(number(value.pid) && Number.isInteger(value.pid) && Number(value.pid) > 0 ? { pid: value.pid as number } : {}),
+    graceful: value.graceful, exitObserved: value.exitObserved, exitCode: value.exitCode as number | null,
+    signalCode: value.signalCode as string | null, closeObserved: value.closeObserved, taskkillAttempted: value.taskkillAttempted,
+    taskkillExitCode: value.taskkillExitCode as number | null, durationMs: value.durationMs as number, phaseMs,
+    completion: value.completion as AgentStopEvidence['completion'] };
+}
+
 export class AgentProcessStopError extends Error {
   readonly processStillRunning = true;
-  constructor(readonly pid: number | undefined, readonly nativeResult?: AgentResult, options?: ErrorOptions) {
+  constructor(readonly pid: number | undefined, readonly nativeResult?: AgentResult, options?: ErrorOptions, readonly stopEvidence?: AgentStopEvidence) {
     super('【桥】CLI 退出待核对。', options);
     this.name = 'AgentProcessStopError';
   }
@@ -63,7 +99,7 @@ export function completedResultFromError(error: unknown): AgentResult | undefine
 }
 
 export function processStopFailure(error: unknown, result = completedResultFromError(error)): AgentProcessStopError {
-  return new AgentProcessStopError(isObject(error) && typeof error.pid === 'number' ? error.pid : undefined, result, { cause: error });
+  return new AgentProcessStopError(isObject(error) && typeof error.pid === 'number' ? error.pid : undefined, result, { cause: error }, stopEvidenceFromError(error));
 }
 
 /** Newline-delimited JSON transport. Never log raw stdout or stderr. */
@@ -74,7 +110,22 @@ export class JsonLineProcess {
   private readonly closed = deferred<void>();
   private failure: Error | null = null;
   private buffer = '';
-  private stopping: Promise<void> | null = null;
+  private gracefulStop: Promise<void> | null = null;
+  private forcedStop: Promise<void> | null = null;
+  private readonly exited = deferred<void>();
+  private readonly escalation = deferred<void>();
+  private readonly stoppedListeners = new Set<() => void>();
+  private forceRequested = false;
+  private gracefulRetirement = false;
+  private protocolRetired = false;
+  private treeKillSucceeded = false;
+  private stopStarted: number | null = null;
+  private lastGraceful = false;
+  private taskkillAttempted = false;
+  private taskkillExitCode: number | null = null;
+  private readonly phaseMs: AgentStopEvidence['phaseMs'] = {};
+  private completion: AgentStopEvidence['completion'] = 'pending';
+  private stopConfirmed = false;
 
   constructor(command: AgentCommand, extraArgs: string[], cwd: string, env: NodeJS.ProcessEnv) {
     this.child = spawn(command.command, [...command.args, ...extraArgs], {
@@ -92,8 +143,18 @@ export class JsonLineProcess {
     this.child.on('error', (error) => this.fail(new Error(`无法启动 Agent 进程：${safeError(error.message, '启动失败')}`)));
     this.child.stdin.on('error', () => this.fail(new Error('Agent 输入连接已断开。')));
     this.child.stdout.on('error', () => this.fail(new Error('Agent 输出连接已断开。')));
+    this.child.on('exit', (code, signal) => {
+      this.exited.resolve();
+      // A descendant may still own stdout/stderr after the actual CLI exits.
+      const timer = setTimeout(() => {
+        if (this.gracefulRetirement && !this.forceRequested) this.establishStop('graceful-exit');
+        else if (!this.closed.settled) this.fail(new Error(`Agent 进程已断开（退出码 ${code ?? '无'}，信号 ${signal ?? '无'}）。`));
+      }, 100);
+      timer.unref();
+    });
     this.child.on('close', (code, signal) => {
       this.closed.resolve();
+      this.confirmStopped();
       this.fail(new Error(`Agent 进程已断开（退出码 ${code ?? '无'}，信号 ${signal ?? '无'}）。`));
     });
   }
@@ -120,6 +181,7 @@ export class JsonLineProcess {
   endInput(): void { this.child.stdin.end(); }
 
   private consume(chunk: string): void {
+    if (this.protocolRetired) return;
     this.buffer += chunk;
     // Bound a single message, not the duration of a legitimate long turn.
     if (this.buffer.length > 16 * 1024 * 1024 && !this.buffer.includes('\n')) {
@@ -152,39 +214,163 @@ export class JsonLineProcess {
     for (const listener of this.failures) listener(error);
   }
 
-  /** EOF is graceful after success; cancellation forcefully stops the process tree. */
-  stop(graceful = false): Promise<void> {
-    if (this.closed.settled) return Promise.resolve();
-    this.stopping ??= this.stopOnce(graceful);
-    return this.stopping;
+  get stopEvidence(): AgentStopEvidence {
+    return { ...(this.child.pid ? { pid: this.child.pid } : {}), graceful: this.lastGraceful,
+      exitObserved: this.exited.settled, exitCode: this.child.exitCode, signalCode: this.child.signalCode,
+      closeObserved: this.closed.settled, taskkillAttempted: this.taskkillAttempted, taskkillExitCode: this.taskkillExitCode,
+      durationMs: this.stopStarted === null ? 0 : Math.round(performance.now() - this.stopStarted),
+      phaseMs: { ...this.phaseMs }, completion: this.completion };
   }
 
-  private async stopOnce(graceful: boolean): Promise<void> {
-    if (this.closed.settled) return;
-    if (graceful) {
-      this.endInput();
-      if (await within(this.closed.promise, 1000)) return;
+  /** CLI transport retirement is distinct from a successful explicit tree cancellation. */
+  confirmStopped(): boolean {
+    if (!this.stopConfirmed) {
+      if (this.exited.settled && this.treeKillSucceeded) this.establishStop('tree-stop');
+      else if (this.exited.settled && this.gracefulRetirement && !this.forceRequested) this.establishStop('graceful-exit');
+      else if (this.closed.settled && !this.child.pid) this.establishStop('not-started');
     }
-    const pid = this.child.pid;
-    if (pid && process.platform === 'win32') {
-      const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
-        shell: false, windowsHide: true, stdio: 'ignore',
-      });
-      const killed = new Promise<void>((resolve) => {
-        killer.once('close', () => resolve());
-        killer.once('error', () => resolve());
-      });
-      if (!(await within(killed, 2000))) killer.kill();
-      if (!this.closed.settled) this.child.kill('SIGKILL');
-    } else if (pid) {
-      try { process.kill(-pid, 'SIGTERM'); }
-      catch { this.child.kill('SIGTERM'); }
-      if (!(await within(this.closed.promise, 1000))) {
-        try { process.kill(-pid, 'SIGKILL'); }
-        catch { this.child.kill('SIGKILL'); }
+    return this.stopConfirmed;
+  }
+
+  onStopped(listener: () => void): () => void {
+    const stopped = this.confirmStopped(); this.stoppedListeners.add(listener);
+    if (stopped) queueMicrotask(() => { if (this.stoppedListeners.has(listener)) listener(); });
+    return () => { this.stoppedListeners.delete(listener); };
+  }
+
+  private retireStdio(): void {
+    this.protocolRetired = true; this.buffer = '';
+    // Keep draining inherited writers: destroying the readers can crash a business
+    // background process with EPIPE. Unref only the bridge's handles.
+    for (const stream of [this.child.stdout, this.child.stderr, this.child.stdin]) {
+      (stream as typeof stream & { unref?: () => void }).unref?.();
+    }
+  }
+
+  private establishStop(completion: AgentStopEvidence['completion']): void {
+    if (this.stopConfirmed) return;
+    this.completion = completion; this.stopConfirmed = true; this.retireStdio();
+    for (const listener of this.stoppedListeners) listener();
+    this.stoppedListeners.clear();
+  }
+
+  /** Only completed turns use graceful retirement; explicit cancellation may escalate it once. */
+  stop(graceful = false): Promise<void> {
+    if (this.confirmStopped()) return Promise.resolve();
+    this.stopStarted ??= performance.now();
+    if (!graceful) {
+      this.lastGraceful = false; this.forceRequested = true; this.gracefulRetirement = false; this.escalation.resolve();
+      return this.forcedStop ??= this.stopForced();
+    }
+    if (this.forceRequested) return this.forcedStop ??= this.stopForced();
+    this.lastGraceful = true; this.gracefulRetirement = true;
+    return this.gracefulStop ??= this.stopGraceful();
+  }
+
+  private unknownStop(): AgentProcessStopError {
+    this.completion = 'unconfirmed';
+    return new AgentProcessStopError(this.child.pid, undefined, undefined, this.stopEvidence);
+  }
+
+  private async drainAfterExit(completion: 'graceful-exit' | 'tree-stop'): Promise<void> {
+    const started = performance.now(); await within(this.closed.promise, 100);
+    this.phaseMs.stdioDrain = Math.round(performance.now() - started);
+    if (completion === 'graceful-exit' && this.forceRequested) { await this.forcedStop; return; }
+    this.establishStop(completion);
+  }
+
+  private async stopGraceful(): Promise<void> {
+    if (!this.exited.settled && !this.child.stdin.destroyed) this.endInput();
+    const started = performance.now();
+    await within(Promise.race([this.exited.promise, this.escalation.promise]), 5000);
+    this.phaseMs.gracefulWait = Math.round(performance.now() - started);
+    if (this.forceRequested) { await this.forcedStop; return; }
+    if (!this.exited.settled) throw this.unknownStop();
+    await this.drainAfterExit('graceful-exit');
+  }
+
+  private async stopWindowsTree(pid: number): Promise<void> {
+    // READY/STOP pins the original process object before authorizing a PID-based
+    // operation. Our original ChildProcess handle is still alive until exit, so
+    // a READY accepted before that event cannot refer to a reused PID. The helper
+    // holds its own handle until taskkill has finished, keeping that PID reserved.
+    const script = `$ErrorActionPreference='Stop';$targetProcess=$null;$treeKiller=$null
+try {
+  $targetProcess=[Diagnostics.Process]::GetProcessById(${pid});$null=$targetProcess.Handle
+  [Console]::Out.WriteLine('READY')
+  if([Console]::ReadLine() -ne 'STOP' -or $targetProcess.HasExited){[Console]::Out.WriteLine('SKIP');exit}
+  $info=New-Object Diagnostics.ProcessStartInfo
+  $info.FileName=[IO.Path]::Combine([Environment]::GetFolderPath('System'),'taskkill.exe')
+  $info.Arguments='/PID ${pid} /T /F';$info.UseShellExecute=$false;$info.CreateNoWindow=$true
+  $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+  [Console]::Out.WriteLine('ATTEMPT')
+  $treeKiller=[Diagnostics.Process]::Start($info)
+  if(-not $treeKiller.WaitForExit(2000)){$treeKiller.Kill();$treeKiller.WaitForExit()}
+  [Console]::Out.WriteLine('EXIT:'+[string]$treeKiller.ExitCode)
+} catch {[Console]::Out.WriteLine('FAILED')}
+finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProcess.Dispose()}}`;
+    const helper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    const finished = deferred<void>(); let buffer = '', permissionOpen = true, authorized = false;
+    helper.stdin.on('error', () => {});
+    helper.stdout.setEncoding('utf8');
+    helper.stdout.on('data', (part: string) => {
+      buffer += part;
+      let at: number;
+      while ((at = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, at).trim(); buffer = buffer.slice(at + 1);
+        if (line === 'READY') {
+          authorized = permissionOpen && !this.exited.settled;
+          helper.stdin.end(authorized ? 'STOP\n' : 'SKIP\n');
+        } else if (line === 'ATTEMPT' && authorized) this.taskkillAttempted = true;
+        else if (authorized && /^EXIT:-?\d+$/.test(line)) {
+          this.taskkillExitCode = Number(line.slice(5)); this.treeKillSucceeded = this.taskkillAttempted && this.taskkillExitCode === 0;
+          this.confirmStopped();
+        }
       }
-    } else this.child.kill();
-    if (!(await within(this.closed.promise, 1000))) throw new AgentProcessStopError(pid);
+      if (buffer.length > 128) buffer = '';
+    });
+    helper.once('error', () => finished.resolve()); helper.once('close', () => finished.resolve());
+    if (!(await within(finished.promise, 5000))) {
+      permissionOpen = false; helper.stdin.end();
+      // Do not kill the holder while its taskkill might still be running: that
+      // would release the PID reservation. Its own taskkill wait is bounded.
+      helper.unref(); (helper.stdout as typeof helper.stdout & { unref?: () => void }).unref?.();
+    }
+  }
+
+  private async stopForced(): Promise<void> {
+    const pid = this.child.pid;
+    if (!pid) {
+      if (await within(this.closed.promise, 1000)) { this.establishStop('not-started'); return; }
+      throw this.unknownStop();
+    }
+    // Never issue a new PID-based tree kill after the original root has exited.
+    if (this.exited.settled) throw this.unknownStop();
+    const started = performance.now();
+    if (process.platform === 'win32') await this.stopWindowsTree(pid);
+    else {
+      try { process.kill(-pid, 'SIGTERM'); } catch {}
+      await within(this.exited.promise, 1000);
+      const groupGone = () => {
+        try { process.kill(-pid, 0); return false; }
+        catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+      };
+      this.treeKillSucceeded = groupGone();
+      if (!this.treeKillSucceeded && !this.exited.settled) {
+        try { process.kill(-pid, 'SIGKILL'); } catch {}
+        for (let check = 0; check < 20 && !this.treeKillSucceeded; check++) {
+          await new Promise<void>(resolve => setTimeout(resolve, 50)); this.treeKillSucceeded = groupGone();
+        }
+      }
+      // If the root disappeared but a group still exists, do not signal a
+      // potentially reused group ID or call a root-only exit a successful stop.
+    }
+    this.phaseMs.treeKill = Math.round(performance.now() - started);
+    const exitStarted = performance.now(); await within(this.exited.promise, 1000);
+    this.phaseMs.exitWait = Math.round(performance.now() - exitStarted);
+    if (!this.treeKillSucceeded || !this.exited.settled) throw this.unknownStop();
+    await this.drainAfterExit('tree-stop');
   }
 }
 
@@ -193,7 +379,7 @@ export class JsonRpcError extends Error {
   constructor(readonly code: number | null, message: string) { super(message); }
 }
 
-export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'>;
+export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'> & Partial<Pick<JsonLineProcess, 'confirmStopped'>>;
 
 export class JsonRpcClient {
   private nextId = 1;

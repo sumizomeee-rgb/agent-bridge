@@ -1,4 +1,5 @@
 import type { PresetBinding } from '../presets/types.js';
+import type { AgentStopEvidence } from '../agents/process.js';
 import type { SessionVisibility, AgentCommand, AgentInput, AgentName, AgentResult, AgentSupplement, AgentModelInfo, SteerResult, AgentExecutionProgress, EffortConfiguration, EffortMetadata } from '../types.js';
 
 /** Non-secret snapshot. Native homes, provider credentials and history stay on the target. */
@@ -50,7 +51,7 @@ export interface RemoteJob {
   nativeId: string | null; ready: boolean; actualModel?: string; actualEffort?: string | null;
   effortConfiguration?: EffortConfiguration | null;
   effortMetadata?: EffortMetadata | null;
-  result?: AgentResult; artifacts?: RemoteArtifact[]; error?: string; stopped?: boolean;
+  result?: AgentResult; artifacts?: RemoteArtifact[]; error?: string; stopped?: boolean; stopEvidence?: AgentStopEvidence; executionError?: string; cleanupError?: string;
   /** Native-owned progress snapshot, distinct from transport query/heartbeat timestamps. */
   progress?: AgentExecutionProgress;
   createdAt: string; updatedAt: string;
@@ -62,7 +63,13 @@ export interface RemoteClient {
 export interface RemoteHandoff { targetId: string; nativeId: string; cwd: string; agent: AgentName; resumeCommand: string; stopped: true }
 export class RemoteDispatchUncertain extends Error {
   readonly processStillRunning = true;
-  constructor(message = '远端执行连接断开，任务结果未知；禁止重新派发或续接。', readonly nativeResult?: AgentResult) { super(message); this.name = 'RemoteDispatchUncertain'; }
+  constructor(message = '远端执行连接断开，任务结果未知；禁止重新派发或续接。', readonly nativeResult?: AgentResult, readonly stopEvidence?: AgentStopEvidence, readonly executionError?: string, readonly cleanupError?: string) { super(message); this.name = 'RemoteDispatchUncertain'; }
+}
+/** Execution effects still need review, but native exit has positive proof. */
+export class RemoteResultUncertain extends Error {
+  readonly resultUncertain = true;
+  readonly nativeStopped = true;
+  constructor(message = '【桥】CLI 已退出，任务结果待核对。', readonly nativeResult?: AgentResult, readonly stopEvidence?: AgentStopEvidence, readonly executionError?: string, readonly cleanupError?: string) { super(message); this.name = 'RemoteResultUncertain'; }
 }
 export class RemoteArtifactTransferError extends Error {
   readonly nativeStopped = true;

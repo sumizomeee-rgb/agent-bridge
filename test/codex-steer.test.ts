@@ -151,3 +151,17 @@ test('Codex retains the final report and releases subscriptions when CLI shutdow
     refuse = false; await f.adapter.interrupt('bridge-1');
   } finally { refuse = false; await f.adapter.close(); }
 });
+
+
+for (const status of ['failed', 'interrupted']) test(`Codex terminal ${status} retires gracefully while preserving its original failure`, async () => {
+  const f = await fixture(), modes: boolean[] = [];
+  f.transport.stop = async (graceful?: boolean) => { modes.push(graceful === true); };
+  try {
+    f.transport.emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status,
+      error: { message: 'native terminal failure' }, items: [] } } });
+    if (status === 'interrupted') await assert.rejects(f.run, { name: 'AbortError' });
+    else await assert.rejects(f.run, /native terminal failure/);
+    assert.deepEqual(modes, [true]); assert.equal(await f.adapter.confirmStopped('bridge-1'), true);
+    assert.equal(f.transport.writes.filter(value => value.method === 'turn/start').length, 1);
+  } finally { await f.adapter.close(); }
+});

@@ -156,3 +156,45 @@ test('completed report reader validates serialized native results without trusti
   for (const value of [null, 'failure', { nativeResult: null }, { nativeResult: { nativeId: '', text: 'x' } },
     { nativeResult: { nativeId: 'native', text: 1 } }]) assert.equal(completedResultFromError(value), undefined);
 });
+
+for (const preset of [false, true]) for (const proof of [false, true]) test(`${preset ? 'preset' : 'ordinary'} wrapper recovers a shutdown-only completed report only with confirmed native exit (${proof})`, async t => {
+  const f = fixture(t), report = { nativeId: 'shutdown-only-native', text: 'Complete native report, business work still needs review' };
+  let closed = false, runs = 0;
+  const factory = (): AgentAdapter => ({
+    async run() { runs++; throw new AgentProcessStopError(123, report); },
+    async close() { closed = true; }, async interrupt() {}, async confirmStopped() { return proof; },
+  });
+  const runtime = new PresetRuntime(f.privateRoot, f.data, f.user);
+  const binding = { id: 'test', targetId: 'local', ...await runtime.describe('test-codex', 1, 'codex', 'gpt-6-luna') };
+  const adapter = preset ? new PresetAgentAdapter(runtime, binding, f.command, {}, factory, 'hidden')
+    : new WorkerSessionAdapter(f.runtime, 'codex', 'hidden', f.command, {}, factory);
+  const turn: AgentTurn = { conversation: { id: 'shutdown-only-worker', userId: 'owner', agent: 'codex', model: 'gpt-6-luna', nativeId: null,
+    title: '', cwd: f.root, createdAt: '', updatedAt: '' }, text: 'one task', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
+  try {
+    if (proof) { assert.deepEqual(await adapter.run(turn), report); assert.equal(await adapter.confirmStopped('shutdown-only-worker'), true); }
+    else { await assert.rejects(adapter.run(turn), AgentProcessStopError); assert.equal(await adapter.confirmStopped('shutdown-only-worker'), false); }
+    assert.equal(runs, 1);
+  } finally { await adapter.close(); }
+});
+for (const preset of [false, true]) test(`${preset ? 'preset' : 'ordinary'} wrapper keeps genuine result uncertainty through cleanup failure and later stop proof`, async t => {
+  const f = fixture(t), report = { nativeId: 'truly-uncertain-native', text: 'A saved report does not resolve this uncertainty' };
+  let refuse = true;
+  const factory = (): AgentAdapter => ({
+    async run(current) { current.onReady?.(); throw Object.assign(new Error('effects must be reconciled'), { nativeResult: report, resultUncertain: true }); },
+    async close() { if (refuse) throw new Error('secondary cleanup failed'); }, async interrupt() {}, async confirmStopped() { return !refuse; },
+  });
+  const runtime = new PresetRuntime(f.privateRoot, f.data, f.user);
+  const binding = { id: 'test', targetId: 'local', ...await runtime.describe('test-codex', 1, 'codex', 'gpt-6-luna') };
+  const adapter = preset ? new PresetAgentAdapter(runtime, binding, f.command, {}, factory, 'hidden')
+    : new WorkerSessionAdapter(f.runtime, 'codex', 'hidden', f.command, {}, factory);
+  const turn: AgentTurn = { conversation: { id: 'truly-uncertain-worker', userId: 'owner', agent: 'codex', model: 'gpt-6-luna', nativeId: null,
+    title: '', cwd: f.root, createdAt: '', updatedAt: '' }, text: 'one task', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
+  try {
+    await assert.rejects(adapter.run(turn), error => {
+      assert(error instanceof AgentProcessStopError); assert.equal((error as AgentProcessStopError & { resultUncertain?: boolean }).resultUncertain, true);
+      assert.deepEqual(completedResultFromError(error), report); return true;
+    });
+    assert.equal(await adapter.confirmStopped('truly-uncertain-worker'), false);
+    refuse = false; assert.equal(await adapter.confirmStopped('truly-uncertain-worker'), true);
+  } finally { refuse = false; await adapter.close(); }
+});

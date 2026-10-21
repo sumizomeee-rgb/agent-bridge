@@ -107,3 +107,19 @@ for (const extra of [{ ownership: 'user' as const }, { handoffPending: true }, {
   assert.equal(f.runtime.store.archiveStoppedWorker(f.worker.id, 'not eligible'), null);
   assert.equal(f.runtime.store.getWorker(f.worker.id)!.archivedAt, undefined);
 });
+test('restart rebuilds persisted unknown exits and polling reconciles only the matching job without replay or archival', async t => {
+  const f = fixture(t), later = { ...f.job, id: randomUUID(), nativeResult: undefined, result: 'a distinct unknown turn' };
+  f.runtime.store.setJob(f.job.id, 'uncertain', { processStopped: false }); f.runtime.store.addJob(later);
+  await f.runtime.start();
+  assert.deepEqual(f.confirmations.map(value => value.dispatchId), [f.job.id, later.id]);
+  assert.equal(f.runtime.store.getJob(f.job.id)!.processStopped, false);
+  f.proof.set(f.job.id, true); await f.runtime.poll();
+  assert.equal(f.runtime.store.getJob(f.job.id)!.processStopped, true); assert.equal(f.runtime.store.getJob(later.id)!.processStopped, undefined);
+  assert.equal(f.runtime.store.getJob(later.id)!.result, later.result); assert.deepEqual(f.runtime.store.getJob(f.job.id)!.nativeResult, f.report);
+  f.proof.set(later.id, true); await f.runtime.poll();
+  assert.equal(f.runtime.store.getJob(later.id)!.processStopped, true);
+  assert.equal(f.runtime.store.getWorker(f.worker.id)!.archivedAt, undefined); assert.equal(f.runtime.store.getWorker(f.worker.id)!.blocked, true);
+  assert.deepEqual(f.runtime.store.jobs(f.worker.id).map(job => job.status), ['uncertain', 'uncertain']);
+  assert.equal(f.runs, 0); assert.equal(f.interrupts, 0);
+  const before = f.confirmations.length; await f.runtime.poll(); assert.equal(f.confirmations.length, before);
+});

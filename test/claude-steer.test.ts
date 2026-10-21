@@ -157,3 +157,17 @@ test('Claude retains its completed report while a failed shutdown still blocks t
     refuse = false; await f.adapter.interrupt('bridge-claude');
   } finally { refuse = false; await f.adapter.close(); }
 });
+
+
+test('Claude terminal failure retires gracefully without replacing its original sanitized error with stop uncertainty', async () => {
+  const f = await fixture(), modes: boolean[] = [];
+  f.transport.stop = async (graceful?: boolean) => { modes.push(graceful === true); };
+  try {
+    f.transport.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'claude-session',
+      errors: ['native failure Bearer private-value'] });
+    await assert.rejects(f.run, error => { assert(error instanceof Error); assert.match(error.message, /native failure/);
+      assert.equal(error.message.includes('private-value'), false); return true; });
+    assert.deepEqual(modes, [true]); assert.equal(await f.adapter.confirmStopped('bridge-claude'), true);
+    assert.equal(f.transport.writes.filter(value => value.type === 'user').length, 1);
+  } finally { await f.adapter.close(); }
+});

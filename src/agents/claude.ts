@@ -13,11 +13,14 @@ function imageMediaType(bytes: Buffer): string {
   throw new Error('Claude 支持 PNG、JPEG、GIF 和 WebP 图片；该附件格式无法识别。');
 }
 
-type ClaudeTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop' | 'endInput'>;
+type ClaudeTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop' | 'endInput'> & Partial<Pick<JsonLineProcess, 'confirmStopped'>>;
 
 /** Claude CLI structured streaming input; prompts never pass through a shell. */
 export class ClaudeAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
+  private readonly executions = new Map<string, ClaudeTransport>();
+  private readonly retirements = new Set<string>();
+  private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
   private readonly metadataProcesses = new Set<JsonLineProcess>();
@@ -110,6 +113,7 @@ export class ClaudeAdapter implements AgentAdapter {
     try { transport = this.createTransport(this.command, args, turn.conversation.cwd,
       readonly?.env ?? { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) }); }
     catch (error) { readonly?.cleanup(); throw error; }
+    this.executions.set(conversationId, transport); this.stopped.delete(conversationId);
     const completed = deferred<AgentResult>();
     let nativeId = turn.conversation.nativeId;
     let cancelled = false;
@@ -215,7 +219,7 @@ export class ClaudeAdapter implements AgentAdapter {
           turn.onProgress(event.delta.text);
         }
       } else if (message.type === 'result') {
-        resultSeen = true;
+        resultSeen = true; this.retirements.add(conversationId);
         for (const [id, pending] of pendingInputs) if (!pending.done.settled) void cancelInput(id).then(value => pending.done.resolve(value));
         recordNativeId(message.session_id);
         if (cancelled) { completed.reject(abortError()); return; }
@@ -232,7 +236,7 @@ export class ClaudeAdapter implements AgentAdapter {
       completed.reject(abortError());
       const operation = transport.stop(false);
       cancelling = operation;
-      void operation.then(() => { if (runFinished) this.active.delete(conversationId); }, () => { if (cancelling === operation) cancelling = null; });
+      void operation.then(() => { this.stopped.add(conversationId); if (runFinished) { this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId); } }, () => { if (cancelling === operation) cancelling = null; });
       return operation;
     };
     if (turn.acceptSupplements) this.supplements.set(conversationId, async message => {
@@ -265,6 +269,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (initialized && turn.acceptSupplements) turn.onReady?.();
       if (!turn.acceptSupplements) transport.endInput();
       nativeResult = await completed.promise;
+      this.retirements.add(conversationId);
       success = true;
       return nativeResult;
     } catch (error) {
@@ -275,8 +280,9 @@ export class ClaudeAdapter implements AgentAdapter {
       try {
         if (success) await Promise.all([...pendingInputs.values()].map(value => value.done.promise));
         if (cancelling) await cancelling;
-        else await transport.stop(success);
-        this.active.delete(conversationId);
+        else await transport.stop(success || resultSeen);
+        this.active.delete(conversationId); this.stopped.add(conversationId);
+        this.executions.delete(conversationId); this.retirements.delete(conversationId);
       } catch (error) { throw processStopFailure(error, nativeResult); }
       finally {
         removeMessage(); removeFailure();
@@ -291,10 +297,17 @@ export class ClaudeAdapter implements AgentAdapter {
   async steer(conversationId: string, message: AgentSupplement): Promise<SteerResult> {
     return this.supplements.get(conversationId)?.(message) ?? { status: 'queued', unsupported: true, reason: '此 Claude 会话未启用运行中输入。' };
   }
+  async confirmStopped(conversationId: string): Promise<boolean> {
+    if (this.executions.get(conversationId)?.confirmStopped?.()) {
+      this.stopped.add(conversationId); this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId);
+    }
+    return this.stopped.has(conversationId);
+  }
+
   async interrupt(conversationId: string): Promise<void> { await this.active.get(conversationId)?.(); }
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.values()].map((cancel) => cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
   }
 }

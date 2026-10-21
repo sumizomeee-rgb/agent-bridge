@@ -9,7 +9,8 @@ import { resolveDefaultModel, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
-import { completedResultFromError } from '../agents/process.js';
+import { completedResultFromError, stopEvidenceFromError, isObject } from '../agents/process.js';
+import { executionErrorEvidence } from '../delivery-errors.js';
 import { sessionVisibility } from '../agents/worker-session.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
@@ -408,9 +409,11 @@ export class ControllerRuntime {
     }
     for (const worker of this.store.workers()) {
       if (!this.config.allowedUserIds.includes(worker.origin.userId)) continue;
-      if (!worker.blocked && this.store.jobs(worker.id).some(job => job.status === 'uncertain')) {
-        worker.blocked = true; this.store.saveWorker(worker);
-      }
+      const uncertain = this.store.jobs(worker.id).filter(job => job.status === 'uncertain');
+      if (!worker.blocked && uncertain.length) { worker.blocked = true; this.store.saveWorker(worker); }
+      // Rebuild observation from durable jobs; a restart must not discard pending exit checks.
+      if (worker.target?.transport === 'ssh' && worker.ownership !== 'user' && !worker.handoffPending
+        && uncertain.some(job => job.processStopped !== true)) this.unconfirmedStops.add(worker.id);
     }
     if (this.stopping || this.closed) return;
     this.started = true;
@@ -1016,7 +1019,10 @@ export class ControllerRuntime {
       const current = this.store.getJob(job.id)!;
       const nativeResult = completedResultFromError(error);
       if (nativeResult) this.nativeId(worker, nativeResult.nativeId);
-      this.store.setJob(current.id, current.status, { ...(nativeResult ? { nativeResult } : {}), processStopped: !stopUnconfirmed(error) });
+      const stopEvidence = stopEvidenceFromError(error);
+      this.store.setJob(current.id, current.status, { ...(nativeResult ? { nativeResult } : {}), ...(stopEvidence ? { stopEvidence } : {}),
+        executionError: isObject(error) && typeof error.executionError === 'string' ? error.executionError : executionErrorEvidence(error),
+        ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanupError: error.cleanupError } : {}), processStopped: !stopUnconfirmed(error) });
       if (error && typeof error === 'object' && 'resultUncertain' in error) await this.finish(worker, current, 'uncertain', error instanceof Error ? error.message : '预设结果未知，未重放。');
       else if (stopUnconfirmed(error)) {
         this.unconfirmedStops.add(worker.id);
@@ -1082,7 +1088,7 @@ export class ControllerRuntime {
   private async stopWorker(workerId: string, reason: string): Promise<boolean> {
     const active = this.active.get(workerId), worker = this.store.getWorker(workerId)!;
     if (!active) {
-      if (this.unconfirmedStops.has(workerId)) {
+      if (this.unconfirmedStops.has(workerId) && worker.target?.transport !== 'ssh') {
         try {
           await this.adapter(worker).interrupt(workerId);
           this.unconfirmedStops.delete(workerId);
@@ -1101,6 +1107,7 @@ export class ControllerRuntime {
           this.store.setJob(job.id, job.status, { processStopped: true });
         } catch (error) { this.error(error); return false; }
       }
+      this.unconfirmedStops.delete(workerId);
       return true;
     }
     active.cancelReason = reason; active.abort.abort(reason);
@@ -1157,9 +1164,15 @@ export class ControllerRuntime {
       .filter(worker => worker?.target?.transport === 'ssh').slice(0, 4);
     for (const worker of workers) {
       if (this.closed || this.stopping) return;
-      try {
-        if (await this.adapter(worker!).confirmStopped?.(worker!.id)) { this.unconfirmedStops.delete(worker!.id); this.recordConfirmedStop(worker!.id); }
-      } catch (error) { this.error(error); }
+      for (const job of this.store.jobs(worker!.id).filter(job => job.status === 'uncertain' && job.processStopped !== true)) {
+        try {
+          if (await this.adapter(worker!).confirmStopped?.(worker!.id, job.id) !== true) continue;
+          const current = this.store.getJob(job.id);
+          if (current?.status === 'uncertain' && current.processStopped !== true) this.store.setJob(current.id, current.status, { processStopped: true });
+        } catch (error) { this.error(error); }
+        if (this.closed || this.stopping) return;
+      }
+      if (!this.store.jobs(worker!.id).some(job => job.status === 'uncertain' && job.processStopped !== true)) this.unconfirmedStops.delete(worker!.id);
       // Rotate unresolved guards so a persistently unreachable machine cannot starve later ones.
       if (this.unconfirmedStops.has(worker!.id)) { this.unconfirmedStops.delete(worker!.id); this.unconfirmedStops.add(worker!.id); }
     }

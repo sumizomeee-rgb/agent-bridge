@@ -1,4 +1,5 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { executionErrorEvidence } from '../delivery-errors.js';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -146,16 +147,25 @@ export class WorkerSessionAdapter implements AgentAdapter {
     const env = this.runtime.prepare(this.agent, id, turn.conversation.nativeId, this.visibility, this.env);
     const adapter = this.factory(this.command, env); this.active.set(id, adapter); this.stopped.delete(id);
     let nativeResult: AgentResult | undefined;
+    let stopOnlyReport = false, resultUncertain = false, executionError: string | undefined;
     try { nativeResult = await adapter.run(turn); return nativeResult; }
     catch (error) {
       nativeResult = completedResultFromError(error);
+      executionError = executionErrorEvidence(error);
+      resultUncertain = isObject(error) && 'resultUncertain' in error;
+      stopOnlyReport = !!nativeResult && isObject(error) && error.processStillRunning === true && !('resultUncertain' in error);
       if (error && typeof error === 'object' && 'processStillRunning' in error) this.unconfirmed.add(id);
       throw error;
     } finally {
-      try { await adapter.close(); }
-      catch (error) { this.unconfirmed.add(id); throw processStopFailure(error, nativeResult); }
-      finally { if (!this.unconfirmed.has(id)) this.active.delete(id); }
-      if (!this.unconfirmed.has(id)) this.stopped.add(id);
+      let cleanupError: unknown, confirmed = false;
+      if (stopOnlyReport) { try { confirmed = await adapter.confirmStopped?.(id) === true; } catch {} }
+      // A completed report does not authorize forcing down a CLI that is still exiting.
+      if (!stopOnlyReport || confirmed) { try { await adapter.close(); } catch (error) { cleanupError = error; } }
+      if (confirmed && cleanupError === undefined && !turn.signal.aborted && !this.closed) {
+        this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id); return nativeResult!;
+      }
+      if (cleanupError !== undefined) { this.unconfirmed.add(id); throw Object.assign(processStopFailure(cleanupError, nativeResult), { executionError, cleanupError: executionErrorEvidence(cleanupError) }, resultUncertain ? { resultUncertain: true } : {}); }
+      if (!this.unconfirmed.has(id)) { this.active.delete(id); this.stopped.add(id); }
     }
   }
   async steer(id: string, message: AgentSupplement): Promise<SteerResult> {
@@ -167,7 +177,14 @@ export class WorkerSessionAdapter implements AgentAdapter {
       await adapter.close(); this.active.delete(id); this.unconfirmed.delete(id); this.stopped.add(id);
     }
   }
-  async confirmStopped(id: string): Promise<boolean> { return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id); }
+  async confirmStopped(id: string): Promise<boolean> {
+    if (this.unconfirmed.has(id)) {
+      try { const adapter = this.active.get(id); if (await adapter?.confirmStopped?.(id) === true) {
+        await adapter?.close(); this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id);
+      } } catch {}
+    }
+    return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id);
+  }
   async close(): Promise<void> {
     this.closed = true; await Promise.all([...this.active.keys()].map(id => this.interrupt(id)));
     await Promise.all([...this.metadata].map(adapter => adapter.close()));

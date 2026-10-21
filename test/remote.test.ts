@@ -407,6 +407,7 @@ test('remote shutdown errors retain completed reports in durable storage and the
   try {
     await tick(); await tick();
     const native = f.natives[0]!; native.close = async () => { if (refuse) throw new Error('second shutdown failure'); };
+    Object.assign(native, { confirmStopped: async () => !refuse });
     const report = { nativeId: native.nativeId, text: '代码已落盘；业务验收未完成' };
     native.reject(new AgentProcessStopError(123, report));
     const error = await outcome;
@@ -482,4 +483,85 @@ test('a stopped uncertain preset dispatch retains its report without dispatching
     assert.equal(await adapter.confirmStopped(turn.conversation.id), true);
     assert.deepEqual(methods, ['hello', 'query', 'query']); assert.equal(f.natives.length, 0);
   } finally { await adapter.close(); await f.daemon.close(); }
+});
+
+test('query reconciles complete exit history without interrupting or completing an uncertain task; missing or partial records remain unknown', async () => {
+  const f = fixture();
+  try {
+    for (const records of [[], [false], [true, false], [true, true]]) {
+      const request = f.request(), report = { nativeId: randomUUID(), text: 'Saved report, original failure category unknown' };
+      f.daemon.store.create(request); f.daemon.store.update(request.dispatchId, { status: 'uncertain', stopped: false, result: report });
+      for (const [index, closed] of records.entries()) f.daemon.store.process({ dispatchId: request.dispatchId, pid: 123456789 + index, identity: null, closed });
+      const observed = await f.daemon.handle('query', { dispatchId: request.dispatchId }) as RemoteJob;
+      assert.equal(observed.stopped, records.length > 0 && records.every(Boolean)); assert.equal(observed.status, 'uncertain'); assert.deepEqual(observed.result, report);
+    }
+    const request = f.request(); await f.daemon.handle('dispatch', request); await tick();
+    f.daemon.store.process({ dispatchId: request.dispatchId, pid: 123456791, identity: null, closed: true });
+    const active = await f.daemon.handle('query', { dispatchId: request.dispatchId }) as RemoteJob;
+    assert.equal(active.status, 'running'); assert.notEqual(active.stopped, true); assert.equal(f.natives[0]!.interrupts, 0);
+    f.natives[0]!.finish(); await tick(); await tick();
+  } finally { await f.daemon.close(); }
+});
+
+for (const confirmed of [false, true]) test(`shutdown-only failure with a full report recovers completion only with positive close proof (${confirmed})`, async () => {
+  const f = fixture(), request = f.request();
+  try {
+    await f.daemon.handle('dispatch', request); await tick();
+    let proof = confirmed; Object.assign(f.natives[0]!, { confirmStopped: async () => proof });
+    f.natives[0]!.close = async () => { if (confirmed) proof = true; };
+    const artifact = join(f.root, 'recovered-report.txt'); writeFileSync(artifact, 'the actual attachment');
+    const report = { nativeId: f.natives[0]!.nativeId, text: `Feature still needs acceptance.\n[Report](<${artifact}>)` };
+    f.natives[0]!.reject(new AgentProcessStopError(123, report)); await tick(); await tick(); await tick();
+    const deadline = Date.now() + 2000;
+    while (f.daemon.store.job(request.dispatchId)!.status === 'running') { assert.ok(Date.now() < deadline); await tick(); }
+    const saved = f.daemon.store.job(request.dispatchId)!;
+    assert.equal(saved.stopped, confirmed); assert.equal(saved.status, confirmed ? 'completed' : 'uncertain');
+    assert.equal(saved.result!.nativeId, report.nativeId); assert.match(saved.result!.text, /Feature still needs acceptance/);
+    assert.equal(saved.artifacts?.length ?? 0, confirmed ? 1 : 0); assert.equal(f.natives[0]!.interrupts, 0);
+    if (confirmed) {
+      const item = saved.artifacts![0]!;
+      const bytes = await f.daemon.handle('artifact', { dispatchId: request.dispatchId, artifactId: item.id, offset: 0 }) as { data: string };
+      assert.equal(Buffer.from(bytes.data, 'base64').toString(), 'the actual attachment');
+    }
+    proof = true; // teardown has explicit exit proof; the assertions above retain the unknown case.
+  } finally { await f.daemon.close(); }
+});
+
+test('a real result-uncertain exception stays uncertain even after reliable exit proof', async () => {
+  const f = fixture(), request = f.request();
+  try {
+    await f.daemon.handle('dispatch', request); await tick();
+    Object.assign(f.natives[0]!, { confirmStopped: async () => true });
+    f.natives[0]!.reject(Object.assign(new Error('effects uncertain'), { resultUncertain: true, processStillRunning: true,
+      nativeResult: { nativeId: f.natives[0]!.nativeId, text: 'Available report must not erase a real uncertainty' } }));
+    await tick(); await tick();
+    const saved = f.daemon.store.job(request.dispatchId)!;
+    assert.equal(saved.stopped, true); assert.equal(saved.status, 'uncertain'); assert.match(saved.result!.text, /real uncertainty/);
+  } finally { await f.daemon.close(); }
+});
+test('explicit cancellation wins over a shutdown-only completed report even when exit later confirms', async () => {
+  const f = fixture(), request = f.request();
+  try {
+    await f.daemon.handle('dispatch', request); await tick(); const native = f.natives[0]!;
+    Object.assign(native, { confirmStopped: async () => true });
+    native.interrupt = async () => { native.interrupts++; native.reject(new AgentProcessStopError(123, { nativeId: native.nativeId, text: 'Report completed just before cancellation' })); };
+    assert.deepEqual(await f.daemon.handle('interrupt', { dispatchId: request.dispatchId }), { stopped: true });
+    const saved = f.daemon.store.job(request.dispatchId)!;
+    assert.equal(saved.status, 'cancelled'); assert.equal(saved.stopped, true); assert.match(saved.result!.text, /before cancellation/);
+  } finally { await f.daemon.close(); }
+});
+test('proof arriving between close eligibility checks retires the pending handle and shutdown preserves completion', async () => {
+  const f = fixture(), request = f.request();
+  try {
+    await f.daemon.handle('dispatch', request); await tick(); const native = f.natives[0]!;
+    let checks = 0, closes = 0; Object.assign(native, { confirmStopped: async () => ++checks >= 2 });
+    native.close = async () => { closes++; };
+    native.reject(new AgentProcessStopError(123, { nativeId: native.nativeId, text: 'Final native report' }));
+    const deadline = Date.now() + 2000;
+    while (f.daemon.store.job(request.dispatchId)!.status === 'running') { assert.ok(Date.now() < deadline); await tick(); }
+    assert.equal(f.daemon.store.job(request.dispatchId)!.status, 'completed'); assert.equal(closes, 1);
+    await f.daemon.close(); assert.equal(native.interrupts, 0);
+    const reopened = new RemoteStore(f.daemon.dataDirectory);
+    try { assert.equal(reopened.job(request.dispatchId)!.status, 'completed'); } finally { reopened.close(); }
+  } finally { await f.daemon.close(); }
 });
