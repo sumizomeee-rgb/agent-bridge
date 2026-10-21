@@ -36,6 +36,32 @@ test('ordinary hidden sessions retain credentials and history across runtime rec
   assert.equal(readFileSync(join(f.user, '.codex/auth.json'), 'utf8'), '{"key":"native-file-credential"}');
   assert.equal(existsSync(join(f.user, '.codex/sessions/worker-history')), false);
 });
+test('hidden Codex adopts only a fresher valid ChatGPT cache for the same account before resume', t => {
+  const f = fixture(t), source = join(f.user, '.codex/auth.json');
+  const now = Math.floor(Date.now() / 1000);
+  const auth = (accountId: string, expires: number) => JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+    account_id: accountId, access_token: 'header.' + Buffer.from(JSON.stringify({ exp: expires })).toString('base64url') + '.signature', refresh_token: 'test-refresh-' + expires,
+  } });
+  const old = auth('same-account', now - 3600), fresh = auth('same-account', now + 86400);
+  writeFileSync(source, old);
+  const env = f.runtime.prepare('codex', 'oauth-worker', null, 'hidden', {}), home = env.CODEX_HOME!;
+  const destination = join(home, 'auth.json'), originalConfig = readFileSync(join(home, 'config.toml'));
+  mkdirSync(join(home, 'sessions')); writeFileSync(join(home, 'sessions/history'), 'native-context');
+  writeFileSync(source, fresh); writeFileSync(join(f.user, '.codex/config.toml'), 'model_provider="other-provider"\n');
+  const resume = () => new WorkerSessionRuntime(f.data, f.user).prepare('codex', 'oauth-worker', 'same-native-id', 'hidden', {});
+  assert.equal(resume().CODEX_HOME, home);
+  assert.equal(readFileSync(destination, 'utf8'), fresh); assert.equal(readFileSync(source, 'utf8'), fresh);
+  assert.deepEqual(readFileSync(join(home, 'config.toml')), originalConfig);
+  assert.equal(readFileSync(join(home, 'sessions/history'), 'utf8'), 'native-context');
+  // Never roll back a CLI-refreshed login, switch accounts, or import an API key.
+  const cliFresh = auth('same-account', now + 172800); writeFileSync(destination, cliFresh);
+  resume(); assert.equal(readFileSync(destination, 'utf8'), cliFresh);
+  for (const foreign of [auth('different-account', now + 259200), '{"OPENAI_API_KEY":"other-provider-key"}', '{', old]) {
+    writeFileSync(source, foreign); resume(); assert.equal(readFileSync(destination, 'utf8'), cliFresh);
+    assert.equal(readFileSync(source, 'utf8'), foreign);
+  }
+});
+
 test('ordinary visible uses the target native profile, not another worker home; visibility and location cannot drift', t => {
   const f = fixture(t), env = f.runtime.prepare('claude', 'visible-A', null, 'visible', {});
   assert.equal(env.CLAUDE_CONFIG_DIR, join(f.user, '.claude')); assert.equal(env.CLAUDE_CODE_ENTRYPOINT, 'local-agent');

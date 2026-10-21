@@ -1,10 +1,11 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
 import type { AgentAdapter, AgentCommand, AgentName, AgentSupplement, AgentTurn, Conversation, SessionVisibility, SteerResult } from '../types.js';
 import { CodexAdapter } from './codex.js';
 import { ClaudeAdapter } from './claude.js';
-import { abortError } from './process.js';
+import { abortError, isObject } from './process.js';
 
 export function sessionVisibility(value: unknown): SessionVisibility | undefined {
   if (value === undefined) return undefined;
@@ -57,6 +58,31 @@ export function exposeCodexHistory(home: string, location: { profileHome: string
   for (const name of ['sessions', 'archived_sessions']) linkDirectory(join(location.profileHome, name), join(home, name));
 }
 
+// A hidden profile keeps its configuration/history pinned, but its copied ChatGPT
+// login must not stay stale after the original profile renews the same account.
+function refreshChatGPTCredentials(home: string, source: string): void {
+  const destination = join(home, 'auth.json'), sourcePath = join(source, 'auth.json');
+  if (!existsSync(destination) || !existsSync(sourcePath)) return;
+  const readAuth = (bytes: Buffer): { accountId: string; expires: number } | null => {
+    try {
+      const value: unknown = JSON.parse(bytes.toString('utf8'));
+      if (!isObject(value) || !isObject(value.tokens) || value.OPENAI_API_KEY
+        || value.auth_mode != null && value.auth_mode !== 'chatgpt') return null;
+      const { account_id: accountId, access_token: accessToken } = value.tokens;
+      if (typeof accountId !== 'string' || !accountId || typeof accessToken !== 'string') return null;
+      const payload: unknown = JSON.parse(Buffer.from(accessToken.split('.')[1] ?? '', 'base64url').toString('utf8'));
+      // Metadata only selects a fresher local cache; Codex still authenticates it.
+      return isObject(payload) && typeof payload.exp === 'number' && Number.isFinite(payload.exp)
+        ? { accountId, expires: payload.exp * 1000 } : null;
+    } catch { return null; }
+  };
+  const sourceBytes = readFileSync(sourcePath), current = readAuth(readFileSync(destination)), fresh = readAuth(sourceBytes);
+  if (!current || !fresh || current.accountId !== fresh.accountId || fresh.expires <= Date.now() || fresh.expires <= current.expires) return;
+  const temporary = destination + '.' + randomUUID() + '.tmp';
+  try { writeFileSync(temporary, sourceBytes, { flag: 'wx', mode: 0o600 }); renameSync(temporary, destination); }
+  finally { if (existsSync(temporary)) unlinkSync(temporary); }
+}
+
 export class WorkerSessionRuntime {
   constructor(readonly dataRoot: string, private readonly userHome = homedir()) {}
   prepare(agent: AgentName, workerId: string, nativeId: string | null, visibility: SessionVisibility, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -81,6 +107,7 @@ export class WorkerSessionRuntime {
         }
         writeFileSync(ready, '1', { flag: 'wx', mode: 0o600 });
       }
+      if (agent === 'codex') refreshChatGPTCredentials(home, location.profileHome);
     }
     if (agent === 'codex') {
       setSessionEnvironment(env, 'CODEX_HOME', visibility === 'hidden' ? home : location.profileHome);
