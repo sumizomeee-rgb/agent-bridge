@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { Agent as HttpAgent, request as httpRequest } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -553,9 +554,11 @@ test('Claude maps parallel same-name MCP calls by exact arguments and closes MCP
   } finally { await adapter.close().catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('Claude MCP 工具失败返回原请求回执并允许下一次调用', async () => {
+test('Claude MCP uses fresh connections for every response without replaying failed tools', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-mcp-error-'));
   const transport = new FakeTransport(); let url = ''; let invoked = 0;
+  const agent = new HttpAgent({ keepAlive: true, maxSockets: 1 });
+  const sockets = new Set<unknown>(); let requests = 0;
   const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, {
     agent: 'claude', dataDir: dir, userHome: dir,
     invokeTool: async () => { invoked++; if (invoked === 1) throw new Error('测试工具执行失败'); return { recovered: true }; },
@@ -567,12 +570,27 @@ test('Claude MCP 工具失败返回原请求回执并允许下一次调用', asy
   const running = adapter.run(turn); void running.catch(() => {});
   try {
     await until(() => transport.written.some(message => message.type === 'user'));
+    const request = (body: unknown, method = 'POST'): Promise<{ status: number; body: string }> => new Promise((resolve, reject) => {
+      const pending = httpRequest(url, { method, agent, headers: { 'content-type': 'application/json' } }, response => {
+        const chunks: Buffer[] = []; response.on('data', chunk => chunks.push(chunk)); response.once('error', reject);
+        response.once('end', () => {
+          try { assert.equal(response.headers.connection, 'close'); resolve({ status: response.statusCode!, body: Buffer.concat(chunks).toString('utf8') }); }
+          catch (error) { reject(error); }
+        });
+      });
+      requests++; pending.on('socket', socket => sockets.add(socket)); pending.once('error', reject);
+      pending.setTimeout(3000, () => pending.destroy(new Error('MCP test request timed out')));
+      pending.end(typeof body === 'string' ? body : JSON.stringify(body));
+    });
+    assert.equal((await request({ jsonrpc: '2.0', id: 1, method: 'initialize' })).status, 200);
+    assert.equal((await request({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).status, 200);
+    assert.equal((await request({ jsonrpc: '2.0', method: 'notifications/initialized' })).status, 202);
+    assert.equal((await request('', 'GET')).status, 404);
     const call = async (id: number) => {
       const args = { title: '测试任务', prompt: '仅在测试中执行' };
       transport.emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'native-' + id, name: 'mcp__bridge_controller__bridge_start_worker', input: args }] } });
-      const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(3000),
-        body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'bridge_start_worker', arguments: args } }) });
-      assert.equal(response.status, 200); return response.json() as Promise<JsonObject>;
+      const response = await request({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'bridge_start_worker', arguments: args } });
+      assert.equal(response.status, 200); return JSON.parse(response.body) as JsonObject;
     };
     const failed = await call(41);
     assert.equal(failed.jsonrpc, '2.0'); assert.equal(failed.id, 41); assert.equal(failed.error, undefined);
@@ -580,11 +598,12 @@ test('Claude MCP 工具失败返回原请求回执并允许下一次调用', asy
     assert.equal(result.isError, true); assert.match(result.content[0]!.text, /测试工具执行失败/);
     const recovered = await call(42); assert.equal(recovered.id, 42);
     assert.equal((recovered.result as JsonObject).isError, undefined); assert.equal(invoked, 2);
-    const malformed = await fetch(url, { method: 'POST', body: '{', signal: AbortSignal.timeout(3000) });
-    assert.equal(malformed.status, 400); const invalid = await malformed.json() as JsonObject;
+    const malformed = await request('{');
+    assert.equal(malformed.status, 400); const invalid = JSON.parse(malformed.body) as JsonObject;
     assert.equal(invalid.jsonrpc, '2.0'); assert.equal(invalid.id, null); assert.equal((invalid.error as JsonObject).code, -32700);
+    assert.equal(requests, 7); assert.equal(sockets.size, requests); assert.equal(invoked, 2);
     transport.emit({ type: 'result', subtype: 'success', session_id: 'mcp-error-native', result: 'DONE' }); await running;
-  } finally { await adapter.close(); await running.catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
+  } finally { agent.destroy(); await adapter.close(); await running.catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
 });
 test('controller effort changes resume original native thread and read CLI settings without guessing', async () => {
   const s = setup(); try {

@@ -623,6 +623,10 @@ export class NativeControllerAdapter implements AgentAdapter {
       try { appendFileSync(diagnosticPath, JSON.stringify({ at: new Date().toISOString(), ...value }) + '\n'); } catch { /* 诊断失败不影响工具执行。 */ }
     };
     const server = createServer(async (req, res) => {
+      // This loopback JSON endpoint needs no persistent connection. Fresh sockets
+      // avoid stale pooled connections in the Claude CLI between model responses;
+      // never retry a tool here, since it may already have performed a side effect.
+      res.setHeader('Connection', 'close');
       const started = Date.now(), requestKey = randomUUID();
       let method: string | undefined, name: string | undefined, phase = 'received';
       let requestId: string | number | null = null;
