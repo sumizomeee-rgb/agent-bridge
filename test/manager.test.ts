@@ -370,7 +370,7 @@ test('会话列表和恢复按用户隔离，白名单之外不会执行', async
   const u2 = f.codex.calls.find(item => item.conversation.userId === 'u2')!;
   assert.notEqual(u1.conversation.id, u2.conversation.id);
   await f.manager.handle(message('steal', `/resume ${u1.conversation.id}`, 'u2'));
-  assert.match(f.sink.replies.at(-1)!.text, /resume 已停用/);
+  assert.match(f.sink.replies.at(-1)!.text, /未知命令/);
   const inspect = new SessionStore(f.config.dataDir);
   try { assert.equal(inspect.getActive('u2')!.id, u2.conversation.id); }
   finally { inspect.close(); }
@@ -506,7 +506,7 @@ test('旧 /resume 的完整、短、原生和无效 ID 都被拒绝，不改绑�
   const argumentsToReject = ['', historical.id, historical.id.slice(0, 8), 'native-historical', original.id, 'invalid-id', 'claude'];
   for (const [index, argument] of argumentsToReject.entries()) {
     await f.manager.handle(message(`disabled-resume-${index}`, `/resume ${argument}`));
-    assert.match(f.sink.replies.at(-1)!.text, /resume 已停用/);
+    assert.match(f.sink.replies.at(-1)!.text, /未知命令/);
     const inspect = new SessionStore(f.config.dataDir);
     try {
       assert.equal(inspect.getActive('u1')!.id, original.id);

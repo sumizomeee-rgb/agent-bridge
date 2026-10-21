@@ -196,12 +196,12 @@ test('命令回复失败仍通过原交互 callback 报错，不退回普通消�
   assert.deepEqual(f.sinkReplies, []);
 });
 
-test('旧 resume 命令的交互回复只告知停用，不恢复会话', async t => {
+test('已移除的 resume 命令按未知命令回复，不恢复会话', async t => {
   const f = await fixture(t);
   const replies: string[] = [];
   await f.manager.handle(message('disabled-resume-menu', '/resume native-historical'), async text => { replies.push(text); });
   assert.equal(replies.length, 1);
-  assert.match(replies[0]!, /resume 已停用/);
+  assert.match(replies[0]!, /未知命令/);
   assert.deepEqual(f.sinkReplies, []);
   assert.equal(f.adapter.turns.length, 0);
   const inspect = new SessionStore(f.config.dataDir);

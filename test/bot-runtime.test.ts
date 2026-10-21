@@ -75,8 +75,9 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
     proxyUrl: null, commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, maxImageBytes: 100 };
   const execution = { codex: new LocalAdapter(), claude: new LocalAdapter() }, controllers = { codex: new LocalAdapter(true), claude: new LocalAdapter(true) };
   const groups: IncomingDM[] = [], initialization: string[] = [], groupCompletions: TaskCompletionEvent[] = []; let ready = 0, reconnected = 0;
+  let activeController: string | null = null;
   const hooks: BotRuntimeHooks = { authorize: user => user === config.ownerUserId, receiveGroup: async message => { groups.push(message); },
-    manager: { onInitializationState: (_conversation, outcome) => { initialization.push(outcome); }, onGroupCompletion: async event => { groupCompletions.push(event); return 'queued'; } },
+    manager: { binding: { getActive: user => user === config.ownerUserId ? activeController : null, setActive(user, id) { assert.equal(user, config.ownerUserId); activeController = id; } }, onInitializationState: (_conversation, outcome) => { initialization.push(outcome); }, onGroupCompletion: async event => { groupCompletions.push(event); return 'queued'; } },
     invoke: (_turn, _name, args, _id, delegate) => delegate(args), pauseGroup() {}, resumeGroup() {},
     requestRestart: async () => ({ accepted: false }), isDraining: () => false, allowDelivery: () => true,
     isGroupChannel: channel => channel.endsWith('|456789012345678901'),
@@ -100,6 +101,13 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
     get ready() { return ready; }, get reconnected() { return reconnected; } };
 }
 
+test('BotRuntime requires one host-owned controller binding before opening runtime resources', t => {
+  const f = setup(t);
+  assert.throws(() => new BotRuntime(f.config, { ...f.hooks, manager: {} } as BotRuntimeHooks, f.dependencies), /必须使用宿主的当前主控绑定/);
+  const store = new SessionStore(f.config.dataDir);
+  try { assert.equal(store.getActive(f.config.ownerUserId!), null); } finally { store.close(); }
+});
+
 test('真实BotRuntime离线初始化可走通执行助手→任务结果→主控与初始化状态回调', async t => {
   const f = setup(t); await f.bot.verify(); await f.bot.start();
   assert.equal(f.bot.isReady(), true); assert.equal(f.ready, 1); assert.equal(f.transport.menus, 1);
@@ -112,7 +120,7 @@ test('真实BotRuntime离线初始化可走通执行助手→任务结果→主�
 
 test('首次连接前seed旧DM游标，停机补取与早到实时输入按平台顺序，群不会混进DM补取或最后联系人', async t => {
   const f = setup(t); const store = new SessionStore(f.config.dataDir);
-  const c = store.createConversation(f.config.ownerUserId!, 'codex', f.config.workspace, { controllerMode: true }); store.setActive(c.userId, c.id); store.saveNativeId(c.id, 'existing-native');
+  const c = store.createConversation(f.config.ownerUserId!, 'codex', f.config.workspace, { controllerMode: true }); f.hooks.manager.binding.setActive(c.userId, c.id); store.saveNativeId(c.id, 'existing-native');
   const old = f.message('100000000000000001', '旧消息'); store.addMessage({ ...old, imagePaths: [] }, c.id, 'completed');
   const group = f.message('100000000000000002', '群消息', true);
   store.addMessage({ ...group, imagePaths: [], groupContext: { eventId: 'old-event', rootId: 'old-root', botId: f.config.botId!, spaceId: group.space!.spaceId, generation: 1, bindingEpoch: 1, principalId: 'owner', originChannelId: group.channelId, scene: 'old group' } }, c.id, 'completed'); store.close();

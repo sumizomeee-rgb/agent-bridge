@@ -10,7 +10,7 @@
 
 1. 获取代码及编译后的 `dist/`，复制同平台 `node_modules/` 和 `.local/runtime/`。
 2. 将 `config.example.json` 复制为 `.local/config.json`，使用 `version: 3`、CLI 路径和同平台的 `startupProfiles` 集合；把 `profiles/` 中模板复制到 `.local/bots/<平台>/<名称>.json`，填写各 Bot 的真实应用 ID、凭据和白名单。明确登记 `principals` 的账号映射；飞书工作群还需 `spaces` 的逐应用群地址。
-3. 为每个 Bot 生成独立上下文工作区，在其 `README.md` 填写导航。默认路径为 `<workspaceRoot>/<平台>/<应用ID>`，也可在对应 Profile 的 `workspace` 指定绝对路径：
+3. 生成用户上下文工作区，在其 `README.md` 填写导航；多个 Bot 可共用同一目录。默认路径为 `<workspaceRoot>/<平台>/<应用ID>`，也可在对应 Profile 的 `workspace` 指定绝对路径：
 
 ```powershell
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
@@ -26,7 +26,7 @@
 ```text
 agent-bridge/
 ├─ README.md                  项目入口
-├─ init-workspace.ps1          生成独立 Agent 工作区
+├─ init-workspace.ps1          生成用户上下文工作区
 ├─ start.ps1 / stop.ps1        启动 / 手动停用
 ├─ install-startup.ps1         登录后后台启动
 ├─ config.example.json        公共配置示例
@@ -42,7 +42,7 @@ agent-bridge/
 └─ .local/                    运行时、配置、会话、日志与备份，不进 Git
 ```
 
-每个 Bot 的上下文工作区独立于桥代码，可放在指定目录；不同 Bot 不能共用或嵌套同一上下文目录。工程执行目录另由 `workingCwd` 或私聊 `/cwd` 选择，初始化与登记仍从固定上下文工作区读取：
+用户上下文工作区独立于桥代码，可由多个 Bot 共用同一目录。账号、当前主控、助手归属和运行数据仍按 Bot ID 隔离。工程执行目录另由 `workingCwd` 或私聊 `/cwd` 选择，初始化与登记仍从固定上下文工作区读取：
 
 ```text
 D:\Agent Workspace/
@@ -73,7 +73,7 @@ D:\Agent Workspace/
 
 ## 使用与维护
 
-- [Profile、Bot 与宿主迁移](docs/profiles.md)：v3 启动集合、独立工作区、账号及群映射、私有资料和离线迁移。
+- [Profile、Bot 与宿主迁移](docs/profiles.md)：v3 启动集合、共享或独立的用户工作区、账号及群映射、私有资料和离线迁移。
 
 - [使用说明](docs/usage.md)：主控与子 Agent、私聊指令、图片和文件、模型及强度、任务计数与安全重启。
 - [部署与迁移](docs/deployment.md)：工作区生成、配置、代理、数据迁移与跨电脑登记。

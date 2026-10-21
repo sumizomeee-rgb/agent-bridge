@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, loadHostConfig } from '../src/config.js';
+import { loadHostConfig } from '../src/config.js';
 import { profileScope, selectProfile } from '../src/profiles.js';
 
 function fixture(t: TestContext) {
@@ -31,12 +31,7 @@ test('optional aliases trim display labels without changing the actual Bot, acco
   assert.deepEqual(after.configs.map(c => c.aliases), [['Teto', '重音'], ['Miku']]);
   assert.deepEqual(after.configs.map(c => ({ botId: c.botId, scope: c.scopePrefix, users: c.allowedUserIds, data: c.dataDir, workspace: c.contextWorkspace })),
     before.configs.map(c => ({ botId: c.botId, scope: c.scopePrefix, users: c.allowedUserIds, data: c.dataDir, workspace: c.contextWorkspace })));
-  const legacy = { ...f.common, version: 2, startupProfile: 'feishu/t', workspace: join(f.root, 'legacy-context') };
-  f.config(legacy);
-  const selected = loadConfig(['--config', f.path], false);
-  assert.deepEqual(selected.aliases, ['Teto', '重音']);
-  assert.equal(selected.scopePrefix, 'feishu:cli_alpha|');
-  const profile = selectProfile(legacy, f.path);
+  const profile = selectProfile(f.common, f.path, 'feishu/t');
   assert.equal(profileScope({ ...profile, aliases: ['renamed'] }), profileScope(profile));
 });
 

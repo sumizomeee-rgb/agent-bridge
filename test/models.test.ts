@@ -7,7 +7,7 @@ import test, { type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CodexAdapter } from '../src/agents/codex.js';
 import { ClaudeAdapter } from '../src/agents/claude.js';
-import { isModelId, loadConfig } from '../src/config.js';
+import { isModelId, loadHostConfig } from '../src/config.js';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentResult, AgentTurn, BridgeConfig } from '../src/types.js';
@@ -242,17 +242,17 @@ test('配置可选model目录及参考默认，不自动覆盖CLI；安全ID校�
   const path = join(root, 'config.json');
   mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
   writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'fake', allowedUserIds: ['123456789012345678'] }));
-  const raw = { version: 2, startupProfile: 'discord/default', workspace: root, dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
+  const raw = { version: 3, startupProfiles: ['discord/default'], workspaceRoot: join(root, 'workspaces'), dataDir: join(root, 'data'),
     commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } },
     defaultModels: { codex: 'gpt-5.6-sol' }, modelOptions: { claude: ['gateway/gpt-6-sol'], codex: ['custom-v1'] } };
   writeFileSync(path, JSON.stringify(raw));
-  const config = loadConfig(['--config', path]);
+  const config = loadHostConfig(['--config', path]).configs[0]!;
   assert.equal(config.defaultModels!.codex, 'gpt-5.6-sol');
   assert.deepEqual(config.commands.codex.args, []);
   for (const id of ['gpt-6.1-sol', 'sonnet[1m]', 'gateway/model:latest']) assert(isModelId(id));
   for (const id of ['', '--flag', 'bad model', '$(echo x)', 'a'.repeat(201), 'x\n--dangerous']) assert(!isModelId(id));
   writeFileSync(path, JSON.stringify({ ...raw, modelOptions: { codex: ['bad model'] } }));
-  assert.throws(() => loadConfig(['--config', path]), /有效模型 ID 数组/);
+  assert.throws(() => loadHostConfig(['--config', path]).configs[0]!, /有效模型 ID 数组/);
 });
 
 const fakeCli = String.raw`

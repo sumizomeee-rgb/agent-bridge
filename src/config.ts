@@ -8,33 +8,6 @@ export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..'
 export function isModelId(value: string): boolean {
   return value.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._:/@+\-]*(?:\[[A-Za-z0-9]+\])?$/.test(value);
 }
-export function loadConfig(argv = process.argv.slice(2), createDirectories = true): BridgeConfig {
-  let configPath = resolve(projectRoot, '.local', 'config.json');
-  let portOverride: number | undefined;
-  let profileOverride: string | undefined;
-  let platformOverride: 'discord' | 'feishu' | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--config') configPath = resolve(argv[++i] ?? '');
-    else if (argv[i] === '--proxy-port') portOverride = parsePort(argv[++i]);
-    else if (argv[i] === '--profile') { profileOverride = argv[++i]; if (!profileOverride) throw new Error('--profile 缺少预设名称。'); }
-    else if (argv[i] === '--platform') { const platform = argv[++i]; if (platform !== 'discord' && platform !== 'feishu') throw new Error('--platform 必须是 discord 或 feishu。'); platformOverride = platform; }
-    else if (!['--check', '--help'].includes(argv[i] ?? '')) throw new Error(`未知参数：${argv[i]}`);
-  }
-  const raw = readJson(configPath);
-  if (raw.version !== 2 || ['token', 'applicationId', 'appId', 'appSecret', 'allowedUserIds'].some(key => key in raw)) throw new Error('请先执行一次性 Profile 语义迁移，运行配置仅支持 version:2。');
-  if (platformOverride && !profileOverride) {
-    const defaults = raw.platformProfiles as Record<string, unknown> | undefined;
-    const candidate = defaults?.[platformOverride] ?? (typeof raw.startupProfile === 'string' && raw.startupProfile.startsWith(platformOverride + '/') ? raw.startupProfile : undefined);
-    if (typeof candidate !== 'string') throw new Error('未配置该平台的默认 Profile。');
-    profileOverride = candidate;
-  }
-  if ('proxyPort' in raw) throw new Error('proxyPort 已移至启动 Profile 的 network.proxyPort；公共配置不接受此字段。');
-  const profile = selectProfile(raw, configPath, profileOverride);
-  if (platformOverride && profile.platform !== platformOverride) throw new Error('Profile 与选择的平台不一致。');
-  const config = buildConfig(raw, profile, portOverride);
-  if (createDirectories) prepareConfigPaths(config);
-  return config;
-}
 function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOverride?: number): BridgeConfig {
   const token = profile.token ?? '';
   if (profile.platform === 'discord' && !token) throw new Error('配置缺少机器人 token');

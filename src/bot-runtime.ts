@@ -24,7 +24,7 @@ import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 export interface BotRuntimeHooks {
   authorize(userId: string, text: string): boolean;
   receiveGroup(message: IncomingDM): Promise<void>;
-  manager: Pick<SessionManagerOptions, 'binding' | 'onConversationScene' | 'onGroupTurnStart' | 'onSceneCheck' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'>;
+  manager: Pick<SessionManagerOptions, 'binding' | 'onConversationScene' | 'onGroupTurnStart' | 'onSceneCheck' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'> & { binding: NonNullable<SessionManagerOptions['binding']> };
   invoke(turn: AgentTurn, name: string, input: Record<string, unknown>, callId: string | undefined, delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown>;
   pauseGroup(): void;
   resumeGroup(): void;
@@ -76,6 +76,7 @@ export class BotRuntime {
   private readonly health: Pick<CapabilityHealthService, 'refresh' | 'query' | 'startupSummary'>;
 
   constructor(readonly config: BridgeConfig, private readonly hooks: BotRuntimeHooks, dependencies: BotRuntimeDependencies = {}) {
+    if (!hooks.manager.binding) throw new Error('BotRuntime 必须使用宿主的当前主控绑定，不能退回按用户选择多个主控。');
     prepareConfigPaths(config);
     this.secrets = [config.token, config.appSecret ?? ''];
     const env = agentEnvironment(config);

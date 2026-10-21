@@ -72,10 +72,6 @@ export class SessionStore {
         native_id TEXT, title TEXT NOT NULL, cwd TEXT NOT NULL,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS active_conversations (
-        user_id TEXT PRIMARY KEY,
-        conversation_id TEXT NOT NULL REFERENCES conversations(id)
-      );
       CREATE TABLE IF NOT EXISTS inbox (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         id TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
@@ -399,21 +395,10 @@ export class SessionStore {
       ORDER BY updated_at DESC, rowid DESC LIMIT ?`).all(userId, limit).map(conversation);
   }
 
-  latestAgentConversation(userId: string, agent: AgentName, cwd: string, controllerMode?: boolean): Conversation | null {
-    const modeFilter = controllerMode === undefined ? '' : ' AND controller_mode = ?';
-    const row = this.db.prepare(`SELECT * FROM conversations WHERE user_id = ? AND agent = ? AND cwd = ?${modeFilter}
-      ORDER BY updated_at DESC, rowid DESC LIMIT 1`).get(userId, agent, cwd, ...(controllerMode === undefined ? [] : [controllerMode ? 1 : 0]));
-    return row ? conversation(row) : null;
-  }
-
-  findConversations(userId: string, id: string): Conversation[] {
-    if (!/^[a-f0-9-]+$/i.test(id)) return [];
-    return this.db.prepare(`SELECT * FROM conversations WHERE user_id = ?
-      AND (id = ? OR id LIKE ?) ORDER BY created_at`).all(userId, id, `${id}%`).map(conversation);
-  }
-
   getActive(userId: string): Conversation | null {
     if (this.binding) { const id = this.binding.getActive(userId); return id ? this.getConversation(id) : null; }
+    // Unbound stores are used by offline legacy migration and standalone tests only.
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_conversations'").get()) return null;
     const row = this.db.prepare(`SELECT c.* FROM conversations c
       JOIN active_conversations a ON a.conversation_id = c.id WHERE a.user_id = ?`).get(userId);
     return row ? conversation(row) : null;
@@ -423,6 +408,7 @@ export class SessionStore {
     const target = this.getConversation(conversationId);
     if (!target || target.userId !== userId) throw new Error('会话不属于当前用户');
     if (this.binding) { this.binding.setActive(userId, conversationId, reason); return; }
+    this.db.exec('CREATE TABLE IF NOT EXISTS active_conversations (user_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id))');
     this.db.prepare(`INSERT INTO active_conversations (user_id, conversation_id) VALUES (?, ?)
       ON CONFLICT(user_id) DO UPDATE SET conversation_id = excluded.conversation_id`).run(userId, conversationId);
   }

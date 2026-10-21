@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { loadConfig, loadHostConfig } from '../src/config.js';
+import { loadHostConfig } from '../src/config.js';
 import { ensureHostSemanticData, migrateHostConfig, restoreHostMigration, relocateHostValue } from '../src/host-migration.js';
 import { SessionStore } from '../src/store.js';
 import { ControllerStore } from '../src/controller/store.js';
@@ -65,7 +65,6 @@ test('v3 host loads one complete same-platform set with stable identity paths an
   assert.equal(existsSync(host.configs[0]!.workspace), false);
   renameSync(profile, join(f.local, 'bots', 'feishu', 'renamed.json')); writeConfig(f, { startupProfiles: ['feishu/renamed', 'feishu/b'], principals: host.principals });
   assert.equal(loadHostConfig(['--config', f.config], false).configs[0]?.workspace, host.configs[0]?.workspace);
-  assert.throws(() => loadConfig(['--config', f.config], false), /语义迁移/);
 });
 
 test('host internal Bot communication flag defaults on, accepts explicit booleans and reaches every Bot config', t => {

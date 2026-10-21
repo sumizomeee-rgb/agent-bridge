@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agentEnvironment, loadConfig, redactText, safeError } from '../src/config.js';
+import { agentEnvironment, loadHostConfig, redactText, safeError } from '../src/config.js';
 
 test('explicit proxy port reaches all agent proxy variables and preserves local bypass', () => {
   const env = agentEnvironment({ proxyUrl: 'http://127.0.0.1:7898' } as Parameters<typeof agentEnvironment>[0]);
@@ -20,10 +20,10 @@ test('port override and invalid ports are validated without printing token', () 
     const path = join(root, 'config.json');
     mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
     writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
-    writeFileSync(path, JSON.stringify({ version: 2, startupProfile: 'discord/default', workspace: join(root, 'workspace'), dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } }));
-    assert.equal(loadConfig(['--config', path, '--proxy-port', '7899']).proxyUrl, 'http://127.0.0.1:7899');
-    assert.throws(() => loadConfig(['--config', path, '--proxy-port', '0']), /1–65535/);
-    assert.throws(() => loadConfig(['--config', path, '--proxy-port', 'bad']), /1–65535/);
+    writeFileSync(path, JSON.stringify({ version: 3, startupProfiles: ['discord/default'], workspaceRoot: join(root, 'workspaces'), dataDir: join(root, 'data'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } }));
+    assert.equal(loadHostConfig(['--config', path, '--proxy-port', '7899']).configs[0]!.proxyUrl, 'http://127.0.0.1:7899');
+    assert.throws(() => loadHostConfig(['--config', path, '--proxy-port', '0']).configs[0]!, /1–65535/);
+    assert.throws(() => loadHostConfig(['--config', path, '--proxy-port', 'bad']).configs[0]!, /1–65535/);
   } finally { rmSync(root, { recursive: true }); }
 });
 test('redaction preserves long replies while limiting diagnostic errors', () => {
@@ -40,18 +40,18 @@ test('ordinary file limit defaults to 20 MiB and validates configuration before 
     const path = join(root, 'config.json');
     mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
     writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
-    const base = { version: 2, startupProfile: 'discord/default', workspace: join(root, 'workspace'),
-      dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'files'),
+    const base = { version: 3, startupProfiles: ['discord/default'], workspaceRoot: join(root, 'workspaces'),
+      dataDir: join(root, 'data'),
       commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } };
     writeFileSync(path, JSON.stringify(base));
-    assert.equal(loadConfig(['--config', path]).maxFileBytes, 20 * 1024 * 1024);
+    assert.equal(loadHostConfig(['--config', path]).configs[0]!.maxFileBytes, 20 * 1024 * 1024);
     for (const limit of [1, 1024, 24 * 1024 * 1024]) {
       writeFileSync(path, JSON.stringify({ ...base, maxFileBytes: limit }));
-      assert.equal(loadConfig(['--config', path]).maxFileBytes, limit);
+      assert.equal(loadHostConfig(['--config', path]).configs[0]!.maxFileBytes, limit);
     }
     for (const limit of [0, -1, 1.5, '100', 24 * 1024 * 1024 + 1]) {
       writeFileSync(path, JSON.stringify({ ...base, maxFileBytes: limit }));
-      assert.throws(() => loadConfig(['--config', path]), /maxFileBytes/);
+      assert.throws(() => loadHostConfig(['--config', path]).configs[0]!, /maxFileBytes/);
     }
   } finally { rmSync(root, { recursive: true }); }
 });

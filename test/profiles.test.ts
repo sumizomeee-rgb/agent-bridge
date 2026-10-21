@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { loadConfig } from '../src/config.js';
+import { loadHostConfig } from '../src/config.js';
 import { acquireInstanceLock } from '../src/instance-lock.js';
 import { ensureSemanticData, migrateProject } from '../src/profile-migration.js';
 import { profileScope } from '../src/profiles.js';
@@ -21,30 +21,30 @@ const scope = 'discord:' + app + '|';
 function directory(t: TestContext): string {
   const root = mkdtempSync(join(tmpdir(), 'agent-profile-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root;
 }
-function common(root: string) { return { version: 2, startupProfile: 'discord/default', platformProfiles: { feishu: 'feishu/personal' },
-  workspace: join(root, 'workspace'), dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
+function common(root: string) { return { version: 3, startupProfiles: ['discord/default'],
+  workspaceRoot: join(root, 'workspaces'), dataDir: join(root, 'data'),
   commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } }; }
 function writeProfile(root: string, name: string, bot: unknown): void { const [platform, alias] = name.split('/'); mkdirSync(join(root, 'bots', platform!), { recursive: true }); writeFileSync(join(root, 'bots', platform!, alias + '.json'), JSON.stringify(bot)); }
-test('only version 2 common config and a named bot Profile are accepted; secrets stay local', t => {
+test('runtime accepts only the v3 host configuration and keeps named Bot secrets local', t => {
   const root = directory(t), path = join(root, 'config.json');
   const bot = { applicationId: app, token: 'secret', allowedUserIds: [user], features: { presence: false } };
   writeProfile(root, 'discord/default', bot); writeFileSync(path, JSON.stringify(common(root)));
-  const config = loadConfig(['--config', path], false);
+  const config = loadHostConfig(['--config', path], false).configs[0]!;
   assert.deepEqual(config.allowedUserIds, [scope + user]); assert.deepEqual(config.externalAllowedUserIds, [user]);
   assert.equal(config.features?.presence, false); assert.equal(existsSync(config.dataDir), false);
   assert.equal(config.scopePrefix, profileScope({ ...bot, platform: 'discord', name: 'discord/alias' }));
   assert.equal(externalId(scope, scope + channel), channel);
   assert.throws(() => externalId(scope, 'discord:987654321098765432|' + channel), /不属于/);
   writeFileSync(path, JSON.stringify({ ...common(root), version: 1, token: 'secret' }));
-  assert.throws(() => loadConfig(['--config', path], false), /语义迁移/);
+  assert.throws(() => loadHostConfig(['--config', path], false).configs[0]!, /离线宿主迁移/);
 });
-test('platform convenience chooses its configured Profile; profile traversal and unsupported features fail', t => {
-  const root = directory(t), path = join(root, 'config.json'); writeFileSync(path, JSON.stringify(common(root)));
+test('platform validation respects the host startup set; traversal and unsupported features fail', t => {
+  const root = directory(t), path = join(root, 'config.json'); writeFileSync(path, JSON.stringify({ ...common(root), startupProfiles: ['feishu/personal'] }));
   writeProfile(root, 'feishu/personal', { applicationId: 'cli_testApp', appSecret: 'private', allowedUserIds: ['ou_owner'], features: { reactions: true } });
-  assert.equal(loadConfig(['--config', path, '--platform', 'feishu'], false).profile, 'feishu/personal');
-  assert.throws(() => loadConfig(['--config', path, '--profile', 'feishu/../../config'], false), /Profile 必须/);
+  assert.equal(loadHostConfig(['--config', path, '--platform', 'feishu'], false).configs[0]!.profile, 'feishu/personal');
+  assert.throws(() => loadHostConfig(['--config', path, '--profile', 'feishu/../../config'], false).configs[0]!, /启动集合/);
   writeProfile(root, 'feishu/personal', { applicationId: 'cli_testApp', appSecret: 'private', allowedUserIds: ['ou_owner'], features: { presence: true } });
-  assert.throws(() => loadConfig(['--config', path, '--platform', 'feishu'], false), /暂不支持/);
+  assert.throws(() => loadHostConfig(['--config', path, '--platform', 'feishu'], false).configs[0]!, /暂不支持/);
 });
 test('project lock excludes every other Profile in the same checkout', async t => {
   const root = directory(t); const first = await acquireInstanceLock(root, root);
@@ -123,7 +123,7 @@ test('inactive bot running messages and task receipts stay pending during anothe
 test('bot default Agent accepts only supported names and takes precedence over the common default', t => {
   const root = directory(t), path = join(root, 'config.json'); writeFileSync(path, JSON.stringify({ ...common(root), defaultAgent: 'claude' }));
   const bot = { applicationId: app, token: 'private', allowedUserIds: [user] };
-  writeProfile(root, 'discord/default', bot); assert.equal(loadConfig(['--config', path], false).defaultAgent, 'claude');
-  for (const defaultAgent of ['codex', 'claude']) { writeProfile(root, 'discord/default', { ...bot, defaultAgent }); assert.equal(loadConfig(['--config', path], false).defaultAgent, defaultAgent); }
-  for (const defaultAgent of [null, '', 'CODEX', 'gemini', 1, false, ['claude'], {}]) { writeProfile(root, 'discord/default', { ...bot, defaultAgent }); assert.throws(() => loadConfig(['--config', path], false), /Profile defaultAgent/); }
+  writeProfile(root, 'discord/default', bot); assert.equal(loadHostConfig(['--config', path], false).configs[0]!.defaultAgent, 'claude');
+  for (const defaultAgent of ['codex', 'claude']) { writeProfile(root, 'discord/default', { ...bot, defaultAgent }); assert.equal(loadHostConfig(['--config', path], false).configs[0]!.defaultAgent, defaultAgent); }
+  for (const defaultAgent of [null, '', 'CODEX', 'gemini', 1, false, ['claude'], {}]) { writeProfile(root, 'discord/default', { ...bot, defaultAgent }); assert.throws(() => loadHostConfig(['--config', path], false).configs[0]!, /Profile defaultAgent/); }
 });
