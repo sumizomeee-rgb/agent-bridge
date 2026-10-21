@@ -1,6 +1,6 @@
 # Agent Bridge
 
-在 Windows 笔记本运行，一个宿主可启动同一平台的多个 Discord 或飞书 Bot。每个 Bot 只服务一个激活账号，其私聊和已激活工作群共用本 Bot 的当前主控；不同 Bot 的记忆、任务和原生会话独立。支持图片、文件回传、后台助手及预约，正常重启保留会话和未启动队列。
+在 Windows 笔记本运行，一个宿主可启动同一平台的多个 Discord 或飞书 Bot。每个 Bot 只服务一个激活账号，其私聊和已激活工作群共用本 Bot 的当前主控；不同 Bot 的任务和原生会话独立；使用同一工作区时共享用户资料。支持图片、文件回传、后台助手及预约，正常重启保留会话和未启动队列。
 
 群聊与连续 Agent 交接已有自动化验证；真实飞书首次激活、不 @ 消息的双 Bot 回复及后续收敛已现场验收。复杂派工、媒体、跨 Agent 往返和 Discord 真机验收仍以唯一设计稿中的范围为准。旧原生会话还需分别核对工具表，能够普通回复不等于新工具已加载。
 
@@ -10,7 +10,7 @@
 
 1. 获取代码及编译后的 `dist/`，复制同平台 `node_modules/` 和 `.local/runtime/`。
 2. 将 `config.example.json` 复制为 `.local/config.json`，使用 `version: 3`、CLI 路径和同平台的 `startupProfiles` 集合；把 `profiles/` 中模板复制到 `.local/bots/<平台>/<名称>.json`，填写各 Bot 的真实应用 ID、凭据和白名单。明确登记 `principals` 的账号映射；飞书工作群还需 `spaces` 的逐应用群地址。
-3. 生成用户上下文工作区，在其 `README.md` 填写导航；多个 Bot 可共用同一目录。默认路径为 `<workspaceRoot>/<平台>/<应用ID>`，也可在对应 Profile 的 `workspace` 指定绝对路径：
+3. 生成用户上下文工作区，在其 `MEMORY.md` 填写本地约定与环境导航；多个 Bot 可共用同一目录。默认路径为 `<workspaceRoot>/<平台>/<应用ID>`，也可在对应 Profile 的 `workspace` 指定绝对路径：
 
 ```powershell
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
@@ -46,8 +46,8 @@ agent-bridge/
 
 ```text
 D:\Agent Workspace/
-├─ MEMORY.md                  持续维护的偏好、纠正与已核实事实
-├─ README.md                  稳定行为约定、初始化入口与工作导航
+├─ MEMORY.md                  用户偏好、本地工作约定、环境与入口
+├─ README.md                  桥通用主控规则、工具使用与初始化约定
 ├─ remote-agents/             远程电脑及 Agent 的非秘密登记
 │  ├─ registry.json           实际登记，默认空表
 │  └─ example.json            填写示例，不自动启用
@@ -58,14 +58,14 @@ D:\Agent Workspace/
 └─ .local/                    tmp/ 临时产物、deliveries/ 正式交付
 ```
 
-工作区 Markdown 骨架为 2 + 平台数：README 统一保存稳定约定与导航，MEMORY 保存持续记忆，每个平台另有一份指南。根目录不放临时产物，生成器预建 `.local/tmp/` 与 `.local/deliveries/`；收工规则见工作区 README。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
+工作区 Markdown 骨架为 2 + 平台数：README 保存桥通用规则与 harness，MEMORY 保存用户偏好、本地工作约定和环境入口，每个平台另有一份指南。根目录不放临时产物，生成器预建 `.local/tmp/` 与 `.local/deliveries/`；收工规则见工作区 README。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
 
 
 ### 工作区职责与生成原理
 
-工作区根目录保留 `README.md`、`MEMORY.md` 和按职责命名的目录。README 是初始化与规则的唯一入口，MEMORY 记录长期偏好和已核实事实；`chat-platforms/` 提供按当前平台选择的操作指南。`remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。这两类 JSON 由程序按需读取，不作为初始化全文注入；示例不会自动启用，任何登记都不包含凭据。
+工作区根目录保留 `README.md`、`MEMORY.md` 和按职责命名的目录。README 保存跨电脑、跨机器人通用的主控规则与初始化约定；MEMORY 分为“用户偏好”“本地工作约定”“环境与入口”，保存本地可变上下文；`chat-platforms/` 提供按当前平台选择的操作指南。`remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。这两类 JSON 由程序按需读取，不作为初始化全文注入；示例不会自动启用，任何登记都不包含凭据。
 
-`workspace-template/` 是随代码维护的公共骨架，`init-workspace.ps1 -Path <绝对目录>` 按固定清单复制缺失文件并预建职能目录和 `.local/tmp/`、`.local/deliveries/`。生成前先检查目录／文件碰撞；已有用户文件保持原字节，不覆盖、不自动同步模板，也不扫描任意新增目录。桥运行时不生成工作区；初始化只读 README 指定的 MEMORY 和当前平台文档，其余资料按任务和工具需要读取。更新已有 README 时需保留用户内容并定点合并，新会话重新初始化后生效。
+`workspace-template/` 是随代码维护的公共骨架，`init-workspace.ps1 -Path <绝对目录>` 按固定清单复制缺失文件并预建职能目录和 `.local/tmp/`、`.local/deliveries/`。生成前先检查目录／文件碰撞；已有用户文件保持原字节，不覆盖、不自动同步模板，也不扫描任意新增目录。桥运行时不生成工作区；初始化只读 README 指定的 MEMORY 和当前平台文档，其余资料按任务和工具需要读取。更新已有工作区时先核对并备份，将有效本地内容归入 MEMORY，再同步通用 README；不覆盖用户手动修改，新会话重新初始化后生效。
 
 新增职能时使用英文小写、短横线目录名，一目录承担一项稳定职责。在工作区 README 写明用途、维护者、文件格式、何时读取以及权威来源；默认按需读取，不自动加入初始化。若需提供公共骨架，将无秘密的最小模板加入 `workspace-template/<职能>/`，同步生成器的目录／文件清单、程序读取路径和相应测试，再更新本节。任务产物进 `.local/tmp/<任务名>/`，保留交付进 `.local/deliveries/<任务名>/`，不占根目录或职能登记目录。
 
