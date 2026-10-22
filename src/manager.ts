@@ -137,7 +137,13 @@ export class SessionManager {
     try { items = await this.options.onListWorkers(target, scope); }
     catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
     const history = args.includes('history');
-    const selected = (filter ? filter(items) : items).filter(item => isActiveWorker(item) !== history);
+    let selected = (filter ? filter(items) : items).filter(item => isActiveWorker(item) !== history);
+    if (selected.some(item => item.presetId)) {
+      try {
+        const names = new Map((await listPresets(this.config.contextWorkspace ?? this.config.workspace)).map(item => [item.id, item.aliases[0]]));
+        selected = selected.map(item => item.presetId ? { ...item, presetLabel: names.get(item.presetId) ?? item.presetLabel } : item);
+      } catch { /* Display names are optional; the saved preset ID still identifies the route. */ }
+    }
     const view = workerOverview(selected, scope, Date.now(), args.includes('details'), history ? 'history' : 'active');
     await reply(presentationText(view), { presentation: view });
   }

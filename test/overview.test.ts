@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -53,8 +53,8 @@ test('电脑总览黄色头、独立编号框区分连接、hello、静态入口
 test('助手条目用实际短模型和中文强度，运行助手人数与排队轮数分开', () => {
   const text = formatWorkerOverview([worker(), worker({ workerId: 'worker-2', title: '等待编译', running: false, status: 'queued', queued: 1, startedAt: null })], 'all', now);
   assert(text.startsWith('```ansi\n\u001b[33m你的全部对话的直属助手 · 运行1个 · 等待3轮'));
-  assert.match(text, /1\. 工位 · Codex · 6\.1-sol · 高 · worker-1/);
-  assert.match(text, /2\. 工位 · Codex/);
+  assert.match(text, /1\. 普通 · 工位 · Codex · 6\.1-sol · 高 · worker-1/);
+  assert.match(text, /2\. 普通 · 工位 · Codex/);
   assert.match(text, /会话名：审查修改/);
   assert.match(text, /运行中 · 本轮耗时：1分30秒 · 等待2轮/);
   assert.match(text, /等待执行 · 本轮耗时：尚未开始 · 等待1轮/);
@@ -182,6 +182,26 @@ function fixture(t: TestContext, options: SessionManagerOptions = {}, configChan
   });
   return { config, adapter, replies, counts, manager };
 }
+
+test('workers uses the saved preset ID, resolves aliases on demand and keeps preset status when the registry is unavailable', async t => {
+  const items = [worker({ workerId: 'ordinary', queued: 0 }), worker({ workerId: 'preset', queued: 0, presetId: 'saved-sol' }),
+    worker({ workerId: 'retired', presetId: 'retired-sol', running: false, queued: 0, status: 'completed' })];
+  const f = fixture(t, { onListWorkers: async () => items });
+  const root = join(f.config.workspace, 'agent-presets'); mkdirSync(root);
+  const path = join(root, 'registry.json');
+  writeFileSync(path, JSON.stringify({ version: 1, presets: [{ id: 'saved-sol', aliases: ['工位 sol'], targetId: 'workstation',
+    agent: 'codex', model: 'gpt-6.1-sol', profileId: 'gateway-sol', revision: 1, enabled: false }] }));
+  await f.manager.handle(message('labels', '/workers'));
+  assert.match(f.replies[0]!, /普通 · 工位 · Codex · 6\.1-sol/);
+  assert.match(f.replies[0]!, /预设·工位 sol · 工位 · Codex · 6\.1-sol/);
+  await f.manager.handle(message('retired-label', '/workers history details'));
+  assert.match(f.replies[1]!, /预设·retired-sol/); assert.match(f.replies[1]!, /预设 ID：retired-sol/);
+  writeFileSync(path, '{');
+  await f.manager.handle(message('unavailable-label', '/workers details'));
+  assert.match(f.replies[2]!, /预设·saved-sol/); assert.match(f.replies[2]!, /预设 ID：saved-sol/);
+  assert.match(f.replies[2]!, /普通 · 工位/); assert.equal(f.adapter.turns.length, 0);
+  assert.equal(items[1]!.presetLabel, undefined);
+});
 
 test('文本和交互命令直接查询认证后的对话，默认刷新和本用户 all，不启动模型', async t => {
   const calls: Array<{ conversation: Conversation; kind: string; value: unknown }> = [];

@@ -275,6 +275,7 @@ export class ControllerRuntime {
       return { workerId: worker.id, conversationId: worker.origin.conversationId,
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
         targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
+        ...(worker.target?.preset ? { presetId: worker.target.preset.id } : {}),
         model: worker.actualModel, effort: worker.actualEffort ?? null, requestedEffort: worker.effort,
         effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId,
         resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped,

@@ -11,6 +11,7 @@ export interface ComputerOverview {
 export interface WorkerOverview {
   workerId: string; conversationId: string; conversationTitle?: string;
   targetId: string; targetLabel: string; agent: AgentName; title: string;
+  presetId?: string; presetLabel?: string;
   model: string | null; effort: string | null; nativeId: string | null;
   requestedEffort?: string | null; effortConfiguration?: EffortConfiguration | null; effortMetadata?: EffortMetadata | null;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
@@ -32,6 +33,7 @@ const clean = (value: string, limit = 120): string => {
 function workerEffort(item: WorkerOverview): string {
   return formatEffortEvidence(item.effortMetadata ?? { actual: item.effort, requested: item.requestedEffort, configuration: item.effortConfiguration });
 }
+const dispatchLabel = (item: WorkerOverview): string => item.presetId ? `预设·${clean(item.presetLabel || item.presetId, 32)}` : '普通';
 const agentLabel = (agent: AgentName): string => agent === 'codex' ? 'Codex' : 'Claude Code';
 const checkedTime = (value: string | null): string => {
   const parsed = value ? Date.parse(value) : NaN;
@@ -130,7 +132,7 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
       const effort = workerEffort(item);
       const status = item.archivedAt && item.processStopped === true && !item.running && !item.queued ? '📁 已归档' : ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
       const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? '尚未开始' : '耗时未回报';
-      const lines = [`${index + 1}. ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
+      const lines = [`${index + 1}. ${dispatchLabel(item)} · ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
         `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
       if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
       if (item.archivedAt) lines.push(`归档：${clean(item.archiveReason ?? '已确认停止，保留异常历史', 80)}`);
@@ -170,9 +172,10 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
     const model = item.model ? clean(item.model).replace(/^gpt-/i, '') || '模型未知' : '模型未知';
     const effort = workerEffort(item);
     const computer = item.targetId === 'local' ? '桥电脑' : clean(item.targetLabel);
-    const lines = [`${index + 1}. ${computer} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
+    const lines = [`${index + 1}. ${dispatchLabel(item)} · ${computer} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
       `会话名：${clean(item.title, 80)}`, `电脑：${clean(item.targetLabel)} · target ID：${clean(item.targetId, 64)}`,
       `workerId：${clean(item.workerId, 256)}`, `原生会话 ID：${item.nativeId ? clean(item.nativeId, 256) : '未回报'}`];
+    if (item.presetId) lines.push(`预设 ID：${clean(item.presetId, 96)}`);
     const metadata = item.effortMetadata, configuration = metadata ? metadata.configuration : item.effortConfiguration;
     const requested = metadata ? metadata.requested : item.requestedEffort, observed = metadata ? metadata.actual : item.effort;
     lines.push(`强度指定：${requested ? clean(requested, 30) : 'CLI 默认'} · CLI 回报：${observed ? clean(observed, 30) : '未回报'}`);

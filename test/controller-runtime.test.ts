@@ -1028,6 +1028,13 @@ test('worker canonical effort evidence persists and reaches the ordinary worker 
     assert.deepEqual(f.runtime.store.getWorker(handle.workerId)!.effortMetadata, metadata);
     const overview = f.runtime.queryWorkerOverview(f.turn.conversation, 'current');
     assert.deepEqual(overview.find(item => item.workerId === handle.workerId)!.effortMetadata, metadata);
+    assert.equal(overview[0]!.presetId, undefined);
+    const saved = f.runtime.store.getWorker(handle.workerId)!;
+    saved.target = { id: 'workstation', label: '工位', transport: 'ssh', agent: 'codex', agentCommand: f.config.commands.codex, cwd: f.dir,
+      preset: { id: 'saved-sol', targetId: 'workstation', profileId: 'gateway-sol', revision: 1, fingerprint: 'a'.repeat(64), agent: 'codex', model: 'gpt-6.1-sol' } };
+    f.runtime.store.saveWorker(saved);
+    assert.equal(f.runtime.queryWorkerOverview(f.turn.conversation)[0]!.presetId, 'saved-sol');
+    delete saved.target; f.runtime.store.saveWorker(saved);
     f.codex.finish(handle.workerId); await flush();
   } finally { await f.runtime.close(); f.registry.close(); }
 });
