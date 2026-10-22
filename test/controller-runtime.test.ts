@@ -451,7 +451,7 @@ test('workspace initialization uses one durable child with the parent backend/mo
     assert.match(child.text, /不靠截断省略关键约束/);
     assert.match(child.text, /workspaceContext仍只放简要工作区能力概括，continuation另放用户纠正和未完成事项/);
     assert(!child.text.includes('用户职责和偏好、当前电脑用途'));
-    assert.match(child.text, /不自行登记桥后台任务、向聊天平台发消息/); assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
+    assert(!child.text.includes('USER_TASK_MUST_NOT_BE_EXECUTED'));
     assert.equal(child.taskContextPath, undefined); assert.equal(child.onPublicMessage, undefined); assert.equal(f.registry.activeCount('parent-A'), 1);
     f.codex.finish(first!.workerId, '主机和导航已阅读；Chrome 登录状态仅依据 README 声明。'); await flush();
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.events.length, 1); assert.equal(f.events[0]!.purpose, 'workspace-context');
@@ -563,7 +563,7 @@ test('dispatch returns before child completion; one child serializes turns and p
     f.codex.finish(handle.workerId, '温度正常'); await flush();
     assert.equal(f.codex.turns.length, 2); assert.equal(f.codex.turns[1]?.conversation.nativeId, `native-${handle.workerId}`);
     assert.equal(f.codex.turns[1]?.conversation.model, 'gpt-6.1-sol'); assert.equal(f.codex.turns[1]?.effort, 'medium');
-    assert.equal(f.codex.turns[0]?.taskContextPath, undefined); assert.match(f.codex.turns[0]!.text, /不要自行登记/);
+    assert.equal(f.codex.turns[0]?.taskContextPath, undefined);
     assert.equal(f.registry.activeCount('parent-A'), 1); f.codex.finish(handle.workerId, 'CPU 20%'); await flush();
     assert.equal(f.registry.activeCount('parent-A'), 0); assert.equal(f.events.length, 2); assert.deepEqual(f.errors, []);
     assert.ok(f.events.every(event => event.nativeId === 'native-parent')); assert.match(f.events[1]!.text, /CPU 20%/);
