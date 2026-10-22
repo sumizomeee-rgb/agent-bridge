@@ -64,6 +64,15 @@ function fixture(t: TestContext, agent: AgentName) {
   return { adapter, protocol, turn, invoked, sends };
 }
 
+test('Claude confirmed final delivery survives a later native error result without another send', async t => {
+  const f = fixture(t, 'claude'), running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+  assert.equal((await f.protocol.call('bridge_send_user', { text: '已经送达的最终正文' })).ok, true);
+  f.protocol.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'continued-native', result: 'Selected model is at capacity.' });
+  const result = await running;
+  assert.equal(result.controlledOutput, true); assert.equal(result.nativeId, 'continued-native');
+  assert.match(result.postDeliveryError!, /at capacity/); assert.equal(f.sends.length, 1); assert.deepEqual(f.invoked, []);
+});
+
 function groupFixture(t: TestContext, agent: AgentName) {
   const f = fixture(t, agent);
   f.turn.source = { messageId: 'real-group-request', userId: 'owner', channelId: 'original-group-channel' };

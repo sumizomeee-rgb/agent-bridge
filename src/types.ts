@@ -164,7 +164,7 @@ export interface AgentTurn {
   /** Adapter-owned evidence, shared by controllers, workers and every presentation. */
   onEffortMetadata?: (metadata: EffortMetadata) => void;
 }
-export interface AgentResult { nativeId: string; text: string; controlledOutput?: boolean }
+export interface AgentResult { nativeId: string; text: string; controlledOutput?: boolean; postDeliveryError?: string }
 export interface AgentAdapter {
   run(turn: AgentTurn): Promise<AgentResult>;
   /** queued 必须表示尚未提交或收到明确拒绝；不确定结果禁止自动重发。 */

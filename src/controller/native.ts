@@ -9,6 +9,7 @@ import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentName, AgentResult, AgentTurn, AgentInput, PrivateInputBatch, EffortConfiguration, EffortCapability } from '../types.js';
 import { claudeEffortConfiguration } from '../agents/claude-effort.js';
 import { AttachmentPreparationError } from '../artifacts.js';
+import { executionErrorEvidence } from '../delivery-errors.js';
 import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
 
@@ -118,6 +119,8 @@ export interface NativeControllerOptions {
 class TurnSealedError extends Error {
   constructor() { super('主控本轮已封闭，等待下一条真实输入。'); this.name = 'TurnSealedError'; }
 }
+/** A native turn failed; final platform delivery is tracked independently. */
+class NativeTurnFailure extends Error {}
 interface ActiveTurn {
   turn: AgentTurn;
   reportEffort: ReturnType<typeof createEffortReporter>;
@@ -306,10 +309,13 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (typeof params.turnId === 'string' && active.nativeTurnId && params.turnId !== active.nativeTurnId) return;
     if (message.method === 'turn/started' && isObject(params.turn) && typeof params.turn.id === 'string') { if (!active.nativeTurnId || active.nativeTurnId === params.turn.id) active.nativeTurnId = params.turn.id; }
     else if (message.method === 'model/rerouted' && typeof params.toModel === 'string') { session.model = params.toModel; active.effortCapability = effortCapabilityForModel(active.effortCapability, params.toModel); active.reportEffort({ capability: active.effortCapability }); active.turn.onModel?.(params.toModel); }
-    else if (message.method === 'error' && params.willRetry === false) active.completed.reject(new Error(`主控请求失败：${safeError(isObject(params.error) ? params.error.message : '', 'Agent 错误')}`));
+    else if (message.method === 'error' && params.willRetry === false) active.completed.reject(new NativeTurnFailure(`主控请求失败：${safeError(isObject(params.error) ? params.error.message : '', 'Agent 错误')}`));
     else if (message.method === 'turn/completed' && isObject(params.turn)) {
       if (active.nativeTurnId && params.turn.id !== active.nativeTurnId) return;
-      if (params.turn.status !== 'completed') active.completed.reject(new Error(`主控执行失败：${safeError(isObject(params.turn.error) ? params.turn.error.message : '', String(params.turn.status))}`));
+      if (params.turn.status !== 'completed') {
+        const failure = `主控执行失败：${safeError(isObject(params.turn.error) ? params.turn.error.message : '', String(params.turn.status))}`;
+        active.completed.reject(params.turn.status === 'failed' ? new NativeTurnFailure(failure) : new Error(failure));
+      }
       else if (!session.nativeId) active.completed.reject(new Error('主控没有返回会话标识。'));
       else this.finish(session, active);
     }
@@ -713,7 +719,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       if (typeof message.message.model === 'string') { session.model = message.message.model; active.effortCapability = effortCapabilityForModel(active.effortCapability, message.message.model); active.reportEffort({ capability: active.effortCapability }); active.turn.onModel?.(message.message.model); }
       if (Array.isArray(message.message.content)) for (const item of message.message.content) if (isObject(item)) this.recordClaudeTool(active, item);
     } else if (message.type === 'result') {
-      if (message.is_error === true || message.subtype !== 'success') active.completed.reject(new Error(`Claude 主控失败：${safeError(message.result, String(message.subtype))}`));
+      if (message.is_error === true || message.subtype !== 'success') active.completed.reject(new NativeTurnFailure(`Claude 主控失败：${safeError(message.result, String(message.subtype))}`));
       else if (!session.nativeId) active.completed.reject(new Error('Claude 主控没有返回会话标识。'));
       else this.finish(session, active);
     }
@@ -840,12 +846,15 @@ export class NativeControllerAdapter implements AgentAdapter {
       return await active.completed.promise;
     } catch (error) {
       await this.stopSession(key, session);
-      if (error instanceof TurnSealedError) {
-        // End the offending CLI, then preserve an already successful public reply.
+      if (error instanceof TurnSealedError || error instanceof NativeTurnFailure && active.sealed && active.publicationPromise && !active.sceneRefreshPending) {
+        // Retire the failed CLI, then preserve only a positively acknowledged final reply.
         // Pending delivery must really succeed before this user turn can complete.
         await active.publicationPromise;
         if (turn.signal.aborted) throw abortError();
-        if ((active.publicCalls > 0 || active.silent) && session.nativeId) return { nativeId: session.nativeId, text: '', controlledOutput: true };
+        if ((active.publicCalls > 0 || error instanceof TurnSealedError && active.silent) && session.nativeId) return {
+          nativeId: session.nativeId, text: '', controlledOutput: true,
+          ...(error instanceof NativeTurnFailure ? { postDeliveryError: executionErrorEvidence(error) } : {}),
+        };
       }
       throw error;
     }

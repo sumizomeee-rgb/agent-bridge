@@ -317,7 +317,7 @@ export class SessionStore {
   }
 
   /** Native completion and process cleanup are independent facts; neither triggers a replay. */
-  saveTurnResult(sourceId: string, conversationId: string, result: AgentResult, exitError: string | null = null): void {
+  saveTurnResult(sourceId: string, conversationId: string, result: AgentResult, exitError: string | null = result.postDeliveryError ?? null): void {
     this.db.prepare(`INSERT INTO turn_results(source_id,conversation_id,native_id,result_json,exit_error,saved_at)
       VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET result_json=excluded.result_json,
       exit_error=excluded.exit_error,saved_at=excluded.saved_at WHERE turn_results.conversation_id=excluded.conversation_id

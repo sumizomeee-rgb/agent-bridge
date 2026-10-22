@@ -28,6 +28,19 @@ function fixture(t: TestContext, run: (turn: AgentTurn) => Promise<AgentResult>,
   return { manager, store, sent, marks, send: (id: string) => manager.handle({ id, userId: 'owner', channelId: 'owner-dm', text: '请到已授权群回复', imagePaths: [] }) };
 }
 
+test('a confirmed final remains completed and stores its later native diagnostic without an extra failure notice', async t => {
+  const diagnostic = JSON.stringify({ name: 'Error', message: 'Selected model is at capacity.' });
+  const f = fixture(t, async turn => {
+    await turn.onPublicMessage!('已送达的最终汇总', [], 'actual-final');
+    return { nativeId: 'native-original', text: '', controlledOutput: true, postDeliveryError: diagnostic };
+  });
+  await f.send('final-with-native-error'); await until(() => f.store.getMessage('final-with-native-error')?.state === 'completed');
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0]!.text, /已送达的最终汇总/);
+  const saved = f.store.turnResult('final-with-native-error')!;
+  assert.equal(saved.exitError, diagnostic); assert.equal(saved.result.postDeliveryError, diagnostic);
+  assert.equal(f.store.getMessage('final-with-native-error')?.replyState, 'delivered');
+});
+
 test('explicit delivery preserves the real private source and does not complete it on a supplementary send', async t => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });

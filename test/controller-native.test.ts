@@ -115,6 +115,55 @@ function tool(transport: FakeTransport, id: number, callId: string, name: string
   transport.emit({ id, method: 'item/tool/call', params: { threadId: transport.nativeId,
     turnId: `turn-${transport.turns}`, callId, tool: name, arguments: JSON.stringify(args) } });
 }
+for (const failure of ['error', 'failed'] as const) test(`confirmed final delivery survives native ${failure} while retaining its diagnostic and original session`, async () => {
+  const s = setup(); s.setMode('hold');
+  try {
+    const turn = s.makeTurn(); turn.event = { kind: 'worker-result', text: 'A saved worker report' };
+    const running = s.adapter.run(turn); await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!;
+    tool(transport, 5101, 'final-before-capacity', 'bridge_send_user', { text: '最终汇总正文' });
+    await until(() => transport.written.some(value => value.id === 5101 && !value.method));
+    const error = { message: 'Selected model is at capacity. Bearer private-fixture-secret' };
+    if (failure === 'error') transport.emit({ method: 'error', params: { threadId: transport.nativeId, turnId: 'turn-1', willRetry: false, error } });
+    else transport.emit({ method: 'turn/completed', params: { threadId: transport.nativeId, turn: { id: 'turn-1', status: 'failed', error } } });
+    const result = await running;
+    assert.equal(result.controlledOutput, true); assert.equal(result.nativeId, transport.nativeId); assert.equal(s.published.length, 1);
+    assert.match(result.postDeliveryError!, /at capacity/); assert(!result.postDeliveryError!.includes('private-fixture-secret'));
+    assert.equal(transport.stopped, true); assert.deepEqual(s.invokes, []);
+    s.setMode('public'); const next = s.makeTurn(); next.conversation.nativeId = result.nativeId;
+    const resumed = await s.adapter.run(next);
+    assert.equal(resumed.nativeId, result.nativeId); assert.equal(resumed.postDeliveryError, undefined);
+    assert.equal(s.transports.length, 2); assert.equal(s.published.length, 2);
+    assert.equal((s.transports[1]!.written.find(value => value.method === 'thread/resume')!.params as JsonObject).threadId, result.nativeId);
+  } finally { await s.cleanup(); }
+});
+
+for (const supplement of [false, true]) test(`native model failure without a confirmed final stays failed (supplement=${supplement})`, async () => {
+  const s = setup(); s.setMode('hold');
+  try {
+    const running = s.adapter.run(s.makeTurn()), rejected = assert.rejects(running, /at capacity/);
+    await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!;
+    if (supplement) {
+      tool(transport, 5201, 'supplement-before-capacity', 'bridge_send_message', { targetId: 'private', text: '进度', finish: false });
+      await until(() => transport.written.some(value => value.id === 5201 && !value.method));
+    }
+    transport.emit({ method: 'error', params: { threadId: transport.nativeId, turnId: 'turn-1', willRetry: false, error: { message: 'Selected model is at capacity.' } } });
+    await rejected; assert.equal(s.published.length, supplement ? 1 : 0); assert.deepEqual(s.invokes, []);
+  } finally { await s.cleanup(); }
+});
+
+test('native model failure during final publication cannot hide an actual delivery failure or resend it', async () => {
+  const s = setup(); s.setMode('hold'); const hold = gate(); let attempts = 0;
+  try {
+    const turn = s.makeTurn(); turn.onPublicMessage = async () => { attempts++; await hold.promise; throw new Error('delivery remained unknown'); };
+    const running = s.adapter.run(turn), rejected = assert.rejects(running, /delivery remained unknown/);
+    await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!;
+    tool(transport, 5301, 'pending-before-capacity', 'bridge_send_user', { text: '正文' }); await until(() => attempts === 1);
+    transport.emit({ method: 'error', params: { threadId: transport.nativeId, turnId: 'turn-1', willRetry: false, error: { message: 'Selected model is at capacity.' } } });
+    await until(() => transport.stopped); hold.release(); await rejected;
+    assert.equal(attempts, 1); assert.deepEqual(s.invokes, []);
+  } finally { hold.release(); await s.cleanup(); }
+});
+
 test('controller removes computer capabilities and native collaboration while retaining the bounded management host', () => {
   const overrides = codexControllerOverrides();
   assert.ok(overrides.includes('agents.enabled=false'));
