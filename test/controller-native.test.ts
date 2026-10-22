@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AgentTurn } from '../src/types.js';
-import type { JsonObject, RpcTransport } from '../src/agents/process.js';
+import { AgentProcessStopError, type JsonObject, type RpcTransport } from '../src/agents/process.js';
 import { NativeControllerAdapter, codexControllerOverrides, isolatedCodexConfig } from '../src/controller/native.js';
 import { parse as parseTOML } from 'smol-toml';
 
@@ -65,6 +65,7 @@ class FakeTransport implements RpcTransport {
   readonly failures = new Set<(error: Error) => void>();
   readonly written: JsonObject[] = [];
   stopped = false;
+  confirmStopped?: () => boolean;
   mode: 'public' | 'silent' | 'unknown' | 'duplicate' | 'hold' = 'public';
   nativeId = 'native-controller';
   turns = 0;
@@ -492,6 +493,57 @@ test('unconfirmed process shutdown rejects abort, interrupt, restart, and close 
     assert.equal(stopCalls, 1); assert.equal(s.transports.length, 1);
   } finally { await s.adapter.close().catch(() => {}); rmSync(s.dir, { recursive: true, force: true }); }
 });
+test('controller initialization retains its rejection when CLI retirement also fails, without submitting a turn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-open-cause-')); let confirmed = false; const transport = new FakeTransport();
+  transport.confirmStopped = () => confirmed;
+  transport.write = m => transport.emit({ id: m.id, error: { code: -1, message: 'initialization rejected fixture' } });
+  transport.stop = async () => { throw new AgentProcessStopError(29); };
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'codex', dataDir: dir,
+    invokeTool: async () => { throw new Error('must not run'); }, createTransport: () => transport });
+  try {
+    await assert.rejects(adapter.run({ conversation: { id: 'opening', userId: 'u', agent: 'codex', nativeId: 'same-native',
+      title: '', cwd: dir, createdAt: '', updatedAt: '' }, text: 'continue', imagePaths: [], signal: new AbortController().signal, onProgress: () => {} }), error => {
+      assert(error instanceof AgentProcessStopError); assert(error.cause instanceof Error);
+      assert.match(error.cause.message, /initialization rejected/); return true;
+    });
+    assert.equal(transport.turns, 0);
+  } finally { confirmed = true; await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('late confirmed controller exit clears only the retired failed session and resumes the same native ID', async () => {
+  const s = setup(); s.setMode('hold'); let confirmed = false;
+  try {
+    const abort = new AbortController(), turn = s.makeTurn(); turn.signal = abort.signal;
+    const running = s.adapter.run(turn), rejected = assert.rejects(running, /退出待核对/);
+    await until(() => s.transports[0]?.turns === 1); const old = s.transports[0]!;
+    let stops = 0; const error = new AgentProcessStopError(17);
+    old.stop = async () => { stops++; throw error; }; old.confirmStopped = () => confirmed;
+    abort.abort(); await rejected;
+    await assert.rejects(s.adapter.run(s.makeTurn()), e => e === error);
+    assert.equal(stops, 1); assert.equal(s.transports.length, 1);
+    confirmed = true; s.setMode('public'); const next = s.makeTurn(); next.conversation.nativeId = old.nativeId;
+    const result = await s.adapter.run(next);
+    assert.equal(result.nativeId, old.nativeId); assert.equal(s.transports.length, 2); assert.equal(stops, 1);
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject).threadId, old.nativeId);
+  } finally { confirmed = true; await s.cleanup(); }
+});
+
+test('native execution error remains the cause when subsequent process shutdown also fails', async () => {
+  const s = setup(); s.setMode('hold'); let confirmed = false;
+  try {
+    const running = s.adapter.run(s.makeTurn());
+    const rejected = assert.rejects(running, error => {
+      assert(error instanceof AgentProcessStopError);
+      assert(error.cause instanceof Error); assert.match(error.cause.message, /at capacity/);
+      assert.match((error as unknown as { cleanupError: string }).cleanupError, /退出待核对/); return true;
+    });
+    await until(() => s.transports[0]?.turns === 1); const old = s.transports[0]!;
+    old.stop = async () => { throw new AgentProcessStopError(18); }; old.confirmStopped = () => confirmed;
+    old.emit({ method: 'error', params: { threadId: old.nativeId, turnId: 'turn-1', willRetry: false, error: { message: 'Selected model is at capacity.' } } });
+    await rejected; assert.equal(old.turns, 1); assert.equal(s.transports.length, 1); assert.deepEqual(s.invokes, []);
+  } finally { confirmed = true; await s.cleanup(); }
+});
+
 test('Claude MCP seals a real ACK before forged human corrections and resumes the same native session on real input', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-native-claude-seal-'));
   const invokes: string[] = [], published: string[] = [], launches: string[][] = [], transports: FakeTransport[] = [];

@@ -8,10 +8,11 @@ import { createServer, type Server } from 'node:http';
 import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentName, AgentResult, AgentTurn, AgentInput, PrivateInputBatch, EffortConfiguration, EffortCapability } from '../types.js';
 import { claudeEffortConfiguration } from '../agents/claude-effort.js';
+import { MetadataProbeError } from '../agents/metadata.js';
 import { AttachmentPreparationError } from '../artifacts.js';
 import { executionErrorEvidence } from '../delivery-errors.js';
 import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
-import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
+import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, processStopFailure, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
 
 const object = (properties: JsonObject): JsonObject => ({ type: 'object', properties, additionalProperties: false });
 const string = (description: string): JsonObject => ({ type: 'string', description });
@@ -157,6 +158,7 @@ interface ControllerSession {
   removeListeners: (() => void)[];
   closed: boolean;
   stopPromise?: Promise<void>;
+  stopFailed?: boolean;
   model?: string;
   effort?: string | null;
   effortConfiguration?: EffortConfiguration | null;
@@ -176,7 +178,20 @@ export class NativeControllerAdapter implements AgentAdapter {
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (!this.options.metadataAdapter?.getModelInfo) throw new Error('主控没有配置模型目录查询适配器。');
-    return this.options.metadataAdapter.getModelInfo(cwd);
+    for (let attempt = 0; ; attempt++) {
+      if (this.closed) throw new Error('主控适配器已关闭。');
+      try { return await this.options.metadataAdapter.getModelInfo(cwd); }
+      catch (error) {
+        const retry = error instanceof MetadataProbeError && error.processStopped && attempt === 0 && !this.closed;
+        try { appendFileSync(join(this.options.dataDir, 'controller-preflight-diagnostic.jsonl'), JSON.stringify({
+          at: new Date().toISOString(), stage: 'metadata', attempt: attempt + 1, retry,
+          evidence: executionErrorEvidence(error), ...(error instanceof MetadataProbeError ? { processStopped: error.processStopped, cleanupError: error.cleanupError, stopEvidence: error.stopEvidence } : {}),
+        }) + '\n'); } catch { /* Diagnostic failure never permits an unsafe retry. */ }
+        if (!retry) throw error;
+        // Only repeat this no-generation probe; never replay a submitted controller turn.
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
   }
   private sourceFiles(): string[] {
     const userHome = this.options.userHome ?? homedir();
@@ -296,7 +311,14 @@ export class NativeControllerAdapter implements AgentAdapter {
       if (typeof response.model === 'string') { session.model = response.model; turn.onModel?.(session.model); }
       if (!selectedEffort(turn) && (typeof response.reasoningEffort === 'string' || response.reasoningEffort === null)) { session.effort = response.reasoningEffort; turn.onReasoningEffort?.(session.effort); }
       return session;
-    } catch (error) { await this.stopSession(turn.conversation.id, session); throw error; }
+    } catch (error) {
+      try { await this.stopSession(turn.conversation.id, session); }
+      catch (cleanup) {
+        const failure = processStopFailure(cleanup); failure.cause = error;
+        Object.assign(failure, { cleanupError: executionErrorEvidence(cleanup) }); throw failure;
+      }
+      throw error;
+    }
   }
   private onCodexMessage(session: ControllerSession, message: JsonObject): void {
     if (typeof message.method !== 'string') return;
@@ -845,7 +867,11 @@ export class NativeControllerAdapter implements AgentAdapter {
       }
       return await active.completed.promise;
     } catch (error) {
-      await this.stopSession(key, session);
+      try { await this.stopSession(key, session); }
+      catch (cleanup) {
+        const failure = processStopFailure(cleanup); failure.cause = error;
+        Object.assign(failure, { cleanupError: executionErrorEvidence(cleanup) }); throw failure;
+      }
       if (error instanceof TurnSealedError || error instanceof NativeTurnFailure && active.sealed && active.publicationPromise && !active.sceneRefreshPending) {
         // Retire the failed CLI, then preserve only a positively acknowledged final reply.
         // Pending delivery must really succeed before this user turn can complete.
@@ -861,7 +887,17 @@ export class NativeControllerAdapter implements AgentAdapter {
     finally { turn.signal.removeEventListener('abort', onAbort); if (session.active === active) session.active = null; }
   }
   private stopSession(key: string, session: ControllerSession): Promise<void> {
-    if (session.stopPromise) return session.stopPromise;
+    if (session.stopPromise) {
+      const proof = this.transportProofs.get(session.transport), current = proof ? this.readProcessProof(key) : null;
+      if (session.stopFailed && !session.active && (session.transport.confirmStopped?.() === true
+        || proof && current?.nonce === proof.nonce && current.stopped)) {
+        // Late exit evidence releases only this exact retired CLI, never replays its failed turn.
+        this.confirmedStopped.set(key, { nonce: proof?.nonce });
+        if (this.closingSessions.get(key) === session) this.closingSessions.delete(key);
+        return Promise.resolve();
+      }
+      return session.stopPromise;
+    }
     session.closed = true;
     if (this.sessions.get(key) === session) this.sessions.delete(key);
     this.closingSessions.set(key, session);
@@ -874,7 +910,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     })();
     // Failed shutdown stays registered: a new controller must not overlap an
     // old process whose exit is still unknown. Every caller awaits the same stop.
-    void session.stopPromise.then(() => { if (this.closingSessions.get(key) === session) this.closingSessions.delete(key); }, () => {});
+    void session.stopPromise.then(() => { if (this.closingSessions.get(key) === session) this.closingSessions.delete(key); }, () => { session.stopFailed = true; });
     return session.stopPromise;
   }
   async interrupt(conversationId: string): Promise<void> { const session = this.sessions.get(conversationId) ?? this.closingSessions.get(conversationId); if (session) { session.active?.completed.reject(abortError()); await this.stopSession(conversationId, session); } }

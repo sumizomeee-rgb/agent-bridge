@@ -1,4 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
+import { MetadataProbeError, retireMetadata } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, processStopFailure, safeError, type JsonObject, type RpcTransport } from './process.js';
@@ -12,6 +13,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
   private readonly metadataProcesses = new Set<RpcTransport>();
+  private readonly metadataUnconfirmed = new Set<RpcTransport>();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
     private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport =
@@ -19,10 +21,13 @@ export class CodexAdapter implements AgentAdapter {
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
+    for (const previous of this.metadataUnconfirmed) {
+      await retireMetadata(previous, false); this.metadataUnconfirmed.delete(previous); this.metadataProcesses.delete(previous);
+    }
     const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], cwd, this.env);
     this.metadataProcesses.add(transport);
     const rpc = new JsonRpcClient(transport);
-    let success = false;
+    let success = false, primary: unknown;
     try {
       await rpc.request('initialize', { clientInfo: { name: 'agent_bridge', version: '0.1.0' }, capabilities: { experimentalApi: false } }, 15_000);
       rpc.notify('initialized');
@@ -49,8 +54,12 @@ export class CodexAdapter implements AgentAdapter {
       } while (cursor);
       success = true;
       return { models, source: 'codex-model-list', defaultModel: typeof config.model === 'string' && config.model ? config.model : models.find(model => model.isDefault)?.id ?? null };
-    } finally {
-      await transport.stop(success); rpc.close(); this.metadataProcesses.delete(transport);
+    } catch (error) { primary = error; throw new MetadataProbeError(error, true); }
+    finally {
+      let stopped = false;
+      try { await retireMetadata(transport, success, primary); stopped = true; }
+      catch (error) { this.metadataUnconfirmed.add(transport); throw error; }
+      finally { rpc.close(); if (stopped) this.metadataProcesses.delete(transport); }
     }
   }
 
@@ -310,6 +319,6 @@ export class CodexAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => retireMetadata(process, false))));
   }
 }

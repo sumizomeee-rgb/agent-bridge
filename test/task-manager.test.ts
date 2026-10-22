@@ -6,6 +6,8 @@ import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { SessionManager } from '../src/manager.js';
+import { MetadataProbeError } from '../src/agents/metadata.js';
+import { AgentProcessStopError } from '../src/agents/process.js';
 import { SessionStore } from '../src/store.js';
 import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 import type { AgentAdapter, AgentName, AgentResult, AgentTurn, BridgeConfig, BridgeMessage, ReplyOptions, ReplySink } from '../src/types.js';
@@ -82,6 +84,36 @@ function fixture(t: TestContext) {
   });
   return f;
 }
+
+for (const failure of ['preparation', 'stop', 'execution'] as const) test(`controller wake ${failure} reports the actual stage without claiming a saved assistant report or replaying`, async t => {
+  const f = fixture(t);
+  await f.manager.handle(message('origin', '安排复查'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const first = f.codex.calls[0]!;
+  const created = f.registry.createContext({ conversationId: first.conversation.id, userId: 'u1', channelId: 'dm-u1',
+    originMessageId: 'origin', nativeId: f.codex.nativeId(first), agent: 'codex', cwd: first.conversation.cwd,
+    purpose: 'schedule', scheduleKind: 'controller' });
+  const task = f.registry.register(JSON.parse(readFileSync(created.contextPath, 'utf8')) as TaskContextFile, '定时自唤醒 · 复查实验');
+  f.codex.finish(0); await waitFor(() => f.inspect.getMessage('origin')?.replyState === 'delivered');
+  f.registry.acceptObservedResult(task.taskId, 'completed', 'scheduled observation');
+  const event = f.registry.getNextEvent()!; f.manager.completionAvailable();
+  await waitFor(() => f.codex.calls.length === 2);
+  const primary = new Error('initial metadata timeout');
+  f.codex.pending[1]!.reject(failure === 'preparation' ? new MetadataProbeError(primary, false, new AgentProcessStopError(25))
+    : failure === 'stop' ? new AgentProcessStopError(25) : new Error('native generation failed'));
+  await waitFor(() => f.sink.replies.some(r => r.options?.presentation?.tone === 'error'));
+  const notice = f.sink.replies.at(-1)!;
+  assert.equal(notice.options?.presentation?.title, failure === 'stop' ? '【桥】退出待确认' : '【桥】唤醒失败');
+  assert(!notice.text.includes('助手结果已保存')); assert(!notice.text.includes('报告已保存'));
+  if (failure === 'preparation') assert(notice.text.includes('未提交给主控'));
+  assert.equal(f.registry.eventState(event.id), 'uncertain'); assert.equal(f.registry.getNextEvent(), null); assert.equal(f.codex.calls.length, 2);
+  const db = new DatabaseSync(join(f.registry.dataDir, 'tasks.sqlite'), { readOnly: true });
+  try {
+    const reason = JSON.parse(String(db.prepare('SELECT reason FROM task_events WHERE id=?').get(event.id)!.reason));
+    assert.equal(reason.stage, failure === 'preparation' ? 'preparation' : failure === 'stop' ? 'process-exit' : 'summary');
+    if (failure === 'preparation') { assert.equal(reason.submitted, false); assert.match(reason.evidence, /initial metadata timeout/); assert.match(reason.cleanup, /退出待核对/); }
+  } finally { db.close(); }
+});
 
 test('登记上下文自动绑定完整父 Session，父 turn 结束即拒绝新登记', async t => {
   const f = fixture(t);

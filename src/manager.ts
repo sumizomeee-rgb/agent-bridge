@@ -10,7 +10,8 @@ import { commandHelp, parseCommand as command, parseNewArguments } from './comma
 import { presentationText, type BridgePresentation } from './presentation.js';
 import { bridgeNotice, type BridgeNoticeCode } from './notices.js';
 import { executionErrorEvidence as errorEvidence } from './delivery-errors.js';
-import { completedResultFromError } from './agents/process.js';
+import { completedResultFromError, isObject, stopEvidenceFromError } from './agents/process.js';
+import { MetadataProbeError } from './agents/metadata.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
@@ -1257,6 +1258,8 @@ export class SessionManager {
           const handled = groupContext && this.options.onGroupTurnError
             ? await this.options.onGroupTurnError(groupContext).catch(() => true) : false;
           if (!handled) await this.sendBridgeNotice(item.channelId, retained ? 'processExitUnconfirmed'
+            : error instanceof MetadataProbeError ? 'controllerPreparationFailed'
+            : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed'
             : error instanceof Error && 'finalReplyMissing' in error ? 'controllerReplyMissing'
             : this.store.turnResult(item.id) || error instanceof Error && 'publicationFailed' in error ? 'controllerReplyFailed' : 'controllerFailed',
             undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
@@ -1510,14 +1513,20 @@ export class SessionManager {
     } catch (error) {
       const retained = completedResultFromError(error);
       if (retained) this.store.saveTurnResult(event.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
-      registry.markUncertain(event.id, JSON.stringify({ stage: retained ? 'process-exit' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : 'summary', evidence: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']) }));
+      registry.markUncertain(event.id, JSON.stringify({ stage: error instanceof MetadataProbeError ? 'preparation' : retained || isObject(error) && error.processStillRunning === true ? 'process-exit' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : 'summary',
+        evidence: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']),
+        ...(error instanceof MetadataProbeError ? { submitted: false, processStopped: error.processStopped } : {}),
+        ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanup: errorEvidence(new Error(error.cleanupError), [this.config.token, this.config.appSecret ?? '']) } : {}),
+        ...(stopEvidenceFromError(error) ? { stopEvidence: stopEvidenceFromError(error) } : {}),
+      }));
       if (workspaceContext) {
         if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.reportInitializationState(target, 'load-failed').catch(() => undefined); await this.sendWorkspaceNotice(target); }
         registry.markUncertainNotified(event.id);
       } else if (observation) registry.markUncertainNotified(event.id);
-      else if (!this.closed) await this.sendBridgeNotice(event.channelId, controller.signal.aborted ? 'summaryStopped'
-        : retained ? 'processExitUnconfirmed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
-        : replyPreparationStarted ? 'resultPreparationFailed' : 'summaryFailed',
+      else if (!this.closed) await this.sendBridgeNotice(event.channelId, controller.signal.aborted ? event.scheduleKind === 'controller' ? 'wakeStopped' : 'summaryStopped'
+        : error instanceof MetadataProbeError ? event.scheduleKind === 'controller' ? 'wakePreparationFailed' : 'controllerPreparationFailed'
+        : retained ? 'processExitUnconfirmed' : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
+        : replyPreparationStarted ? 'resultPreparationFailed' : event.scheduleKind === 'controller' ? 'wakeFailed' : 'summaryFailed',
         event.title, `completion-error:${event.id}`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
     } finally {

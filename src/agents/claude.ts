@@ -1,4 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
+import { MetadataProbeError, retireMetadata } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
 import { claudeEffortConfiguration } from './claude-effort.js';
@@ -13,7 +14,7 @@ function imageMediaType(bytes: Buffer): string {
   throw new Error('Claude 支持 PNG、JPEG、GIF 和 WebP 图片；该附件格式无法识别。');
 }
 
-type ClaudeTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop' | 'endInput'> & Partial<Pick<JsonLineProcess, 'confirmStopped'>>;
+type ClaudeTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop' | 'endInput'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'stopEvidence'>>;
 
 /** Claude CLI structured streaming input; prompts never pass through a shell. */
 export class ClaudeAdapter implements AgentAdapter {
@@ -23,17 +24,22 @@ export class ClaudeAdapter implements AgentAdapter {
   private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
-  private readonly metadataProcesses = new Set<JsonLineProcess>();
+  private readonly metadataProcesses = new Set<ClaudeTransport>();
+  private readonly metadataUnconfirmed = new Set<ClaudeTransport>();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
     private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => ClaudeTransport =
-      (command, args, cwd, env) => new JsonLineProcess(command, args, cwd, env)) {}
+      (command, args, cwd, env) => new JsonLineProcess(command, args, cwd, env),
+    private readonly createMetadataTransport = (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv): ClaudeTransport => new JsonLineProcess(command, args, cwd, env)) {}
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Claude 适配器已关闭。');
+    for (const previous of this.metadataUnconfirmed) {
+      await retireMetadata(previous, false); this.metadataUnconfirmed.delete(previous); this.metadataProcesses.delete(previous);
+    }
     // Same initialize control envelope used by Anthropic's Agent SDK.
     // No user message is sent, so this cannot start a model generation.
-    const transport = new JsonLineProcess(this.command, ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'], cwd, this.env);
+    const transport = this.createMetadataTransport(this.command, ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'], cwd, this.env);
     this.metadataProcesses.add(transport);
     const completed = deferred<AgentModelInfo>();
     const timer = setTimeout(() => completed.reject(new Error('Claude 模型元数据等待超时。')), 10_000);
@@ -60,12 +66,16 @@ export class ClaudeAdapter implements AgentAdapter {
       const defaultModel = typeof payload.model === 'string' ? payload.model : typeof payload.defaultModel === 'string' ? payload.defaultModel : this.env.ANTHROPIC_MODEL ?? null;
       completed.resolve({ models, defaultModel: defaultModel === 'default' ? null : defaultModel, source: 'claude-initialize', ...(typeof payload.cliVersion === 'string' ? { cliVersion: payload.cliVersion } : {}) });
     });
-    let success = false;
+    let success = false, primary: unknown;
     try {
       transport.write({ type: 'control_request', request_id: 'bridge-models', request: { subtype: 'initialize', hooks: null } });
       const result = await completed.promise; success = true; return result;
-    } finally {
-      clearTimeout(timer); await transport.stop(success); removeMessage(); removeFailure(); this.metadataProcesses.delete(transport);
+    } catch (error) { primary = error; throw new MetadataProbeError(error, true); }
+    finally {
+      clearTimeout(timer); let stopped = false;
+      try { await retireMetadata(transport, success, primary); stopped = true; }
+      catch (error) { this.metadataUnconfirmed.add(transport); throw error; }
+      finally { removeMessage(); removeFailure(); if (stopped) this.metadataProcesses.delete(transport); }
     }
   }
 
@@ -308,6 +318,6 @@ export class ClaudeAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => process.stop(false))));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => retireMetadata(process, false))));
   }
 }
