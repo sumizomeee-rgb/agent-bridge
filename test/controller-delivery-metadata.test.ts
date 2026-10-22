@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { DeliveryPreparationError } from '../src/delivery-errors.js';
 import { mkdtempSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -102,4 +104,26 @@ test('an explicit target is rejected when the runtime has no authorized delivery
   await f.send('blocked'); await until(() => f.store.getMessage('blocked')?.state === 'completed');
   assert.equal(f.sent.length, 1); assert.equal(f.sent[0]!.channel, 'owner-dm');
   assert.equal(f.store.getMessage('blocked')?.replyState, 'delivered');
+});
+
+test('a local target rejection is durably rejected, cannot replay its call ID, and permits one corrected final', async t => {
+  let rejectedKey = '', acceptedKey = '', preparations = 0;
+  const f = fixture(t, async turn => {
+    for (let attempt = 0; attempt < 2; attempt++) await assert.rejects(turn.onPublicMessage!('结果', [], 'bad-target-call', 'invalid', false), DeliveryPreparationError);
+    await turn.onPublicMessage!('结果', [], 'correct-target-call', 'private');
+    return { nativeId: 'native-original', text: '', controlledOutput: true };
+  }, { async onControllerPublish(_context, _text, _paths, target, messageKey, deliver) {
+    preparations++;
+    const id = `claude:${_context.conversation.id}:native-original:${messageKey}`;
+    if (target !== 'private') { rejectedKey = id; throw new DeliveryPreparationError('尚未发送：目标无效'); }
+    acceptedKey = id; await deliver('owner-dm');
+  } });
+  await f.send('target-recovery'); await until(() => f.store.getMessage('target-recovery')?.state === 'completed');
+  assert.equal(preparations, 2); assert.equal(f.sent.length, 1);
+  const conversation = f.store.getActive('owner')!;
+  const claim = (id: string, target: string) => f.store.claimPublicMessage(id, conversation.id, 'native-original', 'owner-dm',
+    createHash('sha256').update(JSON.stringify(['结果', [], target, target === 'private'])).digest('hex'));
+  assert.equal(claim(rejectedKey, 'invalid'), 'rejected');
+  assert.equal(claim(acceptedKey, 'private'), 'delivered');
+  assert.equal(f.store.getMessage('target-recovery')?.replyState, 'delivered');
 });

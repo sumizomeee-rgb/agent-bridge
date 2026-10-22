@@ -1,5 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { DeliveryPreparationError } from '../src/delivery-errors.js';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -198,4 +199,33 @@ for (const agent of ['codex', 'claude'] as const) {
       await rejected; assert.equal(f.protocol.stopped, true); assert.equal(attempts, 1); assert.deepEqual(f.invoked, []);
     });
   }
+}
+
+for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent} invalid delivery target can be corrected in the same native turn without replaying management`, async t => {
+    const f = fixture(t, agent); let attempts = 0;
+    f.turn.onPublicMessage = async (text, _paths, _id, target, finish) => {
+      attempts++;
+      if (target !== 'private') throw new DeliveryPreparationError('尚未发送：请查询 bridge_delivery_targets 后修正目标');
+      f.sends.push({ text, target, finish });
+    };
+    const running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_list_workers', {})).ok, true);
+    assert.equal((await f.protocol.call('bridge_send_user', { targetId: 'invalid-channel', text: '结果' })).ok, false);
+    assert.equal(f.protocol.stopped, false); assert.deepEqual(f.sends, []);
+    assert.equal((await f.protocol.call('bridge_delivery_targets', {})).ok, true);
+    assert.equal((await f.protocol.call('bridge_send_user', { targetId: 'private', text: '修正后的结果' })).ok, true);
+    f.protocol.complete(); assert.equal((await running).controlledOutput, true);
+    assert.equal(attempts, 2); assert.equal(f.sends.length, 1);
+    assert.deepEqual(f.invoked, ['bridge_list_workers', 'bridge_delivery_targets']);
+  });
+  test(`${agent} background DONE cannot silently accept an uncorrected delivery preparation failure`, async t => {
+    const f = fixture(t, agent);
+    f.turn.event = { kind: 'worker-result', text: 'saved worker result' };
+    f.turn.onPublicMessage = async () => { throw new DeliveryPreparationError('尚未发送：目标无效'); };
+    const running = f.adapter.run(f.turn), rejected = assert.rejects(running, /尚未发送/);
+    await until(() => f.protocol.started);
+    assert.equal((await f.protocol.call('bridge_send_user', { targetId: 'invalid', text: '结果' })).ok, false);
+    f.protocol.complete(); await rejected; assert.deepEqual(f.sends, []);
+  });
 }

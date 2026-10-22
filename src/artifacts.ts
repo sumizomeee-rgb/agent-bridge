@@ -3,6 +3,7 @@ import { lstat, open, realpath } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OutgoingFile, OutgoingImage } from './types.js';
+import { DeliveryPreparationError } from './delivery-errors.js';
 
 const MAX_IMAGES = 10;
 const DEFAULT_FILE_BYTES = 20 * 1024 * 1024;
@@ -16,7 +17,7 @@ interface ImageMarker { start: number; end: number; destination: string; descrip
 type CodeContainer = { kind: 'quote' } | { kind: 'list'; width: number };
 
 /** Local preparation failed before any attachment bytes were submitted for delivery. */
-export class AttachmentPreparationError extends Error {}
+export class AttachmentPreparationError extends DeliveryPreparationError {}
 class ArtifactReadError extends Error {}
 function failed(reason: string): Error { return new ArtifactReadError(reason); }
 

@@ -9,7 +9,7 @@ import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview
 import { commandHelp, parseCommand as command, parseNewArguments } from './commands.js';
 import { presentationText, type BridgePresentation } from './presentation.js';
 import { bridgeNotice, type BridgeNoticeCode } from './notices.js';
-import { executionErrorEvidence as errorEvidence } from './delivery-errors.js';
+import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } from './delivery-errors.js';
 import { completedResultFromError, isObject, stopEvidenceFromError } from './agents/process.js';
 import { MetadataProbeError } from './agents/metadata.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
@@ -1044,6 +1044,7 @@ export class SessionManager {
     const hash = createHash('sha256').update(JSON.stringify([text, paths, targetId ?? null, finish])).digest('hex');
     const claim = this.store.claimPublicMessage(key, target.id, nativeId, route.channelId, hash, text);
     if (claim === 'delivered') return;
+    if (claim === 'rejected') throw new DeliveryPreparationError('本次发送已在发送前拒绝，未重复执行；请修正声明后重新调用发送工具。');
     if (claim === 'uncertain') throw Object.assign(new Error('这条回复的投递状态未知，已保留，未重复发送'), { deliveryUncertain: true, publicationFailed: true });
     let attempted = false;
     try {
@@ -1067,8 +1068,9 @@ export class SessionManager {
       this.store.finishPublicMessage(key, 'delivered');
       if (!targetId) this.store.saveDelivery(route.userId, route.channelId, identity);
     } catch (error) {
-      this.store.finishPublicMessage(key, 'uncertain', errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
       const uncertain = attempted || !!(error && typeof error === 'object' && 'deliveryUncertain' in error);
+      const rejected = !uncertain && error instanceof DeliveryPreparationError;
+      this.store.finishPublicMessage(key, rejected ? 'rejected' : 'uncertain', errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
       if (uncertain) { const turn = this.running.get(route.userId); if (turn) turn.publicationUncertain = true; }
       throw Object.assign(error instanceof Error ? error : new Error('回复发送失败'), { publicationFailed: true, ...(uncertain ? { deliveryUncertain: true } : {}) });
     }
@@ -1181,8 +1183,9 @@ export class SessionManager {
           onProgress: () => {},
           onPublicMessage: async (text, paths = [], key, targetId, finish = true) => {
             if (!current()) throw new Error('当前主控轮次已经停止');
+            if (privateControllerInput && finish && targetId === item.channelId) targetId = undefined;
             if (privateControllerInput && finish && targetId && targetId !== 'private')
-              throw new Error('普通私聊的最终回复必须发回原私聊；向其他区域发送请用 finish:false。');
+              throw new DeliveryPreparationError('尚未发送：最终回复必须发回原私聊；请省略 targetId 或使用 private，其他区域补充发送用 finish:false。');
             const coverage = [...turn.messageIds];
             if (privateControllerInput && finish) privateFinalStarted = true;
             if (finish) this.store.setReplyState(coverage, 'pending');
@@ -1513,7 +1516,7 @@ export class SessionManager {
     } catch (error) {
       const retained = completedResultFromError(error);
       if (retained) this.store.saveTurnResult(event.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
-      registry.markUncertain(event.id, JSON.stringify({ stage: error instanceof MetadataProbeError ? 'preparation' : retained || isObject(error) && error.processStillRunning === true ? 'process-exit' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : 'summary',
+      registry.markUncertain(event.id, JSON.stringify({ stage: error instanceof MetadataProbeError ? 'preparation' : retained || isObject(error) && error.processStillRunning === true ? 'process-exit' : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'reply-preparation' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : 'summary',
         evidence: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']),
         ...(error instanceof MetadataProbeError ? { submitted: false, processStopped: error.processStopped } : {}),
         ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanup: errorEvidence(new Error(error.cleanupError), [this.config.token, this.config.appSecret ?? '']) } : {}),
@@ -1525,7 +1528,8 @@ export class SessionManager {
       } else if (observation) registry.markUncertainNotified(event.id);
       else if (!this.closed) await this.sendBridgeNotice(event.channelId, controller.signal.aborted ? event.scheduleKind === 'controller' ? 'wakeStopped' : 'summaryStopped'
         : error instanceof MetadataProbeError ? event.scheduleKind === 'controller' ? 'wakePreparationFailed' : 'controllerPreparationFailed'
-        : retained ? 'processExitUnconfirmed' : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
+        : retained ? 'processExitUnconfirmed' : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed'
+        : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'resultPreparationFailed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
         : replyPreparationStarted ? 'resultPreparationFailed' : event.scheduleKind === 'controller' ? 'wakeFailed' : 'summaryFailed',
         event.title, `completion-error:${event.id}`)
         .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);

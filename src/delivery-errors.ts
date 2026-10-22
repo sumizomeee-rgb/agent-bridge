@@ -1,5 +1,8 @@
 import { safeError } from './config.js';
 
+/** A verified local rejection before any platform send; the declaration may be corrected. */
+export class DeliveryPreparationError extends Error {}
+
 export interface DeliveryDiagnostic {
   platform: 'feishu'; stage: 'auth' | 'request' | 'response' | 'outbox';
   method: string; path: string; name: string;

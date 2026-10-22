@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { executionErrorEvidence as errorEvidence } from './delivery-errors.js';
+import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } from './delivery-errors.js';
 import { join } from 'node:path';
 import { collectOutgoingPaths } from './artifacts.js';
 import { assertBotCommunicationAllowed } from './bot-communication.js';
@@ -882,10 +882,13 @@ export class HostRuntime {
   }
   private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
     text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>, observe = true): Promise<void> {
-    const allowDrainingFinal = !turn.groupContext && turn.finish === true && (!targetId || targetId === 'private')
+    const allowDrainingFinal = !turn.groupContext && turn.finish === true && (!targetId || targetId === 'private' || targetId === turn.source?.channelId)
       && this.bots.get(botId)?.manager.controllerActivity(turn.conversation.id).running === true;
     const source = this.deliverySource(botId, turn, allowDrainingFinal);
     const collaboration = source.rootId ? this.store.getRoot(source.rootId)?.replyTo : undefined;
+    // Compatibility for the exact verified original private address, never arbitrary channels.
+    if (!source.spaceId && !collaboration?.collaborationMode && this.defaultDeliveryTarget(source) === 'private'
+      && targetId === source.channelId && this.privateTarget(source)?.channelId === targetId) targetId = 'private';
     if (collaboration?.collaborationMode === 'internal') {
       if (botId !== collaboration.initiatorBotId) throw new Error('静默协作不能向聊天软件发消息；请 bridge_send_bot 回传发起主控，再 bridge_silent。');
       targetId ??= collaboration.returnTargetId;
@@ -907,7 +910,7 @@ export class HostRuntime {
       }
     } else {
       const group = this.store.listGroups(botId).find(group => this.targetId(group) === targetId);
-      if (!group) throw new Error('目标ID不存在或群绑定已更新，请重新查询 bridge_delivery_targets。');
+      if (!group) throw new DeliveryPreparationError('尚未发送：目标ID无效或已更新。请调用 bridge_delivery_targets，使用返回的 targetId 修正；默认回复可省略 targetId。');
       target = this.groupTarget(source, group);
     }
     if (source.spaceId) await this.verifyMember(botId, source.spaceId, source.principalId);

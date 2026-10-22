@@ -296,14 +296,14 @@ export class SessionStore {
   }
 
   claimPublicMessage(id: string, conversationId: string, nativeId: string, channelId: string,
-    contentHash: string, text?: string): 'send' | 'delivered' | 'uncertain' {
+    contentHash: string, text?: string): 'send' | 'delivered' | 'rejected' | 'uncertain' {
     const previous = this.db.prepare('SELECT * FROM controller_public_messages WHERE id=?').get(id);
     if (previous) {
       if (previous.conversation_id !== conversationId || previous.native_id !== nativeId
         || previous.channel_id !== channelId || previous.content_hash !== contentHash) {
         throw new Error('公开消息调用标识被复用于不同内容或会话');
       }
-      return previous.state === 'delivered' ? 'delivered' : 'uncertain';
+      return previous.state === 'delivered' ? 'delivered' : previous.state === 'rejected' ? 'rejected' : 'uncertain';
     }
     const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO controller_public_messages
@@ -311,7 +311,7 @@ export class SessionStore {
       VALUES (?,?,?,?,?,?,'pending',?,?)`).run(id, conversationId, nativeId, channelId, contentHash, text ?? null, now, now);
     return 'send';
   }
-  finishPublicMessage(id: string, state: 'delivered' | 'uncertain', error: string | null = null): void {
+  finishPublicMessage(id: string, state: 'delivered' | 'rejected' | 'uncertain', error: string | null = null): void {
     this.db.prepare('UPDATE controller_public_messages SET state=?,error=?,updated_at=? WHERE id=?')
       .run(state, error, new Date().toISOString(), id);
   }

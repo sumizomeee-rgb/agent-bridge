@@ -1880,3 +1880,24 @@ test('internal task titles stay out of later public scenes and group worker list
   await f.host.receive(A, f.message(A, 'public-worker-status-all', '/workers all details')); await f.drain();
   assert.equal(f.replies.slice(start).some(reply => /静默协作助手不可公开|private-worker|private controller title/.test(reply.text)), false);
 });
+
+for (const platform of ['feishu', 'discord'] as const) test(`${platform} only the current verified private channel aliases a delivery target`, async t => {
+  const f = fixture(t, { platform }); await f.activate();
+  const primary = f.configs[0]!.botId!, other = f.configs[1]!.botId!, owner = f.configs[0]!.ownerUserId!;
+  const dm = `${primary}|${platform === 'feishu' ? 'oc_verified_owner_private' : '777777777777777777'}`;
+  f.run(async (botId, turn) => {
+    assert.equal(botId, primary);
+    for (const target of [`${other}|oc_foreign_private`, `${primary}|oc_other_private`, `${primary}|oc_a_group_1`])
+      await assert.rejects(turn.onPublicMessage!('must not send', [], target, target, false), /尚未发送/);
+    let acknowledged = false;
+    await f.hooks.get(primary)!.manager!.onControllerPublish!({ conversation: turn.conversation, source: turn.source!, signal: turn.signal, finish: true },
+      'background private alias result', [], dm, 'background-original-address', async channel => { assert.equal(channel, dm); acknowledged = true; });
+    assert.equal(acknowledged, true);
+    await turn.onPublicMessage!('verified private result', [], 'exact-original-address', dm);
+  });
+  await f.managers.get(primary)!.handle({ id: 'private-alias-request', userId: owner, channelId: dm, text: 'test current private alias', imagePaths: [] }); await f.drain();
+  assert.equal(f.replies.filter(reply => reply.text.includes('verified private result')).length, 1);
+  assert.equal(f.replies.find(reply => reply.text.includes('verified private result'))!.channel, dm);
+  assert.equal(f.replies.some(reply => reply.text.includes('must not send')), false);
+  const sent = f.host.store.listRoutedDeliveries(); assert.equal(sent.length, 2); assert.ok(sent.every(item => item.target.id === 'private'));
+});
