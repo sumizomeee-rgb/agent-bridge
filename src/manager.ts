@@ -12,6 +12,8 @@ import { bridgeNotice, type BridgeNoticeCode } from './notices.js';
 import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } from './delivery-errors.js';
 import { completedResultFromError, isObject, stopEvidenceFromError } from './agents/process.js';
 import { MetadataProbeError } from './agents/metadata.js';
+import type { BridgeFeedback, FeedbackScope, FeedbackRead } from './controller-feedback.js';
+import type { ControllerSupplement } from './controller/runtime-types.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
@@ -89,6 +91,7 @@ export class SessionManager {
   private recovered = false;
   private recovering = false;
   private readonly receipts = new Map<string, number>();
+  private readonly feedbackSends = new Map<string, { controller: AbortController; promise: Promise<boolean> }>();
   private readonly preparedResets = new Map<string, { sourceId: string | null; userId: string }>();
   private readonly switches = new Map<string, { journal: AgentSwitchJournal; controller: AbortController }>();
   private readonly pendingSwitches = new Set<string>();
@@ -369,7 +372,9 @@ export class SessionManager {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
         const view = bridgeNotice('commandFailed');
-        await reply(presentationText(view), { presentation: view });
+        const target = this.store.getActive(message.userId);
+        if (target?.controllerMode) await this.sendFeedbackNotice(this.failureFeedback(target, message, 'commandFailed', error, { stage: 'command' }), () => reply(presentationText(view), { presentation: view }));
+        else await reply(presentationText(view), { presentation: view });
       } finally {
         this.activeCommands--; finish(); this.commandReplies.delete(message.id);
         if (resetting) {
@@ -417,6 +422,7 @@ export class SessionManager {
     this.recovered = true;
     this.recovering = true;
     try {
+      this.store.feedback.recoverNotices();
       await this.recoverAgentSwitches();
       this.options.taskRegistry?.recoverContexts(this.authorizedUsers());
       const notices = new Set<string>();
@@ -426,8 +432,9 @@ export class SessionManager {
         const key = `${item.channelId}:${item.conversationId}`;
         if (notices.has(key)) continue;
         notices.add(key);
-        await this.sendBridgeNotice(item.channelId, 'turnInterrupted', undefined, `interrupted:${item.id}`)
-          .catch(() => undefined);
+        const target = item.conversationId ? this.store.getConversation(item.conversationId) : null;
+        if (target?.controllerMode) await this.sendFeedbackNotice(this.failureFeedback(target, item, 'turnInterrupted', new Error('桥重启中断了本轮，未自动重做。'), { stage: 'interrupted' }));
+        else await this.sendBridgeNotice(item.channelId, 'turnInterrupted', undefined, `interrupted:${item.id}`).catch(() => undefined);
       }
       if (this.closed) return;
       for (const userId of this.authorizedUsers()) {
@@ -451,10 +458,12 @@ export class SessionManager {
           continue;
         }
         try {
-          await this.sendBridgeNotice(event.channelId, 'summaryInterrupted', event.title, `recovery:${event.id}`);
-          this.options.taskRegistry?.markUncertainNotified(event.id);
+          const target = this.completionTarget(event)!;
+          const item = this.failureFeedback(target, event, 'summaryInterrupted', new Error('桥在汇总期间重启，结果已保留，未自动重做。'), { stage: 'interrupted', taskTitle: event.title, taskId: event.taskId, workerResultKnown: event.status === 'completed' });
+          if (await this.sendFeedbackNotice(item)) this.options.taskRegistry?.markUncertainNotified(event.id);
         } catch { /* Keep the one-time notice pending for a later recovery, never replay the model turn. */ }
       }
+      for (const item of this.store.feedback.pendingNotices()) await this.sendFeedbackNotice(item);
     } finally { this.recovering = false; }
     if (this.closed) return;
     for (const id of this.store.recoverWorkspaceNotices(this.authorizedUsers())) {
@@ -1023,9 +1032,70 @@ export class SessionManager {
     void worker.catch(() => undefined);
   }
 
-  private sendBridgeNotice(channelId: string, code: BridgeNoticeCode, taskTitle?: string, deliveryKey?: string): Promise<void> {
+  private feedbackScope(target: Conversation, route: { userId: string; channelId: string; groupContext?: GroupTurnContext }): FeedbackScope {
+    const group = route.groupContext;
+    return { conversationId: target.id, userId: route.userId, channelId: route.channelId,
+      nativeId: this.store.getConversation(target.id)?.nativeId ?? target.nativeId,
+      ...(group ? { group: { spaceId: group.spaceId, generation: group.generation, bindingEpoch: group.bindingEpoch } } : {}) };
+  }
+  private feedbackInput(target: Conversation, route: { userId: string; channelId: string; groupContext?: GroupTurnContext }, current: () => boolean) {
+    const scope = this.feedbackScope(target, route), offered = new Set<string>();
+    const read = (options: FeedbackRead = {}) => {
+      if (!current()) throw new Error('原主控轮次已停止，不能读取错误回执。');
+      const batch = this.store.feedback.read(scope, options);
+      for (const item of batch.records) offered.add(item.id);
+      return batch;
+    };
+    return { bridgeFeedback: read(), onReadBridgeFeedback: read,
+      confirm: () => { if (current()) this.store.feedback.deliveredToController(scope, [...offered]); } };
+  }
+  private failureFeedback(target: Conversation, route: { id: string; userId: string; channelId: string; groupContext?: GroupTurnContext },
+    code: BridgeNoticeCode, error: unknown, details: Partial<Pick<BridgeFeedback, 'stage' | 'taskTitle' | 'taskId' | 'workerId' | 'jobId' | 'supplementId' | 'workerResultKnown' | 'deliveryState' | 'processStopped' | 'nativeId'>> = {}, notifyUser = true): BridgeFeedback {
+    const known = this.store.turnResult(route.id);
+    const uncertain = this.running.get(route.userId)?.publicationUncertain || isObject(error) && error.deliveryUncertain === true;
+    return this.store.feedback.record({ ...this.feedbackScope(target, route), sourceId: route.id, code,
+      stage: error instanceof MetadataProbeError ? 'preparation' : error instanceof DeliveryPreparationError ? 'reply-preparation' : uncertain ? 'delivery' : 'execution',
+      reason: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']), resultKnown: known !== null,
+      processStopped: error instanceof MetadataProbeError ? error.processStopped : isObject(error) && error.processStillRunning === true ? false : null,
+      deliveryState: uncertain ? 'uncertain' : this.store.getMessage(route.id)?.replyState === 'delivered' ? 'confirmed'
+        : error instanceof MetadataProbeError || error instanceof DeliveryPreparationError ? 'not-attempted' : 'unknown', ...details }, notifyUser);
+  }
+  private sendFeedbackNotice(item: BridgeFeedback, deliver?: () => Promise<void>): Promise<boolean> {
+    const existing = this.feedbackSends.get(item.id); if (existing) return existing.promise;
+    if (this.closed || !this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) return Promise.resolve(false);
+    if (!this.store.feedback.claimNotice(item.id)) return Promise.resolve(item.userState === 'delivered');
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(() => deliver ? deliver() : this.sendBridgeNotice(item.channelId, item.code, item.taskTitle, 'feedback:' + item.id, controller.signal))
+      .then(() => { this.store.feedback.finishNotice(item.id, 'delivered'); return true; }, () => { this.store.feedback.finishNotice(item.id, 'uncertain'); return false; })
+      .finally(() => this.feedbackSends.delete(item.id));
+    this.feedbackSends.set(item.id, { controller, promise }); return promise;
+  }
+  async reportInputFailure(message: BridgeMessage, error: unknown, notifyUser = true, deliver?: () => Promise<void>): Promise<void> {
+    if (this.closed || !this.config.allowedUserIds.includes(message.userId) || this.options.authorizeUser?.(message.userId) === false) return;
+    const target = this.store.getActive(message.userId);
+    if (!target?.controllerMode) { if (notifyUser && deliver) await deliver(); return; }
+    const feedback = this.failureFeedback(target, message, 'messageFailed', error, { stage: 'input', deliveryState: 'not-attempted' }, notifyUser);
+    if (notifyUser) await this.sendFeedbackNotice(feedback, deliver);
+  }
+  async workerInputFailed(value: ControllerSupplement): Promise<boolean> {
+    if (this.closed) return false;
+    const target = this.store.getConversation(value.origin.conversationId);
+    if (!target || target.userId !== value.origin.userId || !target.controllerMode) return true;
+    const scope = this.feedbackScope(target, value.origin);
+    // 补充请求属于其原父会话；换绑后不能借当前主控身份接收旧错误。
+    scope.nativeId = value.origin.nativeId;
+    const item = this.store.feedback.record({ ...scope, sourceId: 'supplement:' + value.id,
+      code: value.status === 'uncertain' ? 'workerInputUncertain' : 'workerInputFailed', stage: 'worker-input',
+      reason: errorEvidence(new Error(value.reason ?? value.status), [this.config.token, this.config.appSecret ?? '']),
+      workerId: value.workerId, jobId: value.jobId, supplementId: value.id, resultKnown: false, processStopped: null,
+      deliveryState: value.status === 'uncertain' ? 'uncertain' : 'not-delivered' }, true);
+    await this.sendFeedbackNotice(item);
+    return true;
+  }
+
+  private sendBridgeNotice(channelId: string, code: BridgeNoticeCode, taskTitle?: string, deliveryKey?: string, signal?: AbortSignal): Promise<void> {
     const view = bridgeNotice(code, { taskTitle });
-    return this.sink.sendText(channelId, presentationText(view), { presentation: view, ...(deliveryKey ? { deliveryKey } : {}) });
+    return this.sink.sendText(channelId, presentationText(view), { presentation: view, ...(deliveryKey ? { deliveryKey } : {}), ...(signal ? { signal } : {}) });
   }
 
   /** Explicit coordinating output never treats prose file citations as upload requests. */
@@ -1139,7 +1209,9 @@ export class SessionManager {
           cwd: target.cwd, agent: target.agent, nativeId: target.nativeId, ...(groupContext ? { groupContext, ...(groupContext.eventKind ? { purpose: 'host-event' as const } : {}) } : {}),
         });
         contextId = context?.contextId;
+        const feedback = this.feedbackInput(target, item, current);
         const result = await this.adapters[target.agent].run({
+          bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
           ...(context ? { taskContextPath: context.contextPath } : {}),
           ...(chatScene != null ? { chatScene } : {}),
           ...(groupContext && this.options.onSceneCheck ? { onSceneCheck: async (input: Parameters<NonNullable<AgentTurn['onSceneCheck']>>[0]) => {
@@ -1207,6 +1279,7 @@ export class SessionManager {
           if (!result.nativeId) throw new Error('Agent 未返回会话 ID，无法保证连续会话');
           if (contextId) this.options.taskRegistry?.updateNativeId(contextId, result.nativeId);
           this.store.saveNativeId(conversationId, result.nativeId);
+          feedback.confirm();
           // 模型已经执行完成；即使在途补充确认/回复期间取消也不能改成待重做。
           for (const id of turn.messageIds) this.store.setState(id, 'completed');
           if (!result.controlledOutput) this.store.setReplyState(turn.messageIds, 'pending');
@@ -1251,6 +1324,7 @@ export class SessionManager {
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
           for (const id of turn.messageIds) if (this.store.getMessage(id)?.state === 'running') this.store.setState(id, 'cancelled');
           this.store.setReplyState(turn.messageIds, 'cancelled');
+          if (target.controllerMode) this.failureFeedback(target, item, 'turnInterrupted', error, { stage: 'interrupted' }, false);
         } else {
           // Preserve an already completed native report even when its process cleanup failed.
           if (retained && (!target.nativeId || target.nativeId === retained.nativeId)) this.store.saveNativeId(target.id, retained.nativeId);
@@ -1260,12 +1334,15 @@ export class SessionManager {
           this.store.setReplyState(unanswered, 'failed');
           const handled = groupContext && this.options.onGroupTurnError
             ? await this.options.onGroupTurnError(groupContext).catch(() => true) : false;
-          if (!handled) await this.sendBridgeNotice(item.channelId, retained ? 'processExitUnconfirmed'
+          const noticeCode: BridgeNoticeCode = retained ? 'processExitUnconfirmed'
             : error instanceof MetadataProbeError ? 'controllerPreparationFailed'
             : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed'
             : error instanceof Error && 'finalReplyMissing' in error ? 'controllerReplyMissing'
-            : this.store.turnResult(item.id) || error instanceof Error && 'publicationFailed' in error ? 'controllerReplyFailed' : 'controllerFailed',
-            undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
+            : this.store.turnResult(item.id) || error instanceof Error && 'publicationFailed' in error ? 'controllerReplyFailed' : 'controllerFailed';
+          if (target.controllerMode) {
+            const feedback = this.failureFeedback(target, item, noticeCode, error, {}, !handled);
+            if (!handled) await this.sendFeedbackNotice(feedback);
+          } else if (!handled) await this.sendBridgeNotice(item.channelId, noticeCode, undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
         }
       } finally {
         turn.executing = false;
@@ -1369,7 +1446,10 @@ export class SessionManager {
     if (event.groupContext) {
       if (!event.wakeAllowed || !this.options.onGroupCompletion) { registry.markDelivered(event.id); return; }
       try { await this.options.onGroupCompletion(event); registry.markDelivered(event.id); }
-      catch (error) { registry.markUncertain(event.id, String(error)); }
+      catch (error) {
+        registry.markUncertain(event.id, String(error));
+        await this.sendFeedbackNotice(this.failureFeedback(target, event, 'summaryFailed', error, { stage: 'preparation', taskTitle: event.title, taskId: event.taskId, workerResultKnown: event.status === 'completed' }));
+      }
       return;
     }
     const observation = event.kind === 'worker-progress';
@@ -1403,8 +1483,8 @@ export class SessionManager {
         this.store.prepareWorkspaceNotice(target.id, 'unknown'); await this.reportInitializationState(target, 'unknown', this.store.getMessage(event.originMessageId) ?? undefined); await this.sendWorkspaceNotice(target);
         registry.markUncertainNotified(event.id); return;
       }
-      await this.sendBridgeNotice(event.channelId, 'parentBindingChanged', event.title, `binding:${event.id}`)
-        .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
+      const feedback = this.failureFeedback(target, event, 'parentBindingChanged', new Error('原生父会话未绑定或已改变，未自动新建或切换会话。'), { stage: 'preparation', taskTitle: event.title, taskId: event.taskId, workerResultKnown: event.status === 'completed', deliveryState: 'not-attempted', nativeId: event.nativeId ?? 'unbound:' + event.id });
+      if (await this.sendFeedbackNotice(feedback)) registry.markUncertainNotified(event.id);
       return;
     }
     const controller = new AbortController();
@@ -1446,7 +1526,9 @@ export class SessionManager {
           '保持简短，不照抄调查或交接摘要；详细路径、任务编号等仅在影响下一步时提及。不因此启动额外任务，回复后结束本轮。]',
         ].join('\n');
       }
+      const feedback = this.feedbackInput(target, event, current);
       const result = await this.adapters[target.agent].run({
+        bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
         conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId, ...(source?.source ? { original: source.source } : {}) }, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
@@ -1487,6 +1569,7 @@ export class SessionManager {
       turn.executing = false;
       if (!current()) throw new Error('父会话已停止或切换，自动汇总已取消');
       if (!result.nativeId || (boundNativeId && result.nativeId !== boundNativeId)) throw new Error('CLI 返回了不同父会话，未投递结果');
+      feedback.confirm();
       if (workspaceContext) {
         if (contextId) registry.updateNativeId(contextId, result.nativeId);
         this.store.saveNativeId(target.id, result.nativeId);
@@ -1516,23 +1599,25 @@ export class SessionManager {
     } catch (error) {
       const retained = completedResultFromError(error);
       if (retained) this.store.saveTurnResult(event.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
-      registry.markUncertain(event.id, JSON.stringify({ stage: error instanceof MetadataProbeError ? 'preparation' : retained || isObject(error) && error.processStillRunning === true ? 'process-exit' : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'reply-preparation' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : 'summary',
+      const failureStage = error instanceof MetadataProbeError ? 'preparation' : retained || isObject(error) && error.processStillRunning === true ? 'process-exit' : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'reply-preparation' : publicationFailed || deliveryStarted ? 'delivery' : replyPreparationStarted ? 'reply-preparation' : event.scheduleKind === 'controller' ? 'wake' : 'summary';
+      registry.markUncertain(event.id, JSON.stringify({ stage: failureStage,
         evidence: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']),
         ...(error instanceof MetadataProbeError ? { submitted: false, processStopped: error.processStopped } : {}),
         ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanup: errorEvidence(new Error(error.cleanupError), [this.config.token, this.config.appSecret ?? '']) } : {}),
         ...(stopEvidenceFromError(error) ? { stopEvidence: stopEvidenceFromError(error) } : {}),
       }));
+      const noticeCode: BridgeNoticeCode = controller.signal.aborted ? event.scheduleKind === 'controller' ? 'wakeStopped' : 'summaryStopped'
+        : error instanceof MetadataProbeError ? event.scheduleKind === 'controller' ? 'wakePreparationFailed' : 'controllerPreparationFailed'
+        : retained ? 'processExitUnconfirmed' : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed'
+        : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'resultPreparationFailed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
+        : replyPreparationStarted ? 'resultPreparationFailed' : event.scheduleKind === 'controller' ? 'wakeFailed' : 'summaryFailed';
+      const failure = this.failureFeedback(target, event, noticeCode, error, { stage: failureStage, taskTitle: event.title, taskId: event.taskId, workerResultKnown: event.status === 'completed',
+        ...(controller.signal.aborted ? { stage: 'interrupted' } : {}), ...(deliveryStarted ? { deliveryState: 'uncertain' } : {}) }, !workspaceContext && !observation && !this.closed);
       if (workspaceContext) {
         if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.reportInitializationState(target, 'load-failed').catch(() => undefined); await this.sendWorkspaceNotice(target); }
         registry.markUncertainNotified(event.id);
       } else if (observation) registry.markUncertainNotified(event.id);
-      else if (!this.closed) await this.sendBridgeNotice(event.channelId, controller.signal.aborted ? event.scheduleKind === 'controller' ? 'wakeStopped' : 'summaryStopped'
-        : error instanceof MetadataProbeError ? event.scheduleKind === 'controller' ? 'wakePreparationFailed' : 'controllerPreparationFailed'
-        : retained ? 'processExitUnconfirmed' : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed'
-        : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'resultPreparationFailed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
-        : replyPreparationStarted ? 'resultPreparationFailed' : event.scheduleKind === 'controller' ? 'wakeFailed' : 'summaryFailed',
-        event.title, `completion-error:${event.id}`)
-        .then(() => registry.markUncertainNotified(event.id)).catch(() => undefined);
+      else if (!this.closed && await this.sendFeedbackNotice(failure)) registry.markUncertainNotified(event.id);
     } finally {
       turn.executing = false;
       if (contextId) registry.closeContext(contextId);
@@ -1556,6 +1641,7 @@ export class SessionManager {
     }
     for (const initialization of this.initializations.values()) initialization.controller.abort();
     for (const notice of this.noticeSends.values()) notice.controller.abort();
+    for (const notice of this.feedbackSends.values()) notice.controller.abort();
     const adapterResults = await Promise.allSettled(Object.entries(this.adapters).map(async ([agent, adapter]) => {
       try { await adapter.close(); }
       catch (cause) { throw new Error(`${agent} close: ${cause instanceof Error ? cause.message : String(cause)}`, { cause }); }
@@ -1564,6 +1650,7 @@ export class SessionManager {
     await Promise.allSettled([...this.initializationRecoveries]);
     await Promise.allSettled([...this.workers.values(), ...this.interruptPromises, ...this.detachPromises.values(), ...[...this.noticeSends.values()].map(notice => notice.promise)]);
     const failures = adapterResults.flatMap(result => result.status === 'rejected' ? [result.reason as Error] : []);
+    await Promise.allSettled([...this.feedbackSends.values()].map(value => value.promise));
     try { this.store.close(); }
     catch (cause) { failures.push(new Error(`会话数据库关闭失败: ${String(cause)}`, { cause })); }
     if (failures.length) throw new AggregateError(failures, failures.map(error => error.message).join('\n'));

@@ -110,7 +110,7 @@ for (const failure of ['preparation', 'stop', 'execution'] as const) test(`contr
   const db = new DatabaseSync(join(f.registry.dataDir, 'tasks.sqlite'), { readOnly: true });
   try {
     const reason = JSON.parse(String(db.prepare('SELECT reason FROM task_events WHERE id=?').get(event.id)!.reason));
-    assert.equal(reason.stage, failure === 'preparation' ? 'preparation' : failure === 'stop' ? 'process-exit' : 'summary');
+    assert.equal(reason.stage, failure === 'preparation' ? 'preparation' : failure === 'stop' ? 'process-exit' : 'wake');
     if (failure === 'preparation') { assert.equal(reason.submitted, false); assert.match(reason.evidence, /initial metadata timeout/); assert.match(reason.cleanup, /退出待核对/); }
   } finally { db.close(); }
 });

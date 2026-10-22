@@ -100,6 +100,7 @@ export class BotRuntime {
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
       onCompletion: () => this.manager.completionAvailable(),
+      onSupplementFailure: value => this.manager.workerInputFailed(value),
       onCountChanged: id => this.manager.refreshTaskCounts(id),
       onWorkCountsChanged: counts => this.transport.setWorkCounts(counts),
       onError: error => this.log('WORKER ' + safeError(error, this.secrets)),
@@ -161,7 +162,7 @@ export class BotRuntime {
         } finally { this.stamps.delete(message.id); }
       },
       onError: (message, error) => { this.log('INGRESS ' + safeError(error, this.secrets));
-        if (!this.closed) void this.send(message.channelId, this.transport.failureText(error)).catch(() => undefined); },
+        if (!this.closed) void this.manager.reportInputFailure({ ...message, imagePaths: [] }, error, true, () => this.send(message.channelId, this.transport.failureText(error))).catch(() => undefined); },
     });
     this.lifecycle = new BridgeLifecycle(config, event => this.transport.onBridgeLifecycle(event), () => {
       const contact = this.ingress.lastAuthorizedContact();

@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { AgentName, AgentResult, BridgeMessage, Conversation } from './types.js';
 import { validMessageId } from './routing.js';
 import { parseCommand } from './commands.js';
+import { ControllerFeedbackJournal } from './controller-feedback.js';
 
 export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
 export interface InboxItem extends BridgeMessage {
@@ -57,6 +58,7 @@ export interface ControllerBinding {
 export class SessionStore {
   readonly path: string;
   private readonly db: DatabaseSync;
+  readonly feedback: ControllerFeedbackJournal;
 
   constructor(dataDir: string, private readonly binding?: ControllerBinding) {
     mkdirSync(dataDir, { recursive: true });
@@ -140,6 +142,7 @@ export class SessionStore {
     const publicColumns = new Set(this.db.prepare('PRAGMA table_info(controller_public_messages)').all().map(row => String(row.name)));
     if (!publicColumns.has('text')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN text TEXT');
     if (!publicColumns.has('error')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN error TEXT');
+    this.feedback = new ControllerFeedbackJournal(this.db);
   }
 
   hasMessage(id: string): boolean {

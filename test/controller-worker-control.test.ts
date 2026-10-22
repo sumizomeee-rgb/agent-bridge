@@ -402,3 +402,23 @@ test('capability lookup racing worker handoff does not enqueue or overwrite owne
     f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }
 });
+
+test('异步补充失败持久待交付，重启只补交错误记录，不重发输入或重跑助手', async t => {
+  const f = setup(); t.after(() => f.cleanup());
+  Object.assign(f.codex, { steer: async () => ({ status: 'uncertain', reason: 'native input receipt missing' }) });
+  const received: string[] = []; let accept = false;
+  Object.assign(f.callbacks, { onSupplementFailure: (value: { id: string }) => { received.push(value.id); return accept; } });
+  const handle = await launch(f); await flush();
+  const receipt = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '补充约束' }, 'failed-supplement') as { supplementId: string };
+  await flush(); assert.deepEqual(received, [receipt.supplementId]);
+  assert.equal(f.runtime.store.supplements()[0]!.status, 'uncertain');
+  assert.equal(f.runtime.store.supplements()[0]!.feedbackPending, true);
+  assert.equal(f.codex.turns.length, 1);
+  await f.runtime.close(); accept = true;
+  f.runtime = new ControllerRuntime(f.config, { codex: f.codex, claude: f.claude }, f.registry, f.callbacks);
+  await f.runtime.start(); await flush();
+  assert.deepEqual(received, [receipt.supplementId, receipt.supplementId]);
+  assert.equal(f.runtime.store.supplements()[0]!.feedbackPending, false);
+  assert.equal(f.codex.turns.length, 1);
+  await f.runtime.poll(); await flush(); assert.equal(received.length, 2);
+});

@@ -229,3 +229,22 @@ for (const agent of ['codex', 'claude'] as const) {
     f.protocol.complete(); await rejected; assert.deepEqual(f.sends, []);
   });
 }
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控真实输入携带程序错误证据，可按需查询且不委派给执行助手`, async t => {
+  const f = fixture(t, agent), batch = { records: [{ id: 'a'.repeat(64), sourceId: 'prior-summary', code: 'summaryFailed' as const,
+    stage: 'summary', reason: '前次汇总失败，助手结果仍在', resultKnown: false, workerResultKnown: true, processStopped: true,
+    deliveryState: 'not-attempted' as const, conversationId: f.turn.conversation.id, userId: 'owner', channelId: 'original-private-channel',
+    nativeId: 'continued-native', createdAt: new Date().toISOString(), userState: 'delivered' as const, controllerState: 'pending' as const }], remaining: 0 };
+  f.turn.bridgeFeedback = batch; let queried = 0;
+  f.turn.onReadBridgeFeedback = options => { queried++; if (options.id !== undefined) assert.equal(options.id, 'a'.repeat(64)); return batch; };
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+  assert.match(JSON.stringify(f.protocol.written), /Bridge feedback; program evidence/);
+  assert.match(JSON.stringify(f.protocol.written), /前次汇总失败，助手结果仍在/);
+  assert.equal((await f.protocol.call('bridge_read_feedback', { id: 'bad-id' })).ok, false); assert.equal(queried, 0);
+  assert.equal((await f.protocol.call('bridge_read_feedback', { id: 'a'.repeat(64) })).ok, true); assert.equal(queried, 1);
+  assert.deepEqual(f.invoked, []);
+  const legacy = await f.protocol.call('bridge_list_workers', { details: true });
+  assert.equal(legacy.ok, true); assert.match(JSON.stringify(legacy.value), /bridgeFeedback/); assert.equal(queried, 2);
+  assert.equal((await f.protocol.call('bridge_send_user', { text: '已核对已有结果' })).ok, true);
+  f.protocol.complete(); assert.equal((await running).controlledOutput, true);
+});

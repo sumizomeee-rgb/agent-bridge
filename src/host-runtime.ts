@@ -1182,6 +1182,7 @@ export class HostRuntime {
     } catch (error) {
       if (['queued', 'reserved'].includes(this.store.getEvent(event.id)?.state ?? '')) this.store.cancelEvent(event.id, String(error));
       this.report('GROUP_EVENT_FAILED ' + String(error));
+      await bot.manager.reportInputFailure(message, error, !this.internalEvent(event.id)).catch(failure => this.report('GROUP_FAILURE_FEEDBACK_FAILED ' + String(failure)));
     }
     return true;
   }

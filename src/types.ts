@@ -1,3 +1,5 @@
+import type { FeedbackBatch, FeedbackRead } from './controller-feedback.js';
+
 export type AgentName = 'codex' | 'claude';
 export type SessionVisibility = 'hidden' | 'visible';
 export type BridgePlatform = 'discord' | 'feishu';
@@ -143,6 +145,9 @@ export interface AgentTurn {
   onPublicDeliveryComplete?: () => Promise<void>;
   /** Automatically supplied bounded active-group evidence; never a fresh request. */
   chatScene?: string;
+  /** 当前会话、聊天与主控代次内的程序错误回执；不构成新授权。 */
+  bridgeFeedback?: FeedbackBatch;
+  onReadBridgeFeedback?: (options: FeedbackRead) => FeedbackBatch;
   /** Frozen per-event audience and host causal identity; never inferred from last contact. */
   groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
   onSilent?: () => Promise<void>;

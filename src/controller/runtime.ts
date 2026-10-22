@@ -56,6 +56,7 @@ export class ControllerRuntime {
   private readonly preparations = new Map<string, { agent: AgentName; abort: AbortController; done: Promise<unknown> }>();
   private readonly dispatches = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   private readonly unconfirmedStops = new Set<string>();
+  private readonly feedbackPublications = new Map<string, Promise<void>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private polling: Promise<void> | undefined;
   private started = false;
@@ -380,6 +381,7 @@ export class ControllerRuntime {
     await this.workCountsChanged();
     for (const supplement of this.store.supplements()) {
       if (!this.config.allowedUserIds.includes(supplement.origin.userId)) continue;
+      if (supplement.feedbackPending) this.publishSupplementFailure(supplement);
       if (supplement.status === 'pending' || supplement.status === 'steering') this.setSupplement(supplement,
         supplement.status === 'steering' ? 'uncertain' : 'not_delivered', '桥在补充期间重启；未自动重发。');
     }
@@ -854,7 +856,9 @@ export class ControllerRuntime {
   private setSupplement(value: ControllerSupplement, status: ControllerSupplement['status'], reason: string): void {
     const current = this.store.supplements(value.jobId).find(item => item.id === value.id);
     if (current) value.origin = current.origin; // A native receipt can return after parent rebind.
+    const previouslyPending = current?.status === 'pending' || current?.status === 'steering';
     value.status = status; value.reason = reason; value.updatedAt = this.timestamp();
+    if (previouslyPending && ['not_delivered', 'unsupported', 'uncertain'].includes(status)) value.feedbackPending = true;
     this.store.transaction(() => {
       this.store.saveSupplement(value);
       if (value.callKey) this.store.updateCall(value.callKey, this.supplementResult(value));
@@ -863,6 +867,16 @@ export class ControllerRuntime {
         worker.imagePaths = [...new Set([...worker.imagePaths, ...value.imagePaths])]; this.store.saveWorker(worker);
       }
     });
+    if (value.feedbackPending) this.publishSupplementFailure(value);
+  }
+  private publishSupplementFailure(value: ControllerSupplement): void {
+    if (!this.callbacks.onSupplementFailure || this.feedbackPublications.has(value.id)) return;
+    const pending = Promise.resolve().then(() => this.callbacks.onSupplementFailure!({ ...value })).then(accepted => {
+      if (accepted === false || this.closed) return;
+      const latest = this.store.supplements(value.jobId).find(item => item.id === value.id);
+      if (latest?.feedbackPending) { latest.feedbackPending = false; this.store.saveSupplement(latest); }
+    }).catch(error => this.error(error)).finally(() => this.feedbackPublications.delete(value.id));
+    this.feedbackPublications.set(value.id, pending);
   }
   private pumpSupplements(workerId: string, state: ActiveWorker): void {
     state.supplements = state.supplements.then(async () => {
@@ -1248,6 +1262,7 @@ export class ControllerRuntime {
       for (const result of results) if (result.status === 'rejected') errors.push(result.reason);
     }));
     await this.polling;
+    await Promise.allSettled([...this.feedbackPublications.values()]);
     this.closed = true; this.store.close();
     if (errors.length) throw new AggregateError(errors, '部分执行子 Agent 的进程停止尚未确认');
   }

@@ -43,6 +43,8 @@ export interface ControllerSupplement {
   id: string; workerId: string; jobId: string; origin: TaskOrigin; prompt: string; imagePaths: string[];
   status: 'pending' | 'steering' | 'accepted' | 'not_delivered' | 'unsupported' | 'uncertain' | 'cancelled';
   reason?: string; callKey?: string; createdAt: string; updatedAt: string;
+  /** 异步失败已落库但尚未交给主控反馈日志；重启仅补交记录。 */
+  feedbackPending?: boolean;
 }
 export interface ControllerSchedule {
   id: string; origin: TaskOrigin; dueAt: string; title: string; text: string;
@@ -74,6 +76,7 @@ export interface ControllerRuntimeCallbacks {
   onRequestRestart?: (origin: TaskOrigin) => Promise<unknown>;
   isDraining?: () => boolean;
   onCompletion?: (event: TaskCompletionEvent) => void | Promise<void>;
+  onSupplementFailure?: (supplement: ControllerSupplement) => boolean | void | Promise<boolean | void>;
   onCountChanged?: (conversationId: string, count: number) => void | Promise<void>;
   onWorkCountsChanged?: (counts: WorkCounts) => void | Promise<void>;
   onError?: (error: unknown) => void;
