@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingDM } from './types.js';
+import { copyForwarded } from './forwarded.js';
 import { compareMessageIds } from './routing.js';
 
 export interface HostInput { id: string; botId: string; message: IncomingDM; state: 'received' | 'processing' | 'accepted' | 'failed' | 'uncertain'; control: boolean; generations: Record<string, number> | null; bindingEpoch: number | null; bindingRevision: number | null; evidenceOnly: boolean }
@@ -24,6 +25,7 @@ export class HostInbox {
       attachments: message.attachments.map(a => ({ id: a.id, filename: a.filename, url: a.url, size: a.size,
         ...(a.content_type ? { content_type: a.content_type } : {}), ...(a.resourceKey ? { resourceKey: a.resourceKey } : {}), ...(a.messageId ? { messageId: a.messageId } : {}) })),
       ...(message.source ? { source: message.source } : {}),
+      ...(message.forwarded ? { forwarded: copyForwarded(message.forwarded) } : {}),
       ...(message.space ? { space: { ...message.space, mentionedUserIds: [...message.space.mentionedUserIds] } } : {}) };
     return Number(this.db.prepare("INSERT OR IGNORE INTO inputs(id,bot_id,value_json,control,state,received_at,generations_json,binding_epoch,binding_revision,evidence_only) VALUES(?,?,?,?,'received',?,?,?,?,?)")
       .run(id, botId, JSON.stringify(value), control ? 1 : 0, new Date().toISOString(), generations ? JSON.stringify(generations) : null, bindingEpoch, bindingRevision, Number(evidenceOnly)).changes) === 1;

@@ -7,6 +7,7 @@ import { isActiveWorker } from './overview.js';
 import type { HostConfig } from './config.js';
 import type { HostSemanticMarker } from './host-migration.js';
 import { HostStore, type HostController, type HostEvent, type HostGroup, type RoutedDeliverySource, type RoutedDeliveryTarget } from './host-store.js';
+import { prepareIncomingMessage } from './forwarded.js';
 import { HostInbox, type HostInput } from './host-inbox.js';
 import { BotRuntime, type BotRuntimeHooks } from './bot-runtime.js';
 import { SessionStore } from './store.js';
@@ -1168,9 +1169,10 @@ export class HostRuntime {
     try {
       const stored = bot.manager.storedHostEvent(message.id);
       if (stored) { message.imagePaths = [...stored.imagePaths]; message.text = stored.text; }
-      else if (payload.original?.attachments.length && payload.sourceBotId) {
+      else if (payload.original && (payload.original.attachments.length || payload.original.forwarded) && payload.sourceBotId) {
         const source = this.bots.get(payload.sourceBotId); if (!source) throw new Error('附件来源 Bot 不可用。');
-        message.imagePaths = await source.transport.downloadImages(payload.original);
+        const content = await prepareIncomingMessage(source.transport, payload.original, message.text);
+        message.imagePaths = content.imagePaths; message.text = content.text;
       }
       if (this.closed) { this.store.cancelEvent(event.id, 'host stopping during preparation'); return false; }
       this.assertContext(context);

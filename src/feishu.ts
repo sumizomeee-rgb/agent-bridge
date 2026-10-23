@@ -15,6 +15,9 @@ import { groupMessagePayloadHash, type GroupMentionView } from './group-mentions
 import { FeishuOutbox } from './feishu-outbox.js';
 import { deliveryDiagnostic, errorEvidence, FeishuRequestError, type DeliveryDiagnostic } from './delivery-errors.js';
 
+import { copyForwarded, renderForwarded, type ForwardedContent } from './forwarded.js';
+import { readFeishuForwarded } from './feishu-forward.js';
+
 type Json = Record<string, any>;
 export interface FeishuOptions {
   apiBase?: string; fetch?: typeof fetch;
@@ -135,12 +138,13 @@ export class FeishuTransport {
     return `${this.config.scopePrefix}${time}|${id}`;
   }
   private normalize(message: Json, user: string): IncomingDM {
-    const content = JSON.parse(String(message.content ?? message.body?.content ?? '{}')) as Json;
+    const type = message.message_type ?? message.msg_type;
+    const content = type === 'merge_forward' ? {} : JSON.parse(String(message.content ?? message.body?.content ?? '{}')) as Json;
+    let forwarded: ForwardedContent | undefined;
     const attachments: DiscordAttachment[] = [];
     const image = (key: string) => attachments.push({ id: key, filename: 'image', url: '', size: 0,
       content_type: 'image/unknown', resourceKey: key, messageId: message.message_id });
     let text = '';
-    const type = message.message_type ?? message.msg_type;
     if (type === 'text') text = String(content.text ?? '');
     else if (type === 'image') image(String(content.image_key ?? ''));
     else if (type === 'post') {
@@ -150,7 +154,8 @@ export class FeishuTransport {
         if (node.tag === 'a') return `[${node.text ?? node.href}](${node.href})`;
         return node.tag === 'text' || node.tag === 'md' ? String(node.text ?? '') : '';
       }).join(''))].filter(Boolean).join('\n');
-    } else attachments.push({ id: String(content.file_key ?? ''), filename: String(content.file_name ?? type ?? 'attachment'),
+    } else if (type === 'merge_forward') forwarded = { status: 'pending', messageId: message.message_id, messages: [], notes: [] };
+    else attachments.push({ id: String(content.file_key ?? ''), filename: String(content.file_name ?? type ?? 'attachment'),
       url: '', size: 0, content_type: 'application/octet-stream', resourceKey: String(content.file_key ?? ''), messageId: message.message_id });
     const channel = String(message.chat_id ?? '');
     if (!/^oc_[a-zA-Z0-9_-]+$/.test(channel)) throw new Error('飞书聊天地址无效。');
@@ -167,7 +172,7 @@ export class FeishuTransport {
         if (mention) text = text.trimStart().slice(mention.key.length).trimStart();
       } while (text !== previous);
     }
-    return { id: this.messageId(message), userId: this.config.scopePrefix + user, channelId: this.config.scopePrefix + channel, text, attachments,
+    return { id: this.messageId(message), userId: this.config.scopePrefix + user, channelId: this.config.scopePrefix + channel, text, attachments, ...(forwarded ? { forwarded } : {}),
       ...(message.chat_type === 'group' ? { space: { kind: 'group' as const, spaceId: channel, mentionedUserIds,
         ...(typeof message.parent_id === 'string' && /^om_[a-zA-Z0-9_-]+$/.test(message.parent_id) ? { replyToMessageId: message.parent_id } : {}) } } : {}) };
   }
@@ -303,6 +308,7 @@ export class FeishuTransport {
     const data = await this.api(`/im/v1/messages?${params}`);
     if (!Array.isArray(data.items) || data.items.length > limit || typeof data.has_more !== 'boolean' || (data.has_more && (typeof data.page_token !== 'string' || !data.page_token || data.page_token.length > 4096))) throw new Error('飞书群历史分页格式无效。');
     const messages = new Map<string, ConversationHistoryMessage>();
+    const forwardSignal = AbortSignal.timeout(20_000);
     for (const item of data.items as Json[]) {
       if (item.chat_id != null && item.chat_id !== spaceId) throw new Error('飞书群历史返回了其他群的消息。');
       this.messageId(item);
@@ -319,6 +325,11 @@ export class FeishuTransport {
       const attachment = (id: unknown, name?: unknown, contentType?: string) => { if (typeof id === 'string' && id) attachments.push({ id, ...(typeof name === 'string' ? { name } : {}), ...(contentType ? { contentType } : {}) }); };
       if (item.deleted === true) text = '[消息已撤回或删除]';
       else if (type === 'text') text = typeof content.text === 'string' ? content.text : '';
+      else if (type === 'merge_forward') {
+        const forwarded = await this.readForwardedContent(this.normalize({ ...item, chat_id: spaceId, chat_type: 'p2p' }, owner), forwardSignal);
+        if (forwarded) { text = renderForwarded(forwarded); truncated = forwarded.status !== 'complete';
+          for (const child of forwarded.messages) for (const file of child.attachments) attachment(file.id, file.filename, file.content_type); }
+      }
       else if (type === 'interactive') {
         const parts: string[] = []; let visited = 0;
         const collect = (value: unknown, depth = 0): void => {
@@ -364,6 +375,17 @@ export class FeishuTransport {
     ids.sort(compareMessageIds);
     return { messages, oldestId: ids[0] ?? null, newestId: ids.at(-1) ?? null, hasMore: data.has_more === true,
       ...(data.page_token ? { pageToken: String(data.page_token) } : {}) };
+  }
+  async readForwardedContent(message: IncomingDM, signal?: AbortSignal): Promise<ForwardedContent | undefined> {
+    const content = copyForwarded(message.forwarded); if (!content) return undefined;
+    if (content.status !== 'pending') return content;
+    const scope = this.config.scopePrefix ?? '';
+    const id = message.id.startsWith(scope) ? message.id.slice(scope.length).split('|')[1] : undefined;
+    if (!id || id !== content.messageId || !message.channelId.startsWith(scope)) throw new Error('转发来源不属于当前平台应用。');
+    return readFeishuForwarded(id, async (messageId, requestSignal) => {
+      const data = await this.api(`/im/v1/messages/${messageId}?user_id_type=open_id`, 'GET', undefined, requestSignal);
+      return data.items;
+    }, signal);
   }
   async downloadImages(message: IncomingDM): Promise<string[]> {
     if (message.attachments.length > 10) throw new Error('图片超过每轮 10 张上限。');

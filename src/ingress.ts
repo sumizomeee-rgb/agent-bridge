@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { copyForwarded } from './forwarded.js';
 import { OrderedInbox } from './inbox.js';
 import type { DiscordAttachment, IncomingDM } from './types.js';
 import { validMessageId as isSnowflake, validChannelId, compareMessageIds, laterMessageId as later } from './routing.js';
@@ -91,6 +92,7 @@ export class DurableIngress {
       }
     }
     if (!columns.has('is_interaction')) this.db.exec('ALTER TABLE messages ADD COLUMN is_interaction INTEGER NOT NULL DEFAULT 0');
+    if (!columns.has('forwarded_json')) this.db.exec('ALTER TABLE messages ADD COLUMN forwarded_json TEXT');
     this.inbox = new OrderedInbox(message => message.userId, async message => {
       if (this.closed || this.paused) return;
       if (message.interaction) { await this.options.handle(message); return; }
@@ -151,19 +153,20 @@ export class DurableIngress {
       ...(item.content_type === undefined ? {} : { content_type: item.content_type }),
       ...(item.resourceKey ? { resourceKey: item.resourceKey, messageId: item.messageId } : {}),
     }));
+    const forwarded = copyForwarded(message.forwarded);
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare('INSERT OR IGNORE INTO channels(channel_id, user_id, cursor) VALUES (?, ?, ?)')
         .run(message.channelId, message.userId, message.id);
       const result = this.db.prepare(`INSERT OR IGNORE INTO messages
-        (id, user_id, channel_id, text, attachments_json, is_control, state, received_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'received', ?, ?)`).run(message.id, message.userId, message.channelId,
-          message.text, JSON.stringify(attachments), (this.options.isImmediate ?? control)(message) ? 1 : 0, now, now);
+        (id, user_id, channel_id, text, attachments_json, forwarded_json, is_control, state, received_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'received', ?, ?)`).run(message.id, message.userId, message.channelId,
+          message.text, JSON.stringify(attachments), forwarded ? JSON.stringify(forwarded) : null, (this.options.isImmediate ?? control)(message) ? 1 : 0, now, now);
       if (Number(result.changes) === 0) {
         // REST returns refreshed signed CDN URLs after an outage; keep the original text.
-        this.db.prepare(`UPDATE messages SET attachments_json = ?, updated_at = ?
-          WHERE id = ? AND state = 'received'`).run(JSON.stringify(attachments), now, message.id);
+        this.db.prepare(`UPDATE messages SET attachments_json = ?, forwarded_json = COALESCE(?,forwarded_json), updated_at = ?
+          WHERE id = ? AND state = 'received'`).run(JSON.stringify(attachments), forwarded ? JSON.stringify(forwarded) : null, now, message.id);
       }
       if (this.started && !this.paused && !this.recoveryBlocked && !this.recovering && channel) {
         this.db.prepare('UPDATE channels SET cursor = ? WHERE channel_id = ?')
@@ -230,6 +233,7 @@ export class DurableIngress {
     const row = this.db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
     return row ? { id: String(row.id), userId: String(row.user_id), channelId: String(row.channel_id),
       text: String(row.text), attachments: JSON.parse(String(row.attachments_json)) as DiscordAttachment[],
+      ...(row.forwarded_json ? { forwarded: copyForwarded(JSON.parse(String(row.forwarded_json))) } : {}),
       state: String(row.state) as IngressState, sequence: Number(row.sequence) } : null;
   }
 

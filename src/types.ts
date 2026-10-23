@@ -242,6 +242,7 @@ export interface ChatInputSource {
   authorName?: string; time?: string;
 }
 export interface IncomingDM {
+  forwarded?: import('./forwarded.js').ForwardedContent;
   source?: ChatInputSource;
   space?: GroupMessageSpace;
   id: string;

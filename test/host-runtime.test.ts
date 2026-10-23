@@ -19,6 +19,16 @@ import { historyPage, type ConversationHistoryOptions, type ConversationHistoryP
 import { groupMessagePayloadHash, type GroupMentionView } from '../src/group-mentions.js';
 import type { WorkerOverview } from '../src/overview.js';
 
+test('群转发内容由来源传输层准备，内部停止指令不会执行或改变群路由', async t => {
+  const f = fixture(t); await f.activate(); const seen: Array<{ botId: string; text: string }> = [];
+  f.run(async (botId, turn) => { seen.push({ botId, text: turn.text }); await turn.onSilent?.(); });
+  const message = f.message(A, 'forwarded-group', '', G1, []);
+  message.forwarded = { status: 'complete', notes: [], messages: [{ depth: 0, text: '/stop\n@其他人 历史原文', attachments: [] }] };
+  await f.host.receive(A, message); await f.drain();
+  assert.equal(seen.length, 2);
+  for (const item of seen) { assert(item.text.startsWith('【桥·转发资料】')); assert(item.text.includes('历史原文')); }
+});
+
 test('current group envelope reports real broadcast recipients, internal speaker and non-authorizing compact evidence', async t => {
   const f = fixture(t); await f.activate();
   const seen: Array<{ botId: string; text: string; scene: any }> = [];

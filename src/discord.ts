@@ -16,6 +16,9 @@ import { shouldShowMessageReceipts, type ReceiptMessage } from './receipt-policy
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import { historyOptions, historyPage, type ConversationHistoryOptions, type ConversationHistoryPage, type ConversationHistoryMessage } from './group-history.js';
 
+import { discordForwarded } from './discord-forward.js';
+import { copyForwarded, renderForwarded, type ForwardedContent } from './forwarded.js';
+
 /** Overrides are for isolated tests; ordinary startup uses Discord's public endpoints. */
 export interface DiscordTransportOptions {
   restBaseUrl?: string;
@@ -456,8 +459,11 @@ export class DiscordTransport {
       const author = record(item.author) ? item.author : {};
       const mentions = Array.isArray(item.mentions) ? item.mentions.flatMap((m: unknown) => record(m) && snowflake(m.id) ? [{ id: m.id, ...(typeof m.username === 'string' ? { name: m.username } : {}) }] : []) : [];
       const attachments = Array.isArray(item.attachments) ? item.attachments.flatMap((a: unknown) => record(a) && typeof a.id === 'string' ? [{ id: a.id, ...(typeof a.filename === 'string' ? { name: a.filename } : {}), ...(typeof a.content_type === 'string' ? { contentType: a.content_type } : {}), ...(typeof a.size === 'number' && Number.isSafeInteger(a.size) && a.size >= 0 ? { size: a.size } : {}) }] : []) : [];
-      const message: ConversationHistoryMessage = { id: item.id, author: { id: snowflake(author.id) ? author.id : 'unknown', type: item.webhook_id != null || author.bot === true ? 'bot' : author.system === true ? 'system' : snowflake(author.id) ? 'user' : 'unknown', ...(typeof author.username === 'string' ? { name: author.username } : {}) }, time: new Date(timestamp).toISOString(), text: typeof item.content === 'string' ? item.content : '', mentions, attachments,
-        ...(record(item.message_reference) && snowflake(item.message_reference.message_id) ? { replyToMessageId: item.message_reference.message_id } : {}) };
+      const forwarded = discordForwarded(item);
+      if (forwarded) for (const child of forwarded.messages) for (const file of child.attachments) attachments.push({ id: file.id, name: file.filename, ...(file.content_type ? { contentType: file.content_type } : {}), size: file.size });
+      const message: ConversationHistoryMessage = { id: item.id, author: { id: snowflake(author.id) ? author.id : 'unknown', type: item.webhook_id != null || author.bot === true ? 'bot' : author.system === true ? 'system' : snowflake(author.id) ? 'user' : 'unknown', ...(typeof author.username === 'string' ? { name: author.username } : {}) }, time: new Date(timestamp).toISOString(), text: [typeof item.content === 'string' ? item.content : '', forwarded ? renderForwarded(forwarded) : ''].filter(Boolean).join('\n\n'), mentions, attachments,
+        ...(forwarded && forwarded.status !== 'complete' ? { truncated: true as const } : {}),
+        ...(record(item.message_reference) && item.message_reference.type !== 1 && snowflake(item.message_reference.message_id) ? { replyToMessageId: item.message_reference.message_id } : {}) };
       messages.set(message.id, message);
     }
     const hasMore = result.length === limit && !reachedStart;
@@ -554,6 +560,8 @@ export class DiscordTransport {
         index === 0 ? 'PATCH' : 'POST', { content: parts[index], allowed_mentions: { parse: [] } });
     }
   }
+
+  async readForwardedContent(message: IncomingDM): Promise<ForwardedContent | undefined> { return copyForwarded(message.forwarded); }
 
   async downloadImages(message: IncomingDM): Promise<string[]> {
     try { return await this.prepareImages(message); }
@@ -946,9 +954,10 @@ export class DiscordTransport {
       while ((match = /^\s*<@!?(\d{1,20})>\s*/.exec(text)) && mentionedUserIds.includes(match[1]!)) text = text.slice(match[0].length);
     }
     const source = data.guild_id != null ? { messageId: data.id, userId: author.id, channelId: data.channel_id, authorType: 'user' as const, ...(typeof author.username === 'string' ? { authorName: author.username } : {}), ...(typeof data.timestamp === 'string' && Number.isFinite(Date.parse(data.timestamp)) ? { time: new Date(data.timestamp).toISOString() } : {}) } : undefined;
-    return { id: data.id, userId: author.id, channelId: data.channel_id, text, attachments, ...(source ? { source } : {}),
+    const forwarded = discordForwarded(data);
+    return { id: data.id, userId: author.id, channelId: data.channel_id, text, attachments, ...(forwarded ? { forwarded } : {}), ...(source ? { source } : {}),
       ...(data.guild_id != null ? { space: { kind: 'group' as const, spaceId: data.channel_id, mentionedUserIds,
-        ...(record(data.message_reference) && snowflake(data.message_reference.message_id) ? { replyToMessageId: data.message_reference.message_id } : {}) } } : {}) };
+        ...(record(data.message_reference) && data.message_reference.type !== 1 && snowflake(data.message_reference.message_id) ? { replyToMessageId: data.message_reference.message_id } : {}) } } : {}) };
   }
 
   private async incomingInteraction(data: RecordValue): Promise<void> {

@@ -44,6 +44,7 @@ class LocalTransport implements BotTransport {
   async listGroupMembers() { return { members: [], hasMore: false, verification: 'unknown' as const }; }
   async getGroupMember(_spaceId: string, userId: string) { return { id: userId, idType: 'discord' as const, isBot: false }; }
   async readGroupMentionView(): Promise<never> { throw new Error('Discord fixture does not use scoped mention correlation'); }
+  async readForwardedContent(message: IncomingDM) { return message.forwarded; }
   async downloadImages(message: IncomingDM) { this.downloads.push(message); return []; }
   async markReplyDelivered() {} async setTaskCount() {} setWorkCounts() {}
   async onBridgeLifecycle(event: BridgeLifecycleEvent) { this.lifecycle.push(event); }
@@ -100,6 +101,23 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
   return { root, config, bot, transport, execution, controllers, hooks, dependencies, groups, initialization, groupCompletions, message,
     get ready() { return ready; }, get reconnected() { return reconnected; } };
 }
+
+test('转发引用到达真实主控入口，历史斜杠不重建会话或重做初始化', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  await f.transport.emit(f.message('100000000000000001', '/new'));
+  await until(() => f.initialization.includes('ready'));
+  const before = f.bot.manager.currentConversation(f.config.ownerUserId!)!;
+  const initialized = f.execution.codex.turns.length;
+  const message = { ...f.message('100000000000000002', ''), forwarded: { status: 'complete' as const, notes: [],
+    messages: [{ depth: 0, text: '/new\n这是转发原文', attachments: [] }] } };
+  await f.transport.emit(message);
+  await until(() => f.controllers.codex.turns.some(turn => turn.text.includes('这是转发原文')));
+  const after = f.bot.manager.currentConversation(f.config.ownerUserId!)!;
+  assert.equal(after.id, before.id); assert.equal(after.nativeId, before.nativeId);
+  assert.equal(f.execution.codex.turns.length, initialized);
+  assert.equal(f.bot.ingress.getMessage(message.id)!.text, '');
+  assert(f.bot.ingress.getMessage(message.id)!.forwarded);
+});
 
 test('BotRuntime requires one host-owned controller binding before opening runtime resources', t => {
   const f = setup(t);

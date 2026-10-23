@@ -6,6 +6,7 @@ import { agentEnvironment, prepareConfigPaths, safeError, redactText } from './c
 import { CodexAdapter } from './agents/codex.js';
 import { ClaudeAdapter } from './agents/claude.js';
 import { SessionManager, type SessionManagerOptions } from './manager.js';
+import { prepareIncomingMessage } from './forwarded.js';
 import { PlatformTransport } from './platform.js';
 import { NativeControllerAdapter } from './controller/native.js';
 import { ControllerRuntime } from './controller/runtime.js';
@@ -154,9 +155,10 @@ export class BotRuntime {
         try {
           if (!this.ready || this.closed || hooks.isDraining() || hooks.isGroupChannel?.(message.channelId) || !hooks.authorize(message.userId, message.text)) return;
           const current = () => control(message) || this.stamps.get(message.id) === (this.revisions.get(message.userId) ?? 0);
-          const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: message.text,
+          const content = current() && !control(message) ? await prepareIncomingMessage(this.transport, message) : { text: message.text, imagePaths: [] };
+          const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: content.text,
             source: { messageId: message.id, userId: message.userId, channelId: message.channelId, authorType: 'user' as const, ...message.source },
-            imagePaths: current() && !control(message) ? await this.transport.downloadImages(message) : [] };
+            imagePaths: content.imagePaths };
           if (!current()) { this.manager.discard(prepared); return; }
           await this.manager.handle(prepared, message.interaction ? (text, options) => this.transport.sendInteractionText(message.interaction!, text, options) : undefined);
         } finally { this.stamps.delete(message.id); }

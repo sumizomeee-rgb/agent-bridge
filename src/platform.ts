@@ -3,6 +3,7 @@ import { FeishuTransport } from './feishu.js';
 import type { BridgeLifecycleEvent } from './lifecycle.js';
 import { externalId } from './routing.js';
 import type { BridgeConfig, IncomingDM, ReplyOptions, BridgeMessage, GroupSpaceInfo, GroupMember, GroupMembersPage } from './types.js';
+import type { ForwardedContent } from './forwarded.js';
 import type { WorkCounts } from './overview.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
 import type { GroupMentionView } from './group-mentions.js';
@@ -66,6 +67,9 @@ export class PlatformTransport {
     const page = await this.transport.readDMHistory(this.raw(channelId), rawOptions), scope = this.config.scopePrefix ?? '';
     return { ...page, messages: page.messages.map(message => this.scoped(message)),
       oldestId: page.oldestId ? scope + page.oldestId : null, newestId: page.newestId ? scope + page.newestId : null };
+  }
+  readForwardedContent(message: IncomingDM, signal?: AbortSignal): Promise<ForwardedContent | undefined> {
+    return this.transport.readForwardedContent(this.transport instanceof FeishuTransport ? message : this.unscoped(message), signal);
   }
   downloadImages(message: IncomingDM): Promise<string[]> { return this.transport.downloadImages(this.transport instanceof FeishuTransport ? message : this.unscoped(message)); }
   async markReplyDelivered(messages: Array<Pick<BridgeMessage, 'id' | 'channelId'> & { text?: string; isGroup?: boolean }>): Promise<void> {
