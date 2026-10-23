@@ -913,7 +913,9 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (this.closingSessions.get(key) === session) this.closingSessions.delete(key);
         return Promise.resolve();
       }
-      return session.stopPromise;
+      if (!session.stopFailed || session.active || session.transport.canRetryStop?.() !== true) return session.stopPromise;
+      // 原 CLI 尚在且上次未授权任何 tree kill：重试收尾，不重放失败轮次。
+      session.stopPromise = undefined; session.stopFailed = false;
     }
     session.closed = true;
     if (this.sessions.get(key) === session) this.sessions.delete(key);

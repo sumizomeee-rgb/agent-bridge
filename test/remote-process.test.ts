@@ -21,10 +21,11 @@ const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
 const start=()=>{
  fs.writeFileSync(path.join(root,'started.json'),JSON.stringify({pid:process.pid,args:process.argv.slice(2)}));
  if(fs.existsSync(path.join(root,'cancel-mode'))){const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync(path.join(root,'grandchild.json'),JSON.stringify({pid:child.pid}));return;}
- setTimeout(()=>{fs.writeFileSync(path.join(root,'completed.txt'),'owned native completed');
+ const finish=()=>{fs.writeFileSync(path.join(root,'completed.txt'),'owned native completed');
   if(codex){send({method:'item/completed',params:{threadId:session,turnId:turn,item:{type:'agentMessage',phase:'final_answer',id:'final',text:'真实进程完成'}}});send({method:'turn/completed',params:{threadId:session,turn:{id:turn,status:'completed',items:[]}}});}
   else{send({type:'result',subtype:'success',is_error:false,result:'真实进程完成',session_id:session});process.exit(0);}
- },350);
+ };
+ if(fs.existsSync(path.join(root,'controlled-completion'))){const gate=setInterval(()=>{if(fs.existsSync(path.join(root,'allow-completion'))){clearInterval(gate);finish();}},10);}else setTimeout(finish,350);
 };
 const input=readline.createInterface({input:process.stdin});input.on('line',line=>{const msg=JSON.parse(line);
  if(codex){
@@ -61,12 +62,14 @@ function stdioClient(root: string) {
 }
 for (const agent of ['codex', 'claude'] as const) {
   test(`${agent}: actual stdio client exit leaves target-owned native CLI alive, reconnect retrieves its completion`, async () => {
-    const f = fixture(agent); await f.daemon.listen(); const first = stdioClient(f.root); let second: ReturnType<typeof stdioClient> | null = null;
+    const f = fixture(agent); writeFileSync(join(f.root, 'controlled-completion'), '1'); await f.daemon.listen(); const first = stdioClient(f.root); let second: ReturnType<typeof stdioClient> | null = null;
     try {
       await first.request('dispatch', f.request); await until(() => existsSync(join(f.root, 'started.json')));
       const pid = JSON.parse(readFileSync(join(f.root, 'started.json'), 'utf8')).pid as number;
       process.kill(pid, 0); await first.transport.stop(true);
       assert.equal(f.daemon.store.job(f.request.dispatchId)!.status, 'running'); process.kill(pid, 0);
+      // 用显式屏障证明 IPC 断开不会杀任务，避免依赖 350ms 调度时间窗。
+      writeFileSync(join(f.root, 'allow-completion'), '1');
       await until(() => f.daemon.store.job(f.request.dispatchId)!.status === 'completed'); second = stdioClient(f.root);
       const result = await second.request('query', { dispatchId: f.request.dispatchId }) as RemoteJob;
       assert.equal(result.result?.text, '真实进程完成'); assert.equal(result.stopped, true); assert.equal(result.nativeId, 'native-process-fixture');

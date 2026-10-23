@@ -116,6 +116,7 @@ export class JsonLineProcess {
   private readonly escalation = deferred<void>();
   private readonly stoppedListeners = new Set<() => void>();
   private forceRequested = false;
+  private retryableStop = false;
   private gracefulRetirement = false;
   private protocolRetired = false;
   private treeKillSucceeded = false;
@@ -127,7 +128,8 @@ export class JsonLineProcess {
   private completion: AgentStopEvidence['completion'] = 'pending';
   private stopConfirmed = false;
 
-  constructor(command: AgentCommand, extraArgs: string[], cwd: string, env: NodeJS.ProcessEnv) {
+  constructor(command: AgentCommand, extraArgs: string[], cwd: string, env: NodeJS.ProcessEnv,
+    private readonly stopHelper?: (script: string) => ChildProcessWithoutNullStreams) {
     this.child = spawn(command.command, [...command.args, ...extraArgs], {
       cwd, env: { ...process.env, ...env }, shell: false, windowsHide: true,
       detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
@@ -254,15 +256,30 @@ export class JsonLineProcess {
     this.stoppedListeners.clear();
   }
 
+  /** 只允许重试尚未授权 taskkill 的失败；已尝试的取消仍需真实停止凭据。 */
+  canRetryStop(): boolean { return this.retryableStop && !this.exited.settled && !this.stopConfirmed; }
+
+  private requestForcedStop(): Promise<void> {
+    if (this.canRetryStop()) { this.forcedStop = null; this.retryableStop = false; }
+    if (!this.forcedStop) {
+      const operation = this.stopForced(); this.forcedStop = operation;
+      void operation.catch(() => {
+        // stopWindowsTree 返回前已关闭授权窗口，迟到的旧 helper 只能收到 SKIP。
+        this.retryableStop = process.platform === 'win32' && !this.taskkillAttempted && !this.exited.settled;
+      });
+    }
+    return this.forcedStop;
+  }
+
   /** Only completed turns use graceful retirement; explicit cancellation may escalate it once. */
   stop(graceful = false): Promise<void> {
     if (this.confirmStopped()) return Promise.resolve();
     this.stopStarted ??= performance.now();
     if (!graceful) {
       this.lastGraceful = false; this.forceRequested = true; this.gracefulRetirement = false; this.escalation.resolve();
-      return this.forcedStop ??= this.stopForced();
+      return this.requestForcedStop();
     }
-    if (this.forceRequested) return this.forcedStop ??= this.stopForced();
+    if (this.forceRequested) return this.requestForcedStop();
     this.lastGraceful = true; this.gracefulRetirement = true;
     return this.gracefulStop ??= this.stopGraceful();
   }
@@ -309,10 +326,10 @@ try {
   [Console]::Out.WriteLine('EXIT:'+[string]$treeKiller.ExitCode)
 } catch {[Console]::Out.WriteLine('FAILED')}
 finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProcess.Dispose()}}`;
-    const helper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-      { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    const helper = this.stopHelper?.(script) ?? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const finished = deferred<void>(); let buffer = '', permissionOpen = true, authorized = false;
-    helper.stdin.on('error', () => {});
+    helper.stdin.on('error', () => {}); helper.stderr.on('data', () => {});
     helper.stdout.setEncoding('utf8');
     helper.stdout.on('data', (part: string) => {
       buffer += part;
@@ -331,12 +348,14 @@ finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProces
       if (buffer.length > 128) buffer = '';
     });
     helper.once('error', () => finished.resolve()); helper.once('close', () => finished.resolve());
-    if (!(await within(finished.promise, 5000))) {
+    if (!(await within(finished.promise, 15_000))) {
       permissionOpen = false; helper.stdin.end();
       // Do not kill the holder while its taskkill might still be running: that
       // would release the PID reservation. Its own taskkill wait is bounded.
-      helper.unref(); (helper.stdout as typeof helper.stdout & { unref?: () => void }).unref?.();
+      helper.unref();
+      for (const stream of [helper.stdin, helper.stdout, helper.stderr]) (stream as typeof helper.stdout & { unref?: () => void }).unref?.();
     }
+    permissionOpen = false;
   }
 
   private async stopForced(): Promise<void> {
@@ -379,7 +398,7 @@ export class JsonRpcError extends Error {
   constructor(readonly code: number | null, message: string) { super(message); }
 }
 
-export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'> & Partial<Pick<JsonLineProcess, 'confirmStopped'>>;
+export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'canRetryStop'>>;
 
 export class JsonRpcClient {
   private nextId = 1;

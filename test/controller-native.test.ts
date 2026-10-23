@@ -528,6 +528,24 @@ test('late confirmed controller exit clears only the retired failed session and 
   } finally { confirmed = true; await s.cleanup(); }
 });
 
+test('主控在未授权 tree kill 的收尾失败后可重试退出，保持原生会话且不重放旧轮', async () => {
+  const s = setup(); s.setMode('hold'); let confirmed = false;
+  try {
+    const abort = new AbortController(), turn = s.makeTurn(); turn.signal = abort.signal;
+    const running = s.adapter.run(turn), rejected = assert.rejects(running, /退出待核对/);
+    await until(() => s.transports[0]?.turns === 1); const old: FakeTransport & { canRetryStop?: () => boolean } = s.transports[0]!;
+    let stops = 0;
+    old.stop = async () => { if (++stops === 1) throw new AgentProcessStopError(17); confirmed = true; };
+    old.confirmStopped = () => confirmed; old.canRetryStop = () => !confirmed;
+    abort.abort(); await rejected; assert.equal(stops, 1);
+    s.setMode('public'); const next = s.makeTurn(); next.conversation.nativeId = old.nativeId;
+    const result = await s.adapter.run(next);
+    assert.equal(result.nativeId, old.nativeId); assert.equal(stops, 2); assert.equal(old.turns, 1);
+    assert.equal(s.transports.length, 2); assert.equal(s.published.length, 1);
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject).threadId, old.nativeId);
+  } finally { confirmed = true; await s.cleanup(); }
+});
+
 test('native execution error remains the cause when subsequent process shutdown also fails', async () => {
   const s = setup(); s.setMode('hold'); let confirmed = false;
   try {

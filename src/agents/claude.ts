@@ -2,6 +2,7 @@ import { readOnlyRuntime } from './readonly.js';
 import { MetadataProbeError, retireMetadata } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { claudeEffortConfiguration } from './claude-effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, processStopFailure, safeError, type JsonObject } from './process.js';
@@ -39,10 +40,24 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     // Same initialize control envelope used by Anthropic's Agent SDK.
     // No user message is sent, so this cannot start a model generation.
-    const transport = this.createMetadataTransport(this.command, ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'], cwd, this.env);
+    // CLI 重复的 --settings 取最后一个，必须保留原启动参数中的认证与模型设置。
+    let sessionSettings: string | undefined;
+    for (let at = 0; at < this.command.args.length; at++) {
+      const arg = this.command.args[at]!;
+      if (arg === '--settings') sessionSettings = this.command.args[++at];
+      else if (arg.startsWith('--settings=')) sessionSettings = arg.slice('--settings='.length);
+    }
+    let settings: JsonObject = {};
+    if (sessionSettings) {
+      const value: unknown = JSON.parse(sessionSettings.trimStart().startsWith('{') ? sessionSettings : await readFile(resolve(cwd, sessionSettings), 'utf8'));
+      if (isObject(value)) settings = value;
+    }
+    // 模型目录只需要控制协议；保留模型、认证设置，隔离与查询无关的 MCP 和 hooks。
+    const transport = this.createMetadataTransport(this.command, ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions',
+      '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--settings', JSON.stringify({ ...settings, disableAllHooks: true }), '--no-session-persistence', '--no-chrome'], cwd, this.env);
     this.metadataProcesses.add(transport);
     const completed = deferred<AgentModelInfo>();
-    const timer = setTimeout(() => completed.reject(new Error('Claude 模型元数据等待超时。')), 10_000);
+    const timer = setTimeout(() => completed.reject(new Error('Claude 模型元数据等待超时。')), 30_000);
     const removeFailure = transport.onFailure(error => completed.reject(error));
     const removeMessage = transport.onMessage(message => {
       if (message.type !== 'control_response' || !isObject(message.response) || message.response.request_id !== 'bridge-models') return;
