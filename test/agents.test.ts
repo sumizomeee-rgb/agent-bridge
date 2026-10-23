@@ -144,7 +144,7 @@ test('Codex 新会话：图片、最高权限、显式代理、先保存 ID，�
   const f = await fixture('codex');
   try {
     const result = await f.adapter.run(f.turn);
-    assert.deepEqual(result, { nativeId: 'native-codex', text: '最终答案🙂' });
+    assert.equal(result.nativeId, 'native-codex'); assert.equal(result.text, '最终答案🙂'); assert.equal(typeof result.processStopped, 'boolean');
     assert.deepEqual(f.nativeIds, ['native-codex']);
     assert.deepEqual(f.progress, ['正在处理图片🙂']);
     const traces = await f.traces();
@@ -168,7 +168,7 @@ test('Codex 新会话：图片、最高权限、显式代理、先保存 ID，�
 test('Claude 新会话：stdin 图片 base64 和 MIME、显式代理、过滤子代理进展', async () => {
   const f = await fixture('claude');
   try {
-    assert.deepEqual(await f.adapter.run(f.turn), { nativeId: 'native-claude', text: 'Claude 最终答案🙂' });
+    const result = await f.adapter.run(f.turn); assert.equal(result.nativeId, 'native-claude'); assert.equal(result.text, 'Claude 最终答案🙂'); assert.equal(typeof result.processStopped, 'boolean');
     assert.deepEqual(f.nativeIds, ['native-claude']);
     assert.deepEqual(f.progress, ['Claude 处理中🙂']);
     const traces = await f.traces();
@@ -323,6 +323,10 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent}的摘要只读�
   try {
     await f.adapter.run({ ...f.turn, readOnly: true });
     const traces = await f.traces(), launch = traces[0]!;
+    const deadline = Date.now() + 3000;
+    while (await f.adapter.confirmStopped?.(f.turn.conversation.id) !== true) {
+      assert(Date.now() < deadline, '只读进程应正常收尾'); await new Promise(resolve => setTimeout(resolve, 10));
+    }
     assert.notEqual(launch.readonlyHome, home); assert.equal(launch.taskContext, undefined);
     await assert.rejects(readFile(join(launch.readonlyHome, agent === 'codex' ? 'config.toml' : 'settings.json')), error => (error as NodeJS.ErrnoException).code === 'ENOENT');
     if (agent === 'codex') {

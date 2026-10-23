@@ -72,7 +72,7 @@ for (const agent of ['codex', 'claude'] as const) {
       writeFileSync(join(f.root, 'allow-completion'), '1');
       await until(() => f.daemon.store.job(f.request.dispatchId)!.status === 'completed'); second = stdioClient(f.root);
       const result = await second.request('query', { dispatchId: f.request.dispatchId }) as RemoteJob;
-      assert.equal(result.result?.text, '真实进程完成'); assert.equal(result.stopped, true); assert.equal(result.nativeId, 'native-process-fixture');
+      assert.equal(result.result?.text, '真实进程完成'); await until(() => f.daemon.store.job(f.request.dispatchId)!.stopped === true); assert.equal(result.nativeId, 'native-process-fixture');
       assert.equal(readFileSync(join(f.root, 'completed.txt'), 'utf8'), 'owned native completed');
       assert.throws(() => process.kill(pid, 0));
     } finally { await first.transport.stop(true); await second?.transport.stop(true); await f.daemon.close(); }
@@ -128,6 +128,6 @@ test('HTTP request disconnect does not kill the hosted native turn; later authen
     const repeat = await requestRemoteHttp<RemoteJob>(endpoint.port, endpoint.token, 'dispatch', f.request); assert.equal(repeat.dispatchId, f.request.dispatchId);
     await until(() => f.daemon.store.job(f.request.dispatchId)!.status === 'completed');
     const completed = await requestRemoteHttp<RemoteJob>(endpoint.port, endpoint.token, 'query', { dispatchId: f.request.dispatchId });
-    assert.equal(completed.result?.text, '真实进程完成'); assert.equal(completed.stopped, true); assert.equal(f.daemon.store.jobs().length, 1);
+    assert.equal(completed.result?.text, '真实进程完成'); await until(() => f.daemon.store.job(f.request.dispatchId)!.stopped === true); assert.equal(f.daemon.store.jobs().length, 1);
   } finally { await f.daemon.close(); }
 });

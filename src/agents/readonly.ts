@@ -11,9 +11,11 @@ export interface ReadOnlyRuntime { env: NodeJS.ProcessEnv; args: string[]; clean
 /** Fresh CLI state preserves provider/auth routing but excludes inherited MCP, hooks, plugins and skills. */
 export function readOnlyRuntime(agent: 'codex' | 'claude', env: NodeJS.ProcessEnv): ReadOnlyRuntime {
   const root = mkdtempSync(join(tmpdir(), `bridge-${agent}-readonly-`));
+  let cleaned = false;
   const cleanup = () => {
+    if (cleaned) return;
     if (dirname(resolve(root)) !== resolve(tmpdir()) || !basename(root).startsWith(`bridge-${agent}-readonly-`) || lstatSync(root).isSymbolicLink()) throw new Error('只读摘要临时目录边界无效。');
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true }); cleaned = true;
   };
   try {
     const userHome = env.USERPROFILE || env.HOME || process.env.USERPROFILE || process.env.HOME || homedir();

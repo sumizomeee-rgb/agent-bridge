@@ -76,7 +76,7 @@ export class RemoteStore {
     if (session.agent !== ref.agent) throw new Error('此原生编号已登记为另一引擎的会话。');
     const jobs = this.jobs().filter(job => job.workerId === session.worker);
     return { userId: session.userId ?? 'unknown-owner', workerId: session.worker, state: session.ownership === 'user' ? 'user' : 'bridge', revision: 0, cwd: session.cwd,
-      busy: jobs.some(job => job.status === 'running'), blocked: jobs.some(job => job.status === 'uncertain') };
+      busy: jobs.some(job => job.status === 'running' || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true), blocked: jobs.some(job => job.status === 'uncertain') };
   }
   /** Called inside the native lease transaction after fresh file-holder/terminal checks. */
   adoptSession(ref: NativeSessionRef, userId: string, workerId: string, cwd: string): void {

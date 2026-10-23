@@ -2,13 +2,14 @@ import { readOnlyRuntime } from './readonly.js';
 import { MetadataProbeError, retireMetadata } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
-import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, processStopFailure, safeError, type JsonObject, type RpcTransport } from './process.js';
+import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, processStopFailure, retireCompletedTurn, safeError, type JsonObject, type RpcTransport } from './process.js';
 
 /** App-server v2 stdio protocol, verified against Codex rust-v0.160.0. */
 export class CodexAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
   private readonly executions = new Map<string, RpcTransport>();
   private readonly retirements = new Set<string>();
+  private readonly retirementCleanups = new Map<string, () => void>();
   private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
@@ -80,6 +81,10 @@ export class CodexAdapter implements AgentAdapter {
     if (turn.signal.aborted) throw abortError();
     if (this.closed) throw new Error('Codex 适配器已关闭。');
     const conversationId = turn.conversation.id;
+    if (this.retirements.has(conversationId)) {
+      try { await this.executions.get(conversationId)?.stop(true); }
+      catch (error) { throw new Error('上一轮已完成，CLI 仍在收尾；本轮尚未提交。', { cause: error }); }
+    }
     if (this.active.has(conversationId)) throw new Error('该 Codex 会话仍在执行任务。');
 
     if (turn.readOnly && (turn.conversation.nativeId || turn.taskContextPath)) throw new Error('只读摘要必须使用独立的新会话且不能持有任务登记权限。');
@@ -90,6 +95,7 @@ export class CodexAdapter implements AgentAdapter {
     catch (error) { readonly?.cleanup(); throw error; }
     const rpc = new JsonRpcClient(transport);
     this.executions.set(conversationId, transport); this.stopped.delete(conversationId);
+    if (readonly) this.retirementCleanups.set(conversationId, readonly.cleanup);
     const completed = deferred<AgentResult>();
     const replies = new Map<string, { text: string; phase: unknown }>();
     const observedItems = new Set<string>();
@@ -178,7 +184,7 @@ export class CodexAdapter implements AgentAdapter {
         await transport.stop(false);
       })();
       cancelling = operation;
-      void operation.then(() => { this.stopped.add(conversationId); if (runFinished) { this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId); } }, () => { if (cancelling === operation) cancelling = null; });
+      void operation.then(() => { this.stopped.add(conversationId); if (runFinished) { this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId); this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId); } }, () => { if (cancelling === operation) cancelling = null; }).catch(() => { process.emitWarning('只读临时目录清理未完成。', { code: 'BRIDGE_READONLY_CLEANUP' }); });
       return operation;
     };
     // 0.160.0 generate-ts：TurnSteerParams / TurnSteerResponse，非实验协议。
@@ -290,16 +296,19 @@ export class CodexAdapter implements AgentAdapter {
     } finally {
       turn.signal.removeEventListener('abort', onAbort);
       try {
-        if (cancelling) await cancelling;
-        else await transport.stop(success || terminalReceipt);
-        this.active.delete(conversationId); this.stopped.add(conversationId);
-        this.executions.delete(conversationId); this.retirements.delete(conversationId);
+        const released = () => {
+          this.active.delete(conversationId); this.stopped.add(conversationId);
+          this.executions.delete(conversationId); this.retirements.delete(conversationId);
+          this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId);
+        };
+        if (success && nativeResult && !cancelled) retireCompletedTurn(transport, nativeResult, released);
+        else { if (cancelling) await cancelling; else await transport.stop(terminalReceipt); released(); }
       } catch (error) { throw processStopFailure(error, nativeResult); }
       finally {
         removeMessage(); removeFailure(); rpc.close();
         this.supplements.delete(conversationId);
         runFinished = true;
-        readonly?.cleanup();
+        if (!success) readonly?.cleanup();
       }
     }
   }
@@ -311,6 +320,7 @@ export class CodexAdapter implements AgentAdapter {
   async confirmStopped(conversationId: string): Promise<boolean> {
     if (this.executions.get(conversationId)?.confirmStopped?.()) {
       this.stopped.add(conversationId); this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId);
+      this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId);
     }
     return this.stopped.has(conversationId);
   }

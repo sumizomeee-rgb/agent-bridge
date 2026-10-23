@@ -18,6 +18,7 @@ import type { RemoteArtifact, RemoteDaemonConfig, RemoteDispatch, RemoteJob, Rem
 import { RemoteStore, fingerprint, type ProcessRecord } from './store.js';
 import { observeActivity } from '../agents/activity.js';
 import { executionErrorEvidence } from '../delivery-errors.js';
+import { completedRetirementFailure } from '../agents/retirement.js';
 import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
 
 const CHUNK = 192 * 1024;
@@ -95,6 +96,7 @@ export class RemoteDaemon {
   private readonly active = new Map<string, { adapter: AgentAdapter; abort: AbortController; done: Promise<void> }>();
   private readonly operations = new Map<string, Promise<SteerResult>>();
   private readonly pendingExits = new Map<string, { adapter: AgentAdapter; abort: AbortController }>();
+  private readonly pendingCleanup = new Map<string, Promise<void>>();
   private readonly trackedProcesses = new Map<string, Array<{ transport: JsonLineProcess; record: ProcessRecord }>>();
   private readonly dispatches = new Map<string, { fingerprint: string; promise: Promise<RemoteJob> }>();
   private readonly metadataAdapters = new Set<AgentAdapter>();
@@ -123,6 +125,7 @@ export class RemoteDaemon {
     await new Promise<void>((resolveValue, reject) => { this.server!.once('error', reject); this.server!.listen(remoteEndpoint(this.root), () => { this.server!.off('error', reject); resolveValue(); }); });
     // Only the daemon that acquired the IPC endpoint may reconcile the journal.
     // A duplicate service launch must never mutate another daemon's live jobs.
+    for (const job of this.store.jobs()) if (job.status === 'uncertain' && completedRetirementFailure(job)) this.store.update(job.dispatchId, { status: 'completed' });
     for (const job of this.store.jobs()) if (job.status === 'running') this.store.update(job.dispatchId, { status: 'uncertain', ready: false, error: '远端托管器曾中断，原生进程及结果需核实；未重新执行任务。' });
     this.httpServer = createHttpServer((request, response) => {
       if (request.method !== 'POST' || request.url !== '/rpc' || request.headers.authorization !== `Bearer ${this.token}`) {
@@ -191,14 +194,16 @@ export class RemoteDaemon {
       const id = identifier(raw.dispatchId, '派发编号');
       const pending = this.dispatches.get(id); if (pending) await pending.promise;
       const job = this.store.job(id); if (!job) throw Object.assign(new Error('此派发编号未在目标电脑登记，未自动重新执行。'), { code: 'DISPATCH_NOT_FOUND' });
-      const pendingExit = this.pendingExits.get(id);
-      if (pendingExit && !this.active.has(id)) {
-        try {
-          if (await pendingExit.adapter.confirmStopped?.(job.workerId, id) === true) {
-            await pendingExit.adapter.close(); this.pendingExits.delete(id);
-            this.store.update(id, { stopped: true, ready: false });
-          }
-        } catch {}
+      await this.finishPendingExit(id);
+      // 重启后只读核对已登记进程的退出或 PID 复用，绝不发送停止信号。
+      if (['completed', 'failed'].includes(job.status) && job.result && job.stopEvidence?.graceful === true && job.stopped !== true && !this.active.has(id) && !this.trackedProcesses.has(id)) {
+        for (const record of this.store.processRecords(id).filter(value => !value.closed)) {
+          let exited = false;
+          try { process.kill(record.pid, 0); }
+          catch (error) { exited = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+          if (!exited && record.identity) { const identity = await processIdentity(record.pid); exited = identity !== null && identity !== record.identity; }
+          if (exited) this.store.process({ ...record, closed: true });
+        }
       }
       // A query may reconcile positive exit evidence, but never sends a signal or resolves task effects.
       if (job.status !== 'running' && job.stopped !== true && !this.active.has(id) && this.trackedExitConfirmed(id))
@@ -261,7 +266,7 @@ export class RemoteDaemon {
     const agent = this.agent(raw.agent); const engine = this.config.engines[agent]!;
     if (fingerprint(raw.agentCommand) !== fingerprint(engine.agentCommand)) throw new Error('登记的 CLI 命令与目标执行器配置不一致。');
     const cwd = await this.directory(raw.cwd); const workerId = identifier(raw.workerId, '子任务编号');
-    if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain'))) throw new Error('同一子会话尚在执行或结果未知，拒绝并发续接。');
+    if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain' || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true))) throw new Error('同一子会话尚在执行、收尾或结果未知，拒绝并发续接。');
     const nativeId = raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号');
     const userId = principal(raw.userId);
     const priorWorker = this.store.jobs().filter(job => job.workerId === workerId).map(job => this.store.request(job.dispatchId)).find(Boolean);
@@ -289,7 +294,7 @@ export class RemoteDaemon {
       ...(raw.input !== undefined ? { input: await this.input(raw.input) } : {}) };
     // Check again after filesystem awaits. The SQLite insert/active check is synchronous.
     const raced = this.store.job(id); if (raced) return this.store.create(request).job;
-    if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain'))) throw new Error('同一子会话已开始执行，拒绝并发续接。');
+    if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain' || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true))) throw new Error('同一子会话仍在执行或收尾，拒绝并发续接。');
     if (nativeId) this.store.bindSession(nativeId, workerId, agent, cwd, userId);
     const created = this.store.create(request); if (created.created) this.start(request);
     return created.job;
@@ -308,7 +313,7 @@ export class RemoteDaemon {
       removeStopped = transport.onStopped(() => {
         record.closed = true;
         if (!this.closing) { this.store.process(record); this.store.update(id, { stopEvidence: transport.stopEvidence }); }
-        removeStopped();
+        removeStopped(); void this.finishPendingExit(id);
       });
       void processIdentity(pid).then(identity => { record.identity = identity; if (!this.closing) this.store.process(record); });
     };
@@ -319,6 +324,20 @@ export class RemoteDaemon {
     if (request.sessionVisibility) return new WorkerSessionAdapter(this.workerSessions, agent, request.sessionVisibility, request.agentCommand, this.environment(),
       (command, env) => agent === 'codex' ? new CodexAdapter(command, env, factory) : new ClaudeAdapter(command, env, factory));
     return agent === 'codex' ? new CodexAdapter(request.agentCommand, this.environment(), factory) : new ClaudeAdapter(request.agentCommand, this.environment(), factory);
+  }
+  private finishPendingExit(id: string): Promise<void> {
+    const running = this.pendingCleanup.get(id); if (running) return running;
+    if (this.closing || this.active.has(id)) return Promise.resolve();
+    const pending = this.pendingExits.get(id), job = this.store.job(id);
+    if (!pending || !job) return Promise.resolve();
+    const work = (async () => {
+      if (await pending.adapter.confirmStopped?.(job.workerId, id) !== true) return;
+      await pending.adapter.close(); this.pendingExits.delete(id);
+      this.store.update(id, { stopped: true, ready: false, ...(job.result ? { result: { ...job.result, processStopped: true } } : {}) });
+      this.releaseTracked(id);
+    })().catch(error => { if (!this.closing) this.store.update(id, { cleanupError: executionErrorEvidence(error) }); })
+      .finally(() => this.pendingCleanup.delete(id));
+    this.pendingCleanup.set(id, work); return work;
   }
   private trackedExitConfirmed(dispatchId: string): boolean {
     for (const { transport, record } of this.trackedProcesses.get(dispatchId) ?? []) {
@@ -371,8 +390,10 @@ export class RemoteDaemon {
         const result = await adapter.run(turn);
         this.store.bindSession(result.nativeId, request.workerId, request.agent, request.cwd, request.userId);
         this.store.update(request.dispatchId, { nativeId: result.nativeId, result, ready: false, stopped: false });
+        if (result.processStopped === false) stopOnlyReport = result;
         terminal = { status: abort.signal.aborted ? 'cancelled' : 'completed', nativeId: result.nativeId,
-          ...await this.captureResult(request, result), ready: false, stopped: true };
+          ...await this.captureResult(request, result), ready: false, stopped: result.processStopped !== false,
+          ...(result.stopEvidence ? { stopEvidence: result.stopEvidence } : {}), ...(result.cleanupError ? { cleanupError: result.cleanupError } : {}) };
       } catch (error) {
         const processUnknown = Boolean(error && typeof error === 'object' && 'processStillRunning' in error);
         const uncertain = processUnknown || Boolean(error && typeof error === 'object' && 'resultUncertain' in error);
@@ -388,17 +409,17 @@ export class RemoteDaemon {
           ...(stopEvidenceFromError(error) ? { stopEvidence: stopEvidenceFromError(error) } : {}),
           executionError: isObject(error) && typeof error.executionError === 'string' ? error.executionError : executionErrorEvidence(error),
           ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanupError: error.cleanupError } : {}),
-          error: safeError(error instanceof Error ? error.message : '', '远端任务失败'), stopped: !processUnknown };
+          error: safeError(error instanceof Error ? error.message : '', '远端任务失败'), stopped: !processUnknown && nativeResult?.processStopped !== false };
       }
       this.store.update(request.dispatchId, { ready: false });
       let canClose = !stopOnlyReport;
       if (stopOnlyReport) { try { canClose = await adapter.confirmStopped?.(request.workerId, request.dispatchId) === true; } catch {} }
       if (canClose) { try { await adapter.close(); }
-      catch (error) { terminal = { ...terminal, status: 'uncertain', stopped: false, ready: false,
+      catch (error) { terminal = { ...terminal, status: terminal.status === 'completed' ? 'completed' : 'uncertain', stopped: false, ready: false,
         ...(stopEvidenceFromError(error) ? { stopEvidence: stopEvidenceFromError(error) } : {}),
         cleanupError: executionErrorEvidence(error),
         error: safeError(error instanceof Error ? error.message : '', 'CLI 退出未确认') }; } }
-      else this.pendingExits.set(request.dispatchId, { adapter, abort });
+      if (!canClose || terminal.result && terminal.stopped !== true) this.pendingExits.set(request.dispatchId, { adapter, abort });
       // Successful close alone is not exit evidence for every wrapper. Accept only an explicit native proof or complete tracked history.
       if (terminal.stopped !== true) {
         let confirmed = this.trackedExitConfirmed(request.dispatchId);
@@ -423,7 +444,7 @@ export class RemoteDaemon {
       }
       // Other uncertainty is preserved; native turn completion never implies business acceptance.
       this.store.update(request.dispatchId, terminal);
-      this.active.delete(request.dispatchId); this.releaseTracked(request.dispatchId);
+      this.active.delete(request.dispatchId); await this.finishPendingExit(request.dispatchId); this.releaseTracked(request.dispatchId);
     });
     this.active.set(request.dispatchId, { adapter, abort, done });
   }
@@ -459,12 +480,12 @@ export class RemoteDaemon {
       await pendingExit.adapter.interrupt(job.workerId); pendingExit.abort.abort(); await pendingExit.adapter.close();
       if (await pendingExit.adapter.confirmStopped?.(job.workerId, dispatchId) !== true && !this.trackedExitConfirmed(dispatchId))
         throw new Error('未确认目标电脑上的 CLI 已停止。');
-      this.pendingExits.delete(dispatchId); this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
+      this.pendingExits.delete(dispatchId); this.store.update(dispatchId, { status: job.result && ['completed', 'failed'].includes(job.status) ? job.status : 'cancelled', ready: false, stopped: true });
     } else if (active) {
       await active.adapter.interrupt(job.workerId); active.abort.abort(); await active.done;
       if (this.store.job(dispatchId)?.stopped !== true) throw new Error('未确认目标电脑上的 CLI 已停止。');
       this.pendingExits.delete(dispatchId); this.store.update(dispatchId, { status: 'cancelled', ready: false, stopped: true });
-    } else if (job.status === 'uncertain' && job.stopped !== true) {
+    } else if ((job.status === 'uncertain' || job.status === 'completed' || job.status === 'failed' && !!job.result) && job.stopped !== true) {
       const processes = this.store.processRecords(dispatchId);
       if (!processes.length) throw new Error('没有可靠的远端进程记录，停止结果未知。');
       for (const record of processes.filter(record => !record.closed)) {
@@ -525,9 +546,18 @@ export class RemoteDaemon {
     if (this.closing) return;
     this.nativeClosing = true;
     await Promise.allSettled([...this.nativeOperations]);
-    for (const id of new Set([...this.active.keys(), ...this.pendingExits.keys()])) await this.interrupt(id);
+    for (const id of new Set([...this.active.keys(), ...this.pendingExits.keys()])) {
+      const job = this.store.job(id), pending = this.pendingExits.get(id);
+      if (job?.result && ['completed', 'failed'].includes(job.status) && pending && !this.active.has(id)) {
+        // 正常关闭只等待已完成轮次收尾；不强杀其业务后台进程。
+        await pending.adapter.close();
+        if (await pending.adapter.confirmStopped?.(job.workerId, id) !== true && !this.trackedExitConfirmed(id)) throw new Error('CLI 仍在收尾，执行器尚未安全关闭。');
+        this.pendingExits.delete(id); this.store.update(id, { stopped: true, ready: false });
+      } else await this.interrupt(id);
+    }
     // Metadata queries own native CLI transports too. Keep any failed close tracked for retry.
     for (const adapter of [...this.metadataAdapters]) { await adapter.close(); this.metadataAdapters.delete(adapter); }
+    await Promise.allSettled([...this.pendingCleanup.values()]);
     this.closing = true;
     for (const socket of this.sockets) socket.destroy();
     if (this.httpServer) { this.httpServer.closeAllConnections(); await new Promise<void>(resolveValue => this.httpServer!.close(() => resolveValue())); }

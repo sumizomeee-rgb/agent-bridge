@@ -95,11 +95,25 @@ export function completedResultFromError(error: unknown): AgentResult | undefine
   if (!isObject(error) || !isObject(error.nativeResult)) return undefined;
   const result = error.nativeResult;
   return typeof result.nativeId === 'string' && result.nativeId.length > 0 && typeof result.text === 'string'
-    ? { nativeId: result.nativeId, text: result.text, ...(result.controlledOutput === true ? { controlledOutput: true } : {}) } : undefined;
+    ? { nativeId: result.nativeId, text: result.text, ...(result.controlledOutput === true ? { controlledOutput: true } : {}),
+      ...(typeof result.processStopped === 'boolean' ? { processStopped: result.processStopped } : {}),
+      ...(stopEvidenceFromError(result) ? { stopEvidence: stopEvidenceFromError(result) } : {}) } : undefined;
 }
 
 export function processStopFailure(error: unknown, result = completedResultFromError(error)): AgentProcessStopError {
   return new AgentProcessStopError(isObject(error) && typeof error.pid === 'number' ? error.pid : undefined, result, { cause: error }, stopEvidenceFromError(error));
+}
+
+/** 原生成功回执与 CLI 收尾独立；失败只保留诊断，退出证明前仍由适配器持有会话。 */
+export function retireCompletedTurn(transport: Pick<JsonLineProcess, 'stop'> & Partial<Pick<JsonLineProcess, 'stopEvidence'>>,
+  result: AgentResult, stopped: () => void): void {
+  result.processStopped = false;
+  void (async () => {
+    try { await transport.stop(true); result.processStopped = true; stopped(); }
+    catch (error) { result.cleanupError = safeError(error instanceof Error ? error.message : error, 'CLI 收尾未确认'); }
+    finally { if (transport.stopEvidence) result.stopEvidence = transport.stopEvidence; }
+  })();
+  if (transport.stopEvidence) result.stopEvidence = transport.stopEvidence;
 }
 
 /** Newline-delimited JSON transport. Never log raw stdout or stderr. */
@@ -322,7 +336,8 @@ try {
   $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
   [Console]::Out.WriteLine('ATTEMPT')
   $treeKiller=[Diagnostics.Process]::Start($info)
-  if(-not $treeKiller.WaitForExit(2000)){$treeKiller.Kill();$treeKiller.WaitForExit()}
+  $treeKiller.BeginOutputReadLine();$treeKiller.BeginErrorReadLine()
+  if(-not $treeKiller.WaitForExit(10000)){$treeKiller.Kill();$treeKiller.WaitForExit()}
   [Console]::Out.WriteLine('EXIT:'+[string]$treeKiller.ExitCode)
 } catch {[Console]::Out.WriteLine('FAILED')}
 finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProcess.Dispose()}}`;
@@ -348,7 +363,7 @@ finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProces
       if (buffer.length > 128) buffer = '';
     });
     helper.once('error', () => finished.resolve()); helper.once('close', () => finished.resolve());
-    if (!(await within(finished.promise, 15_000))) {
+    if (!(await within(finished.promise, 30_000))) {
       permissionOpen = false; helper.stdin.end();
       // Do not kill the holder while its taskkill might still be running: that
       // would release the PID reservation. Its own taskkill wait is bounded.

@@ -159,9 +159,9 @@ export class RemoteAgentAdapter implements AgentAdapter {
           turn.onActivity?.({ ...job.progress.lastActivity, snapshot: job.progress });
         }
         if (job.status === 'completed' && job.result) {
-          if (job.stopped !== true) throw new RemoteDispatchUncertain('【桥】报告已保存，CLI 退出待核对。', job.result, stopEvidenceFromError(job), job.executionError, job.cleanupError);
-          try { return await this.download(job); }
-          catch (error) { throw new RemoteArtifactTransferError(job.result, error instanceof Error ? error.message : '产物传输错误'); }
+          try { return { ...await this.download(job), processStopped: job.stopped === true,
+            ...(job.stopEvidence ? { stopEvidence: job.stopEvidence } : {}), ...(job.cleanupError ? { cleanupError: job.cleanupError } : {}) }; }
+          catch (error) { throw new RemoteArtifactTransferError({ ...job.result, processStopped: job.stopped === true }, error instanceof Error ? error.message : '产物传输错误'); }
         }
         if (job.status === 'uncertain') {
           if (job.stopped === true) {
@@ -171,7 +171,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
           throw new RemoteDispatchUncertain(job.error, job.result, stopEvidenceFromError(job), job.executionError, job.cleanupError);
         }
         if (job.status === 'cancelled') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端取消已登记，CLI 退出尚未确认。'); throw Object.assign(new Error('目标电脑上的 CLI 已停止。'), { name: 'AbortError' }); }
-        if (job.status === 'failed') { if (job.stopped !== true) throw new RemoteDispatchUncertain('远端任务失败，CLI 退出尚未确认。'); throw Object.assign(new Error(job.error ?? '远端任务失败。'), { code: 'REMOTE_JOB_FAILED' }); }
+        if (job.status === 'failed') { if (job.result && job.stopped !== true) throw new RemoteArtifactTransferError({ ...job.result, processStopped: false }, job.error ?? '产物整理失败'); if (job.stopped !== true) throw new RemoteDispatchUncertain('远端任务失败，CLI 退出尚未确认。'); throw Object.assign(new Error(job.error ?? '远端任务失败。'), { code: 'REMOTE_JOB_FAILED' }); }
         await new Promise<void>(resolveValue => setTimeout(resolveValue, this.options.pollMs ?? 750));
       }
     } catch (error) {
@@ -211,10 +211,10 @@ export class RemoteAgentAdapter implements AgentAdapter {
       return await this.retryRead<SteerResult>('steer', { dispatchId, id: supplement.id, input });
     } catch (error) { return { status: 'uncertain', reason: error instanceof Error ? error.message : '远端補充回执未知。' }; }
   }
-  async interrupt(conversationId: string): Promise<void> {
+  async interrupt(conversationId: string, knownDispatchId?: string): Promise<void> {
     const execution = this.jobs.get(conversationId);
     if (execution && !execution.submitted) { execution.cancelled = true; return; }
-    const dispatchId = execution?.dispatchId ?? this.lastDispatch.get(conversationId); if (!dispatchId) throw new RemoteDispatchUncertain('没有活动远端派发编号，无法确认停止。');
+    const dispatchId = knownDispatchId ?? execution?.dispatchId ?? this.lastDispatch.get(conversationId); if (!dispatchId) throw new RemoteDispatchUncertain('没有活动远端派发编号，无法确认停止。');
     try {
       try { const result = await this.connection().request<{ stopped: boolean }>('interrupt', { dispatchId }); if (!result.stopped) throw new Error('停止未确认'); }
       catch (error) {

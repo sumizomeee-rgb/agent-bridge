@@ -146,13 +146,10 @@ test('Claude retains its completed report while a failed shutdown still blocks t
   f.transport.stop = async () => { if (refuse) throw new Error('close failed after result'); };
   try {
     f.transport.emit({ type: 'result', subtype: 'success', is_error: false, session_id: 'claude-session', result: '调查已返回，目标仍未验收' });
-    await assert.rejects(f.run, error => {
-      assert(error instanceof Error && 'processStillRunning' in error);
-      assert.deepEqual(completedResultFromError(error), { nativeId: 'claude-session', text: '调查已返回，目标仍未验收' });
-      return true;
-    });
+    const result = await f.run;
+    assert.equal(result.nativeId, 'claude-session'); assert.equal(result.text, '调查已返回，目标仍未验收'); assert.equal(result.processStopped, false);
     assert.equal(f.transport.messages.size, 0); assert.equal(f.transport.failures.size, 0);
-    await assert.rejects(f.adapter.run(f.turn), /仍在执行/);
+    await assert.rejects(f.adapter.run(f.turn), /CLI 仍在收尾/);
     assert.equal(f.transport.writes.filter(value => value.type === 'user').length, 1);
     refuse = false; await f.adapter.interrupt('bridge-claude');
   } finally { refuse = false; await f.adapter.close(); }

@@ -11,6 +11,7 @@ import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
 import { completedResultFromError, stopEvidenceFromError, isObject } from '../agents/process.js';
 import { executionErrorEvidence } from '../delivery-errors.js';
+import { completedRetirementFailure } from '../agents/retirement.js';
 import { sessionVisibility } from '../agents/worker-session.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
@@ -47,6 +48,11 @@ function stopUnconfirmed(error: unknown): boolean {
   return error instanceof Error && (error.name === 'AgentProcessStopError'
     || error.name === 'RemoteDispatchUncertain'
     || (error as Error & { processStillRunning?: boolean }).processStillRunning === true);
+}
+
+/** 仅恢复有原生成功回执、且唯一错误是正常退出超时的旧误分类。 */
+function completedRetirement(job: ControllerJob): boolean {
+  return completedRetirementFailure({ result: job.nativeResult, stopEvidence: job.stopEvidence, executionError: job.executionError, cleanupError: job.cleanupError, cancelled: !!job.cancelReason });
 }
 
 /** The controller only dispatches; this service owns child processes and their durable routing. */
@@ -163,6 +169,15 @@ export class ControllerRuntime {
     if (worker.target?.transport === 'ssh') throw new Error('远端执行目标服务未配置，拒绝改为本机执行');
     return this.adapters[worker.agent];
   }
+  private retirementPending(workerId: string): boolean {
+    return this.store.jobs(workerId).some(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false);
+  }
+  private localExitConfirmed(job: ControllerJob): boolean {
+    const pid = job.stopEvidence?.pid ?? job.nativeResult?.stopEvidence?.pid;
+    if (!pid) return false;
+    try { process.kill(pid, 0); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+  }
   private async validateWorkerSelection(worker: ControllerWorker, execution: NonNullable<ControllerJob['execution']> = { model: worker.model, effort: worker.effort, ...(worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {}) }): Promise<void> {
     if (worker.target?.preset) {
       const adapter = this.adapter(worker);
@@ -267,12 +282,13 @@ export class ControllerRuntime {
     return this.store.workers().filter(worker => worker.origin.userId === conversation.userId
       && worker.origin.channelId && (scope === 'all' || worker.origin.conversationId === conversation.id)).map(worker => {
       const jobs = this.store.jobs(worker.id); const active = jobs.find(job => job.status === 'running');
-      const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1) : jobs.at(-1);
+      const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
+        : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? jobs.at(-1);
       const currentJob = active ?? latest;
       const queued = jobs.filter(job => job.status === 'queued').length;
       const status = worker.handoffPending || worker.adoption?.status === 'pending' ? 'handoff-pending'
         : worker.ownership === 'user' || worker.supersededBy ? 'handed-off' : worker.blocked ? 'uncertain'
-        : active ? 'running' : queued ? 'queued' : latest?.status ?? 'idle';
+        : active ? 'running' : this.retirementPending(worker.id) && latest?.status === 'completed' ? 'retiring' : queued ? 'queued' : latest?.status ?? 'idle';
       return { workerId: worker.id, conversationId: worker.origin.conversationId,
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
         targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
@@ -385,6 +401,14 @@ export class ControllerRuntime {
       if (supplement.status === 'pending' || supplement.status === 'steering') this.setSupplement(supplement,
         supplement.status === 'steering' ? 'uncertain' : 'not_delivered', '桥在补充期间重启；未自动重发。');
     }
+    // 保留原报告和历史错误凭据；修正旧的收尾误分类，不新增主控回合或重放任务。
+    for (const job of this.store.jobs().filter(job => job.status === 'uncertain' && job.origin.purpose !== 'workspace-context' && completedRetirement(job))) {
+      const worker = this.store.getWorker(job.workerId);
+      if (!worker || worker.archivedAt || worker.ownership === 'user' || worker.supersededBy || worker.handoffPending
+        || !this.config.allowedUserIds.includes(job.origin.userId) || worker.nativeId !== job.nativeResult!.nativeId) continue;
+      this.store.setJob(job.id, 'completed', { result: job.nativeResult!.text });
+      if (!this.store.jobs(worker.id).some(value => value.status === 'uncertain')) { worker.blocked = false; this.store.saveWorker(worker); }
+    }
     // Local interrupted work stays uncertain. A remote daemon follows the original dispatch only.
     for (const job of this.store.jobs().filter(job => job.status === 'running')) {
       if (!this.config.allowedUserIds.includes(job.origin.userId)) continue;
@@ -415,8 +439,8 @@ export class ControllerRuntime {
       const uncertain = this.store.jobs(worker.id).filter(job => job.status === 'uncertain');
       if (!worker.blocked && uncertain.length) { worker.blocked = true; this.store.saveWorker(worker); }
       // Rebuild observation from durable jobs; a restart must not discard pending exit checks.
-      if (worker.target?.transport === 'ssh' && worker.ownership !== 'user' && !worker.handoffPending
-        && uncertain.some(job => job.processStopped !== true)) this.unconfirmedStops.add(worker.id);
+      if (worker.ownership !== 'user' && !worker.handoffPending
+        && (this.retirementPending(worker.id) || worker.target?.transport === 'ssh' && uncertain.some(job => job.processStopped !== true))) this.unconfirmedStops.add(worker.id);
     }
     if (this.stopping || this.closed) return;
     this.started = true;
@@ -586,7 +610,7 @@ export class ControllerRuntime {
       const args = object(input, ['workerId']);
       const worker = this.ownedWorker(origin, args.workerId);
       this.assertBridgeOwnership(worker);
-      if (worker.blocked || this.active.has(worker.id) || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
+      if (worker.blocked || this.active.has(worker.id) || this.retirementPending(worker.id) || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
         || this.store.supplements().some(value => value.workerId === worker.id && ['pending', 'steering'].includes(value.status))) {
         throw new Error('只能交接已确认空闲的子 Agent；活动、排队或未知任务需要先处理');
       }
@@ -599,7 +623,7 @@ export class ControllerRuntime {
       this.store.transaction(() => {
         const current = this.store.getWorker(worker.id)!;
         this.assertBridgeOwnership(current);
-        if (current.blocked || this.active.has(worker.id) || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
+        if (current.blocked || this.active.has(worker.id) || this.retirementPending(worker.id) || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
           || current.nativeId !== worker.nativeId) throw new Error('子 Agent 状态在交接准备期间发生变化，未执行交接');
         Object.assign(worker, current); worker.handoffPending = true;
         this.store.saveWorker(worker); if (key) this.store.saveCall(key, fingerprint, initial);
@@ -806,7 +830,8 @@ export class ControllerRuntime {
         };
         result = { workers: workers.map(worker => {
           const jobs = this.store.jobs(worker.id);
-          const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1) : jobs.at(-1);
+          const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
+            : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? jobs.at(-1);
           const currentJob = jobs.find(job => job.status === 'running') ?? latest;
           const progress = currentJob?.progress;
           const progressSummary = { observed: !!progress, stage: progress?.stage ?? 'unobserved', jobId: currentJob?.id ?? null,
@@ -826,7 +851,7 @@ export class ControllerRuntime {
               ...(worker.origin.groupContext ? { spaceId: worker.origin.groupContext.spaceId } : {}) },
             target: worker.target ?? null, sessionVisibility: worker.target?.sessionVisibility ?? 'legacy', ownership: worker.ownership ?? 'bridge', handoffPending: worker.handoffPending === true,
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
-            resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped,
+            resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped, retiring: this.retirementPending(worker.id),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
             ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
@@ -907,7 +932,7 @@ export class ControllerRuntime {
       cancelReason: null, wakeAllowed: true, execution, createdAt: this.timestamp(), updatedAt: this.timestamp() };
   }
   private kick(workerId: string): void {
-    if (!this.started || this.stopping || this.closed || this.isDraining() || this.active.has(workerId) || this.store.getWorker(workerId)?.blocked || !this.store.nextJob(workerId)) return;
+    if (!this.started || this.stopping || this.closed || this.isDraining() || this.active.has(workerId) || this.unconfirmedStops.has(workerId) || this.retirementPending(workerId) || this.store.getWorker(workerId)?.blocked || !this.store.nextJob(workerId)) return;
     const worker = this.store.getWorker(workerId)!;
     if (!this.config.allowedUserIds.includes(worker.origin.userId)) return;
     if (worker.ownership === 'user' || worker.handoffPending || (this.store.nextJob(workerId)?.scheduleId && this.store.isConversationPaused(worker.origin.conversationId))) return;
@@ -989,8 +1014,11 @@ export class ControllerRuntime {
       const running = adapter.run(prepared);
       void this.count(job.origin.conversationId);
       let result = await running;
-      await this.settleSupplements(state);
       this.nativeId(worker, result.nativeId);
+      this.store.setJob(job.id, 'running', { nativeResult: result, processStopped: result.processStopped !== false,
+        ...(result.stopEvidence ? { stopEvidence: result.stopEvidence } : {}) });
+      if (result.processStopped === false) this.unconfirmedStops.add(worker.id);
+      await this.settleSupplements(state);
       if (job.origin.purpose === 'workspace-context') {
         const handoffs = new SessionHandoffs(this.config.dataDir);
         const owner = { id: job.origin.conversationId, userId: job.origin.userId, cwd: job.origin.cwd };
@@ -1023,7 +1051,9 @@ export class ControllerRuntime {
         }
       }
       const current = this.store.getJob(job.id)!;
-      this.store.setJob(current.id, current.status, { nativeResult: result, processStopped: true });
+      this.store.setJob(current.id, current.status, { nativeResult: result, processStopped: result.processStopped !== false,
+        ...(result.stopEvidence ? { stopEvidence: result.stopEvidence } : {}), ...(result.cleanupError ? { cleanupError: result.cleanupError } : {}) });
+      if (result.processStopped === false) this.unconfirmedStops.add(worker.id);
       if (job.origin.purpose === 'workspace-context' && (current.wakeAllowed ?? worker.wakeAllowed) === false
         && new SessionHandoffs(this.config.dataDir).get({ id: job.origin.conversationId, userId: job.origin.userId, cwd: job.origin.cwd }, job.origin.channelId)) await this.finish(worker, current, 'cancelled', '父会话已切换或重置；未接受旧初始化回执。');
       else if (state.closing) await this.finish(worker, current, 'uncertain', '桥关闭时停止了执行子 Agent；本轮结果未知，未自动重做。');
@@ -1032,12 +1062,13 @@ export class ControllerRuntime {
     } catch (error) {
       await this.settleSupplements(state);
       const current = this.store.getJob(job.id)!;
-      const nativeResult = completedResultFromError(error);
+      const nativeResult = completedResultFromError(error) ?? current.nativeResult;
       if (nativeResult) this.nativeId(worker, nativeResult.nativeId);
       const stopEvidence = stopEvidenceFromError(error);
       this.store.setJob(current.id, current.status, { ...(nativeResult ? { nativeResult } : {}), ...(stopEvidence ? { stopEvidence } : {}),
         executionError: isObject(error) && typeof error.executionError === 'string' ? error.executionError : executionErrorEvidence(error),
-        ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanupError: error.cleanupError } : {}), processStopped: !stopUnconfirmed(error) });
+        ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanupError: error.cleanupError } : {}), processStopped: nativeResult?.processStopped === false ? false : !stopUnconfirmed(error) });
+      if (nativeResult?.processStopped === false) this.unconfirmedStops.add(worker.id);
       if (error && typeof error === 'object' && 'resultUncertain' in error) await this.finish(worker, current, 'uncertain', error instanceof Error ? error.message : '预设结果未知，未重放。');
       else if (stopUnconfirmed(error)) {
         this.unconfirmedStops.add(worker.id);
@@ -1103,6 +1134,16 @@ export class ControllerRuntime {
   private async stopWorker(workerId: string, reason: string): Promise<boolean> {
     const active = this.active.get(workerId), worker = this.store.getWorker(workerId)!;
     if (!active) {
+      if (this.retirementPending(workerId)) {
+        const job = this.store.jobs(workerId).findLast(value => ['completed', 'failed'].includes(value.status) && !!value.nativeResult && value.processStopped === false)!;
+        try {
+          await this.adapter(worker).interrupt(workerId, job.id);
+          if (await this.adapter(worker).confirmStopped?.(workerId, job.id) !== true
+            && !(worker.target?.transport !== 'ssh' && this.localExitConfirmed(job))) return false;
+          this.store.setJob(job.id, job.status, { processStopped: true, nativeResult: { ...job.nativeResult!, processStopped: true } });
+          this.unconfirmedStops.delete(workerId); return true;
+        } catch (error) { this.error(error); return false; }
+      }
       if (this.unconfirmedStops.has(workerId) && worker.target?.transport !== 'ssh') {
         try {
           await this.adapter(worker).interrupt(workerId);
@@ -1175,19 +1216,22 @@ export class ControllerRuntime {
     await this.terminateWorkers(workers, '用户停止了父会话');
   }
   private async confirmUncertainStops(): Promise<void> {
-    const workers = [...this.unconfirmedStops].map(id => this.store.getWorker(id))
-      .filter(worker => worker?.target?.transport === 'ssh').slice(0, 4);
+    const workers = [...this.unconfirmedStops].map(id => this.store.getWorker(id)).filter((worker): worker is ControllerWorker => !!worker).slice(0, 4);
     for (const worker of workers) {
       if (this.closed || this.stopping) return;
-      for (const job of this.store.jobs(worker!.id).filter(job => job.status === 'uncertain' && job.processStopped !== true)) {
+      for (const job of this.store.jobs(worker!.id).filter(job => job.status === 'uncertain' && job.processStopped !== true || ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false)) {
         try {
-          if (await this.adapter(worker!).confirmStopped?.(worker!.id, job.id) !== true) continue;
+          if (await this.adapter(worker!).confirmStopped?.(worker!.id, job.id) !== true
+            && !(worker!.target?.transport !== 'ssh' && ['completed', 'failed'].includes(job.status) && !!job.nativeResult && this.localExitConfirmed(job))) continue;
           const current = this.store.getJob(job.id);
-          if (current?.status === 'uncertain' && current.processStopped !== true) this.store.setJob(current.id, current.status, { processStopped: true });
+          if (current && ['uncertain', 'completed', 'failed'].includes(current.status) && current.processStopped !== true)
+            this.store.setJob(current.id, current.status, { processStopped: true, ...(current.status !== 'uncertain' && current.nativeResult ? { nativeResult: { ...current.nativeResult, processStopped: true } } : {}) });
         } catch (error) { this.error(error); }
         if (this.closed || this.stopping) return;
       }
-      if (!this.store.jobs(worker!.id).some(job => job.status === 'uncertain' && job.processStopped !== true)) this.unconfirmedStops.delete(worker!.id);
+      if (!this.store.jobs(worker!.id).some(job => job.status === 'uncertain' && job.processStopped !== true || ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false)) {
+        this.unconfirmedStops.delete(worker!.id); this.kick(worker!.id); await this.workCountsChanged(); this.callbacks.onExecutionSettled?.();
+      }
       // Rotate unresolved guards so a persistently unreachable machine cannot starve later ones.
       if (this.unconfirmedStops.has(worker!.id)) { this.unconfirmedStops.delete(worker!.id); this.unconfirmedStops.add(worker!.id); }
     }

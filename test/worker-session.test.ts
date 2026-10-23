@@ -132,7 +132,7 @@ for (const preset of [false, true]) for (const completedThroughError of [false, 
     let refuse = true, runs = 0;
     const factory = (): AgentAdapter => ({
       run: async () => { runs++; if (completedThroughError) throw new AgentProcessStopError(123, report); return report; },
-      interrupt: async () => {}, close: async () => { if (refuse) throw new Error('nested close failed'); },
+      interrupt: async () => {}, close: async () => { if (refuse) throw new Error('nested close failed'); }, confirmStopped: async () => !refuse,
     });
     const runtime = new PresetRuntime(f.privateRoot, f.data, f.user);
     const binding = { id: 'test', targetId: 'local', ...await runtime.describe('test-codex', 1, 'codex', 'gpt-6-luna') };
@@ -141,7 +141,8 @@ for (const preset of [false, true]) for (const completedThroughError of [false, 
     const turn: AgentTurn = { conversation: { id: 'nested-worker', userId: 'owner', agent: 'codex', model: 'gpt-6-luna', nativeId: null,
       title: '', cwd: f.root, createdAt: '', updatedAt: '' }, text: 'hello', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
     try {
-      await assert.rejects(adapter.run(turn), error => { assert.deepEqual(completedResultFromError(error), report); return true; });
+      if (completedThroughError) await assert.rejects(adapter.run(turn), error => { assert.deepEqual(completedResultFromError(error), report); return true; });
+      else { const result = await adapter.run(turn); assert.equal(result.nativeId, report.nativeId); assert.equal(result.text, report.text); assert.equal(result.processStopped, false); }
       assert.equal(await adapter.confirmStopped('nested-worker'), false);
       await assert.rejects(adapter.run(turn), /仍在执行/); assert.equal(runs, 1);
       refuse = false; await adapter.interrupt('nested-worker');

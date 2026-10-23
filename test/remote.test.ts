@@ -226,15 +226,20 @@ test('terminal completion is not visible until native close confirms exit', asyn
   } finally { release(); await f.daemon.close(); }
 });
 
-test('a native close failure preserves uncertain result and blocks further continuation', async () => {
-  const f = fixture();
+test('原生成功后的收尾失败保留 completed，仅阻止原会话复用且不强杀', async () => {
+  const f = fixture(); let refuse = true;
   try {
-    const request = f.request(); await f.daemon.handle('dispatch', request); await tick(); f.natives[0]!.close = async () => { throw new Error('CLI still alive'); };
+    const request = f.request(); await f.daemon.handle('dispatch', request); await tick();
+    f.natives[0]!.close = async () => { if (refuse) throw new Error('CLI still alive'); };
+    Object.assign(f.natives[0]!, { confirmStopped: async () => !refuse });
     f.natives[0]!.finish(); await tick(); await tick(); const old = f.daemon.store.job(request.dispatchId)!;
-    assert.equal(old.status, 'uncertain'); assert.equal(old.stopped, false);
+    assert.equal(old.status, 'completed'); assert.equal(old.stopped, false);
     assert.equal(old.result?.text, '完成'); assert.equal(old.result?.nativeId, f.natives[0]!.nativeId);
-    await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: request.workerId, nativeId: old.nativeId })), /结果未知/);
-  } finally { await f.daemon.close(); }
+    await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: request.workerId, nativeId: old.nativeId })), /收尾/);
+    await assert.rejects(f.daemon.close(), /CLI still alive/); assert.equal(f.natives[0]!.interrupts, 0);
+    refuse = false; const query = await f.daemon.handle('query', { dispatchId: request.dispatchId }) as RemoteJob;
+    assert.equal(query.status, 'completed'); assert.equal(query.stopped, true);
+  } finally { refuse = false; await f.daemon.close(); }
 });
 
 test('query waits for a received dispatch still doing async validation instead of claiming it does not exist', async () => {

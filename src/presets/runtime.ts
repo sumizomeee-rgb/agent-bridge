@@ -144,6 +144,7 @@ export class PresetAgentAdapter implements AgentAdapter {
   private readonly metadata = new Set<AgentAdapter>();
   private readonly unconfirmed = new Set<string>();
   private readonly stopped = new Set<string>();
+  private readonly completed = new Set<string>();
   private closed = false;
   constructor(private readonly runtime: PresetRuntime, readonly binding: PresetBinding, private readonly command: AgentCommand,
     private readonly env: NodeJS.ProcessEnv, private readonly factory: (command: AgentCommand, env: NodeJS.ProcessEnv) => AgentAdapter =
@@ -163,16 +164,16 @@ export class PresetAgentAdapter implements AgentAdapter {
     if (this.closed || turn.signal.aborted) throw abortError();
     if (turn.conversation.agent !== this.binding.agent || turn.conversation.model !== this.binding.model) throw new Error('预设助手的引擎或模型不匹配。');
     const id = turn.conversation.id; if (this.active.has(id)) throw new Error('预设助手仍在执行。');
-    const state: { stopped: boolean; adapter?: AgentAdapter; prepared?: PreparedPreset } = { stopped: false }; this.active.set(id, state); this.stopped.delete(id);
+    const state: { stopped: boolean; adapter?: AgentAdapter; prepared?: PreparedPreset } = { stopped: false }; this.active.set(id, state); this.stopped.delete(id); this.completed.delete(id);
     let prepared: PreparedPreset | undefined;
     let nativeResult: AgentResult | undefined;
-    let stopOnlyReport = false, resultUncertain = false, executionError: string | undefined;
+    let success = false, stopOnlyReport = false, resultUncertain = false, executionError: string | undefined;
     try {
       prepared = await this.runtime.prepare(this.binding, id, turn.conversation.nativeId, this.command, this.env, this.visibility); state.prepared = prepared;
       if (this.closed || state.stopped || turn.signal.aborted) throw abortError();
       state.adapter = this.factory(prepared.command, prepared.env);
       let ready = false;
-      try { nativeResult = await state.adapter.run({ ...turn, onReady: () => { ready = true; turn.onReady?.(); } }); return nativeResult; }
+      try { nativeResult = await state.adapter.run({ ...turn, onReady: () => { ready = true; turn.onReady?.(); } }); success = true; return nativeResult; }
       catch (error) {
         nativeResult = completedResultFromError(error);
         executionError = executionErrorEvidence(error);
@@ -184,10 +185,15 @@ export class PresetAgentAdapter implements AgentAdapter {
       }
     } finally {
       let cleanupError: unknown, confirmed = false;
+      if (success && nativeResult?.processStopped === false) { stopOnlyReport = true; this.unconfirmed.add(id); this.completed.add(id); }
       if (stopOnlyReport) { try { confirmed = await state.adapter?.confirmStopped?.(id) === true; } catch {} }
       if (!stopOnlyReport || confirmed) { try { await state.adapter?.close(); } catch (error) { cleanupError = error; } }
       if (!stopOnlyReport || confirmed) { try { await prepared?.close(); } catch (error) { cleanupError ??= error; } }
       if (confirmed && cleanupError === undefined && !turn.signal.aborted && !state.stopped && !this.closed) { this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id); return nativeResult!; }
+      if (success && nativeResult && cleanupError !== undefined && !turn.signal.aborted && !state.stopped && !this.closed) {
+        nativeResult.processStopped = false; nativeResult.cleanupError = executionErrorEvidence(cleanupError);
+        this.unconfirmed.add(id); this.completed.add(id); return nativeResult;
+      }
       if (cleanupError !== undefined) { this.unconfirmed.add(id); throw Object.assign(processStopFailure(cleanupError, nativeResult), { executionError, cleanupError: executionErrorEvidence(cleanupError) }, resultUncertain ? { resultUncertain: true } : {}); }
       if (!this.unconfirmed.has(id)) { this.active.delete(id); this.stopped.add(id); }
     }
@@ -208,5 +214,10 @@ export class PresetAgentAdapter implements AgentAdapter {
     }
     return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id);
   }
-  async close(): Promise<void> { this.closed = true; await Promise.all([...this.active.keys()].map(id => this.interrupt(id))); await Promise.all([...this.metadata].map(adapter => adapter.close())); }
+  async close(): Promise<void> { this.closed = true; await Promise.all([...this.active.keys()].map(async id => {
+    if (this.completed.has(id)) {
+      await this.active.get(id)!.adapter!.close();
+      if (await this.confirmStopped(id) !== true) throw processStopFailure(new Error('CLI 仍在收尾。'));
+    } else await this.interrupt(id);
+  })); await Promise.all([...this.metadata].map(adapter => adapter.close())); }
 }

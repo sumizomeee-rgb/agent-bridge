@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { claudeEffortConfiguration } from './claude-effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
-import { abortError, deferred, isObject, JsonLineProcess, processStopFailure, safeError, type JsonObject } from './process.js';
+import { abortError, deferred, isObject, JsonLineProcess, processStopFailure, retireCompletedTurn, safeError, type JsonObject } from './process.js';
 
 function imageMediaType(bytes: Buffer): string {
   if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
@@ -22,6 +22,7 @@ export class ClaudeAdapter implements AgentAdapter {
   private readonly active = new Map<string, () => Promise<void>>();
   private readonly executions = new Map<string, ClaudeTransport>();
   private readonly retirements = new Set<string>();
+  private readonly retirementCleanups = new Map<string, () => void>();
   private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
@@ -109,6 +110,10 @@ export class ClaudeAdapter implements AgentAdapter {
       reportEffort({ capability: currentCapability }); turn.onModel?.(model);
     };
     const conversationId = turn.conversation.id;
+    if (this.retirements.has(conversationId)) {
+      try { await this.executions.get(conversationId)?.stop(true); }
+      catch (error) { throw new Error('上一轮已完成，CLI 仍在收尾；本轮尚未提交。', { cause: error }); }
+    }
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');
     const content: JsonObject[] = [];
     for (const value of turn.input ?? [
@@ -139,6 +144,7 @@ export class ClaudeAdapter implements AgentAdapter {
       readonly?.env ?? { ...this.env, ...(turn.taskContextPath ? { BRIDGE_TASK_CONTEXT: turn.taskContextPath } : {}) }); }
     catch (error) { readonly?.cleanup(); throw error; }
     this.executions.set(conversationId, transport); this.stopped.delete(conversationId);
+    if (readonly) this.retirementCleanups.set(conversationId, readonly.cleanup);
     const completed = deferred<AgentResult>();
     let nativeId = turn.conversation.nativeId;
     let cancelled = false;
@@ -261,7 +267,7 @@ export class ClaudeAdapter implements AgentAdapter {
       completed.reject(abortError());
       const operation = transport.stop(false);
       cancelling = operation;
-      void operation.then(() => { this.stopped.add(conversationId); if (runFinished) { this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId); } }, () => { if (cancelling === operation) cancelling = null; });
+      void operation.then(() => { this.stopped.add(conversationId); if (runFinished) { this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId); this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId); } }, () => { if (cancelling === operation) cancelling = null; }).catch(() => { process.emitWarning('只读临时目录清理未完成。', { code: 'BRIDGE_READONLY_CLEANUP' }); });
       return operation;
     };
     if (turn.acceptSupplements) this.supplements.set(conversationId, async message => {
@@ -303,18 +309,21 @@ export class ClaudeAdapter implements AgentAdapter {
     } finally {
       turn.signal.removeEventListener('abort', onAbort);
       try {
-        if (success) await Promise.all([...pendingInputs.values()].map(value => value.done.promise));
-        if (cancelling) await cancelling;
-        else await transport.stop(success || resultSeen);
-        this.active.delete(conversationId); this.stopped.add(conversationId);
-        this.executions.delete(conversationId); this.retirements.delete(conversationId);
+        const released = () => {
+          this.active.delete(conversationId); this.stopped.add(conversationId);
+          this.executions.delete(conversationId); this.retirements.delete(conversationId);
+          this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId);
+        };
+        if (success && pendingInputs.size) await new Promise<void>(resolve => setImmediate(resolve));
+        if (success && nativeResult && !cancelled) retireCompletedTurn(transport, nativeResult, released);
+        else { if (cancelling) await cancelling; else await transport.stop(resultSeen); released(); }
       } catch (error) { throw processStopFailure(error, nativeResult); }
       finally {
         removeMessage(); removeFailure();
         for (const value of pendingInputs.values()) value.done.resolve({ status: 'uncertain', reason: 'Claude 轮次已关闭，补充接收未确认；不能重发。' });
         this.supplements.delete(conversationId);
         runFinished = true;
-        readonly?.cleanup();
+        if (!success) readonly?.cleanup();
       }
     }
   }
@@ -325,6 +334,7 @@ export class ClaudeAdapter implements AgentAdapter {
   async confirmStopped(conversationId: string): Promise<boolean> {
     if (this.executions.get(conversationId)?.confirmStopped?.()) {
       this.stopped.add(conversationId); this.active.delete(conversationId); this.executions.delete(conversationId); this.retirements.delete(conversationId);
+      this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId);
     }
     return this.stopped.has(conversationId);
   }

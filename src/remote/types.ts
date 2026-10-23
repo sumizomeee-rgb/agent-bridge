@@ -72,8 +72,10 @@ export class RemoteResultUncertain extends Error {
   constructor(message = '【桥】CLI 已退出，任务结果待核对。', readonly nativeResult?: AgentResult, readonly stopEvidence?: AgentStopEvidence, readonly executionError?: string, readonly cleanupError?: string) { super(message); this.name = 'RemoteResultUncertain'; }
 }
 export class RemoteArtifactTransferError extends Error {
-  readonly nativeStopped = true;
-  constructor(readonly nativeResult: AgentResult, message: string) { super(`远端原生任务已完成、CLI 已结束；附件传回失败：${message}`); this.name = 'RemoteArtifactTransferError'; }
+  readonly nativeStopped: boolean;
+  constructor(readonly nativeResult: AgentResult, message: string) {
+    super(`远端原生任务已完成；附件传回失败：${message}`); this.name = 'RemoteArtifactTransferError'; this.nativeStopped = nativeResult.processStopped !== false;
+  }
 }
 export type RemoteRequest = { id: string; method: string; args: unknown; token?: string };
 export type RemoteResponse = { id: string; result?: unknown; error?: { code: string; message: string } };

@@ -14,7 +14,7 @@ export interface WorkerOverview {
   presetId?: string; presetLabel?: string;
   model: string | null; effort: string | null; nativeId: string | null;
   requestedEffort?: string | null; effortConfiguration?: EffortConfiguration | null; effortMetadata?: EffortMetadata | null;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
+  status: 'queued' | 'running' | 'retiring' | 'completed' | 'failed' | 'cancelled' | 'uncertain' | 'idle' | 'handed-off' | 'handoff-pending';
   running: boolean; queued: number; startedAt: string | null; endedAt?: string | null;
   blocked?: boolean; ownership?: 'bridge' | 'user'; statusReason?: string;
   resultKnown?: boolean; processStopped?: boolean; archivedAt?: string; archiveReason?: string;
@@ -24,7 +24,8 @@ export interface WorkerOverview {
 export type WorkerView = 'active' | 'history';
 /** 明确归档且已确认停止的异常会话转入历史；运行或未确认状态仍可见。 */
 export const isActiveWorker = (item: WorkerOverview): boolean => item.running || item.queued > 0
-  || (!(item.archivedAt && item.processStopped === true) && ['queued', 'running', 'uncertain', 'handoff-pending'].includes(item.status));
+  || item.status === 'failed' && item.resultKnown === true && item.processStopped === false
+  || (!(item.archivedAt && item.processStopped === true) && ['queued', 'running', 'retiring', 'uncertain', 'handoff-pending'].includes(item.status));
 
 const clean = (value: string, limit = 120): string => {
   const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();
@@ -42,7 +43,7 @@ const checkedTime = (value: string | null): string => {
 
 /** 仅识别本模块生成的总览，在完整条目之间分页，不改变普通回复。 */
 export function splitOverviewMessage(text: string, limit = 2000): string[] | null {
-  if (!/^```ansi\n\u001b\[33m(?:当前工作区的电脑 · 已登记\d+台|(?:当前对话|你的全部对话)的(?:直属助手 · 运行\d+个 · 等待\d+轮(?: · 待核对\d+个)?|历史助手 · 共\d+个))\u001b\[0m\n```(?:\n\n|$)/.test(text)) return null;
+  if (!/^```ansi\n\u001b\[33m(?:当前工作区的电脑 · 已登记\d+台|(?:当前对话|你的全部对话)的(?:直属助手 · 运行\d+个 · 等待\d+轮(?: · 待核对\d+个)?(?: · 收尾\d+个)?|历史助手 · 共\d+个))\u001b\[0m\n```(?:\n\n|$)/.test(text)) return null;
   const [heading, ...blocks] = text.split('\n\n');
   if (!heading || !heading.endsWith('\n```') || heading.length > limit) throw new Error('总览标题超过消息限制。');
   const parts: string[] = [];
@@ -118,6 +119,7 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
   const label = scope === 'all' ? '你的全部对话' : '当前对话';
   const running = items.filter(item => item.running).length, queued = items.reduce((sum, item) => sum + item.queued, 0);
   const uncertain = items.filter(item => item.status === 'uncertain').length;
+  const retiring = items.filter(item => item.status === 'retiring').length;
   const rank = (item: WorkerOverview) => item.running ? 0 : ['uncertain', 'handoff-pending'].includes(item.status) ? 1 : item.queued ? 2 : 3;
   const endedAt = (item: WorkerOverview) => {
     const timestamp = Date.parse(item.endedAt ?? '');
@@ -125,12 +127,12 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
   };
   const sorted = [...items].sort((a, b) => rank(a) - rank(b) || endedAt(b) - endedAt(a));
   if (details) return workerDetails(sorted, scope, now, view);
-  const states = { queued: '⏳ 等待执行', running: '🔄 运行中', completed: '✅ 已完成', failed: '❌ 失败', cancelled: '⏹ 已停止', uncertain: '⚠️ 待核对', idle: '💤 空闲', 'handed-off': '👤 已交给你', 'handoff-pending': '⚠️ 交接待确认' };
-  return { title: view === 'history' ? `${label}的历史助手 · 共${items.length}个` : `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`, tone: 'info', purpose: 'overview',
+  const states = { queued: '⏳ 等待执行', running: '🔄 运行中', retiring: '✅ 本轮完成 · CLI 收尾中', completed: '✅ 已完成', failed: '❌ 失败', cancelled: '⏹ 已停止', uncertain: '⚠️ 待核对', idle: '💤 空闲', 'handed-off': '👤 已交给你', 'handoff-pending': '⚠️ 交接待确认' };
+  return { title: view === 'history' ? `${label}的历史助手 · 共${items.length}个` : `${label}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}${retiring ? ` · 收尾${retiring}个` : ''}`, tone: 'info', purpose: 'overview',
     blocks: sorted.length ? sorted.map((item, index) => {
       const model = item.model ? clean(item.model, 60).replace(/^gpt-/i, '') : '模型未知';
       const effort = workerEffort(item);
-      const status = item.archivedAt && item.processStopped === true && !item.running && !item.queued ? '📁 已归档' : ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
+      const status = item.archivedAt && item.processStopped === true && !item.running && !item.queued ? '📁 已归档' : ['uncertain', 'handoff-pending', 'handed-off', 'retiring'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
       const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? '尚未开始' : '耗时未回报';
       const lines = [`${index + 1}. ${dispatchLabel(item)} · ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
         `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
@@ -160,14 +162,15 @@ function workerDetails(items: readonly WorkerOverview[], scope: 'current' | 'all
   const running = items.filter(item => item.running).length;
   const queued = items.reduce((total, item) => total + item.queued, 0);
   const uncertain = items.filter(item => item.status === 'uncertain').length;
-  const title = view === 'history' ? `${prefix}的历史助手 · 共${items.length}个` : `${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}`;
+  const retiring = items.filter(item => item.status === 'retiring').length;
+  const title = view === 'history' ? `${prefix}的历史助手 · 共${items.length}个` : `${prefix}的直属助手 · 运行${running}个 · 等待${queued}轮${uncertain ? ` · 待核对${uncertain}个` : ''}${retiring ? ` · 收尾${retiring}个` : ''}`;
   if (!items.length) return { title, tone: 'info', purpose: 'overview', blocks: [{ kind: 'text', text: view === 'history' ? `${prefix}没有历史助手。` : `${prefix}没有正在执行、排队或待核对的助手。` }] };
-  const statuses = { queued: '等待执行', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已停止', uncertain: '状态待核对', idle: '空闲', 'handed-off': '已交给用户', 'handoff-pending': '交接待确认' };
+  const statuses = { queued: '等待执行', running: '运行中', retiring: '本轮完成 · CLI 收尾中', completed: '已完成', failed: '失败', cancelled: '已停止', uncertain: '状态待核对', idle: '空闲', 'handed-off': '已交给用户', 'handoff-pending': '交接待确认' };
   return { title, tone: 'info', purpose: 'overview', blocks: items.map((item, index) => {
-    const status = ['uncertain', 'handoff-pending', 'handed-off'].includes(item.status) ? statuses[item.status]
+    const status = ['uncertain', 'handoff-pending', 'handed-off', 'retiring'].includes(item.status) ? statuses[item.status]
       : item.running ? '运行中' : item.queued > 0 ? '等待执行' : statuses[item.status];
     const elapsed = item.status === 'uncertain' ? '未知（状态待核对）' : item.running ? elapsedText(item.startedAt, now)
-      : item.status === 'queued' || item.queued > 0 ? '尚未开始'
+      : item.status === 'queued' || item.queued > 0 && item.status !== 'retiring' ? '尚未开始'
       : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : '未回报';
     const model = item.model ? clean(item.model).replace(/^gpt-/i, '') || '模型未知' : '模型未知';
     const effort = workerEffort(item);

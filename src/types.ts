@@ -169,12 +169,18 @@ export interface AgentTurn {
   /** Adapter-owned evidence, shared by controllers, workers and every presentation. */
   onEffortMetadata?: (metadata: EffortMetadata) => void;
 }
-export interface AgentResult { nativeId: string; text: string; controlledOutput?: boolean; postDeliveryError?: string }
+export interface AgentResult {
+  nativeId: string; text: string; controlledOutput?: boolean; postDeliveryError?: string;
+  /** 原生轮已完成；false 只表示 CLI 仍在收尾，不改变本轮结果。缺省兼容旧适配器。 */
+  processStopped?: boolean;
+  stopEvidence?: import('./agents/process.js').AgentStopEvidence;
+  cleanupError?: string;
+}
 export interface AgentAdapter {
   run(turn: AgentTurn): Promise<AgentResult>;
   /** queued 必须表示尚未提交或收到明确拒绝；不确定结果禁止自动重发。 */
   steer?(conversationId: string, supplement: AgentSupplement): Promise<SteerResult>;
-  interrupt(conversationId: string): Promise<void>;
+  interrupt(conversationId: string, dispatchId?: string): Promise<void>;
   /** Read-only reconciliation; true only after target-native exit was confirmed. */
   confirmStopped?(conversationId: string, dispatchId?: string): Promise<boolean>;
   close(): Promise<void>;
