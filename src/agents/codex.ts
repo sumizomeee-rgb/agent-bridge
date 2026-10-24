@@ -1,5 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
-import { MetadataProbeError, retireMetadata } from './metadata.js';
+import { MetadataProbeError, MetadataProbes } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcError, processStopFailure, retireCompletedTurn, safeError, type JsonObject, type RpcTransport } from './process.js';
@@ -13,8 +13,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
-  private readonly metadataProcesses = new Set<RpcTransport>();
-  private readonly metadataUnconfirmed = new Set<RpcTransport>();
+  private readonly metadata = new MetadataProbes();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
     private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport =
@@ -22,11 +21,13 @@ export class CodexAdapter implements AgentAdapter {
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
-    for (const previous of this.metadataUnconfirmed) {
-      await retireMetadata(previous, false); this.metadataUnconfirmed.delete(previous); this.metadataProcesses.delete(previous);
-    }
-    const transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://'], cwd, this.env);
-    this.metadataProcesses.add(transport);
+    const priorRetirement = this.metadata.prepare(); if (priorRetirement) await priorRetirement;
+    // 元数据查询不需要用户 MCP、hooks 或其他工具；认证与模型路由保留在独立临时 home。
+    const readonly = readOnlyRuntime('codex', this.env);
+    let transport: RpcTransport;
+    try { transport = this.createTransport(this.command, ['app-server', '--listen', 'stdio://', ...readonly.args], cwd, readonly.env); }
+    catch (error) { readonly.cleanup(); throw error; }
+    this.metadata.track(transport, readonly.cleanup);
     const rpc = new JsonRpcClient(transport);
     let success = false, primary: unknown;
     try {
@@ -57,10 +58,9 @@ export class CodexAdapter implements AgentAdapter {
       return { models, source: 'codex-model-list', defaultModel: typeof config.model === 'string' && config.model ? config.model : models.find(model => model.isDefault)?.id ?? null };
     } catch (error) { primary = error; throw new MetadataProbeError(error, true); }
     finally {
-      let stopped = false;
-      try { await retireMetadata(transport, success, primary); stopped = true; }
-      catch (error) { this.metadataUnconfirmed.add(transport); throw error; }
-      finally { rpc.close(); if (stopped) this.metadataProcesses.delete(transport); }
+      rpc.close();
+      if (success) this.metadata.complete(transport);
+      else await this.metadata.failed(transport, primary);
     }
   }
 
@@ -329,6 +329,6 @@ export class CodexAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => retireMetadata(process, false))));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([this.metadata.close()]));
   }
 }

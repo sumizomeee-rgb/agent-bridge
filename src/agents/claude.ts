@@ -1,5 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
-import { MetadataProbeError, retireMetadata } from './metadata.js';
+import { MetadataProbeError, MetadataProbes } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -26,8 +26,7 @@ export class ClaudeAdapter implements AgentAdapter {
   private readonly stopped = new Set<string>();
   private readonly supplements = new Map<string, (message: AgentSupplement) => Promise<SteerResult>>();
   private closed = false;
-  private readonly metadataProcesses = new Set<ClaudeTransport>();
-  private readonly metadataUnconfirmed = new Set<ClaudeTransport>();
+  private readonly metadata = new MetadataProbes();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
     private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => ClaudeTransport =
@@ -36,9 +35,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Claude 适配器已关闭。');
-    for (const previous of this.metadataUnconfirmed) {
-      await retireMetadata(previous, false); this.metadataUnconfirmed.delete(previous); this.metadataProcesses.delete(previous);
-    }
+    const priorRetirement = this.metadata.prepare(); if (priorRetirement) await priorRetirement;
     // Same initialize control envelope used by Anthropic's Agent SDK.
     // No user message is sent, so this cannot start a model generation.
     // CLI 重复的 --settings 取最后一个，必须保留原启动参数中的认证与模型设置。
@@ -56,7 +53,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // 模型目录只需要控制协议；保留模型、认证设置，隔离与查询无关的 MCP 和 hooks。
     const transport = this.createMetadataTransport(this.command, ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions',
       '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--settings', JSON.stringify({ ...settings, disableAllHooks: true }), '--no-session-persistence', '--no-chrome'], cwd, this.env);
-    this.metadataProcesses.add(transport);
+    this.metadata.track(transport);
     const completed = deferred<AgentModelInfo>();
     const timer = setTimeout(() => completed.reject(new Error('Claude 模型元数据等待超时。')), 30_000);
     const removeFailure = transport.onFailure(error => completed.reject(error));
@@ -88,10 +85,9 @@ export class ClaudeAdapter implements AgentAdapter {
       const result = await completed.promise; success = true; return result;
     } catch (error) { primary = error; throw new MetadataProbeError(error, true); }
     finally {
-      clearTimeout(timer); let stopped = false;
-      try { await retireMetadata(transport, success, primary); stopped = true; }
-      catch (error) { this.metadataUnconfirmed.add(transport); throw error; }
-      finally { removeMessage(); removeFailure(); if (stopped) this.metadataProcesses.delete(transport); }
+      clearTimeout(timer); removeMessage(); removeFailure();
+      if (success) this.metadata.complete(transport);
+      else await this.metadata.failed(transport, primary);
     }
   }
 
@@ -343,6 +339,6 @@ export class ClaudeAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([...this.metadataProcesses].map(process => retireMetadata(process, false))));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([this.metadata.close()]));
   }
 }
