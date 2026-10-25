@@ -1215,7 +1215,6 @@ export class SessionManager {
           } finally { clearTimeout(timeout); noticeController.abort(); }
         }).catch(() => undefined); // An auxiliary status send cannot fail or replay the controller.
       };
-      const waitingTimer = privateControllerInput ? setTimeout(() => statusNotice('controllerWaiting'), 30000) : undefined;
       try {
         if (privateControllerInput) this.store.startPrivateBatch(item.id);
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
@@ -1283,7 +1282,7 @@ export class SessionManager {
               throw new DeliveryPreparationError('尚未发送：最终回复必须发回原私聊；请省略 targetId 或使用 private，其他区域补充发送用 finish:false。');
             const coverage = [...turn.messageIds];
             if (privateControllerInput && finish) {
-              privateFinalStarted = true; clearTimeout(waitingTimer); await noticeTail;
+              privateFinalStarted = true; await noticeTail;
             }
             if (finish) this.store.setReplyState(coverage, 'pending');
             await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
@@ -1344,7 +1343,7 @@ export class SessionManager {
       } catch (error) {
         turn.executing = false;
         await turn.supplements;
-        clearTimeout(waitingTimer); await noticeTail;
+        await noticeTail;
         const retained = completedResultFromError(error);
         if (retained) this.store.saveTurnResult(item.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
@@ -1376,7 +1375,7 @@ export class SessionManager {
           } else if (!handled) await this.sendBridgeNotice(item.channelId, noticeCode, undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
         }
       } finally {
-        clearTimeout(waitingTimer); await noticeTail;
+        await noticeTail;
         turn.executing = false;
         await turn.supplements;
         if (!this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) {

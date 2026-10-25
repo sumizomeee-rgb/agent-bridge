@@ -243,18 +243,20 @@ test('manager persists submission and bounded recovery; failed status delivery d
   assert(f.sent.some(text => text.includes('正在补齐回复'))); assert(f.sent.some(text => text.includes('confirmed reply')));
 });
 
-test('long waits give one status notice without terminating or duplicating an active controller', async t => {
+test('normal long-running turns never emit a time-based warning or get interrupted', async t => {
   const s = fixture(t); const f = managerFixture(t, s); await f.send();
   // The message enters processQueue through a real merge timer before clock mocking.
   await until(() => s.transports[0]?.turns === 1);
-  // The real wait timer is already scheduled: use a new message with mocked time after cancelling this one.
+  // Start the next input with mocked time so every turn-local timeout is covered.
   await reply(s.transports[0]!); await until(() => f.store.getMessage('original-message')?.state === 'completed');
   t.mock.timers.enable({ apis: ['setTimeout'] });
   await f.manager.handle({ id: 'long-message', userId: 'owner', channelId: 'private', text: 'long', imagePaths: [] });
   t.mock.timers.tick(1); await until(() => s.transports[0]!.turns === 2);
-  t.mock.timers.tick(30001); await until(() => f.sent.some(text => text.includes('仍在等待主控')));
+  const sentBeforeWait = f.sent.length;
+  t.mock.timers.tick(30001); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.sent.length, sentBeforeWait, '30 seconds of normal execution must not generate a notification');
   t.mock.timers.tick(600000); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(f.sent.filter(text => text.includes('仍在等待主控')).length, 1);
+  assert.equal(f.sent.length, sentBeforeWait, 'longer normal execution must remain free of time-based notifications');
   assert.equal(s.transports[0]!.stopped, false); assert.equal(f.store.getMessage('long-message')?.state, 'running');
   await reply(s.transports[0]!); await until(() => f.store.getMessage('long-message')?.state === 'completed'); t.mock.timers.reset();
 });
