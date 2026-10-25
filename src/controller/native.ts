@@ -6,9 +6,10 @@ import { homedir } from 'node:os';
 import { resolve, join, dirname, basename } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
-import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentName, AgentResult, AgentTurn, AgentInput, PrivateInputBatch, EffortConfiguration, EffortCapability } from '../types.js';
+import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentName, AgentResult, AgentTurn, AgentInput, PrivateInputBatch, EffortConfiguration, EffortCapability, Conversation } from '../types.js';
 import { claudeEffortConfiguration } from '../agents/claude-effort.js';
 import { MetadataProbeError } from '../agents/metadata.js';
+import { readCodexModelInfo } from '../agents/codex-models.js';
 import { DeliveryPreparationError, executionErrorEvidence } from '../delivery-errors.js';
 import { FEEDBACK_RULE } from '../controller-feedback.js';
 import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
@@ -164,6 +165,8 @@ interface ControllerSession {
   model?: string;
   effort?: string | null;
   effortConfiguration?: EffortConfiguration | null;
+  effortCapability?: EffortCapability;
+  metadataSource?: string;
 }
 
 interface ControllerProcessProof {
@@ -178,7 +181,14 @@ export class NativeControllerAdapter implements AgentAdapter {
   private closed = false;
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv, private readonly options: NativeControllerOptions) {}
 
-  async getModelInfo(cwd: string): Promise<AgentModelInfo> {
+  async getModelInfo(cwd: string, conversation?: Conversation): Promise<AgentModelInfo> {
+    if (this.closed) throw new Error('主控适配器已关闭。');
+    const session = conversation && this.sessions.get(conversation.id);
+    // 同一配置的已初始化主控提供目录，不再为每条消息额外启动 CLI。
+    if (session?.rpc && !session.closed && !session.stopFailed && session.metadataSource === this.metadataSource(cwd)) {
+      try { return await readCodexModelInfo(session.rpc, cwd); }
+      catch (error) { throw new MetadataProbeError(error, false); }
+    }
     if (!this.options.metadataAdapter?.getModelInfo) throw new Error('主控没有配置模型目录查询适配器。');
     for (let attempt = 0; ; attempt++) {
       if (this.closed) throw new Error('主控适配器已关闭。');
@@ -201,11 +211,14 @@ export class NativeControllerAdapter implements AgentAdapter {
       ? [join(userHome, '.codex', 'config.toml'), join(userHome, '.codex', 'auth.json')]
       : [join(userHome, '.claude', 'settings.json'), join(userHome, '.claude', '.credentials.json'), join(userHome, '.claude.json')];
   }
-  private signature(turn: AgentTurn): string {
+  private metadataSource(cwd: string): string {
     const hash = createHash('sha256');
     for (const file of this.sourceFiles()) hash.update(existsSync(file) ? readFileSync(file) : 'missing');
-    hash.update(JSON.stringify([turn.conversation.cwd, turn.conversation.model ?? null, selectedEffort(turn)]));
-    return hash.digest('hex');
+    hash.update(cwd); return hash.digest('hex');
+  }
+  private signature(turn: AgentTurn): string {
+    return createHash('sha256').update(this.metadataSource(turn.conversation.cwd))
+      .update(JSON.stringify([turn.conversation.model ?? null, selectedEffort(turn)])).digest('hex');
   }
   private processProofPath(conversationId: string): string {
     if (!/^[a-zA-Z0-9_-]{1,100}$/.test(conversationId)) throw new Error('主控会话标识不合法。');
@@ -295,6 +308,9 @@ export class NativeControllerAdapter implements AgentAdapter {
     try {
       await session.rpc!.request('initialize', { clientInfo: { name: 'discord_bridge_controller', version: '1' }, capabilities: { experimentalApi: true } }, 15000);
       session.rpc!.notify('initialized');
+      if (this.signature(turn) !== signature) throw new Error('主控启动期间源配置已变化；本轮未提交。');
+      session.metadataSource = this.metadataSource(turn.conversation.cwd);
+      if (selectedEffort(turn)) session.effortCapability = await validateEffort(this, turn.conversation, selectedEffort(turn)!);
       const configured = await session.rpc!.request('config/read', { includeLayers: false, cwd: turn.conversation.cwd }, 15000);
       if (!isObject(configured.config)) throw new Error('Codex 主控没有返回供应商配置。');
       const provider = configured.config.model_provider ?? 'openai';
@@ -308,7 +324,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         : { ...params, ephemeral: false, environments: [], selectedCapabilityRoots: [], dynamicTools: controllerToolsForCommunication(this.options.internalBotCommunicationEnabled).map(tool => ({ ...tool, type: 'function' })) }, 20000);
       if (!isObject(response.thread) || typeof response.thread.id !== 'string' || (prior && response.thread.id !== prior)) throw new Error('Codex 主控续接返回了不同会话；原会话已保留。');
       if (typeof response.modelProvider !== 'string' || response.modelProvider !== provider) throw new Error('Codex 主控回报的供应商与当前配置不一致；原会话已保留，本轮未提交。');
-      if (selectedEffort(turn) && typeof response.model === 'string' && response.model !== turn.conversation.model) await validateEffort(this, { ...turn.conversation, model: response.model }, selectedEffort(turn)!);
+      if (selectedEffort(turn) && typeof response.model === 'string' && response.model !== turn.conversation.model) session.effortCapability = await validateEffort(this, { ...turn.conversation, model: response.model }, selectedEffort(turn)!);
       session.nativeId = response.thread.id; turn.onNativeId?.(session.nativeId);
       if (typeof response.model === 'string') { session.model = response.model; turn.onModel?.(session.model); }
       if (!selectedEffort(turn) && (typeof response.reasoningEffort === 'string' || response.reasoningEffort === null)) { session.effort = response.reasoningEffort; turn.onReasoningEffort?.(session.effort); }
@@ -832,8 +848,6 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (turn.signal.aborted) throw abortError();
     turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
-    const capability = effort ? await validateEffort(this, turn.conversation, effort)
-      : normalizeEffortCapability(this.options.agent, undefined, { source: this.options.agent + '-native', modelId: turn.conversation.model ?? null });
     const key = turn.conversation.id, signature = this.signature(turn);
     const closing = this.closingSessions.get(key);
     if (closing) await this.stopSession(key, closing);
@@ -842,7 +856,13 @@ export class NativeControllerAdapter implements AgentAdapter {
     let session = this.sessions.get(key);
     if (session?.active) throw new Error('主控消息必须按顺序执行。');
     if (session && session.signature !== signature) { await this.stopSession(key, session); session = undefined; }
+    // 能力只复用于相同源配置、目录、模型和 effort 的同一运行会话。
+    let capability = session?.effortCapability ?? normalizeEffortCapability(this.options.agent, undefined, { source: this.options.agent + '-native', modelId: turn.conversation.model ?? null });
+    if (!session && effort && this.options.agent === 'claude') capability = await validateEffort(this, turn.conversation, effort);
+    if (turn.signal.aborted) throw abortError();
     session ??= await this.open(turn, signature);
+    capability = session.effortCapability ?? capability;
+    session.effortCapability = capability;
     if (turn.signal.aborted) { await this.stopSession(key, session); throw abortError(); }
     if (session.nativeId) turn.onNativeId?.(session.nativeId);
     if (session.model) turn.onModel?.(session.model);

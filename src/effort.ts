@@ -64,7 +64,7 @@ export async function validateEffort(adapter: AgentAdapter, target: Conversation
 /** Explicit default is resolved per launch, never persisted as a model ID. */
 export async function resolveDefaultModel(adapter: AgentAdapter, turn: AgentTurn): Promise<AgentTurn> {
   if (turn.conversation.modelPolicy !== 'cli-default' || turn.conversation.model || !turn.conversation.nativeId) return turn;
-  const info = await adapter.getModelInfo?.(turn.conversation.cwd);
+  const info = await adapter.getModelInfo?.(turn.conversation.cwd, turn.conversation);
   if (!info?.defaultModel || info.defaultModel === 'default') throw new Error('无法确认目标 CLI 当前默认模型，本轮未提交；显式默认策略已保留。');
   return { ...turn, conversation: { ...turn.conversation, model: info.defaultModel } };
 }

@@ -78,6 +78,7 @@ class FakeTransport implements RpcTransport {
     const params = message.params as JsonObject;
     if (message.method === 'initialize') this.emit({ id: message.id, result: {} });
     else if (message.method === 'thread/read') this.emit({ id: message.id, result: { thread: { reasoningEffort: (this.written.findLast(m => m.method === 'turn/start')?.params as JsonObject)?.effort ?? null } } });
+    else if (message.method === 'model/list') this.emit({ id: message.id, result: { data: [{ model: 'gpt-6.1-sol', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'xhigh' }] }] } });
     else if (message.method === 'config/read') this.emit({ id: message.id, result: { config: { model_provider: 'current-provider', model: 'gpt-6.1-sol' } } });
     else if (message.method === 'thread/start' || message.method === 'thread/resume') this.emit({ id: message.id, result: { thread: { id: this.nativeId }, modelProvider: 'current-provider', model: 'gpt-6.1-sol', reasoningEffort: 'medium' } });
     else if (message.method === 'turn/start') {
@@ -99,13 +100,14 @@ function setup() {
   let mode: FakeTransport['mode'] = 'public';
   const invokes: string[] = [], published: { text: string; key?: string }[] = [];
   let managementHold: Promise<unknown> | undefined;
+  let metadataReads = 0, metadataUnavailable = false;
   const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, { HTTP_PROXY: 'http://127.0.0.1:7898' }, { agent: 'codex', dataDir: join(dir, 'data'), userHome,
-    metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => ({ defaultModel: 'gpt-6.1-sol', models: [{ id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['medium', 'xhigh'] }] }) },
+    metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => { metadataReads++; if (metadataUnavailable) throw new Error('独立探测不可用'); return { defaultModel: 'gpt-6.1-sol', models: [{ id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['medium', 'xhigh'] }] }; } },
     invokeTool: async (_turn, name) => { invokes.push(name); return managementHold ?? {}; },
     createTransport: (_command, args, _cwd, env) => { const t = new FakeTransport(); t.mode = mode; transports.push(t); launches.push({ args, env }); return t; },
   });
   const makeTurn = (): AgentTurn => ({ conversation: { id: 'conversation-1', userId: 'u', agent: 'codex', nativeId: null, title: '', cwd: dir, createdAt: '', updatedAt: '' }, text: '请调查', imagePaths: [], signal: new AbortController().signal, onProgress: () => {}, onPublicMessage: async (text, _paths, key) => { published.push({ text, key }); } });
-  return { dir, userHome, adapter, transports, launches, invokes, published, makeTurn, setMode: (value: FakeTransport['mode']) => { mode = value; }, holdManagement: (promise: Promise<unknown>) => { managementHold = promise; }, cleanup: async () => { await adapter.close(); rmSync(dir, { recursive: true, force: true }); } };
+  return { dir, userHome, adapter, transports, launches, invokes, published, makeTurn, get metadataReads() { return metadataReads; }, disableMetadata: () => { metadataUnavailable = true; }, setMode: (value: FakeTransport['mode']) => { mode = value; }, holdManagement: (promise: Promise<unknown>) => { managementHold = promise; }, cleanup: async () => { await adapter.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
 async function until(check: () => boolean): Promise<void> {
@@ -724,6 +726,54 @@ test('Claude MCP uses fresh connections for every response without replaying fai
     transport.emit({ type: 'result', subtype: 'success', session_id: 'mcp-error-native', result: 'DONE' }); await running;
   } finally { agent.destroy(); await adapter.close(); await running.catch(() => {}); rmSync(dir, { recursive: true, force: true }); }
 });
+test('Codex controller validates on its own initialized connection and reuses unchanged capability without another CLI probe', async () => {
+  const s = setup(); s.disableMetadata();
+  try {
+    const turn = s.makeTurn(); turn.conversation.model = 'gpt-6.1-sol'; turn.conversation.effort = 'xhigh';
+    const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
+    const transport = s.transports[0]!;
+    const methods = transport.written.map(m => m.method);
+    assert(methods.indexOf('initialize') < methods.indexOf('model/list'));
+    assert(methods.indexOf('model/list') < methods.indexOf('thread/start'));
+    assert(methods.indexOf('thread/start') < methods.indexOf('turn/start'));
+    const reads = methods.filter(m => m === 'model/list').length;
+    await s.adapter.run(turn);
+    assert.equal(s.transports.length, 1); assert.equal(transport.turns, 2); assert.equal(s.metadataReads, 0);
+    assert.equal(transport.written.filter(m => m.method === 'model/list').length, reads);
+    assert.equal((await s.adapter.getModelInfo(turn.conversation.cwd, turn.conversation)).defaultModel, 'gpt-6.1-sol');
+    assert.equal(s.transports.length, 1); assert.equal(s.metadataReads, 0);
+    writeFileSync(join(s.userHome, '.codex', 'config.toml'), 'model_provider="changed"\n');
+    await assert.rejects(s.adapter.getModelInfo(turn.conversation.cwd, turn.conversation), /独立探测不可用/);
+    assert.equal(s.metadataReads, 1);
+    await s.adapter.run(turn);
+    assert.equal(s.transports.length, 2); assert.equal(transport.stopped, true); assert.equal(s.metadataReads, 1);
+    assert(s.transports[1]!.written.some(m => m.method === 'model/list'));
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject).threadId, first.nativeId);
+  } finally { await s.cleanup(); }
+});
+
+test('Codex controller keeps unsupported effort out of thread and turn submission', async () => {
+  const s = setup(); s.disableMetadata();
+  try {
+    const turn = s.makeTurn(); turn.conversation.model = 'gpt-6.1-sol'; turn.conversation.effort = 'ultra';
+    await assert.rejects(s.adapter.run(turn), /不支持/);
+    assert.equal(s.metadataReads, 0); assert.equal(s.transports.length, 1);
+    assert(s.transports[0]!.stopped);
+    assert(!s.transports[0]!.written.some(m => ['thread/start', 'thread/resume', 'turn/start'].includes(String(m.method))));
+  } finally { await s.cleanup(); }
+});
+
+test('Codex CLI-default continuation reads its live connection and never starts an independent metadata probe', async () => {
+  const s = setup(); s.disableMetadata();
+  try {
+    const turn = s.makeTurn(); turn.conversation.modelPolicy = 'cli-default'; turn.conversation.effort = 'xhigh';
+    const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
+    await s.adapter.run(turn);
+    assert.equal(s.metadataReads, 0); assert.equal(s.transports.reduce((n, t) => n + t.turns, 0), 2);
+    assert(s.transports.at(-1)!.written.some(m => m.method === 'thread/resume' && (m.params as JsonObject).threadId === first.nativeId));
+  } finally { await s.cleanup(); }
+});
+
 test('controller effort changes resume original native thread and read CLI settings without guessing', async () => {
   const s = setup(); try {
     const turn = s.makeTurn(); const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
@@ -776,10 +826,10 @@ test('Claude controller filters invalid external effort in settings and preserve
 });
 
 test('Claude controller passes its own effort with same native resume and leaves actual effort unknown', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'bridge-claude-effort-')); const launches: string[][] = [];
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-claude-effort-')); const launches: string[][] = []; let metadataReads = 0;
   const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'claude', dataDir: dir, userHome: dir,
     invokeTool: async () => ({}),
-    metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => ({ defaultModel: 'sonnet', models: [{ id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['high'] }] }) },
+    metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => { metadataReads++; return { defaultModel: 'sonnet', models: [{ id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['high'] }] }; } },
     createTransport: (_command, args) => { launches.push(args); const transport = new FakeTransport();
       transport.write = message => { if (message.type === 'user') {
         transport.emit({ type: 'system', subtype: 'init', session_id: 'claude-original', model: 'sonnet', tools: [] });
@@ -793,6 +843,9 @@ test('Claude controller passes its own effort with same native resume and leaves
     assert.equal(launches[0]![launches[0]!.indexOf('--effort') + 1], 'high');
     assert.equal(launches[0]![launches[0]!.indexOf('--resume') + 1], 'claude-original');
     assert.deepEqual(reports, [null]);
+    assert.equal(metadataReads, 1);
+    assert.equal((await adapter.run(turn)).nativeId, 'claude-original');
+    assert.equal(metadataReads, 1); assert.equal(launches.length, 1);
     turn.conversation.effort = 'xhigh'; await assert.rejects(adapter.run(turn), /不支持/);
     assert.equal(launches.length, 1);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
