@@ -15,15 +15,22 @@ import { SessionStore } from '../src/store.js';
 import { FeishuTransport } from '../src/feishu.js';
 import type { BridgeConfig, ReplyOptions, AgentAdapter } from '../src/types.js';
 
-test('normal Feishu startup and restart do not send chat notifications', async () => {
-  const sends: unknown[] = [];
+test('Feishu preserves startup and completed restart notifications without announcing recovery phases', async () => {
+  const sends: Array<{ channel: string; title?: string }> = [];
   const transport = { config: { allowedUserIds: ['owner'], scopePrefix: 'feishu:test|' },
-    sendText: async (...args: unknown[]) => { sends.push(args); } } as unknown as FeishuTransport;
-  for (const reason of ['start', 'restart'] as const) {
-    await FeishuTransport.prototype.onBridgeLifecycle.call(transport, { phase: 'ready', reason,
-      recipient: { userId: 'owner', channelId: 'feishu:test|private' } });
+    sendText: async (channel: string, _text: string, options?: ReplyOptions) => { sends.push({ channel, title: options?.presentation?.title }); } } as unknown as FeishuTransport;
+  const recipient = { userId: 'owner', channelId: 'feishu:test|private' };
+  for (const phase of ['draining', 'recovering'] as const) {
+    await FeishuTransport.prototype.onBridgeLifecycle.call(transport, { phase, recipient });
   }
   assert.deepEqual(sends, []);
+  for (const reason of ['start', 'restart'] as const) {
+    await FeishuTransport.prototype.onBridgeLifecycle.call(transport, { phase: 'ready', reason, recipient });
+  }
+  assert.deepEqual(sends, [{ channel: 'private', title: '【桥】已就绪' }, { channel: 'private', title: '【桥】已重启' }]);
+  await FeishuTransport.prototype.onBridgeLifecycle.call(transport, { phase: 'ready', reason: 'restart',
+    recipient: { userId: 'another-owner', channelId: 'feishu:test|private' } });
+  assert.equal(sends.length, 2);
 });
 
 const prefix = 'feishu:cli_personal|';

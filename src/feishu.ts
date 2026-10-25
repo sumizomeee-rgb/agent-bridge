@@ -1,5 +1,5 @@
 import { feishuPresentationCards, type BridgePresentation } from './presentation.js';
-import { type BridgeLifecycleEvent } from './lifecycle.js';
+import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, writeFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -515,8 +515,14 @@ export class FeishuTransport {
       this.processingReactions.delete(id);
     })));
   }
-  async onBridgeLifecycle(_event: BridgeLifecycleEvent): Promise<void> {
-    // Routine readiness stays in the lifecycle journal; it is not a chat notification.
+  async onBridgeLifecycle(event: BridgeLifecycleEvent): Promise<void> {
+    if (event.phase !== 'ready' || !event.recipient) return;
+    if (!this.config.allowedUserIds.includes(event.recipient.userId)) return;
+    const prefix = this.config.scopePrefix!;
+    if (!event.recipient.channelId.startsWith(prefix)) throw new Error('启动通知不属于当前机器人。');
+    const view: BridgePresentation = { title: event.reason === 'restart' ? BRIDGE_LIFECYCLE_COPY.restart : BRIDGE_LIFECYCLE_COPY.ready,
+      tone: 'success', purpose: 'lifecycle', blocks: [{ kind: 'text', text: BRIDGE_LIFECYCLE_COPY.continuation }] };
+    await this.sendText(event.recipient.channelId.slice(prefix.length), '', { presentation: view });
   }
   isIdle(): boolean { return this.sends.size === 0 && this.receipts.size === 0; }
   setPresence(): void {} setWorkCounts(): void {} async syncSlashCommands(): Promise<void> {} async setTaskCount(): Promise<void> {}
