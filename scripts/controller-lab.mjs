@@ -4,10 +4,12 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { verifyParity } from './controller-lab/parity.mjs';
 
 const { values } = parseArgs({ options: {
   live: { type: 'boolean', default: false }, config: { type: 'string' },
   agent: { type: 'string', default: 'codex' }, 'runtime-root': { type: 'string' },
+  'source-root': { type: 'string' },
 } });
 const root = resolve(values['runtime-root'] ?? join(dirname(fileURLToPath(import.meta.url)), '..'));
 if (!['codex', 'claude', 'both'].includes(values.agent)) throw new Error('--agent must be codex, claude or both');
@@ -21,17 +23,20 @@ const evidence = { version: 1, startedAt: new Date().toISOString(), mode: values
 for (const file of ['controller/native.js', 'controller/runtime.js', 'manager.js', 'store.js', 'agents/process.js']) {
   evidence.runtimeHashes[file] = createHash('sha256').update(readFileSync(join(root, 'dist/src', file))).digest('hex');
 }
-for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/faults.mjs']) {
+for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/faults.mjs', 'controller-lab/parity.mjs']) {
   evidence.harnessHashes[file] = createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), file))).digest('hex');
 }
 const save = () => writeFileSync(join(runDir, 'report.json'), JSON.stringify(evidence, null, 2));
 save(); console.log(JSON.stringify({ runDir, mode: evidence.mode }));
 try {
+  const parity = await verifyParity({ root, sourceRoot: resolve(values['source-root'] ?? root), runDir, includeTests: !values.live });
+  evidence.parity = parity.evidence; save();
+  try {
   if (!values.live) {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
     const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain'];
     const output = [];
-    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', join(dirname(fileURLToPath(import.meta.url)), 'controller-lab/faults.test.mjs'), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
+    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...['faults', 'parity'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', bytes => output.push(bytes)); child.stderr.on('data', bytes => output.push(bytes));
     const code = await new Promise((accept, reject) => { child.on('error', reject); child.on('close', accept); });
@@ -45,6 +50,7 @@ try {
       await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save });
     }
   }
+  } finally { parity.assertUnchanged(); evidence.parity.unchangedAtEnd = true; }
   evidence.status = evidence.cases.length > 0 && evidence.cases.every(item => item.status === 'passed') ? 'passed' : 'failed';
 } catch (error) {
   // Do not print config, native prompts, auth environment or raw subprocess output.
