@@ -1054,11 +1054,11 @@ export class SessionManager {
     const known = this.store.turnResult(route.id);
     const uncertain = this.running.get(route.userId)?.publicationUncertain || isObject(error) && error.deliveryUncertain === true;
     return this.store.feedback.record({ ...this.feedbackScope(target, route), sourceId: route.id, code,
-      stage: error instanceof MetadataProbeError ? 'preparation' : error instanceof DeliveryPreparationError ? 'reply-preparation' : uncertain ? 'delivery' : 'execution',
+      stage: error instanceof MetadataProbeError || code === 'controllerPreparationFailed' ? 'preparation' : error instanceof DeliveryPreparationError ? 'reply-preparation' : uncertain ? 'delivery' : 'execution',
       reason: errorEvidence(error, [this.config.token, this.config.appSecret ?? '']), resultKnown: known !== null,
       processStopped: error instanceof MetadataProbeError ? error.processStopped : isObject(error) && error.processStillRunning === true ? false : null,
       deliveryState: uncertain ? 'uncertain' : this.store.getMessage(route.id)?.replyState === 'delivered' ? 'confirmed'
-        : error instanceof MetadataProbeError || error instanceof DeliveryPreparationError ? 'not-attempted' : 'unknown', ...details }, notifyUser);
+        : error instanceof MetadataProbeError || error instanceof DeliveryPreparationError || code === 'controllerPreparationFailed' ? 'not-attempted' : 'unknown', ...details }, notifyUser);
   }
   private sendFeedbackNotice(item: BridgeFeedback, deliver?: () => Promise<void>): Promise<boolean> {
     const existing = this.feedbackSends.get(item.id); if (existing) return existing.promise;
@@ -1198,6 +1198,24 @@ export class SessionManager {
       let privateReplyDelivered = false;
       let privateFinalStarted = false;
       const privateControllerInput = this.config.controllerMode === true && !groupContext;
+      let noticeTail = Promise.resolve();
+      const statusNotice = (code: BridgeNoticeCode) => {
+        noticeTail = noticeTail.then(async () => {
+          if (!current() || privateFinalStarted) return;
+          const noticeController = new AbortController();
+          const signal = AbortSignal.any([controller.signal, noticeController.signal]);
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              this.sendBridgeNotice(item.channelId, code, undefined, `controller-status:${item.id}:${code}`, signal),
+              new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => {
+                noticeController.abort(); reject(new Error('辅助状态通知等待超时。'));
+              }, 5000); }),
+            ]);
+          } finally { clearTimeout(timeout); noticeController.abort(); }
+        }).catch(() => undefined); // An auxiliary status send cannot fail or replay the controller.
+      };
+      const waitingTimer = privateControllerInput ? setTimeout(() => statusNotice('controllerWaiting'), 30000) : undefined;
       try {
         if (privateControllerInput) this.store.startPrivateBatch(item.id);
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
@@ -1212,6 +1230,11 @@ export class SessionManager {
         const feedback = this.feedbackInput(target, item, current);
         const result = await this.adapters[target.agent].run({
           bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
+          ...(privateControllerInput ? { controllerRecovery: true, onControllerState: (state: import('./controller-lifecycle.js').ControllerTurnState) => {
+            this.store.controllerLifecycle.record(item.id, conversationId, state);
+            if (state.phase === 'retrying') statusNotice('controllerRecovering');
+            if (state.phase === 'reply-recovery') statusNotice('controllerReplyRecovering');
+          } } : {}),
           ...(context ? { taskContextPath: context.contextPath } : {}),
           ...(chatScene != null ? { chatScene } : {}),
           ...(groupContext && this.options.onSceneCheck ? { onSceneCheck: async (input: Parameters<NonNullable<AgentTurn['onSceneCheck']>>[0]) => {
@@ -1259,7 +1282,9 @@ export class SessionManager {
             if (privateControllerInput && finish && targetId && targetId !== 'private')
               throw new DeliveryPreparationError('尚未发送：最终回复必须发回原私聊；请省略 targetId 或使用 private，其他区域补充发送用 finish:false。');
             const coverage = [...turn.messageIds];
-            if (privateControllerInput && finish) privateFinalStarted = true;
+            if (privateControllerInput && finish) {
+              privateFinalStarted = true; clearTimeout(waitingTimer); await noticeTail;
+            }
             if (finish) this.store.setReplyState(coverage, 'pending');
             await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
             if (!finish && current()) supplementaryPublished = true;
@@ -1319,6 +1344,7 @@ export class SessionManager {
       } catch (error) {
         turn.executing = false;
         await turn.supplements;
+        clearTimeout(waitingTimer); await noticeTail;
         const retained = completedResultFromError(error);
         if (retained) this.store.saveTurnResult(item.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
@@ -1334,17 +1360,23 @@ export class SessionManager {
           this.store.setReplyState(unanswered, 'failed');
           const handled = groupContext && this.options.onGroupTurnError
             ? await this.options.onGroupTurnError(groupContext).catch(() => true) : false;
+          const lifecycle = privateControllerInput ? this.store.controllerLifecycle.latest(item.id) : null;
           const noticeCode: BridgeNoticeCode = retained ? 'processExitUnconfirmed'
             : error instanceof MetadataProbeError ? 'controllerPreparationFailed'
             : isObject(error) && error.processStillRunning === true ? 'controllerStopUnconfirmed'
             : error instanceof Error && 'finalReplyMissing' in error ? 'controllerReplyMissing'
-            : this.store.turnResult(item.id) || error instanceof Error && 'publicationFailed' in error ? 'controllerReplyFailed' : 'controllerFailed';
+            : this.store.turnResult(item.id) || error instanceof Error && 'publicationFailed' in error ? 'controllerReplyFailed'
+            : isObject(error) && error.deliveryUncertain === true ? 'controllerDeliveryUncertain'
+            : lifecycle?.submission === 'not-submitted' ? 'controllerPreparationFailed'
+            : lifecycle?.submission === 'unknown' ? 'controllerSubmissionUnknown'
+            : lifecycle?.submission === 'accepted' ? 'controllerExecutionInterrupted' : 'controllerFailed';
           if (target.controllerMode) {
             const feedback = this.failureFeedback(target, item, noticeCode, error, {}, !handled);
             if (!handled) await this.sendFeedbackNotice(feedback);
           } else if (!handled) await this.sendBridgeNotice(item.channelId, noticeCode, undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
         }
       } finally {
+        clearTimeout(waitingTimer); await noticeTail;
         turn.executing = false;
         await turn.supplements;
         if (!this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) {

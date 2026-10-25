@@ -130,6 +130,10 @@ export interface AgentTurn {
   dispatchId?: string;
   /** Reattach to a previously dispatched remote job; never submit a fresh task. */
   recovering?: boolean;
+  /** Bounded recovery only for ordinary private owner inputs; never replay unknown execution. */
+  controllerRecovery?: boolean;
+  /** Durable lifecycle evidence; called before the corresponding transport operation. */
+  onControllerState?: (state: import('./controller-lifecycle.js').ControllerTurnState) => void;
   /** app-server 确认活动 turn 后通知桥尝试补充。 */
   onReady?: () => void;
   /** Bridge child accepts supplements through its current native transport. */

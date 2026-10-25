@@ -6,6 +6,7 @@ import type { AgentName, AgentResult, BridgeMessage, Conversation } from './type
 import { validMessageId } from './routing.js';
 import { parseCommand } from './commands.js';
 import { ControllerFeedbackJournal } from './controller-feedback.js';
+import { ControllerLifecycleJournal } from './controller-lifecycle.js';
 
 export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
 export interface InboxItem extends BridgeMessage {
@@ -59,6 +60,7 @@ export class SessionStore {
   readonly path: string;
   private readonly db: DatabaseSync;
   readonly feedback: ControllerFeedbackJournal;
+  readonly controllerLifecycle: ControllerLifecycleJournal;
 
   constructor(dataDir: string, private readonly binding?: ControllerBinding) {
     mkdirSync(dataDir, { recursive: true });
@@ -143,6 +145,7 @@ export class SessionStore {
     if (!publicColumns.has('text')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN text TEXT');
     if (!publicColumns.has('error')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN error TEXT');
     this.feedback = new ControllerFeedbackJournal(this.db);
+    this.controllerLifecycle = new ControllerLifecycleJournal(this.db);
   }
 
   hasMessage(id: string): boolean {

@@ -12,6 +12,7 @@ import { MetadataProbeError } from '../agents/metadata.js';
 import { readCodexModelInfo } from '../agents/codex-models.js';
 import { DeliveryPreparationError, executionErrorEvidence } from '../delivery-errors.js';
 import { FEEDBACK_RULE } from '../controller-feedback.js';
+import type { ControllerSubmission, ControllerTurnState } from '../controller-lifecycle.js';
 import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, processStopFailure, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
 
@@ -147,6 +148,8 @@ interface ActiveTurn {
   sceneReassessmentStarted?: boolean;
   privateFinalCallId?: string;
   completingNativeTurn?: boolean;
+  replyRecovery?: boolean;
+  submissionAcknowledged?: boolean;
   retiredNativeTurnIds: Set<string>;
   seenClaudeTools: Set<string>;
   inFlightTools: Map<string, { name: string; signature: string; promise: Promise<unknown> }>;
@@ -162,6 +165,7 @@ interface ControllerSession {
   closed: boolean;
   stopPromise?: Promise<void>;
   stopFailed?: boolean;
+  transportFailure?: Error;
   model?: string;
   effort?: string | null;
   effortConfiguration?: EffortConfiguration | null;
@@ -175,6 +179,7 @@ interface ControllerProcessProof {
 }
 export class NativeControllerAdapter implements AgentAdapter {
   private readonly sessions = new Map<string, ControllerSession>();
+  private readonly metadataConnections = new WeakMap<MetadataProbeError, ControllerSession>();
   private readonly closingSessions = new Map<string, ControllerSession>();
   private readonly transportProofs = new WeakMap<RpcTransport, ControllerProcessProof>();
   private readonly confirmedStopped = new Map<string, { nonce?: string }>();
@@ -185,9 +190,9 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (this.closed) throw new Error('主控适配器已关闭。');
     const session = conversation && this.sessions.get(conversation.id);
     // 同一配置的已初始化主控提供目录，不再为每条消息额外启动 CLI。
-    if (session?.rpc && !session.closed && !session.stopFailed && session.metadataSource === this.metadataSource(cwd)) {
+    if (session?.rpc && !session.closed && !session.stopFailed && !session.transportFailure && session.metadataSource === this.metadataSource(cwd)) {
       try { return await readCodexModelInfo(session.rpc, cwd); }
-      catch (error) { throw new MetadataProbeError(error, false); }
+      catch (error) { const failure = new MetadataProbeError(error, false); this.metadataConnections.set(failure, session); throw failure; }
     }
     if (!this.options.metadataAdapter?.getModelInfo) throw new Error('主控没有配置模型目录查询适配器。');
     for (let attempt = 0; ; attempt++) {
@@ -304,7 +309,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     const transport = this.createTransport(args, turn.conversation.cwd, { ...this.env, CODEX_HOME: home });
     const session: ControllerSession = { transport, rpc: new JsonRpcClient(transport), nativeId: turn.conversation.nativeId, signature, active: null, server: null, removeListeners: [], closed: false };
     this.sessions.set(turn.conversation.id, session);
-    session.removeListeners.push(transport.onFailure(error => session.active?.completed.reject(error)), transport.onMessage(message => this.onCodexMessage(session, message)));
+    session.removeListeners.push(transport.onFailure(error => { session.transportFailure = error; session.active?.completed.reject(error); }), transport.onMessage(message => this.onCodexMessage(session, message)));
     try {
       await session.rpc!.request('initialize', { clientInfo: { name: 'discord_bridge_controller', version: '1' }, capabilities: { experimentalApi: true } }, 15000);
       session.rpc!.notify('initialized');
@@ -347,7 +352,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     if ((typeof params.turnId === 'string' && active.retiredNativeTurnIds.has(params.turnId))
       || (isObject(params.turn) && typeof params.turn.id === 'string' && active.retiredNativeTurnIds.has(params.turn.id))) return;
     if (typeof params.turnId === 'string' && active.nativeTurnId && params.turnId !== active.nativeTurnId) return;
-    if (message.method === 'turn/started' && isObject(params.turn) && typeof params.turn.id === 'string') { if (!active.nativeTurnId || active.nativeTurnId === params.turn.id) active.nativeTurnId = params.turn.id; }
+    if (message.method === 'turn/started' && isObject(params.turn) && typeof params.turn.id === 'string') { if (!active.nativeTurnId || active.nativeTurnId === params.turn.id) { active.nativeTurnId = params.turn.id; this.acknowledgeSubmission(active); } }
     else if (message.method === 'model/rerouted' && typeof params.toModel === 'string') { session.model = params.toModel; active.effortCapability = effortCapabilityForModel(active.effortCapability, params.toModel); active.reportEffort({ capability: active.effortCapability }); active.turn.onModel?.(params.toModel); }
     else if (message.method === 'error' && params.willRetry === false) active.completed.reject(new NativeTurnFailure(`主控请求失败：${safeError(isObject(params.error) ? params.error.message : '', 'Agent 错误')}`));
     else if (message.method === 'turn/completed' && isObject(params.turn)) {
@@ -431,6 +436,12 @@ export class NativeControllerAdapter implements AgentAdapter {
   }
   private async invokeOnce(active: ActiveTurn, name: string, args: JsonObject, callId: string): Promise<unknown> {
     if (active.turn.preparing) throw new Error('目标会话准备轮次禁止工具、副作用和公开回复。');
+    if (active.replyRecovery) {
+      const finalReply = (name === 'bridge_send_user' || name === 'bridge_send_message') && args.finish !== false
+        && (args.targetId == null || args.targetId === 'private');
+      if (!finalReply && name !== 'bridge_read_feedback' && name !== 'bridge_list_workers')
+        throw new Error('本次补救只允许核对已有结果并补发原私聊最终回复；禁止重派任务或产生其他副作用。');
+    }
     if (name === 'bridge_claim_work' || name === 'bridge_finish_work') return { performed: false, legacyTool: true, message: 'Work ownership and completion are recorded automatically. Use bridge_start_worker, bridge_continue_worker, bridge_schedule_worker or bridge_list_workers directly; no separate claim/finish step is needed.' };
     if (!controllerTools.some(tool => tool.name === name)) throw new Error('主控不能调用未登记的工具。');
     assertBotCommunicationAllowed(this.options.internalBotCommunicationEnabled, name, args);
@@ -439,7 +450,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (privateFinal && args.targetId != null && args.targetId !== 'private') return { performed: false, privateResponseRequired: true,
       message: 'This private owner input still needs its private FINAL. Send authorized group content with bridge_send_message finish=false, then send the final response to targetId=private (or omit targetId in bridge_send_user). Nothing was sent and this rejection did not consume reassessment.' };
     if (privateFinal && !active.privateFinalCallId) active.privateFinalCallId = callId;
-    const scenePause = active.turn.onSceneCheck || active.turn.onPrivateInputCheck || active.sceneRefreshPending ? await this.checkScene(active, name, args, callId) : undefined;
+    const scenePause = !active.replyRecovery && (active.turn.onSceneCheck || active.turn.onPrivateInputCheck || active.sceneRefreshPending) ? await this.checkScene(active, name, args, callId) : undefined;
     if (scenePause) return scenePause;
     if (active.sealed) this.rejectSealed(active);
     if (++active.toolCalls > (this.options.maxToolCalls ?? 12)) { active.completed.reject(new Error('主控本轮协调调用过多，已停止继续派发。')); throw new Error('主控协调调用上限'); }
@@ -633,9 +644,38 @@ export class NativeControllerAdapter implements AgentAdapter {
           message: { role: 'user', content: [{ type: 'text', text: evidence }] } });
         return;
       }
+      if (active.turn.controllerRecovery && !active.turn.groupContext && !active.turn.event
+        && active.publicCalls === 0 && !active.silent && !active.sealed && !active.replyRecovery) {
+        // The previous native decision completed. Only a missing, never-sent final may be repaired.
+        active.replyRecovery = true;
+        active.privateFinalCallId = undefined;
+        active.toolCalls = 0;
+        active.pendingClaudeTools = [];
+        if (active.nativeTurnId) active.retiredNativeTurnIds.add(active.nativeTurnId);
+        active.nativeTurnId = null;
+        active.completingNativeTurn = false;
+        const reason = active.publicationPreparationError ? 'final delivery rejected before any send' : 'native decision completed without a private final reply';
+        active.publicationPreparationError = undefined;
+        active.turn.onControllerState?.({ attempt: 1, phase: 'reply-recovery', submission: 'accepted' });
+        if (active.turn.signal.aborted) throw abortError();
+        const evidence = '[Bridge reply recovery; program evidence, not a new user request] ' + JSON.stringify({
+          reason, previousDecisionCompleted: true, finalReplySent: false,
+          rule: 'This is the only recovery decision. Earlier successful actions and workers remain valid. Do not repeat, continue, cancel or dispatch work. Read existing worker/feedback receipts if needed and send one honest final reply to the original private chat using bridge_send_user or bridge_send_message targetId=private. If the task is incomplete, explain its actual status. Never claim completion without evidence. Other actions are blocked.'
+        });
+        if (session.rpc) {
+          const started = await session.rpc.request('turn/start', { threadId: session.nativeId, environments: [], input: [],
+            toolOutput: { name: 'bridge_reply_recovery', namespace: null, output: evidence },
+            ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) }, 20000);
+          if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('回复补救没有返回轮次标识。');
+          if (active.nativeTurnId && active.nativeTurnId !== started.turn.id) throw new Error('回复补救轮次确认不一致。');
+          active.nativeTurnId = started.turn.id;
+        } else session.transport.write({ type: 'user', session_id: session.nativeId ?? '', parent_tool_use_id: null,
+          message: { role: 'user', content: [{ type: 'text', text: evidence }] } });
+        return;
+      }
       if (active.publicationPreparationError && !active.silent) throw active.publicationPreparationError;
       const privateFinalRequired = !!active.turn.onPrivateInputCheck && !active.turn.groupContext && !active.turn.event;
-      if (!active.turn.event && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired)) throw new Error('主控没有通过公开通道回复，本轮未标记为成功。');
+      if (!active.turn.event && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired)) throw Object.assign(new Error('主控没有通过公开通道回复，本轮未标记为成功。'), { finalReplyMissing: true });
       if (!session.nativeId) throw new Error('主控没有返回会话标识。');
       active.completed.resolve({ nativeId: session.nativeId, text: '', controlledOutput: true });
     };
@@ -737,6 +777,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     server.on('clientError', (error, socket) => { diagnostic({ event: 'client-error', errorType: error.name, code: (error as NodeJS.ErrnoException).code ?? null }); socket.destroy(); });
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('无法启动主控 MCP。');
+    try {
     let settingsEnv: JsonObject = {}, modelSettings: JsonObject = {}, sourceSettings: JsonObject = {};
     const settingsPath = this.sourceFiles()[0]!;
     if (existsSync(settingsPath)) { const settings: unknown = JSON.parse(readFileSync(settingsPath, 'utf8').replace(/^\uFEFF/, '')); if (isObject(settings)) { sourceSettings = settings; if (isObject(settings.env)) settingsEnv = settings.env; modelSettings = claudeModelSettings(settings); } }
@@ -747,8 +788,13 @@ export class NativeControllerAdapter implements AgentAdapter {
     session = { transport, rpc: null, nativeId: turn.conversation.nativeId, signature, active: null, server, removeListeners: [], closed: false,
       effortConfiguration: configuration ?? (typeof sourceSettings.effortLevel === 'string' ? { value: sourceSettings.effortLevel, source: 'user-settings', applied: false, reason: '当前适配器未将此设置传入主控 CLI' } : null) };
     this.sessions.set(turn.conversation.id, session);
-    session.removeListeners.push(transport.onFailure(error => session.active?.completed.reject(error)), transport.onMessage(message => this.onClaudeMessage(session, message)));
+    session.removeListeners.push(transport.onFailure(error => { session.transportFailure = error; session.active?.completed.reject(error); }), transport.onMessage(message => this.onClaudeMessage(session, message)));
     return session;
+    } catch (error) {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      throw error;
+    }
   }
   private onClaudeMessage(session: ControllerSession, message: JsonObject): void {
     const active = session.active;
@@ -770,13 +816,21 @@ export class NativeControllerAdapter implements AgentAdapter {
     } else if (message.type === 'stream_event' && isObject(message.event) && message.event.type === 'content_block_start' && isObject(message.event.content_block)) {
       this.recordClaudeTool(active, message.event.content_block);
     } else if (message.type === 'assistant' && !message.parent_tool_use_id && isObject(message.message)) {
+      this.acknowledgeSubmission(active);
       if (typeof message.message.model === 'string') { session.model = message.message.model; active.effortCapability = effortCapabilityForModel(active.effortCapability, message.message.model); active.reportEffort({ capability: active.effortCapability }); active.turn.onModel?.(message.message.model); }
       if (Array.isArray(message.message.content)) for (const item of message.message.content) if (isObject(item)) this.recordClaudeTool(active, item);
     } else if (message.type === 'result') {
+      this.acknowledgeSubmission(active);
       if (message.is_error === true || message.subtype !== 'success') active.completed.reject(new NativeTurnFailure(`Claude 主控失败：${safeError(message.result, String(message.subtype))}`));
       else if (!session.nativeId) active.completed.reject(new Error('Claude 主控没有返回会话标识。'));
       else this.finish(session, active);
     }
+  }
+  private acknowledgeSubmission(active: ActiveTurn): void {
+    if (active.submissionAcknowledged) return;
+    active.submissionAcknowledged = true;
+    try { active.turn.onControllerState?.({ attempt: 1, phase: 'accepted', submission: 'accepted' }); }
+    catch (error) { active.completed.reject(error); }
   }
   private recordClaudeTool(active: ActiveTurn, item: JsonObject): void {
     if (item.type !== 'tool_use' || typeof item.id !== 'string' || typeof item.name !== 'string') return;
@@ -846,6 +900,50 @@ export class NativeControllerAdapter implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('主控适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
+    // A parallel call is a caller error, not permission to retire another active decision.
+    if (this.sessions.get(turn.conversation.id)?.active) throw new Error('主控消息必须按顺序执行。');
+    const recover = turn.controllerRecovery === true && !turn.event && !turn.groupContext && !turn.preparing;
+    const originalSignature = this.signature(turn);
+    let nativeId = turn.conversation.nativeId;
+    for (let attempt = 1; ; attempt++) {
+      let submission: ControllerSubmission = 'not-submitted';
+      const state = (phase: ControllerTurnState['phase'], value = submission, error?: unknown) => {
+        submission = value; turn.onControllerState?.({ attempt, phase, submission, ...(error === undefined ? {} : { diagnostic: executionErrorEvidence(error) }) });
+      };
+      state('preparing');
+      try {
+        const result = await this.runAttempt({ ...turn, conversation: { ...turn.conversation, nativeId },
+          onNativeId: id => { nativeId = id; turn.onNativeId?.(id); },
+          onControllerState: update => state(update.phase, update.submission),
+        }, value => state(value === 'unknown' ? 'submitting' : 'accepted', value));
+        state('completed', 'accepted');
+        return result;
+      } catch (error) {
+        const session = this.sessions.get(turn.conversation.id) ?? this.closingSessions.get(turn.conversation.id);
+        const unsafeProbe = error instanceof MetadataProbeError && !error.processStopped
+          && (!session || this.metadataConnections.get(error) !== session);
+        // A failed independent probe is not permission to retire the healthy controller or overlap that probe.
+        // Only pre-submission recovery may retire a session here. Submitted failures are already handled by runAttempt.
+        if (recover && submission === 'not-submitted' && session && !session.active && !unsafeProbe) {
+          try { await this.stopSession(turn.conversation.id, session); }
+          catch (cleanup) { const failure = processStopFailure(cleanup); failure.cause = error; state('failed', submission, failure); throw failure; }
+        }
+        const stopping = this.closingSessions.has(turn.conversation.id);
+        if (recover && attempt === 1 && submission === 'not-submitted' && !unsafeProbe && !stopping
+          && !this.closed && !turn.signal.aborted && this.signature(turn) === originalSignature) {
+          state('retrying', submission, error);
+          continue;
+        }
+        state('failed', submission, error);
+        throw error;
+      }
+    }
+  }
+  private async runAttempt(turn: AgentTurn, submitted: (state: ControllerSubmission) => void): Promise<AgentResult> {
+    if (this.closed) throw new Error('主控适配器已关闭。');
+    if (turn.signal.aborted) throw abortError();
+    const idle = this.sessions.get(turn.conversation.id);
+    if (idle?.transportFailure) await this.stopSession(turn.conversation.id, idle);
     turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
     const key = turn.conversation.id, signature = this.signature(turn);
@@ -882,10 +980,12 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (!turn.event) input.push({ type: 'text', text: clock, text_elements: [] });
         const params: JsonObject = { threadId: session.nativeId, environments: [], input: turn.event ? [] : input, ...(effort ? { effort } : {}) };
         if (turn.event) params.toolOutput = { name: turn.event.toolName ?? (turn.event.kind === 'wake' ? 'bridge_schedule_controller' : 'bridge_worker_result'), namespace: null, output: `${clock}\n\n${turn.event.text}` };
+        submitted('unknown'); // Persist before I/O: a lost acknowledgement must never cause a replay.
         const started = await session.rpc.request('turn/start', params, 20000);
         if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 主控没有返回轮次标识。');
         if (active.nativeTurnId && active.nativeTurnId !== started.turn.id) throw new Error('Codex 主控轮次确认不一致。');
         active.nativeTurnId = started.turn.id;
+        if (!active.submissionAcknowledged) { active.submissionAcknowledged = true; submitted('accepted'); }
         if (effort) {
           try {
             const configured = await session.rpc.request('thread/read', { includeTurns: false, threadId: session.nativeId }, 15000);
@@ -900,24 +1000,27 @@ export class NativeControllerAdapter implements AgentAdapter {
         const manifest = imageManifest(turn);
         if (!turn.event && manifest) content.push({ type: 'text', text: manifest });
         content.push({ type: 'text', text: this.runtimeContext(turn, session) });
+        submitted('unknown'); // A successful pipe write alone is not model acceptance.
         session.transport.write({ type: 'user', session_id: session.nativeId ?? '', parent_tool_use_id: null, message: { role: 'user', content } });
       }
       return await active.completed.promise;
     } catch (error) {
-      try { await this.stopSession(key, session); }
-      catch (cleanup) {
-        const failure = processStopFailure(cleanup); failure.cause = error;
-        Object.assign(failure, { cleanupError: executionErrorEvidence(cleanup) }); throw failure;
-      }
-      if (error instanceof TurnSealedError || error instanceof NativeTurnFailure && active.sealed && active.publicationPromise && !active.sceneRefreshPending) {
+      let cleanupFailure: unknown;
+      try { await this.stopSession(key, session); } catch (cleanup) { cleanupFailure = cleanup; }
+      if (error instanceof TurnSealedError || active.sealed && active.publicationPromise && !active.sceneRefreshPending) {
         // Retire the failed CLI, then preserve only a positively acknowledged final reply.
         // Pending delivery must really succeed before this user turn can complete.
         await active.publicationPromise;
         if (turn.signal.aborted) throw abortError();
         if ((active.publicCalls > 0 || error instanceof TurnSealedError && active.silent) && session.nativeId) return {
           nativeId: session.nativeId, text: '', controlledOutput: true,
-          ...(error instanceof NativeTurnFailure ? { postDeliveryError: executionErrorEvidence(error) } : {}),
+          ...(!(error instanceof TurnSealedError) || cleanupFailure ? { postDeliveryError: executionErrorEvidence(error) } : {}),
+          ...(cleanupFailure ? { processStopped: false, cleanupError: executionErrorEvidence(cleanupFailure) } : {}),
         };
+      }
+      if (cleanupFailure) {
+        const failure = processStopFailure(cleanupFailure); failure.cause = error;
+        Object.assign(failure, { cleanupError: executionErrorEvidence(cleanupFailure) }); throw failure;
       }
       throw error;
     }
