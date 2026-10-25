@@ -21,7 +21,7 @@ const evidence = { version: 1, startedAt: new Date().toISOString(), mode: values
 for (const file of ['controller/native.js', 'controller/runtime.js', 'manager.js', 'store.js', 'agents/process.js']) {
   evidence.runtimeHashes[file] = createHash('sha256').update(readFileSync(join(root, 'dist/src', file))).digest('hex');
 }
-for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs']) {
+for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/faults.mjs']) {
   evidence.harnessHashes[file] = createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), file))).digest('hex');
 }
 const save = () => writeFileSync(join(runDir, 'report.json'), JSON.stringify(evidence, null, 2));
@@ -31,7 +31,7 @@ try {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
     const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain'];
     const output = [];
-    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
+    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', join(dirname(fileURLToPath(import.meta.url)), 'controller-lab/faults.test.mjs'), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', bytes => output.push(bytes)); child.stderr.on('data', bytes => output.push(bytes));
     const code = await new Promise((accept, reject) => { child.on('error', reject); child.on('close', accept); });
