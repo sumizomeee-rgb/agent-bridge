@@ -29,7 +29,7 @@ save(); console.log(JSON.stringify({ runDir, mode: evidence.mode }));
 try {
   if (!values.live) {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
-    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle'];
+    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain'];
     const output = [];
     const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });

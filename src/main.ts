@@ -6,6 +6,7 @@ import { acquireInstanceLock } from './instance-lock.js';
 import { BotRuntime } from './bot-runtime.js';
 import { HostRuntime } from './host-runtime.js';
 import { RestartService } from './restart.js';
+import { DrainStop } from './shutdown.js';
 
 if (process.argv.includes('--help')) {
   console.log('启动宿主：start.ps1；配置检查：start.ps1 -Check；首次升级：host-migration-cli --config 配置路径（默认dry-run）。启动集合在version:3 startupProfiles配置，私聊/help，群/group start。');
@@ -28,6 +29,7 @@ let host: HostRuntime;
 let closing: Promise<void> | undefined;
 let poll: ReturnType<typeof setInterval> | undefined;
 const pidFile = join(config.rootDataDir, 'bridge.pid.json'), stopFile = join(config.rootDataDir, 'stop.request');
+const drainStopFile = join(config.rootDataDir, 'drain-stop.request');
 async function shutdown(planned = false): Promise<void> {
   if (closing) return closing;
   closing = (async () => {
@@ -38,6 +40,7 @@ async function shutdown(planned = false): Promise<void> {
     finally {
       guard.close(); if (existsSync(pidFile)) unlinkSync(pidFile);
       if (existsSync(stopFile)) unlinkSync(stopFile);
+      if (existsSync(drainStopFile)) unlinkSync(drainStopFile);
       if (!planned) restart?.close();
     }
   })();
@@ -53,9 +56,10 @@ try {
     onError: error => log('RESTART ' + safeError(error, secrets)),
   });
   restart.beginRecovery(); host.beginRecovery();
-  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), main: process.argv[1],
+  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), drainStopVersion: 1, main: process.argv[1],
     platform: config.configs[0]!.platform, profiles: config.configs.map(c => c.profile), bots: config.configs.map(c => c.botId) }));
   if (existsSync(stopFile)) unlinkSync(stopFile);
+  if (existsSync(drainStopFile)) unlinkSync(drainStopFile);
   // Verify each actual app and reserve its own identity, while keeping a failed Bot isolated.
   for (const selected of config.configs) {
     try {
@@ -73,7 +77,12 @@ try {
   await host.recover(); restart.ready();
   await Promise.all([...host.bots].filter(([id]) => !host.failures.has(id)).map(([, bot]) => bot.publishReadyLifecycle()));
   log(`HOST_READY bots=${config.configs.length - host.failures.size}/${config.configs.length}`);
-  poll = setInterval(() => { if (existsSync(stopFile)) void shutdown().catch(error => { log('STOP_FAILED ' + safeError(error, secrets)); process.exitCode = 76; }); }, 1000);
+  const drainStop = new DrainStop({ beginDrain: () => { host.beginDrain(); log('MAINTENANCE_DRAINING'); },
+    isIdle: () => host.isIdle(), shutdown: () => shutdown() });
+  poll = setInterval(() => {
+    const stopping = existsSync(stopFile) ? shutdown() : drainStop.check(existsSync(drainStopFile));
+    void stopping.catch(error => { log('STOP_FAILED ' + safeError(error, secrets)); process.exitCode = 76; });
+  }, 1000);
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) process.on(signal, () => void shutdown().catch(error => { log('STOP_FAILED ' + safeError(error, secrets)); process.exitCode = 76; }));
   process.on('uncaughtException', error => { log('FATAL ' + safeError(error, secrets)); restart.failed(safeError(error, secrets)); void shutdown().finally(() => { process.exitCode = 76; }); });
   process.on('unhandledRejection', error => log('ERROR ' + safeError(error, secrets)));

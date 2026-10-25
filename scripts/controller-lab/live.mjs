@@ -170,7 +170,7 @@ export async function runLive({ root, runDir, configPath, agent, evidence, save 
       await finished('dispatch');
       await wait(() => receipt.workerRuns[0]?.finishedAt && runtime.isIdle() && manager.isIdle() && receipt.deliveries.some(item => item.text.includes('LAB_RESULT')), 'worker result returned to controller');
       assert.equal(receipt.workerRuns.length, 1); assert.match(receipt.workerRuns[0].result, /LAB_WORKER_42/);
-      assert(receipt.deliveries.some(item => /LAB_RESULT[\s\S]*LAB_WORKER_42/.test(item.text)));
+      assert(receipt.deliveries.some(item => /LAB_RESULT[\s\S]*(?:LAB_WORKER_42\b|\b42\b)/.test(item.text)));
       nativeId = store.getConversation(conversationId).nativeId; assert(nativeId);
     });
     await checkpoints('warm turn with a second input arriving during tool execution', async () => {

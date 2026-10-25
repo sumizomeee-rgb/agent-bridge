@@ -4,6 +4,7 @@ import { join, dirname, resolve, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setImmediate as nextImmediate } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
+import { DeliveryPreparationError } from '../src/delivery-errors.js';
 import { HostRuntime } from '../src/host-runtime.js';
 import { HostStore } from '../src/host-store.js';
 import { ControllerStore } from '../src/controller/store.js';
@@ -38,7 +39,7 @@ test('current group envelope reports real broadcast recipients, internal speaker
     if (turn.event && turn.text === 'internal exact speaker') {
       const targets: any = await f.host.invoke(botId, turn, 'bridge_delivery_targets', {});
       assert.equal(targets.defaultTargetId, null);
-      await assert.rejects(turn.onPublicMessage!('not an implicit public reply'), /内部消息/);
+      await assert.rejects(turn.onPublicMessage!('not an implicit public reply'), error => error instanceof DeliveryPreparationError && /内部消息/.test(error.message));
     }
     await turn.onSilent?.();
   });
@@ -1708,7 +1709,7 @@ test('private internal collaboration wakes the current target and returns intern
     } else if (id === B) {
       const scene = JSON.parse(turn.groupContext!.scene); assert.equal(scene.collaboration.mode, 'internal');
       assert.equal(turn.source?.original?.authorType, 'system');
-      await assert.rejects(turn.onPublicMessage!('不得泄漏到群的内容'), /静默协作/);
+      await assert.rejects(turn.onPublicMessage!('不得泄漏到群的内容'), error => error instanceof DeliveryPreparationError && /静默协作/.test(error.message));
       const regions = await f.host.invoke(B, turn, 'bridge_delivery_targets', {}) as any;
       await assert.rejects(turn.onPublicMessage!('不得通过显式群目标泄漏', [], 'leak', `group:${G1}:${f.host.store.getGroup(G1)!.epoch}:${f.host.store.getGroup(G1)!.revision}`), /静默协作/);
       await assert.rejects(f.host.invoke(B, turn, 'bridge_start_collaboration', { targetBotId: A, mode: 'public', text: '不能伪造新授权' }), /真实负责人/);

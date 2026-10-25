@@ -1539,6 +1539,9 @@ export class SessionManager {
       const feedback = this.feedbackInput(target, event, current);
       const result = await this.adapters[target.agent].run({
         bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
+        controllerRecovery: this.config.controllerMode === true && target.controllerMode === true
+          && !observation && !workspaceContext && event.scheduleKind !== 'controller' && event.status === 'completed',
+        onControllerState: state => this.store.controllerLifecycle.record(event.id, target.id, state),
         conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId, ...(source?.source ? { original: source.source } : {}) }, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',

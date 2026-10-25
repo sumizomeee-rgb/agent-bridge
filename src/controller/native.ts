@@ -125,6 +125,8 @@ class TurnSealedError extends Error {
 }
 /** A native turn failed; final platform delivery is tracked independently. */
 class NativeTurnFailure extends Error {}
+/** A failed report decision ended, its CLI stopped, and no publication or tool is outstanding. */
+class ReportRecoveryFailure extends Error {}
 interface ActiveTurn {
   turn: AgentTurn;
   reportEffort: ReturnType<typeof createEffortReporter>;
@@ -152,7 +154,7 @@ interface ActiveTurn {
   submissionAcknowledged?: boolean;
   retiredNativeTurnIds: Set<string>;
   seenClaudeTools: Set<string>;
-  inFlightTools: Map<string, { name: string; signature: string; promise: Promise<unknown> }>;
+  inFlightTools: Map<string, { name: string; signature: string; promise: Promise<unknown>; succeeded: boolean }>;
 }
 interface ControllerSession {
   transport: RpcTransport;
@@ -407,7 +409,9 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (active.privateFinalCallId === callId && !active.sealed) active.privateFinalCallId = undefined;
       });
     })();
-    active.inFlightTools.set(callId, { name, signature, promise: work });
+    const receipt = { name, signature, promise: work, succeeded: false };
+    active.inFlightTools.set(callId, receipt);
+    void work.then(() => { receipt.succeeded = true; }, () => {});
     if ((name === 'bridge_send_message' || name === 'bridge_send_private') && args.finish === false) active.deliveryPromise = Promise.allSettled([...(active.deliveryPromise ? [active.deliveryPromise] : []), work]);
     if (name === 'bridge_start_collaboration') active.collaborationPromise = Promise.allSettled([...(active.collaborationPromise ? [active.collaborationPromise] : []), work]);
     return work;
@@ -675,7 +679,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       }
       if (active.publicationPreparationError && !active.silent) throw active.publicationPreparationError;
       const privateFinalRequired = !!active.turn.onPrivateInputCheck && !active.turn.groupContext && !active.turn.event;
-      if (!active.turn.event && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired)) throw Object.assign(new Error('主控没有通过公开通道回复，本轮未标记为成功。'), { finalReplyMissing: true });
+      if ((!active.turn.event || active.replyRecovery) && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired)) throw Object.assign(new Error('主控没有通过公开通道回复，本轮未标记为成功。'), { finalReplyMissing: true });
       if (!session.nativeId) throw new Error('主控没有返回会话标识。');
       active.completed.resolve({ nativeId: session.nativeId, text: '', controlledOutput: true });
     };
@@ -902,7 +906,9 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (turn.signal.aborted) throw abortError();
     // A parallel call is a caller error, not permission to retire another active decision.
     if (this.sessions.get(turn.conversation.id)?.active) throw new Error('主控消息必须按顺序执行。');
-    const recover = turn.controllerRecovery === true && !turn.event && !turn.groupContext && !turn.preparing;
+    const report = turn.event?.kind === 'worker-result';
+    const recover = turn.controllerRecovery === true && (!turn.event || report) && !turn.groupContext && !turn.preparing;
+    let reportRecovery = false;
     const originalSignature = this.signature(turn);
     let nativeId = turn.conversation.nativeId;
     for (let attempt = 1; ; attempt++) {
@@ -915,7 +921,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         const result = await this.runAttempt({ ...turn, conversation: { ...turn.conversation, nativeId },
           onNativeId: id => { nativeId = id; turn.onNativeId?.(id); },
           onControllerState: update => state(update.phase, update.submission),
-        }, value => state(value === 'unknown' ? 'submitting' : 'accepted', value));
+        }, value => state(value === 'unknown' ? 'submitting' : 'accepted', value), reportRecovery);
         state('completed', 'accepted');
         return result;
       } catch (error) {
@@ -934,12 +940,25 @@ export class NativeControllerAdapter implements AgentAdapter {
           state('retrying', submission, error);
           continue;
         }
+        if (recover && report && attempt === 1 && (submission as ControllerSubmission) === 'accepted' && error instanceof ReportRecoveryFailure
+          && !stopping && !this.closed && !turn.signal.aborted && this.signature(turn) === originalSignature) {
+          // Continue only the saved report, in the same native history, with execution tools blocked.
+          reportRecovery = true;
+          state('reply-recovery', submission, error);
+          const evidence = '[Bridge report recovery; program evidence, not a human request] '
+            + 'The previous report decision failed and its CLI has stopped. This is the only recovery attempt. '
+            + 'The worker result below is already saved. Do not replay, dispatch, continue, cancel or schedule work. '
+            + 'Read existing receipts if needed and send one accurate final report to the original private chat. '
+            + 'Earlier actions remain valid; never claim more than the saved evidence.\n\n' + turn.event!.text;
+          turn = { ...turn, event: { ...turn.event!, text: evidence }, text: evidence, input: [{ type: 'text', text: evidence }] };
+          continue;
+        }
         state('failed', submission, error);
         throw error;
       }
     }
   }
-  private async runAttempt(turn: AgentTurn, submitted: (state: ControllerSubmission) => void): Promise<AgentResult> {
+  private async runAttempt(turn: AgentTurn, submitted: (state: ControllerSubmission) => void, reportRecovery = false): Promise<AgentResult> {
     if (this.closed) throw new Error('主控适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
     const idle = this.sessions.get(turn.conversation.id);
@@ -967,7 +986,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     const scopedCapability = session.model ? effortCapabilityForModel(capability, session.model) : capability;
     const reportEffort = createEffortReporter(turn, this.options.agent, { capability: scopedCapability, configuration: session.effortConfiguration ?? null, actual: !effort ? session.effort ?? null : null });
     reportEffort();
-    const active: ActiveTurn = { turn, reportEffort, effortCapability: scopedCapability, completed: deferred<AgentResult>(), nativeTurnId: null, toolCalls: 0, publicCalls: 0, restartAccepted: false, sealed: false, pendingClaudeTools: [], seenClaudeTools: new Set(), inFlightTools: new Map(), retiredNativeTurnIds: new Set() };
+    const active: ActiveTurn = { turn, reportEffort, effortCapability: scopedCapability, completed: deferred<AgentResult>(), nativeTurnId: null, replyRecovery: reportRecovery, toolCalls: 0, publicCalls: 0, restartAccepted: false, sealed: false, pendingClaudeTools: [], seenClaudeTools: new Set(), inFlightTools: new Map(), retiredNativeTurnIds: new Set() };
     session.active = active;
     const onAbort = () => { active.completed.reject(abortError()); void this.stopSession(key, session!).catch(() => {}); };
     turn.signal.addEventListener('abort', onAbort, { once: true });
@@ -1021,6 +1040,11 @@ export class NativeControllerAdapter implements AgentAdapter {
       if (cleanupFailure) {
         const failure = processStopFailure(cleanupFailure); failure.cause = error;
         Object.assign(failure, { cleanupError: executionErrorEvidence(cleanupFailure) }); throw failure;
+      }
+      if (error instanceof NativeTurnFailure && turn.controllerRecovery && turn.event?.kind === 'worker-result'
+        && !active.sealed && !active.silent && active.publicCalls === 0 && [...active.inFlightTools.values()].every(tool => tool.succeeded)
+        && !active.publicationPromise && !active.deliveryPromise && !active.collaborationPromise) {
+        throw new ReportRecoveryFailure('已保存的助手结果汇报失败；原进程已退出，尚无最终投递。', { cause: error });
       }
       throw error;
     }

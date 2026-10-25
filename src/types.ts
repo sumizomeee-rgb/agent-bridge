@@ -130,7 +130,7 @@ export interface AgentTurn {
   dispatchId?: string;
   /** Reattach to a previously dispatched remote job; never submit a fresh task. */
   recovering?: boolean;
-  /** Bounded recovery only for ordinary private owner inputs; never replay unknown execution. */
+  /** Bounded recovery for private owner inputs and completed private worker reports; never replay unknown execution. */
   controllerRecovery?: boolean;
   /** Durable lifecycle evidence; called before the corresponding transport operation. */
   onControllerState?: (state: import('./controller-lifecycle.js').ControllerTurnState) => void;

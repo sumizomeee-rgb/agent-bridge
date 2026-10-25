@@ -1,5 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { Agent, fetch } from 'undici';
 import { DeliveryPreparationError } from '../src/delivery-errors.js';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +19,7 @@ function gate() { let release!: () => void; const promise = new Promise<void>(re
 class DeliveryProtocol implements RpcTransport {
   listeners = new Set<(message: JsonObject) => void>(); failures = new Set<(error: Error) => void>(); written: JsonObject[] = [];
   started = false; stopped = false; mcpUrl = ''; private sequence = 100;
+  readonly http = new Agent({ connections: 1, pipelining: 0 });
   constructor(readonly agent: AgentName) {}
   onMessage(callback: (message: JsonObject) => void) { this.listeners.add(callback); return () => this.listeners.delete(callback); }
   onFailure(callback: (error: Error) => void) { this.failures.add(callback); return () => this.failures.delete(callback); }
@@ -40,7 +42,7 @@ class DeliveryProtocol implements RpcTransport {
     }
     this.emit({ type: 'assistant', session_id: 'continued-native', message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__bridge_controller__' + name, input: args }] } });
     try {
-      const response = await fetch(this.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(5000),
+      const response = await fetch(this.mcpUrl, { dispatcher: this.http, method: 'POST', headers: { 'content-type': 'application/json', connection: 'close' }, signal: AbortSignal.timeout(5000),
         body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) });
       const value = await response.json() as { error?: unknown; result?: { isError?: boolean } };
       return { ok: response.status === 200 && !value.error && value.result?.isError !== true, value };
@@ -61,7 +63,7 @@ function fixture(t: TestContext, agent: AgentName) {
   const turn: AgentTurn = { conversation: { id: 'existing-controller', userId: 'owner', agent, nativeId: 'continued-native', title: '', cwd: root, createdAt: '', updatedAt: '' },
     source: { messageId: 'real-private-request', userId: 'owner', channelId: 'original-private-channel' }, text: '查询区域后只向测试群发一句，不在本私聊重复', imagePaths: [], signal: new AbortController().signal, onProgress() {},
     onPublicMessage: async (text, _paths, _id, target, finish) => { sends.push({ text, target, finish }); } };
-  t.after(async () => { await adapter.close(); rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await adapter.close(); await protocol.http.close(); rmSync(root, { recursive: true, force: true }); });
   return { adapter, protocol, turn, invoked, sends };
 }
 
@@ -106,11 +108,13 @@ for (const agent of ['codex', 'claude'] as const) {
   });
 
   test(`${agent} 旧私聊前置owner或参数拒绝不封闭本轮，也不绕过统一投递验权`, { timeout: 10000 }, async t => {
-    const f = groupFixture(t, agent), context = f.turn.groupContext!, running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    const f = groupFixture(t, agent), running = f.adapter.run(f.turn); await until(() => f.protocol.started);
     assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'another-owner', text: '禁止越权' })).ok, false);
-    f.turn.groupContext = undefined;
-    assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '缺少群来源' })).ok, false);
-    f.turn.groupContext = context;
+    const privateOnly = fixture(t, agent), privateRun = privateOnly.adapter.run(privateOnly.turn);
+    await until(() => privateOnly.protocol.started);
+    assert.equal((await privateOnly.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '缺少群来源' })).ok, false);
+    assert.equal((await privateOnly.protocol.call('bridge_send_user', { text: '合法原私聊回复' })).ok, true);
+    privateOnly.protocol.complete(); await privateRun;
     assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '无效收尾', finish: 'false' })).ok, false);
     assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: 'x'.repeat(12001) })).ok, false);
     assert.equal((await f.protocol.call('bridge_send_private', { principalId: 'verified-owner-principal', text: '禁止\0空字符' })).ok, false);

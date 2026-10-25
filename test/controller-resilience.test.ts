@@ -306,3 +306,86 @@ test('exhausted pre-submission recovery sends one final failure notification', a
   assert.equal(s.transports.length, 2); assert(s.transports.every(transport => transport.turns === 0));
   assert.equal(f.sent.length, 1); assert.match(f.sent[0]!, /主控准备失败/);
 });
+
+
+function workerReport(s: ReturnType<typeof fixture>) {
+  s.turn.event = { kind: 'worker-result', text: 'Saved worker result: checksum verified; worker already completed.' };
+  s.turn.onPrivateInputCheck = undefined;
+  return s.turn;
+}
+test('completed worker report retries a verified pre-submission failure silently in the same parent', async t => {
+  const s = fixture(t, (transport, index) => {
+    transport.intercept = message => {
+      if (index !== 0 || message.method !== 'initialize') return false;
+      transport.emit({ id: message.id, error: { code: -1, message: 'metadata unavailable' } }); return true;
+    };
+  });
+  const running = s.adapter.run(workerReport(s));
+  await until(() => s.transports[1]?.turns === 1); await reply(s.transports[1]!); await running;
+  assert.equal(s.transports[0]!.turns, 0); assert.equal(s.transports[1]!.nativeId, 'existing-controller');
+  assert.deepEqual(s.published, ['confirmed reply']); assert.deepEqual(s.management, []);
+  assert.equal(s.states.filter(state => state.phase === 'retrying').length, 1);
+});
+
+test('failed accepted worker report continues saved evidence once; execution tools are blocked', async t => {
+  const s = fixture(t); const running = s.adapter.run(workerReport(s));
+  await until(() => s.transports[0]?.turns === 1);
+  s.transports[0]!.tool('bridge_list_workers', { details: true }, 150);
+  await until(() => s.transports[0]!.written.some(message => message.id === 150));
+  s.transports[0]!.complete('failed');
+  await until(() => s.transports[1]?.turns === 1);
+  assert.equal(s.transports[0]!.stopped, true);
+  const next = s.transports[1]!;
+  const params = next.written.find(message => message.method === 'turn/start')!.params as JsonObject;
+  assert.deepEqual(params.input, []);
+  assert.match(JSON.stringify(params.toolOutput), /Saved worker result/);
+  assert.match(JSON.stringify(params.toolOutput), /only recovery attempt/);
+  next.tool('bridge_start_worker', { title: 'must not replay', prompt: 'do it again' }, 151);
+  await until(() => next.written.some(message => message.id === 151));
+  assert.deepEqual(s.management, ['bridge_list_workers']);
+  assert.match(JSON.stringify(next.written.find(message => message.id === 151)), /禁止重派/);
+  await reply(next); await running;
+  assert.deepEqual(s.published, ['confirmed reply']);
+  assert.equal(s.states.filter(state => state.phase === 'reply-recovery').length, 1);
+});
+
+test('report recovery is bounded and a second failure is not converted to silent success', async t => {
+  const s = fixture(t); const rejected = assert.rejects(s.adapter.run(workerReport(s)));
+  await until(() => s.transports[0]?.turns === 1); s.transports[0]!.complete('failed');
+  await until(() => s.transports[1]?.turns === 1); s.transports[1]!.complete();
+  await rejected; assert.equal(s.transports.length, 2); assert.deepEqual(s.published, []);
+});
+
+for (const failure of ['lost-ack', 'stop-unknown', 'delivery-unknown', 'transport-lost'] as const) {
+  test(`worker report ${failure} does not start another decision`, async t => {
+    const s = fixture(t, transport => {
+      if (failure === 'lost-ack') transport.intercept = message => message.method === 'turn/start';
+      if (failure === 'stop-unknown') transport.failStop = true;
+    });
+    workerReport(s);
+    if (failure === 'delivery-unknown') s.turn.onPublicMessage = async () => { throw Object.assign(new Error('send ACK lost'), { deliveryUncertain: true }); };
+    if (failure === 'lost-ack') t.mock.timers.enable({ apis: ['setTimeout'] });
+    const rejected = assert.rejects(s.adapter.run(s.turn));
+    await until(() => s.transports[0]?.written.some(message => message.method === 'turn/start') === true);
+    if (failure === 'lost-ack') t.mock.timers.tick(20001);
+    else if (failure === 'delivery-unknown') s.transports[0]!.tool('bridge_send_user', { text: 'report' });
+    else if (failure === 'transport-lost') s.transports[0]!.fail();
+    else s.transports[0]!.complete('failed');
+    await rejected; if (failure === 'lost-ack') t.mock.timers.reset();
+    assert.equal(s.transports.length, 1);
+  });
+}
+
+test('Claude explicit failed report resumes same history with saved evidence only once', async t => {
+  const s = fixture(t, transport => { transport.intercept = message => {
+    if (message.type !== 'user') return false;
+    transport.turns++;
+    transport.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'existing-controller', result: 'capacity unavailable' });
+    return true;
+  }; }, 'claude');
+  await assert.rejects(s.adapter.run(workerReport(s)));
+  assert.equal(s.transports.length, 2); assert.equal(s.transports[0]!.stopped, true);
+  assert.equal(s.transports[1]!.turns, 1);
+  assert.match(JSON.stringify(s.transports[1]!.written), /Saved worker result/);
+  assert.equal(s.states.filter(state => state.phase === 'reply-recovery').length, 1);
+});

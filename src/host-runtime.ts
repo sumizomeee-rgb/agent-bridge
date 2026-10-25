@@ -891,12 +891,12 @@ export class HostRuntime {
     if (!source.spaceId && !collaboration?.collaborationMode && this.defaultDeliveryTarget(source) === 'private'
       && targetId === source.channelId && this.privateTarget(source)?.channelId === targetId) targetId = 'private';
     if (collaboration?.collaborationMode === 'internal') {
-      if (botId !== collaboration.initiatorBotId) throw new Error('静默协作不能向聊天软件发消息；请 bridge_send_bot 回传发起主控，再 bridge_silent。');
+      if (botId !== collaboration.initiatorBotId) throw new DeliveryPreparationError('静默协作不能向聊天软件发消息；请 bridge_send_bot 回传发起主控，再 bridge_silent。');
       targetId ??= collaboration.returnTargetId;
-      if (targetId !== collaboration.returnTargetId) throw new Error('静默协作只允许发起主控回到原交付区域总结。');
+      if (targetId !== collaboration.returnTargetId) throw new DeliveryPreparationError('静默协作只允许发起主控回到原交付区域总结。');
     } else if (collaboration?.collaborationMode === 'public' && targetId && targetId !== 'private'
-      && targetId !== this.targetId(this.store.getGroup(source.spaceId!)!)) throw new Error('公开协作只允许当前指定群或负责人私聊。');
-    if (targetId === undefined && this.defaultDeliveryTarget(source) === null) throw new Error('本条是内部消息，没有默认公开区域；请内部回传，或明确选择获授权的交付目标。');
+      && targetId !== this.targetId(this.store.getGroup(source.spaceId!)!)) throw new DeliveryPreparationError('公开协作只允许当前指定群或负责人私聊。');
+    if (targetId === undefined && this.defaultDeliveryTarget(source) === null) throw new DeliveryPreparationError('本条是内部消息，没有默认公开区域；请内部回传，或明确选择获授权的交付目标。');
     let target: RoutedDeliveryTarget;
     if (!targetId || targetId === 'private') {
       if (!targetId && source.spaceId) target = this.groupTarget(source, this.store.getGroup(source.spaceId)!);
@@ -907,7 +907,7 @@ export class HostRuntime {
           && !this.hooks(this.bots.get(botId)!.config).isGroupChannel?.(collaboration.sourceChannelId);
         const privateTarget = originalPrivate ? { id: 'private', kind: 'private' as const, botId, principalId: source.principalId,
           userId: this.ownerAccount(botId, source.principalId)!, channelId: collaboration.sourceChannelId! } : this.privateTarget(source);
-        if (!privateTarget) throw new Error('此 Bot 尚无负责人真实私聊地址，请先在 Bot 私聊发消息。'); target = privateTarget;
+        if (!privateTarget) throw new DeliveryPreparationError('此 Bot 尚无负责人真实私聊地址，请先在 Bot 私聊发消息。'); target = privateTarget;
       }
     } else {
       const group = this.store.listGroups(botId).find(group => this.targetId(group) === targetId);

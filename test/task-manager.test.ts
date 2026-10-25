@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
+import { DrainStop } from '../src/shutdown.js';
 import { SessionManager } from '../src/manager.js';
 import { MetadataProbeError } from '../src/agents/metadata.js';
 import { AgentProcessStopError } from '../src/agents/process.js';
@@ -509,4 +510,30 @@ test('恢复通知网络等待期间不能提前启动完成汇总并被标成�
   assert.doesNotThrow(() => f.register(1, 'fresh continuation task'), '恢复后新context保持可登记');
   f.codex.finish(1);
   await waitFor(() => f.registry.eventState(event.id) === 'delivered');
+});
+
+
+test('maintenance drain waits for a completed worker report and leaves the next event queued', async t => {
+  const f = fixture(t); f.config.controllerMode = true;
+  await f.manager.handle(message('origin', 'delegate'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const task = f.register(), later = f.register(0, 'later report');
+  f.codex.finish(0); await waitFor(() => f.inspect.getMessage('origin')?.replyState === 'delivered');
+  f.registry.acceptObservedResult(task.taskId, 'completed', 'saved result');
+  const event = f.registry.getNextEvent()!; f.manager.completionAvailable();
+  await waitFor(() => f.codex.calls.length === 2);
+  assert.equal(f.codex.calls[1]!.controllerRecovery, true);
+  f.codex.calls[1]!.onControllerState?.({ attempt: 1, phase: 'accepted', submission: 'accepted' });
+  assert.equal(f.inspect.controllerLifecycle.latest(event.id)?.submission, 'accepted');
+  let shutdowns = 0;
+  const drain = new DrainStop({ beginDrain: () => f.manager.beginDrain(), isIdle: () => f.manager.isIdle(),
+    shutdown: async () => { shutdowns++; await f.manager.close(); } });
+  await drain.check(true); assert.equal(shutdowns, 0);
+  assert.equal(f.codex.calls[1]!.signal.aborted, false);
+  f.registry.acceptObservedResult(later.taskId, 'completed', 'next saved result'); f.manager.completionAvailable();
+  f.codex.finish(1, 'report delivered');
+  await waitFor(() => f.registry.eventState(event.id) === 'delivered' && f.manager.isIdle());
+  await drain.check(true); assert.equal(shutdowns, 1);
+  assert.equal(f.codex.calls.length, 2); assert.equal(f.registry.queuedEvents().length, 1);
+  assert.equal(f.sink.replies.filter(reply => reply.options?.presentation?.tone === 'error').length, 0);
 });
