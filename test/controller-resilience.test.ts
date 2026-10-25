@@ -236,7 +236,7 @@ test('Claude missing final uses one evidence continuation and never replays orig
   assert(!JSON.stringify(s.transports[0]!.written[1]).includes(s.turn.text));
 });
 
-function managerFixture(t: TestContext, s: ReturnType<typeof fixture>, sinkFailure = false, hangNotice = false) {
+function managerFixture(t: TestContext, s: ReturnType<typeof fixture>) {
   const sent: string[] = [];
   const config: BridgeConfig = { token: 'fixture', allowedUserIds: ['owner'], defaultAgent: 'codex', controllerMode: true,
     workspace: s.root, dataDir: join(s.root, 'manager'), attachmentsDir: join(s.root, 'images'), logsDir: join(s.root, 'logs'), proxyUrl: null, maxImageBytes: 100,
@@ -245,21 +245,19 @@ function managerFixture(t: TestContext, s: ReturnType<typeof fixture>, sinkFailu
   const conversation = store.createConversation('owner', 'codex', s.root, { controllerMode: true }); store.setActive('owner', conversation.id);
   const manager = new SessionManager(config, { codex: s.adapter, claude: s.adapter }, { async sendText(_channel, text) {
     sent.push(text);
-    if (hangNotice && text.includes('【桥】')) await new Promise<void>(() => {});
-    if (sinkFailure && text.includes('【桥】')) throw new Error('status notice failed');
   } }, { mergeDelayMs: 0 });
   s.cleanups.push(async () => { await manager.close(); store.close(); });
   return { sent, store, manager, config, send: () => manager.handle({ id: 'original-message', userId: 'owner', channelId: 'private', text: 'test', imagePaths: [] }) };
 }
 
-test('manager persists submission and bounded recovery; failed status delivery does not fail the main reply', async t => {
-  const s = fixture(t); const f = managerFixture(t, s, true); await f.send();
+test('missing final recovery stays silent while persisting lifecycle and delivering the answer', async t => {
+  const s = fixture(t); const f = managerFixture(t, s); await f.send();
   await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!; transport.complete();
-  await until(() => transport.turns === 2); await reply(transport);
+  await until(() => transport.turns === 2); assert.deepEqual(f.sent, []); await reply(transport);
   await until(() => f.store.getMessage('original-message')?.state === 'completed');
   assert.equal(f.store.getMessage('original-message')?.replyState, 'delivered');
   assert.equal(f.store.controllerLifecycle.latest('original-message')?.phase, 'completed');
-  assert(f.sent.some(text => text.includes('正在补齐回复'))); assert(f.sent.some(text => text.includes('confirmed reply')));
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0]!, /confirmed reply/);
 });
 
 test('normal long-running turns never emit a time-based warning or get interrupted', async t => {
@@ -280,15 +278,31 @@ test('normal long-running turns never emit a time-based warning or get interrupt
   await reply(s.transports[0]!); await until(() => f.store.getMessage('long-message')?.state === 'completed'); t.mock.timers.reset();
 });
 
-test('a stuck auxiliary notification cannot indefinitely block the final private reply', async t => {
-  const s = fixture(t); const f = managerFixture(t, s, false, true); await f.send();
-  await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!;
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  transport.complete(); await until(() => transport.turns === 2 && f.sent.some(text => text.includes('正在补齐回复')));
-  transport.tool('bridge_send_user', { text: 'confirmed reply' });
-  await new Promise(resolve => setImmediate(resolve));
-  t.mock.timers.tick(5001);
-  await until(() => transport.written.some(message => message.id === 102)); transport.complete();
-  await until(() => f.store.getMessage('original-message')?.replyState === 'delivered');
-  assert(f.sent.some(text => text.includes('confirmed reply'))); assert.equal(transport.turns, 2); t.mock.timers.reset();
+test('pre-submission recovery stays silent and sends only the eventual final reply', async t => {
+  const s = fixture(t, (transport, index) => {
+    transport.intercept = message => {
+      if (index !== 0 || message.method !== 'initialize') return false;
+      transport.emit({ id: message.id, error: { code: -1, message: 'startup unavailable' } }); return true;
+    };
+  });
+  const f = managerFixture(t, s); await f.send();
+  await until(() => s.transports[1]?.turns === 1);
+  assert.deepEqual(f.sent, []);
+  await reply(s.transports[1]!);
+  await until(() => f.store.getMessage('original-message')?.state === 'completed');
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0]!, /confirmed reply/);
+  assert.equal(s.transports[0]!.turns, 0);
+});
+
+test('exhausted pre-submission recovery sends one final failure notification', async t => {
+  const s = fixture(t, transport => {
+    transport.intercept = message => {
+      if (message.method !== 'initialize') return false;
+      transport.emit({ id: message.id, error: { code: -1, message: 'startup unavailable' } }); return true;
+    };
+  });
+  const f = managerFixture(t, s); await f.send();
+  await until(() => f.store.getMessage('original-message')?.state === 'failed' && f.sent.length > 0);
+  assert.equal(s.transports.length, 2); assert(s.transports.every(transport => transport.turns === 0));
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0]!, /主控准备失败/);
 });

@@ -1198,23 +1198,6 @@ export class SessionManager {
       let privateReplyDelivered = false;
       let privateFinalStarted = false;
       const privateControllerInput = this.config.controllerMode === true && !groupContext;
-      let noticeTail = Promise.resolve();
-      const statusNotice = (code: BridgeNoticeCode) => {
-        noticeTail = noticeTail.then(async () => {
-          if (!current() || privateFinalStarted) return;
-          const noticeController = new AbortController();
-          const signal = AbortSignal.any([controller.signal, noticeController.signal]);
-          let timeout: ReturnType<typeof setTimeout> | undefined;
-          try {
-            await Promise.race([
-              this.sendBridgeNotice(item.channelId, code, undefined, `controller-status:${item.id}:${code}`, signal),
-              new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => {
-                noticeController.abort(); reject(new Error('辅助状态通知等待超时。'));
-              }, 5000); }),
-            ]);
-          } finally { clearTimeout(timeout); noticeController.abort(); }
-        }).catch(() => undefined); // An auxiliary status send cannot fail or replay the controller.
-      };
       try {
         if (privateControllerInput) this.store.startPrivateBatch(item.id);
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
@@ -1231,8 +1214,6 @@ export class SessionManager {
           bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
           ...(privateControllerInput ? { controllerRecovery: true, onControllerState: (state: import('./controller-lifecycle.js').ControllerTurnState) => {
             this.store.controllerLifecycle.record(item.id, conversationId, state);
-            if (state.phase === 'retrying') statusNotice('controllerRecovering');
-            if (state.phase === 'reply-recovery') statusNotice('controllerReplyRecovering');
           } } : {}),
           ...(context ? { taskContextPath: context.contextPath } : {}),
           ...(chatScene != null ? { chatScene } : {}),
@@ -1282,7 +1263,7 @@ export class SessionManager {
               throw new DeliveryPreparationError('尚未发送：最终回复必须发回原私聊；请省略 targetId 或使用 private，其他区域补充发送用 finish:false。');
             const coverage = [...turn.messageIds];
             if (privateControllerInput && finish) {
-              privateFinalStarted = true; await noticeTail;
+              privateFinalStarted = true;
             }
             if (finish) this.store.setReplyState(coverage, 'pending');
             await this.publishControlled(target, { ...item, groupContext }, text, paths, key, controller.signal, current, actualModel, actualEffort, effortMetadata, targetId, finish);
@@ -1343,7 +1324,6 @@ export class SessionManager {
       } catch (error) {
         turn.executing = false;
         await turn.supplements;
-        await noticeTail;
         const retained = completedResultFromError(error);
         if (retained) this.store.saveTurnResult(item.id, target.id, retained, errorEvidence(error, [this.config.token, this.config.appSecret ?? '']));
         if (controller.signal.aborted || this.closed || this.store.getMessage(item.id)?.state === 'cancelled') {
@@ -1375,7 +1355,6 @@ export class SessionManager {
           } else if (!handled) await this.sendBridgeNotice(item.channelId, noticeCode, undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
         }
       } finally {
-        await noticeTail;
         turn.executing = false;
         await turn.supplements;
         if (!this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) {

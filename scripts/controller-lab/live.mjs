@@ -189,7 +189,7 @@ export async function runLive({ root, runDir, configPath, agent, evidence, save 
       await finished('resumed'); assert.equal(store.getConversation(conversationId).nativeId, nativeId);
       assert(receipt.deliveries.some(item => /LAB_RESUMED[\s\S]*(42|LAB_WORKER_42)/.test(item.text))); assert.equal(receipt.workerRuns.length, 1);
     });
-    assert(!receipt.deliveries.some(item => item.text.includes('仍在等待主控')), 'Elapsed-time warning returned');
+    assert(!receipt.deliveries.some(item => /仍在等待主控|正在恢复主控|正在补齐回复/.test(item.text)), 'Routine recovery notification returned');
   } catch (error) {
     receipt.failure = String(error.message).slice(0, 300);
     if (!evidence.cases.some(item => item.name.startsWith(agent + ': ') && item.status === 'failed')) {

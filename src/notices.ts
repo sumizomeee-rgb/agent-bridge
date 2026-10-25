@@ -12,8 +12,6 @@ export const BRIDGE_NOTICE_COPY = {
   wakeFailed: { title: '唤醒失败', tone: 'error', text: '本次唤醒未完成，请核对状态。' },
   wakePreparationFailed: { title: '唤醒失败', tone: 'error', text: '本次未提交给主控。' },
   wakeStopped: { title: '唤醒已停止', tone: 'warning', text: '本次唤醒已停止。' },
-  controllerRecovering: { title: '正在恢复主控', tone: 'warning', text: '消息尚未提交，正在尝试一次恢复。' },
-  controllerReplyRecovering: { title: '正在补齐回复', tone: 'warning', text: '主控已结束本轮但缺少最终回复，正在核对结果并补答。' },
   controllerDeliveryUncertain: { title: '回复投递待核对', tone: 'error', text: '回复可能已送达，但尚未取得确认；未自动重发。' },
   controllerSubmissionUnknown: { title: '主控接收待核对', tone: 'error', text: '消息已尝试提交，但未能确认接收或结果；未自动重发。' },
   controllerExecutionInterrupted: { title: '主控本轮中断', tone: 'error', text: '已确认主控接收消息，但未取得最终回复；已执行的操作需要核对，未自动重做。' },

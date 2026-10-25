@@ -12,7 +12,19 @@ import { discordPresentationPages, feishuPresentationCards, markdownParts } from
 import { DurableIngress } from '../src/ingress.js';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
+import { FeishuTransport } from '../src/feishu.js';
 import type { BridgeConfig, ReplyOptions, AgentAdapter } from '../src/types.js';
+
+test('normal Feishu startup and restart do not send chat notifications', async () => {
+  const sends: unknown[] = [];
+  const transport = { config: { allowedUserIds: ['owner'], scopePrefix: 'feishu:test|' },
+    sendText: async (...args: unknown[]) => { sends.push(args); } } as unknown as FeishuTransport;
+  for (const reason of ['start', 'restart'] as const) {
+    await FeishuTransport.prototype.onBridgeLifecycle.call(transport, { phase: 'ready', reason,
+      recipient: { userId: 'owner', channelId: 'feishu:test|private' } });
+  }
+  assert.deepEqual(sends, []);
+});
 
 const prefix = 'feishu:cli_personal|';
 const configFor = (root: string, scope = prefix): BridgeConfig => ({ platform: 'feishu', profile: 'feishu/default', applicationId: 'cli_personal',
