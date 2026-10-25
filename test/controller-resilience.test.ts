@@ -87,6 +87,25 @@ test('startup failure: retry once before submission, preserve native session and
   assert.equal((s.transports[1]!.written.find(message => message.method === 'thread/resume')!.params as JsonObject).threadId, 'existing-controller');
 });
 
+test('initialize timeout before submission recovers once without replaying the user message', async t => {
+  const s = fixture(t, (transport, index) => {
+    transport.intercept = message => index === 0 && message.method === 'initialize';
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = s.adapter.run(s.turn);
+  await until(() => s.transports[0]?.written.some(message => message.method === 'initialize') === true);
+  assert.equal(s.states.at(-1)?.submission, 'not-submitted');
+  t.mock.timers.tick(15001);
+  await until(() => s.transports[1]?.turns === 1);
+  await reply(s.transports[1]!); await running; t.mock.timers.reset();
+  assert.equal(s.transports[0]!.stopped, true);
+  assert.equal(s.transports[0]!.turns, 0);
+  assert.equal(s.transports[1]!.turns, 1);
+  assert.equal(s.states.filter(state => state.phase === 'retrying').length, 1);
+  assert.match(s.states.find(state => state.phase === 'retrying')!.diagnostic!, /initialize/);
+  assert.equal(s.states.at(-1)?.phase, 'completed');
+});
+
 test('startup recovery is bounded and an unconfirmed old process forbids another launch', async t => {
   for (const failStop of [false, true]) {
     const s = fixture(t, transport => {
