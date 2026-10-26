@@ -71,6 +71,7 @@ export class BotRuntime {
   private startPromise?: Promise<void>;
   private closePromise?: Promise<void>;
   private reconnecting?: Promise<void>;
+  private lagTimer?: ReturnType<typeof setInterval>;
   private readonly revisions = new Map<string, number>();
   private readonly stamps = new Map<string, number>();
   private readonly secrets: string[];
@@ -129,6 +130,7 @@ export class BotRuntime {
       ...hooks.manager, taskRegistry: this.tasks, botName: () => this.transport.botUser?.username,
       authorizeUser: user => hooks.authorize(user, ''),
       onListComputers: (_conversation, refresh) => this.targetCatalog.computerOverview(config.contextWorkspace ?? config.workspace, refresh),
+      onDiagnostic: message => this.log(message),
       onListWorkers: (conversation, scope) => Promise.resolve(this.controller?.queryWorkerOverview(conversation, scope) ?? []),
       onRequestRestart: origin => hooks.requestRestart(origin) as ReturnType<NonNullable<SessionManagerOptions['onRequestRestart']>>,
       ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
@@ -152,6 +154,9 @@ export class BotRuntime {
         this.manager.privateInputQueued(message);
         this.revisions.set(message.userId, n); if (!replayOnly) this.stamps.set(message.id, n); },
       handle: async message => {
+        const workersCommand = /^\/workers(?:\s|$)/i.test(message.text.trim());
+        const began = performance.now();
+        if (workersCommand) this.log('WORKERS_INPUT stage=handler');
         try {
           if (!this.ready || this.closed || hooks.isDraining() || hooks.isGroupChannel?.(message.channelId) || !hooks.authorize(message.userId, message.text)) return;
           const current = () => control(message) || this.stamps.get(message.id) === (this.revisions.get(message.userId) ?? 0);
@@ -160,6 +165,7 @@ export class BotRuntime {
             source: { messageId: message.id, userId: message.userId, channelId: message.channelId, authorType: 'user' as const, ...message.source },
             imagePaths: content.imagePaths };
           if (!current()) { this.manager.discard(prepared); return; }
+          if (workersCommand) this.log(`WORKERS_INPUT stage=prepared ms=${Math.round(performance.now() - began)}`);
           await this.manager.handle(prepared, message.interaction ? (text, options) => this.transport.sendInteractionText(message.interaction!, text, options) : undefined);
         } finally { this.stamps.delete(message.id); }
       },
@@ -234,6 +240,10 @@ export class BotRuntime {
     await this.ingress.recover((channel, options) => this.readDMHistory(channel, options));
     if (this.closed) throw new Error('Bot 恢复期间已关闭。');
     this.ready = true;
+    let lastTick = performance.now();
+    this.lagTimer = setInterval(() => { const now = performance.now(), lag = now - lastTick - 1000; lastTick = now;
+      if (lag >= 1000) this.log(`EVENT_LOOP_LAG ms=${Math.round(lag)}`); }, 1000);
+    this.lagTimer.unref();
     this.taskService.start(); this.ingress.start(); this.manager.completionAvailable();
     if (this.config.features?.nativeCommands !== false) {
       try { await this.transport.syncSlashCommands(); this.log('SLASH_COMMANDS_SYNCED'); }
@@ -259,7 +269,7 @@ export class BotRuntime {
   isIdle(): boolean { return this.manager.isIdle() && (this.controller?.isIdle() ?? true) && this.transport.isIdle(); }
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closed = true; this.ready = false;
+    this.closed = true; this.ready = false; clearInterval(this.lagTimer);
     this.closePromise = closeResources([
       { name: '通信平台', close: () => this.transport.close() }, { name: '收件', close: () => this.ingress.close() },
       { name: '任务回执', close: () => this.taskService.close() }, { name: '主控', close: () => this.manager.close() },

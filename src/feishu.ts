@@ -66,6 +66,7 @@ export class FeishuTransport {
   }
   private async request(path: string, method: string, body?: unknown, signal?: AbortSignal, token?: string, stage: 'auth' | 'request' = 'request'): Promise<Json> {
     if (this.closed) throw new Error('飞书通信已关闭。');
+    const began = performance.now();
     const form = body instanceof FormData;
     const combinedSignal = AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(stage === 'auth' ? 15_000 : 30_000), ...(signal ? [signal] : [])]);
     let response: Awaited<ReturnType<typeof fetch>>;
@@ -85,6 +86,8 @@ export class FeishuTransport {
     if (!response.ok || data.code !== 0) throw this.requestError((stage === 'auth' ? '飞书鉴权失败' : '飞书请求失败') + '（HTTP ' + response.status + '，code=' + (typeof data.code === 'number' ? data.code : 'unknown') + '）；未自动重发。',
       stage, method, path, new Error(), { code: typeof data.code === 'number' ? data.code : undefined, httpStatus: response.status, requestId },
       !combinedSignal.aborted && (response.status === 429 || response.status >= 500) && (data.code === undefined || data.code === 0));
+    const elapsed = performance.now() - began;
+    if (elapsed >= 1000) this.log(`FEISHU_HTTP_TIMING stage=${stage} resource=${path.includes('/reactions') ? 'reaction' : path.includes('/messages') ? 'message' : 'other'} ms=${Math.round(elapsed)}`);
     return stage === 'auth' ? data : data.data ?? data;
   }
   private async api(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<Json> {
@@ -415,7 +418,12 @@ export class FeishuTransport {
   }
   sendText(channelId: string, text: string, options?: ReplyOptions): Promise<void> {
     const prior = this.sends.get(channelId) ?? Promise.resolve();
-    const send = prior.catch(() => {}).then(() => this.send(channelId, text, options)); this.sends.set(channelId, send);
+    const queuedAt = performance.now();
+    const send = prior.catch(() => {}).then(() => {
+      const wait = performance.now() - queuedAt;
+      if (options?.presentation?.purpose === 'overview' || wait >= 1000) this.log(`FEISHU_SEND_QUEUE ms=${Math.round(wait)}`);
+      return this.send(channelId, text, options);
+    }); this.sends.set(channelId, send);
     void send.finally(() => { if (this.sends.get(channelId) === send) this.sends.delete(channelId); }).catch(() => {});
     return send;
   }

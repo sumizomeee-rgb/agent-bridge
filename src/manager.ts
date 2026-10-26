@@ -64,6 +64,7 @@ export interface SessionManagerOptions {
   onInitializationError?: (conversation: Conversation, error: unknown) => void;
   onInitializationState?: (conversation: Conversation, outcome: WorkspaceNoticeOutcome) => void | Promise<void>;
   onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
+  onDiagnostic?: (message: string) => void;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
   onRequestRestart?: (origin: RestartOrigin) => Promise<RestartReceipt>;
 }
@@ -136,10 +137,16 @@ export class SessionManager {
       const view: BridgePresentation = { title: '直属助手', tone: 'info', blocks: [{ kind: 'entry', text: '尚未初始化主控；请先在此 Bot 私聊初始化。' }] };
       await reply(presentationText(view), { presentation: view }); return;
     }
+    const trace = randomUUID().slice(0, 8);
+    let previous = performance.now();
+    const timing = (stage: string) => { const now = performance.now();
+      try { this.options.onDiagnostic?.(`WORKERS_TIMING trace=${trace} stage=${stage} ms=${Math.round(now - previous)}`); } catch { /* Diagnostics must not affect replies. */ }
+      previous = performance.now(); };
     const scope = args.includes('all') ? 'all' : 'current';
     let items: WorkerOverview[];
     try { items = await this.options.onListWorkers(target, scope); }
     catch { throw new Error('直属 Agent 状态读取失败，请稍后重试。'); }
+    timing('query');
     const history = args.includes('history');
     let selected = (filter ? filter(items) : items).filter(item => isActiveWorker(item) !== history);
     if (selected.some(item => item.presetId)) {
@@ -148,8 +155,11 @@ export class SessionManager {
         selected = selected.map(item => item.presetId ? { ...item, presetLabel: names.get(item.presetId) ?? item.presetLabel } : item);
       } catch { /* Display names are optional; the saved preset ID still identifies the route. */ }
     }
+    timing('labels');
     const view = workerOverview(selected, scope, Date.now(), args.includes('details'), history ? 'history' : 'active');
-    await reply(presentationText(view), { presentation: view });
+    timing('render');
+    try { await reply(presentationText(view), { presentation: view }); }
+    finally { timing('delivery'); }
   }
 
   currentConversation(userId: string): Conversation | null { return this.store.getActive(userId); }

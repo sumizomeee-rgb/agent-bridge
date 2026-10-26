@@ -280,7 +280,10 @@ export class ControllerRuntime {
       queued: jobs.filter(job => job.status === 'queued').length };
   }
   queryWorkerOverview(conversation: Conversation, scope: 'current' | 'all' = 'current'): WorkerOverview[] {
-    return this.store.workers().filter(worker => worker.origin.userId === conversation.userId
+    const supplementCounts = new Map<string, number>();
+    for (const value of this.store.supplements()) if (['pending', 'steering', 'uncertain'].includes(value.status))
+      supplementCounts.set(value.workerId, (supplementCounts.get(value.workerId) ?? 0) + 1);
+    return this.store.workers(scope === 'current' ? conversation.id : undefined).filter(worker => worker.origin.userId === conversation.userId
       && worker.origin.channelId && (scope === 'all' || worker.origin.conversationId === conversation.id)).map(worker => {
       const jobs = this.store.jobs(worker.id); const active = jobs.find(job => job.status === 'running');
       const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
@@ -289,7 +292,7 @@ export class ControllerRuntime {
       const queued = jobs.filter(job => job.status === 'queued').length;
       const status = worker.handoffPending || worker.adoption?.status === 'pending' ? 'handoff-pending'
         : worker.ownership === 'user' || worker.supersededBy ? 'handed-off' : worker.blocked ? 'uncertain'
-        : active ? 'running' : this.retirementPending(worker.id) && latest?.status === 'completed' ? 'retiring' : queued ? 'queued' : latest?.status ?? 'idle';
+        : active ? 'running' : jobs.some(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) && latest?.status === 'completed' ? 'retiring' : queued ? 'queued' : latest?.status ?? 'idle';
       return { workerId: worker.id, conversationId: worker.origin.conversationId,
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
         targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
@@ -303,7 +306,7 @@ export class ControllerRuntime {
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
           : latest?.cancelReason ? { statusReason: latest.cancelReason } : {}),
         lastResultPreview: latest?.result == null ? null : listText(latest.result, 180),
-        unresolvedSupplements: this.store.supplements().filter(value => value.workerId === worker.id && ['pending', 'steering', 'uncertain'].includes(value.status)).length,
+        unresolvedSupplements: supplementCounts.get(worker.id) ?? 0,
         status, running: !!active, queued, startedAt: currentJob?.startedAt ?? null,
         endedAt: currentJob && ['completed', 'failed', 'cancelled'].includes(currentJob.status) ? currentJob.updatedAt : null };
     });
