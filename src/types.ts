@@ -18,6 +18,8 @@ export interface Conversation {
   actualEffort?: string | null;
   /** Explicit per-conversation effort; null uses the CLI default. */
   effort?: string | null;
+  /** Current controller only; null/absent preserves native speed settings. */
+  fastMode?: boolean | null;
   title: string;
   controllerMode?: boolean;
   contextSeed?: string | null;

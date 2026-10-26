@@ -288,14 +288,15 @@ export class ControllerRuntime {
       const jobs = this.store.jobs(worker.id); const active = jobs.find(job => job.status === 'running');
       const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
         : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? jobs.at(-1);
-      const currentJob = active ?? latest;
+      const nextQueued = jobs.find(job => job.status === 'queued');
+      const currentJob = active ?? nextQueued ?? latest;
       const queued = jobs.filter(job => job.status === 'queued').length;
       const status = worker.handoffPending || worker.adoption?.status === 'pending' ? 'handoff-pending'
         : worker.ownership === 'user' || worker.supersededBy ? 'handed-off' : worker.blocked ? 'uncertain'
-        : active ? 'running' : jobs.some(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) && latest?.status === 'completed' ? 'retiring' : queued ? 'queued' : latest?.status ?? 'idle';
+        : active ? 'running' : queued ? 'queued' : jobs.some(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) && latest?.status === 'completed' ? 'retiring' : latest?.status ?? 'idle';
       return { workerId: worker.id, conversationId: worker.origin.conversationId,
         ...(worker.origin.conversationId === conversation.id ? { conversationTitle: conversation.title } : {}),
-        targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: worker.title,
+        targetId: worker.target?.id ?? 'local', targetLabel: worker.target?.label ?? '本机', agent: worker.agent, title: !active && nextQueued ? listText(nextQueued.prompt, 120) : worker.title,
         ...(worker.target?.preset ? { presetId: worker.target.preset.id } : {}),
         model: worker.actualModel, effort: worker.actualEffort ?? null, requestedEffort: worker.effort,
         effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId,

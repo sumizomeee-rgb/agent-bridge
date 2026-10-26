@@ -10,7 +10,7 @@ test('程序通知集中定义短文案、级别和统一前缀，不包含具�
     assert.match(view.title, /^【桥】/);
     assert([...view.title].length < 20);
     assert.equal(view.blocks.length, 1);
-    assert([...view.blocks[0]!.text].length < 30);
+    assert([...view.blocks[0]!.text].length < 120);
     assert.equal(view.footer, undefined);
   }
   assert.equal(bridgeNotice('resultDeliveryFailed').blocks[0]!.text, '结果已保存。');

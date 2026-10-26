@@ -23,6 +23,9 @@ export const COMMANDS: CommandDefinition[] = [
   { name: 'effort', help: "/effort [level|default]：查询或设置推理强度，保留上下文", description: '查看或设置当前会话推理强度，保留上下文', options: [
     { type: 'string', name: 'level', description: '留空查询；default 使用 CLI 默认；可用值取决于后端和模型', choices: ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(value => ({ name: value, value })) },
   ] },
+  { name: 'fast', help: '/fast [on|off]：查询或切换当前 Codex 主控的 Fast，保留上下文', description: '查询或切换当前 Codex 主控 Fast 模式', options: [
+    { type: 'string', name: 'mode', description: '留空查询；on 开启（额度消耗更快），off 关闭', choices: [{ name: '开启', value: 'on' }, { name: '关闭', value: 'off' }] },
+  ] },
   { name: 'models', help: "/models：列出当前 Agent 的模型选项", description: '列出当前 Agent 的模型选项' },
   { name: 'status', help: "/status：查看桥、模型、会话、运行与排队状态", description: '查看当前模型、会话和排队情况' },
   { name: 'computers', help: "/computers [refresh|cached] [details]：查看登记电脑、连接与 CLI 入口", description: '查看已登记电脑、连接状态和 Agent CLI 入口', options: [

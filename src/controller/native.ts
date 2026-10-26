@@ -225,7 +225,7 @@ export class NativeControllerAdapter implements AgentAdapter {
   }
   private signature(turn: AgentTurn): string {
     return createHash('sha256').update(this.metadataSource(turn.conversation.cwd))
-      .update(JSON.stringify([turn.conversation.model ?? null, selectedEffort(turn)])).digest('hex');
+      .update(JSON.stringify([turn.conversation.model ?? null, selectedEffort(turn), this.options.agent === 'codex' && turn.conversation.fastMode != null])).digest('hex');
   }
   private processProofPath(conversationId: string): string {
     if (!/^[a-zA-Z0-9_-]{1,100}$/.test(conversationId)) throw new Error('主控会话标识不合法。');
@@ -307,7 +307,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     return this.openClaude(turn, signature, home);
   }
   private async openCodex(turn: AgentTurn, signature: string, home: string): Promise<ControllerSession> {
-    const args = ['app-server', '--listen', 'stdio://', ...codexControllerOverrides().flatMap(value => ['-c', value])];
+    const args = ['app-server', '--listen', 'stdio://', ...codexControllerOverrides().flatMap(value => ['-c', value]), ...(turn.conversation.fastMode != null ? ['-c', 'features.fast_mode=true'] : [])];
     const transport = this.createTransport(args, turn.conversation.cwd, { ...this.env, CODEX_HOME: home });
     const session: ControllerSession = { transport, rpc: new JsonRpcClient(transport), nativeId: turn.conversation.nativeId, signature, active: null, server: null, removeListeners: [], closed: false };
     this.sessions.set(turn.conversation.id, session);
@@ -1011,7 +1011,8 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (!turn.event && manifest) input.push({ type: 'text', text: manifest, text_elements: [] });
         const clock = this.runtimeContext(turn, session);
         if (!turn.event) input.push({ type: 'text', text: clock, text_elements: [] });
-        const params: JsonObject = { threadId: session.nativeId, environments: [], input: turn.event ? [] : input, ...(effort ? { effort } : {}) };
+        const params: JsonObject = { threadId: session.nativeId, environments: [], input: turn.event ? [] : input, ...(effort ? { effort } : {}),
+          ...(turn.conversation.fastMode != null ? { serviceTierForTurn: turn.conversation.fastMode ? 'fast' : 'default' } : {}) };
         if (turn.event) params.toolOutput = { name: turn.event.toolName ?? (turn.event.kind === 'wake' ? 'bridge_schedule_controller' : 'bridge_worker_result'), namespace: null, output: `${clock}\n\n${turn.event.text}` };
         submitted('unknown'); // Persist before I/O: a lost acknowledgement must never cause a replay.
         const started = await this.startCodexTurn(session, active, params);

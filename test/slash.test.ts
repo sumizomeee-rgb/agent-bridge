@@ -82,8 +82,16 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
   };
 }
 
-test('native registry contains fourteen supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'models', 'status', 'computers', 'presetlist', 'workers', 'stop', 'restart', 'help']);
+test('fast 原生菜单与文本参数一致，非法值拒绝', () => {
+  assert.deepEqual(result('fast'), { text: '/fast' });
+  assert.deepEqual(result('fast', [option('mode', 'on')]), { text: '/fast on' });
+  assert.deepEqual(result('fast', [option('mode', 'off')]), { text: '/fast off' });
+  assert.equal('text' in result('fast', [option('mode', 'invalid')]), false);
+  assert.equal(GROUP_SLASH_COMMANDS.some(c => c.name === 'fast'), false);
+});
+
+test('native registry contains fifteen supported DM-only commands, never resume/startup', () => {
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'presetlist', 'workers', 'stop', 'restart', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);

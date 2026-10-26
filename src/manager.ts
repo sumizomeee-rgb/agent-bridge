@@ -614,7 +614,7 @@ export class SessionManager {
 
   private modelStatus(target: Conversation): string {
     const actual = target.actualModel ?? '尚未由 CLI 回报';
-    return `实际模型：${actual}\n会话选择：${target.model ?? 'CLI 默认'}\n强度选择：${target.effort ?? 'CLI 默认'}\n推理强度：${target.actualEffort ?? '尚未由 CLI 回报'}`;
+    return `实际模型：${actual}\n会话选择：${target.model ?? 'CLI 默认'}\n强度选择：${target.effort ?? 'CLI 默认'}\n推理强度：${target.actualEffort ?? '尚未由 CLI 回报'}${target.agent === 'codex' && target.controllerMode ? '\n' + this.fastStatus(target) : ''}`;
   }
 
   private async modelInfo(target: Conversation): Promise<AgentModelInfo> {
@@ -691,6 +691,24 @@ export class SessionManager {
       this.modelChanges.delete(target.id);
       if (!this.closed && (this.store.pendingCount(target.id) > 0 || this.options.taskRegistry?.getNextEvent(target.id))) this.wake(target.id);
     }
+  }
+
+  private async handleFast(message: BridgeMessage, argument: string, reply: (text: string) => Promise<void>): Promise<void> {
+    const target = this.store.getActive(message.userId);
+    if (!target || target.agent !== 'codex' || !target.controllerMode) {
+      await reply('/fast 仅适用于当前已建立的 Codex 主控会话。'); return;
+    }
+    if (!argument) { await reply(this.fastStatus(target) + '\n/fast on 开启（额度消耗更快）；/fast off 关闭。'); return; }
+    if (!['on', 'off'].includes(argument)) { await reply('用法：/fast [on|off]'); return; }
+    if (this.running.get(message.userId)?.conversationId === target.id || this.workers.has(target.id)
+      || this.store.pendingCount(target.id) > 0 || this.modelChanges.has(target.id)) {
+      await reply('当前主控正在执行、排队或切换设置，请完成后再设置 Fast。'); return;
+    }
+    this.store.setFastMode(target.id, argument === 'on');
+    await reply(`当前 Codex 主控 Fast 已设置为${argument === 'on' ? '开启（额度消耗更快）' : '关闭'}，下轮请求；服务端是否采用尚未确认。上下文保留，仅影响当前主控。`);
+  }
+  private fastStatus(target: Conversation): string {
+    return `Fast 设置：${target.fastMode == null ? '沿用 Codex 配置（未核实）' : target.fastMode ? '开启' : '关闭'}；服务端实际采用状态未确认。`;
   }
 
   private async handleEffort(message: BridgeMessage, argument: string, reply: (text: string) => Promise<void>): Promise<void> {
@@ -815,6 +833,7 @@ export class SessionManager {
         await reply(presentationText(view), { presentation: view }); return;
       }
       case 'model': await this.handleModel(message, argument, reply); return;
+      case 'fast': await this.handleFast(message, argument, reply); return;
       case 'effort': await this.handleEffort(message, argument, reply); return;
       case 'models': await this.handleModel(message, '', reply, true); return;
       case 'new':

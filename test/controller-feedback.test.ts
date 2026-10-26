@@ -37,6 +37,29 @@ async function final(turn: AgentTurn): Promise<AgentResult> {
   await turn.onPublicMessage!('已核对已有结果，不重做原任务', [], 'final-' + turn.source!.messageId);
   return { nativeId: turn.conversation.nativeId ?? 'parent-native', text: '', controlledOutput: true };
 }
+
+test('已接收后中断通知说明会话可继续，反馈待下一轮接收，不冒称已恢复', async t => {
+  const f = fixture(t, async turn => {
+    if (turn.source!.messageId === 'accepted-failure') {
+      turn.onControllerState?.({ attempt: 1, phase: 'accepted', submission: 'accepted' });
+      throw new Error('model service at capacity');
+    }
+    assert.equal(turn.bridgeFeedback!.records[0]!.code, 'controllerExecutionInterrupted');
+    return final(turn);
+  });
+  await f.send('accepted-failure');
+  await until(() => f.store.feedback.read(f.scope()).records[0]?.userState === 'delivered');
+  assert.match(f.sent[0]!, /本轮中断，会话可继续/);
+  assert.match(f.sent[0]!, /主控下一轮会收到/);
+  assert.match(f.sent[0]!, /无需重启/);
+  assert.match(f.sent[0]!, /本次未自动重试/);
+  assert.equal(f.store.feedback.read(f.scope()).records[0]!.controllerState, 'pending');
+  assert.equal(f.turns.length, 1);
+  await f.send('continue');
+  await until(() => f.store.getMessage('continue')?.replyState === 'delivered');
+  assert.equal(f.turns.length, 2);
+  assert.equal(f.store.feedback.read(f.scope()).records.length, 0);
+});
 function entry(scope: FeedbackScope, sourceId: string): Omit<BridgeFeedback, 'id' | 'createdAt' | 'controllerState' | 'userState'> {
   return { ...scope, sourceId, code: 'summaryFailed', stage: 'summary', reason: '汇总中断', resultKnown: false, workerResultKnown: true, processStopped: true, deliveryState: 'not-attempted' };
 }

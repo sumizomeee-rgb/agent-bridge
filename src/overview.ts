@@ -22,10 +22,10 @@ export interface WorkerOverview {
 }
 
 export type WorkerView = 'active' | 'history';
-/** 明确归档且已确认停止的异常会话转入历史；运行或未确认状态仍可见。 */
+/** 已完成轮次的 CLI 收尾属于历史；真实运行、排队及未解决异常仍可见。 */
 export const isActiveWorker = (item: WorkerOverview): boolean => item.running || item.queued > 0
   || item.status === 'failed' && item.resultKnown === true && item.processStopped === false
-  || (!(item.archivedAt && item.processStopped === true) && ['queued', 'running', 'retiring', 'uncertain', 'handoff-pending'].includes(item.status));
+  || (!(item.archivedAt && item.processStopped === true) && ['queued', 'running', 'uncertain', 'handoff-pending'].includes(item.status));
 
 const clean = (value: string, limit = 120): string => {
   const text = value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/`/g, 'ˋ').replace(/@/g, '＠').replace(/\s+/g, ' ').trim();

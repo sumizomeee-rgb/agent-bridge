@@ -35,6 +35,7 @@ function conversation(row: Row): Conversation {
     nativeId: row.native_id === null ? null : String(row.native_id), title: String(row.title),
     model: row.model == null ? null : String(row.model), ...(row.model_policy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}), actualModel: row.actual_model == null ? null : String(row.actual_model),
     effort: row.effort == null ? null : String(row.effort),
+    fastMode: row.fast_mode == null ? null : Number(row.fast_mode) === 1,
     actualEffort: row.actual_effort == null ? null : String(row.actual_effort),
     cwd: String(row.cwd), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
     controllerMode: Number(row.controller_mode ?? 0) === 1, contextSeed: row.context_seed == null ? null : String(row.context_seed),
@@ -133,6 +134,7 @@ export class SessionStore {
     if (!columns.has('model')) this.db.exec('ALTER TABLE conversations ADD COLUMN model TEXT');
     if (!columns.has('model_policy')) this.db.exec('ALTER TABLE conversations ADD COLUMN model_policy TEXT');
     if (!columns.has('actual_model')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_model TEXT');
+    if (!columns.has('fast_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN fast_mode INTEGER');
     if (!columns.has('effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN effort TEXT');
     if (!columns.has('actual_effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_effort TEXT');
     if (!columns.has('controller_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN controller_mode INTEGER NOT NULL DEFAULT 0');
@@ -459,6 +461,10 @@ export class SessionStore {
       .run(model, model === null ? 'cli-default' : null, new Date().toISOString(), id);
   }
 
+  setFastMode(id: string, enabled: boolean): void {
+    this.db.prepare('UPDATE conversations SET fast_mode = ?, updated_at = ? WHERE id = ?')
+      .run(enabled ? 1 : 0, new Date().toISOString(), id);
+  }
   setEffort(id: string, effort: string | null): void {
     this.db.prepare('UPDATE conversations SET effort = ?, actual_effort = NULL, updated_at = ? WHERE id = ?')
       .run(effort, new Date().toISOString(), id);

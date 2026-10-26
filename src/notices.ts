@@ -14,7 +14,7 @@ export const BRIDGE_NOTICE_COPY = {
   wakeStopped: { title: '唤醒已停止', tone: 'warning', text: '本次唤醒已停止。' },
   controllerDeliveryUncertain: { title: '回复投递待核对', tone: 'error', text: '回复可能已送达，但尚未取得确认；未自动重发。' },
   controllerSubmissionUnknown: { title: '主控接收待核对', tone: 'error', text: '消息已尝试提交，但未能确认接收或结果；未自动重发。' },
-  controllerExecutionInterrupted: { title: '主控本轮中断', tone: 'error', text: '已确认主控接收消息，但未取得最终回复；已执行的操作需要核对，未自动重做。' },
+  controllerExecutionInterrupted: { title: '本轮中断，会话可继续', tone: 'error', text: '主控已接收原消息，但本轮未完成回复。异常已记录，主控下一轮会收到并核对已有操作；你可以直接发消息继续，无需重启。本次未自动重试。' },
   controllerPreparationFailed: { title: '主控准备失败', tone: 'error', text: '本轮未提交给主控。' },
   controllerStopUnconfirmed: { title: '退出待确认', tone: 'error', text: '主控进程退出未确认，请核对状态。' },
   summaryStopped: { title: '汇总已停止', tone: 'warning', text: '助手结果已保存。' },

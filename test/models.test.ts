@@ -59,6 +59,38 @@ function fixture(t: TestContext, auto = true) {
   return { f, send, inspect };
 }
 
+test('/fast 仅当前 Codex 主控，持久化但不传播到新会话或其他用户', async t => {
+  const { f, send, inspect } = fixture(t);
+  await send('/fast on'); assert.match(f.replies.at(-1)!.text, /仅适用于/);
+  assert.equal(inspect(s => s.getActive('owner')), null);
+  const id = inspect(s => { const c = s.createConversation('owner', 'codex', f.root, { controllerMode: true }); s.setActive('owner', c.id); s.saveNativeId(c.id, 'existing-native'); return c.id; });
+  await send('/fast'); assert.match(f.replies.at(-1)!.text, /沿用 Codex 配置/);
+  await send('/fast on'); assert.equal(inspect(s => s.getActive('owner')!.fastMode), true);
+  assert.equal(inspect(s => s.getActive('owner')!.nativeId), 'existing-native');
+  await send('/status'); assert.match(f.replies.at(-1)!.text, /Fast 设置：开启/);
+  await send('/fast invalid'); assert.match(f.replies.at(-1)!.text, /用法/);
+  assert.equal(inspect(s => s.getActive('owner')!.fastMode), true);
+  await send('/fast off'); assert.equal(inspect(s => s.getActive('owner')!.fastMode), false);
+  await send('/fast on', 'other'); assert.match(f.replies.at(-1)!.text, /仅适用于/);
+  inspect(s => { const c = s.createConversation('owner', 'claude', f.root, { controllerMode: true }); s.setActive('owner', c.id); });
+  await send('/fast on'); assert.match(f.replies.at(-1)!.text, /仅适用于/);
+  assert.equal(inspect(s => s.getActive('owner')!.fastMode), null);
+  inspect(s => { const c = s.createConversation('owner', 'codex', f.root, { controllerMode: true }); s.setActive('owner', c.id); });
+  await send('/fast'); assert.match(f.replies.at(-1)!.text, /沿用 Codex 配置/);
+  assert.equal(inspect(s => s.getConversation(id)!.fastMode), false);
+  assert.equal(f.codex.calls.length + f.claude.calls.length, 0);
+});
+
+test('/fast 忙碌时拒绝修改，不中断当前主控', async t => {
+  const { f, send, inspect } = fixture(t, false);
+  f.config.controllerMode = true;
+  inspect(s => { const c = s.createConversation('owner', 'codex', f.root, { controllerMode: true }); s.setActive('owner', c.id); });
+  await send('busy'); await waitFor(() => f.codex.calls.length === 1);
+  await send('/fast on'); assert.match(f.replies.at(-1)!.text, /正在执行/);
+  assert.equal(inspect(s => s.getActive('owner')!.fastMode), null);
+  assert.equal(f.codex.pending.length, 1);
+});
+
 test('/model 查询区分实际模型与CLI默认，/models列目录且不生成', async t => {
   const { f, send, inspect } = fixture(t);
   await send('/model');

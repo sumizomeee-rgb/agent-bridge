@@ -38,6 +38,28 @@ function setup(agent: AgentName, settings: Record<string, unknown>, env: NodeJS.
   return { root, source, adapter, launches, transports, snapshots, observations, turn, async close() { await adapter.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
+test('Codex Fast 每轮显式传参，关闭覆盖默认速度，同一原生会话续接且不改用户配置', async () => {
+  const s = setup('codex', {});
+  const source = join(s.root, 'user', '.codex', 'config.toml'), original = readFileSync(source);
+  try {
+    const turn = s.turn();
+    await s.adapter.run(turn);
+    assert.equal((s.transports[0]!.written.find(m => m.method === 'turn/start')!.params as JsonObject).serviceTierForTurn, undefined);
+    turn.conversation.nativeId = 'native'; turn.conversation.fastMode = true;
+    await s.adapter.run(turn);
+    assert.equal(s.transports.length, 2);
+    assert.ok(s.launches[1]!.args.includes('features.fast_mode=true'));
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject).threadId, 'native');
+    assert.equal((s.transports[1]!.written.find(m => m.method === 'turn/start')!.params as JsonObject).serviceTierForTurn, 'fast');
+    turn.conversation.fastMode = false;
+    await s.adapter.run(turn);
+    assert.equal(s.transports.length, 2);
+    assert.equal((s.transports[1]!.written.filter(m => m.method === 'turn/start').at(-1)!.params as JsonObject).serviceTierForTurn, 'default');
+    assert.equal(turn.conversation.nativeId, 'native');
+    assert.deepEqual(readFileSync(source), original);
+  } finally { await s.close(); }
+});
+
 test('Claude controller records filtered ultra as unadopted configuration and never as actual effort', async () => {
   const s = setup('claude', { model: 'haiku', effortLevel: 'ultra' }); const original = readFileSync(s.source);
   try {

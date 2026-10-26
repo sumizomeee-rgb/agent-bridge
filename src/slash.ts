@@ -54,6 +54,7 @@ export function slashText(data: unknown, context: 'dm' | 'group' = 'dm'): { text
     case 'group': return { text: `/group ${values.get('action')}` };
     case 'new': return { text: `/new${values.get('continue') ? ' continue' : ''}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'agent': return { text: `/${definition.name}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
+    case 'fast': return { text: `/fast${values.has('mode') ? ` ${values.get('mode')}` : ''}` };
     case 'effort': return { text: `/effort${values.has('level') ? ` ${values.get('level')}` : ''}` };
     case 'cwd': return { text: `/cwd ${values.get('path')}` };
     case 'computers': return { text: `/computers${values.has('refresh') ? values.get('refresh') ? ' refresh' : ' cached' : ''}${values.get('details') ? ' details' : ''}` };
