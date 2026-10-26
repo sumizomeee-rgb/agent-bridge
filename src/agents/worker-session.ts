@@ -129,6 +129,21 @@ export class WorkerSessionAdapter implements AgentAdapter {
   private readonly unconfirmed = new Set<string>();
   private readonly stopped = new Set<string>();
   private readonly completed = new Set<string>();
+  private readonly dispatches = new Map<string, string>();
+  private proofPath(id: string, dispatchId: string): string {
+    return join(this.runtime.dataRoot, 'worker-exits', this.agent, encodeURIComponent(id), encodeURIComponent(dispatchId) + '.json');
+  }
+  private recordStopped(id: string): void {
+    const dispatchId = this.dispatches.get(id);
+    if (dispatchId) {
+      const path = this.proofPath(id, dispatchId);
+      mkdirSync(join(path, '..'), { recursive: true });
+      const temporary = path + '.' + randomUUID() + '.tmp';
+      writeFileSync(temporary, JSON.stringify({ workerId: id, dispatchId, stopped: true }), { flag: 'wx', mode: 0o600 });
+      renameSync(temporary, path);
+    }
+    this.stopped.add(id);
+  }
   private closed = false;
   constructor(private readonly runtime: WorkerSessionRuntime, private readonly agent: AgentName, private readonly visibility: SessionVisibility,
     private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
@@ -146,7 +161,12 @@ export class WorkerSessionAdapter implements AgentAdapter {
     const id = turn.conversation.id;
     if (this.active.has(id)) throw new Error('该助手会话仍在执行。');
     const env = this.runtime.prepare(this.agent, id, turn.conversation.nativeId, this.visibility, this.env);
+    if (turn.dispatchId) {
+      try { unlinkSync(this.proofPath(id, turn.dispatchId)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
     const adapter = this.factory(this.command, env); this.active.set(id, adapter); this.stopped.delete(id); this.completed.delete(id);
+    if (turn.dispatchId) this.dispatches.set(id, turn.dispatchId); else this.dispatches.delete(id);
     let nativeResult: AgentResult | undefined;
     let success = false, stopOnlyReport = false, resultUncertain = false, executionError: string | undefined;
     try { nativeResult = await adapter.run(turn); success = true; return nativeResult; }
@@ -164,14 +184,14 @@ export class WorkerSessionAdapter implements AgentAdapter {
       // A completed report does not authorize forcing down a CLI that is still exiting.
       if (!stopOnlyReport || confirmed) { try { await adapter.close(); } catch (error) { cleanupError = error; } }
       if (confirmed && cleanupError === undefined && !turn.signal.aborted && !this.closed) {
-        this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id); return nativeResult!;
+        this.unconfirmed.delete(id); this.active.delete(id); this.recordStopped(id); return nativeResult!;
       }
       if (success && nativeResult && cleanupError !== undefined && !turn.signal.aborted && !this.closed) {
         nativeResult.processStopped = false; nativeResult.cleanupError = executionErrorEvidence(cleanupError);
         this.unconfirmed.add(id); this.completed.add(id); return nativeResult;
       }
       if (cleanupError !== undefined) { this.unconfirmed.add(id); throw Object.assign(processStopFailure(cleanupError, nativeResult), { executionError, cleanupError: executionErrorEvidence(cleanupError) }, resultUncertain ? { resultUncertain: true } : {}); }
-      if (!this.unconfirmed.has(id)) { this.active.delete(id); this.stopped.add(id); }
+      if (!this.unconfirmed.has(id)) { this.active.delete(id); this.recordStopped(id); }
     }
   }
   async steer(id: string, message: AgentSupplement): Promise<SteerResult> {
@@ -180,13 +200,20 @@ export class WorkerSessionAdapter implements AgentAdapter {
   async interrupt(id: string): Promise<void> {
     const adapter = this.active.get(id); await adapter?.interrupt(id);
     if (adapter && this.unconfirmed.has(id)) {
-      await adapter.close(); this.active.delete(id); this.unconfirmed.delete(id); this.stopped.add(id);
+      await adapter.close(); this.active.delete(id); this.unconfirmed.delete(id); this.recordStopped(id);
     }
   }
-  async confirmStopped(id: string): Promise<boolean> {
+  async confirmStopped(id: string, dispatchId?: string): Promise<boolean> {
+    if (dispatchId && this.dispatches.has(id) && this.dispatches.get(id) !== dispatchId) return false;
+    if (dispatchId && !this.active.has(id) && !this.unconfirmed.has(id)) {
+      try {
+        const proof = JSON.parse(readFileSync(this.proofPath(id, dispatchId), 'utf8'));
+        if (proof.workerId === id && proof.dispatchId === dispatchId && proof.stopped === true) return true;
+      } catch {}
+    }
     if (this.unconfirmed.has(id)) {
       try { const adapter = this.active.get(id); if (await adapter?.confirmStopped?.(id) === true) {
-        await adapter?.close(); this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id);
+        await adapter?.close(); this.unconfirmed.delete(id); this.active.delete(id); this.recordStopped(id);
       } } catch {}
     }
     return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id);

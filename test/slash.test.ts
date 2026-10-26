@@ -23,7 +23,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
   let handler: (request: Request) => Promise<Response> | Response = request =>
     request.path === '/applications/@me' ? new Response('{"id":"777"}', { status: 200 }) : ok();
   let onMessage: (message: IncomingDM) => Promise<void> = async () => {};
-  let sequence = 0, heartbeats = 0;
+  let sequence = 0, heartbeats = 0; const presenceStates: string[] = [];
   const gateway = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>(resolve => gateway.once('listening', resolve));
   const address = gateway.address(); assert(address && typeof address !== 'string');
@@ -33,6 +33,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
     socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 40 } }));
     socket.on('message', raw => {
       const packet = JSON.parse(raw.toString());
+      if (packet.op === 3) presenceStates.push(packet.d.activities[0].state);
       if (packet.op === 1) { heartbeats++; socket.send('{"op":11}'); }
       if (packet.op === 2) socket.send(JSON.stringify({ op: 0, t: 'READY', s: ++sequence, d: {
         session_id: 'local-session', resume_gateway_url: wsUrl, user: { id: '999', username: 'LocalTestBot' },
@@ -70,7 +71,7 @@ async function fixture(t: TestContext, readyApplication = true, allowedUserIds =
     return data.id;
   };
   const callbacks = () => requests.filter(request => request.path.endsWith('/callback'));
-  return { transport, requests, received, logs, sockets, dispatch, callbacks,
+  return { transport, requests, received, logs, sockets, dispatch, callbacks, presenceStates,
     get heartbeats() { return heartbeats; },
     set handler(value: typeof handler) { handler = value; },
     set onMessage(value: typeof onMessage) { onMessage = value; },
@@ -177,12 +178,9 @@ test('registration failure does not close transport or break ordinary DMs', asyn
 });
 
 test('authorized slash input clears the restart receipt; unauthorized interaction does not', async t => {
-  const f = await fixture(t); const states: string[] = [];
-  f.sockets.at(-1)!.on('message', raw => {
-    const packet = JSON.parse(raw.toString()); if (packet.op === 3) states.push(packet.d.activities[0].state);
-  });
-  f.transport.setPresence('idle'); await until(() => states.at(-1) === '已重启');
-  f.dispatch({ user: { id: '444' } }); await until(() => f.callbacks().length === 1); assert.equal(states.at(-1), '已重启');
+  const f = await fixture(t); const states = f.presenceStates;
+  f.transport.setPresence('idle'); await until(() => /已重启$/.test(states.at(-1) ?? ''));
+  f.dispatch({ user: { id: '444' } }); await until(() => f.callbacks().length === 1); assert.match(states.at(-1)!, /已重启$/);
   f.dispatch({ data: { name: 'workers', type: 1 } }); await until(() => f.received.length === 1 && states.at(-1) === '空闲');
 });
 
@@ -339,7 +337,9 @@ test('business dispatch failure is reported through the original interaction, wi
   assert.equal(f.callbacks().length, 1);
   assert(f.requests.every(request => !request.path.startsWith('/channels/')));
   assert(f.logs.every(line => !line.includes('SECRET')));
-  assert.equal(f.requests.find(request => request.method === 'PATCH')!.body.content, '这条命令处理失败，请稍后重试。');
+  const content = f.requests.find(request => request.method === 'PATCH')!.body.content;
+  assert.match(content, /【桥】命令失败/); assert.match(content, /请核对命令或查看本地记录/);
+  assert.doesNotMatch(content, /FAKE_INTERACTION_SECRET/);
 });
 
 test('registration non-global 429 waits locally without delaying ordinary DM delivery', async t => {

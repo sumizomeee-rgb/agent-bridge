@@ -658,29 +658,26 @@ test('an unconfirmed process stop never reports stopped=true or a successful can
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
-test('shutdown stops a running CLI, persists uncertainty, and retains queued work and alarms for restart', async () => {
+test('shutdown preserves interruption evidence; restart cancels stale queue and allows a fresh continuation', async () => {
   const f = fixture(); let second: ControllerRuntime | undefined;
   try {
     const a = await launch(f.runtime, f.turn); await flush();
-    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '独立的下一轮', delivery: 'next' });
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: 'stale queued instruction', delivery: 'next' });
     await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 60, text: '恢复下载检查' });
     await f.runtime.close(); assert.equal(f.codex.pending.size, 0); assert.equal(f.registry.activeCount('parent-A'), 0);
     const inspect = new ControllerStore(f.dir);
-    assert.deepEqual(inspect.jobs(a.workerId).map(job => job.status), ['uncertain', 'queued']); assert.equal(inspect.schedules()[0]?.status, 'pending'); inspect.close();
+    assert.deepEqual(inspect.jobs(a.workerId).map(job => job.status), ['uncertain', 'queued']);
+    assert.equal(inspect.jobs(a.workerId)[0]?.processStopped, true); inspect.close();
     const adapter = new FakeAdapter(); second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
     await second.start(); await flush(); assert.equal(adapter.turns.length, 0);
-    assert.equal(second.store.getWorker(a.workerId)?.blocked, true);
-    assert.equal(second.store.jobs(a.workerId)[1]?.status, 'queued');
-    await assert.rejects(second.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '自动继续不行' }), /不能自动续接/);
-    const listed = await second.invoke(f.turn, 'bridge_list_workers', {}) as { workers: { blocked: boolean; lastStatus: string }[] };
-    assert.equal(listed.workers[0]?.blocked, true); assert.equal(listed.workers[0]?.lastStatus, 'uncertain');
-    assert.equal(second.store.jobs(a.workerId)[0]?.status, 'uncertain');
-    await second.invoke(f.turn, 'bridge_cancel_worker', { workerId: a.workerId, reason: '取消未知任务的排队后续' });
-    assert.equal(second.store.jobs(a.workerId)[1]?.status, 'cancelled');
-    await assert.rejects(second.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '取消后仅查状态' }), error => {
-      assert.ok(error instanceof Error); assert.match(error.message, /旧任务不会自动重做/); assert.doesNotMatch(error.message, /保留/); return true;
-    });
-    assert.equal(adapter.turns.length, 0);
+    assert.equal(second.store.getWorker(a.workerId)?.blocked, false);
+    assert.deepEqual(second.store.jobs(a.workerId).map(job => job.status), ['failed', 'cancelled']);
+    assert.equal(second.store.jobs(a.workerId)[0]?.interrupted, true);
+    assert.equal(second.store.schedules()[0]?.status, 'pending');
+    await second.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '按新指令继续' }); await flush();
+    assert.equal(adapter.turns.length, 1); assert.match(adapter.turns[0]!.text, /先核对历史及已保存产物/);
+    assert.doesNotMatch(adapter.turns[0]!.text, /stale queued instruction/);
+    adapter.finish(a.workerId); await flush();
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });
 

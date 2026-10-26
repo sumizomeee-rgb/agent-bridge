@@ -166,12 +166,13 @@ export class ControllerStore {
     const row = this.db.prepare("SELECT * FROM controller_jobs WHERE worker_id=? AND status='queued' ORDER BY created_at,rowid LIMIT 1").get(workerId);
     return row ? job(row) : null;
   }
-  setJob(id: string, status: ControllerJobStatus, update: { taskId?: string; result?: string; cancelReason?: string; wakeAllowed?: boolean; startedAt?: string; nativeResult?: ControllerJob['nativeResult']; processStopped?: boolean; stopEvidence?: ControllerJob['stopEvidence']; executionError?: string; cleanupError?: string } = {}): void {
+  setJob(id: string, status: ControllerJobStatus, update: { taskId?: string; result?: string; cancelReason?: string; wakeAllowed?: boolean; startedAt?: string; nativeResult?: ControllerJob['nativeResult']; processStopped?: boolean; interrupted?: boolean; stopEvidence?: ControllerJob['stopEvidence']; executionError?: string; cleanupError?: string } = {}): void {
     const current = this.getJob(id); if (!current) throw new Error('子任务不存在');
     const value = { ...current, status, taskId: update.taskId ?? current.taskId, result: update.result ?? current.result,
       cancelReason: update.cancelReason ?? current.cancelReason, wakeAllowed: update.wakeAllowed ?? current.wakeAllowed,
       ...(update.nativeResult ? { nativeResult: update.nativeResult } : {}),
       ...(update.processStopped !== undefined ? { processStopped: update.processStopped } : {}),
+      ...(update.interrupted !== undefined ? { interrupted: update.interrupted } : {}),
       ...(update.stopEvidence ? { stopEvidence: update.stopEvidence } : {}),
       ...(update.executionError ? { executionError: update.executionError } : {}),
       ...(update.cleanupError ? { cleanupError: update.cleanupError } : {}),

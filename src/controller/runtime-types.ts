@@ -27,6 +27,8 @@ export interface ControllerJob {
   /** A completed turn report and process exit proof are independent of reconciliation status. */
   nativeResult?: AgentResult;
   processStopped?: boolean;
+  /** Previous execution ended without a reliable business result; new input may resume after proven exit. */
+  interrupted?: boolean;
   stopEvidence?: AgentStopEvidence;
   executionError?: string; cleanupError?: string;
   /** Optional metadata keeps old JSON rows compatible; no native payloads are stored. */

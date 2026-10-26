@@ -62,6 +62,7 @@ export class ControllerRuntime {
   private readonly preparations = new Map<string, { agent: AgentName; abort: AbortController; done: Promise<unknown> }>();
   private readonly dispatches = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   private readonly unconfirmedStops = new Set<string>();
+  private readonly recoveredLocalStops = new Set<string>();
   private readonly feedbackPublications = new Map<string, Promise<void>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private polling: Promise<void> | undefined;
@@ -73,7 +74,7 @@ export class ControllerRuntime {
   private lastWorkCounts: string | undefined;
   private isDraining(): boolean { return this.draining || this.callbacks.isDraining?.() === true; }
   beginDrain(): void { this.draining = true; }
-  isIdle(): boolean { return this.active.size === 0 && this.preparations.size === 0 && this.dispatches.size === 0 && this.unconfirmedStops.size === 0 && !this.polling && !this.starting; }
+  isIdle(): boolean { return this.active.size === 0 && this.preparations.size === 0 && this.dispatches.size === 0 && [...this.unconfirmedStops].every(id => this.recoveredLocalStops.has(id)) && !this.polling && !this.starting; }
 
   constructor(private readonly config: BridgeConfig, private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
@@ -409,7 +410,7 @@ export class ControllerRuntime {
       this.store.setJob(job.id, 'completed', { result: job.nativeResult!.text });
       if (!this.store.jobs(worker.id).some(value => value.status === 'uncertain')) { worker.blocked = false; this.store.saveWorker(worker); }
     }
-    // Local interrupted work stays uncertain. A remote daemon follows the original dispatch only.
+    // Remote dispatches retain their original identity; local jobs reconcile only with durable exit proof.
     for (const job of this.store.jobs().filter(job => job.status === 'running')) {
       if (!this.config.allowedUserIds.includes(job.origin.userId)) continue;
       const worker = this.store.getWorker(job.workerId)!;
@@ -440,8 +441,12 @@ export class ControllerRuntime {
       if (!worker.blocked && uncertain.length) { worker.blocked = true; this.store.saveWorker(worker); }
       // Rebuild observation from durable jobs; a restart must not discard pending exit checks.
       if (worker.ownership !== 'user' && !worker.handoffPending
-        && (this.retirementPending(worker.id) || worker.target?.transport === 'ssh' && uncertain.some(job => job.processStopped !== true))) this.unconfirmedStops.add(worker.id);
+        && (this.retirementPending(worker.id) || uncertain.some(job => job.processStopped !== true))) {
+        this.unconfirmedStops.add(worker.id);
+        if (worker.target?.transport !== 'ssh' && !this.retirementPending(worker.id)) this.recoveredLocalStops.add(worker.id);
+      }
     }
+    for (const worker of this.store.workers()) this.reconcileInterruptedWorker(worker.id);
     if (this.stopping || this.closed) return;
     this.started = true;
     await this.poll();
@@ -676,6 +681,11 @@ export class ControllerRuntime {
       if (args.delivery !== undefined && args.delivery !== 'current' && args.delivery !== 'next') throw new Error('delivery 必须是 current 或 next');
       const worker = this.ownedWorker(origin, args.workerId);
       this.assertBridgeOwnership(worker);
+      if (worker.blocked && !worker.archivedAt && !worker.handoffPending) {
+        await this.confirmUncertainStops();
+        this.reconcileInterruptedWorker(worker.id);
+        worker.blocked = this.store.getWorker(worker.id)!.blocked;
+      }
       if (worker.blocked) {
         if (this.store.jobs(worker.id).some(job => job.status === 'uncertain' && job.nativeResult)) throw new Error('【桥】报告已保存，会话待核对；请先核对退出状态和已发生的操作。');
         throw new Error('此子 Agent 上一轮结果未知，已暂停；不能自动续接旧原生会话。请新起核查子 Agent，确认进程及已发生的操作。旧任务不会自动重做。');
@@ -853,6 +863,7 @@ export class ControllerRuntime {
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped, retiring: this.retirementPending(worker.id),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
+            ...(jobs.some(job => job.interrupted) ? { recovery: { previousExecutionInterrupted: true, canContinue: !worker.blocked && !worker.archivedAt && worker.ownership !== 'user', instruction: '旧轮次未重放；可以用 bridge_continue_worker 在原会话按最新指令续接，先核对已发生的操作。' } } : {}),
             ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
             startedAt: currentJob?.startedAt ?? null,
@@ -969,6 +980,7 @@ export class ControllerRuntime {
     let worker = this.store.getWorker(workerId)!;
     let job = this.store.getJob(state.job.id)!;
     if (job.status !== (state.recovering ? 'running' : 'queued') || this.stopping) { await this.settleSupplements(state); return; }
+    this.recoveredLocalStops.delete(workerId);
     if (!state.recovering) this.store.setJob(job.id, 'running', { startedAt: this.timestamp() });
     await this.workCountsChanged();
     try {
@@ -994,7 +1006,9 @@ export class ControllerRuntime {
       const conversation: Conversation = { id: worker.id, userId: worker.origin.userId, agent: worker.agent, nativeId: worker.nativeId,
         model: worker.model, ...worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {}, actualModel: worker.actualModel, effort: worker.effort, actualEffort: worker.actualEffort ?? null, title: worker.title, cwd: worker.cwd,
         createdAt: worker.createdAt, updatedAt: this.timestamp() };
-      const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction) + job.prompt, imagePaths: job.imagePaths,
+      const previous = this.store.jobs(worker.id).filter(value => value.id !== job.id && !['queued', 'cancelled'].includes(value.status)).at(-1);
+      const recovery = previous?.interrupted ? '\n上轮执行已中断，CLI 退出已确认，但业务结果未确认。保留原会话；先核对历史及已保存产物，避免重复已发生的操作。以下是新的续接指令，不是重放旧任务。\n' : '';
+      const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction) + recovery + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
         onReady: () => { state.ready = true; this.pumpSupplements(workerId, state); },
         onActivity: activity => {
@@ -1121,6 +1135,24 @@ export class ControllerRuntime {
     await this.count(job.origin.conversationId);
     if (changed) await this.notify(taskId);
   }
+  private reconcileInterruptedWorker(workerId: string): void {
+    const worker = this.store.getWorker(workerId);
+    if (!worker?.blocked || worker.target?.transport === 'ssh' || worker.archivedAt || worker.supersededBy || worker.ownership === 'user' || worker.handoffPending || worker.adoption?.status === 'pending'
+      || !this.config.allowedUserIds.includes(worker.origin.userId) || this.active.has(workerId)) return;
+    const jobs = this.store.jobs(workerId), uncertain = jobs.filter(job => job.status === 'uncertain');
+    if (!uncertain.length || uncertain.some(job => job.processStopped !== true || job.origin.purpose === 'workspace-context')) return;
+    this.store.transaction(() => {
+      // A stopped execution is resumable, not retrospectively successful. Preserve its original result/evidence.
+      for (const job of uncertain) this.store.setJob(job.id, 'failed', { interrupted: true });
+      // Never replay pre-crash queued instructions when releasing the worker.
+      for (const job of jobs.filter(job => job.status === 'queued')) {
+        this.store.setJob(job.id, 'cancelled', { result: '前轮中断；旧队列未自动重放，请按最新进度重新续接。' });
+        if (job.scheduleId) { const plan = this.store.getSchedule(job.scheduleId); if (plan) { plan.status = 'cancelled'; this.store.saveSchedule(plan); } }
+      }
+      worker.blocked = false; this.store.saveWorker(worker);
+    });
+    this.unconfirmedStops.delete(workerId);
+  }
   private requestCancellation(workerId: string, reason: string): void {
     for (const job of this.store.jobs(workerId)) {
       if (job.status === 'queued') {
@@ -1144,7 +1176,7 @@ export class ControllerRuntime {
           this.unconfirmedStops.delete(workerId); return true;
         } catch (error) { this.error(error); return false; }
       }
-      if (this.unconfirmedStops.has(workerId) && worker.target?.transport !== 'ssh') {
+      if (this.unconfirmedStops.has(workerId) && !this.recoveredLocalStops.has(workerId) && worker.target?.transport !== 'ssh') {
         try {
           await this.adapter(worker).interrupt(workerId);
           this.unconfirmedStops.delete(workerId);
@@ -1156,8 +1188,7 @@ export class ControllerRuntime {
       const uncertain = this.store.jobs(workerId).filter(job => job.status === 'uncertain');
       if (!uncertain.length) return false;
       for (const job of uncertain.filter(job => job.processStopped !== true)) {
-        // A restarted remote adapter has no in-memory dispatch map. Read the durable job ID only; never submit or interrupt it.
-        if (worker.target?.transport !== 'ssh') return false;
+        // After restart, require a receipt for this exact dispatch; absence is never exit proof.
         try {
           if (await this.adapter(worker).confirmStopped?.(workerId, job.id) !== true) return false;
           this.store.setJob(job.id, job.status, { processStopped: true });
@@ -1229,6 +1260,7 @@ export class ControllerRuntime {
         } catch (error) { this.error(error); }
         if (this.closed || this.stopping) return;
       }
+      this.reconcileInterruptedWorker(worker!.id);
       if (!this.store.jobs(worker!.id).some(job => job.status === 'uncertain' && job.processStopped !== true || ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false)) {
         this.unconfirmedStops.delete(worker!.id); this.kick(worker!.id); await this.workCountsChanged(); this.callbacks.onExecutionSettled?.();
       }
