@@ -10,6 +10,9 @@ import type { ExecutionTargetBinding, RemoteClient } from './types.js';
 import type { AgentCommand } from '../types.js';
 
 interface Endpoint { version: 1; hostname: string; port: number; token: string }
+let deploymentHook: ((binding: ExecutionTargetBinding, cwd: string) => Promise<unknown>) | undefined;
+/** Installed once by the host; transport fixtures and standalone clients keep their existing behavior. */
+export function setRemoteDeploymentHook(hook: typeof deploymentHook): void { deploymentHook = hook; }
 /** Private metadata is transferred by SFTP; it never appears in a command argument or registry. */
 export function remoteMetadataSpec(binding: ExecutionTargetBinding): string {
   const windows = /^[A-Za-z]:[\\/]/.test(binding.remoteRoot!);
@@ -106,6 +109,8 @@ export class SshRemoteClient implements RemoteClient {
   }
   async request<T = unknown>(method: string, args: unknown): Promise<T> {
     if (this.closed) throw new Error('远端隧道客户端已关闭。');
+    // Cached tunnels must also wait for a concurrent deployment before their next dispatch handshake.
+    if (method === 'hello' && !this.options.createProcess) await deploymentHook?.(this.binding, this.cwd);
     this.startup ??= this.initialize().catch(async error => {
       // Keep concurrent callers on one failure; a later call must reread the endpoint.
       await this.clearConnection(); this.startup = null;

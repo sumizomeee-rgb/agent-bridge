@@ -7,6 +7,10 @@ import { BotRuntime } from './bot-runtime.js';
 import { HostRuntime } from './host-runtime.js';
 import { RestartService } from './restart.js';
 import { DrainStop } from './shutdown.js';
+import { RemoteDeploymentService } from './remote/deployment.js';
+import { parseTargetRegistry } from './remote/catalog.js';
+import { setRemoteDeploymentHook } from './remote/client.js';
+import { readFileSync } from 'node:fs';
 
 if (process.argv.includes('--help')) {
   console.log('启动宿主：start.ps1；配置检查：start.ps1 -Check；首次升级：host-migration-cli --config 配置路径（默认dry-run）。启动集合在version:3 startupProfiles配置，私聊/help，群/group start。');
@@ -28,12 +32,15 @@ let restart: RestartService;
 let host: HostRuntime;
 let closing: Promise<void> | undefined;
 let poll: ReturnType<typeof setInterval> | undefined;
+let deployments: RemoteDeploymentService | undefined;
 const pidFile = join(config.rootDataDir, 'bridge.pid.json'), stopFile = join(config.rootDataDir, 'stop.request');
 const drainStopFile = join(config.rootDataDir, 'drain-stop.request');
 async function shutdown(planned = false): Promise<void> {
   if (closing) return closing;
   closing = (async () => {
     if (poll) clearInterval(poll);
+    setRemoteDeploymentHook(undefined);
+    await deployments?.close();
     if (!planned) restart?.cancel();
     log(planned ? 'RESTART_STOPPING' : 'STOPPING');
     try { await host?.close(); log('STOPPED'); }
@@ -48,6 +55,22 @@ async function shutdown(planned = false): Promise<void> {
 }
 try {
   const marker = ensureHostSemanticData(config);
+  deployments = new RemoteDeploymentService(async () => {
+    const targets = [];
+    for (const selected of config.configs) {
+      const cwd = selected.contextWorkspace ?? selected.workspace, path = join(cwd, 'remote-agents', 'registry.json');
+      if (!existsSync(path)) continue;
+      for (const registration of parseTargetRegistry(JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')))) {
+        const agent = registration.engines.codex ? 'codex' as const : 'claude' as const, engine = registration.engines[agent]!;
+        targets.push({ cwd, target: { id: registration.id, label: registration.label, transport: 'ssh' as const, expectedHostname: registration.expectedHostname,
+          sshConfig: registration.sshConfig, alias: registration.alias, remoteRoot: registration.remoteRoot, nodePath: registration.nodePath,
+          agent, agentCommand: engine.agentCommand, cwd: engine.defaultCwd } });
+      }
+    }
+    return targets;
+  }, log);
+  setRemoteDeploymentHook((target, cwd) => deployments!.ensure(target, cwd));
+  deployments.start();
   host = new HostRuntime(config, marker, origin => Promise.resolve(restart.request(origin)), log);
   restart = new RestartService(config.rootDataDir, {
     supervised: process.env.BRIDGE_SUPERVISED === '1', beginDrain: () => host.beginDrain(), isIdle: () => host.isIdle(),

@@ -18,6 +18,18 @@ function Quote-NativeArgument([string]$Value) {
     # Escape exactly for Windows CommandLineToArgvW, including trailing backslashes.
     '"' + [Regex]::Replace([Regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
-$arguments = @((Quote-NativeArgument $entry), '--serve', '--root', (Quote-NativeArgument $resolvedRoot))
-$daemonProcess = Start-Process -FilePath $NodePath -ArgumentList $arguments -WorkingDirectory $resolvedRoot -WindowStyle Hidden -RedirectStandardError $errorLog -PassThru -Wait
-exit $daemonProcess.ExitCode
+# This independent logon task also supervises release changes. User data stays at Root.
+while ($true) {
+    $selectedEntry = $entry
+    $pointer = Join-Path $resolvedRoot '.local\remote\active-release.json'
+    if (Test-Path -LiteralPath $pointer) {
+        $release = Get-Content -LiteralPath $pointer -Raw -Encoding UTF8 | ConvertFrom-Json
+        $expected = [IO.Path]::GetFullPath((Join-Path $resolvedRoot ('.local\remote\releases\' + $release.id)))
+        if ($release.id -notmatch '^[a-f0-9]{64}$' -or [IO.Path]::GetFullPath($release.path) -ne $expected) { throw 'Invalid active executor release.' }
+        $selectedEntry = Join-Path $expected 'dist\src\remote\cli.js'
+        $env:BRIDGE_EXECUTOR_RELEASE = $release.id
+    } else { Remove-Item Env:\BRIDGE_EXECUTOR_RELEASE -ErrorAction SilentlyContinue }
+    $arguments = @((Quote-NativeArgument $selectedEntry), '--serve', '--root', (Quote-NativeArgument $resolvedRoot))
+    $daemonProcess = Start-Process -FilePath $NodePath -ArgumentList $arguments -WorkingDirectory $resolvedRoot -WindowStyle Hidden -RedirectStandardError $errorLog -PassThru -Wait
+    Start-Sleep -Seconds $(if ($daemonProcess.ExitCode -eq 0) { 1 } else { 5 })
+}

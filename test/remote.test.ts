@@ -53,6 +53,25 @@ function fixture() {
   return { root, daemon, natives, config, binding, adapter, request, turn, calls, disconnect: () => { disconnect = true; } };
 }
 
+test('执行器更新租约只在空闲时取得，阻止新派工和原生查询，取消后恢复且不杀助手', async () => {
+  const f = fixture(), lease = 'a'.repeat(32);
+  try {
+    const request = f.request(); await f.daemon.handle('dispatch', request); await tick();
+    assert.deepEqual(await f.daemon.handle('maintenance/prepare', { lease }), { ready: false });
+    assert.equal(f.natives[0]!.interrupts, 0);
+    f.natives[0]!.finish('已完成'); await tick(); await tick();
+    assert.deepEqual(await f.daemon.handle('maintenance/prepare', { lease }), { ready: true });
+    await assert.rejects(f.daemon.handle('dispatch', f.request()), /正在安全更新/);
+    await assert.rejects(f.daemon.handle('sessions/list', {}), /正在安全更新/);
+    assert.deepEqual(await f.daemon.handle('maintenance/prepare', { lease: 'b'.repeat(32) }), { ready: false });
+    await f.daemon.handle('maintenance/cancel', { lease: 'b'.repeat(32) });
+    await assert.rejects(f.daemon.handle('dispatch', f.request()), /正在安全更新/);
+    await f.daemon.handle('maintenance/cancel', { lease });
+    const next = f.request(); await f.daemon.handle('dispatch', next); await tick();
+    assert.equal(f.natives.length, 2); f.natives[1]!.finish('下一轮'); await tick(); await tick();
+  } finally { await f.adapter.close(); await f.daemon.close(); }
+});
+
 test('remote dispatch is durable, deduplicated and serial per worker while other workers run concurrently', async () => {
   const f = fixture();
   try {

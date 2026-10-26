@@ -85,6 +85,8 @@ async function stopPersisted(record: ProcessRecord): Promise<boolean> {
 }
 
 export interface RemoteDaemonOptions {
+  release?: string;
+  onMaintenanceStop?: () => void;
   nativeSessionOptions?: Pick<NativeSessionServiceOptions, 'busyProbe' | 'userHome'>;
   /** Test seam only; production always uses target-native adapters and current target environment. */
   adapterFactory?: (agent: AgentName, dispatch: RemoteDispatch, track: (process: JsonLineProcess) => void) => AgentAdapter;
@@ -105,6 +107,7 @@ export class RemoteDaemon {
   private httpServer: HttpServer | null = null;
   private closing = false;
   private nativeClosing = false;
+  private maintenance: { lease: string; until: number } | null = null;
   private readonly nativeOperations = new Set<Promise<unknown>>();
   private token: string;
   private readonly presetRuntime: PresetRuntime;
@@ -180,7 +183,26 @@ export class RemoteDaemon {
   private respond(socket: Socket, response: RemoteResponse): void { if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`); }
   async handle(method: string, raw: unknown): Promise<unknown> {
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
-    if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, presetDispatch: 1, sessionVisibility: 1, cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
+    if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, presetDispatch: 1, sessionVisibility: 1,
+      deployment: { release: this.options.release ?? process.env.BRIDGE_EXECUTOR_RELEASE ?? null, maintenance: 1 },
+      cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
+    if (this.maintenance && this.maintenance.until < Date.now()) this.maintenance = null;
+    if (method.startsWith('maintenance/')) {
+      if (typeof raw.lease !== 'string' || !/^[a-f0-9]{32}$/.test(raw.lease)) throw new Error('无效的执行器更新租约。');
+      if (method === 'maintenance/cancel') { if (this.maintenance?.lease === raw.lease) this.maintenance = null; return { cancelled: true }; }
+      if (method === 'maintenance/prepare') {
+        if (this.maintenance && this.maintenance.lease !== raw.lease || !this.isUpdateIdle()) return { ready: false };
+        this.maintenance = { lease: raw.lease, until: Date.now() + 30_000 }; return { ready: true };
+      }
+      if (method === 'maintenance/stop') {
+        if (this.maintenance?.lease !== raw.lease || !this.isUpdateIdle() || !this.options.onMaintenanceStop) throw new Error('执行器尚未确认可安全更新。');
+        this.maintenance.until = Number.POSITIVE_INFINITY;
+        setTimeout(() => this.options.onMaintenanceStop!(), 100); return { stopping: true };
+      }
+      throw new Error('未知执行器维护操作。');
+    }
+    if (this.maintenance && (['dispatch', 'models', 'preset/pin', 'preset/describe', 'upload'].includes(method) || method.startsWith('sessions/')))
+      throw Object.assign(new Error('执行器正在安全更新，稍后自动重试。'), { code: 'EXECUTOR_UPDATING' });
     if (method === 'preset/pin') {
       assertPresetBinding(raw.preset); this.agent(raw.preset.agent);
       await this.presetRuntime.pin(raw.preset, identifier(raw.workerId, '助手编号'), raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号'), sessionVisibility(raw.sessionVisibility), this.environment()); return { pinned: true };
@@ -541,6 +563,12 @@ export class RemoteDaemon {
     const file = await open(path, 'r');
     try { const info = await file.stat(); if (info.size !== artifact.size) throw new Error('产物缓存发生变化。'); const bytes = Buffer.alloc(Math.min(CHUNK, artifact.size - offset)); await file.read(bytes, 0, bytes.length, offset); return { data: bytes.toString('base64'), offset: offset + bytes.length, complete: offset + bytes.length === artifact.size }; }
     finally { await file.close(); }
+  }
+  isUpdateIdle(): boolean {
+    return !this.closing && !this.nativeClosing && !this.active.size && !this.dispatches.size && !this.operations.size
+      && !this.pendingExits.size && !this.pendingCleanup.size && !this.metadataAdapters.size && !this.nativeOperations.size
+      && !this.store.jobs().some(job => job.status === 'running' || job.stopped !== true)
+      && !this.store.db.prepare('SELECT 1 FROM processes WHERE closed=0 LIMIT 1').get();
   }
   async close(): Promise<void> {
     if (this.closing) return;

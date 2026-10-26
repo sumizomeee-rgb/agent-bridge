@@ -13,7 +13,7 @@ export async function runRemoteCli(argv: string[]): Promise<void> {
   const root = resolve(argv[rootIndex + 1]!);
   if (mode === '--serve') {
     ensureRemoteSemanticData(root);
-    const daemon = new RemoteDaemon(root, loadRemoteConfig(root)); await daemon.listen();
+    const daemon = new RemoteDaemon(root, loadRemoteConfig(root), { onMaintenanceStop: () => stop() }); await daemon.listen();
     const stop = () => { void daemon.close().then(() => process.exit(0), () => process.exit(2)); };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     // This process is launched independently of SSH; stdout contains no IPC credential.
