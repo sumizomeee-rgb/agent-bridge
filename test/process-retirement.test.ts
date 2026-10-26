@@ -145,10 +145,10 @@ test('an unexpected launcher close cannot prove its detached CLI descendant stop
 
 test('Windows unresponsive unauthorized stop helper is replaced once; next helper proves tree stop', { skip: process.platform !== 'win32', timeout: 45000 }, async t => {
   let attempts = 0; const helpers: ReturnType<typeof spawn>[] = []; const events: Array<{ attempt: number; text: string }> = [];
-  const f = fixture({ ignoreEof: true, nativeMs: 60000, stopHelper: script => {
+  const f = fixture({ ignoreEof: true, nativeMs: 60000, stopHelper: (script, command) => {
     const helper = ++attempts === 1
       ? spawn(process.execPath, ['-e', 'process.stdin.resume();setInterval(()=>{},1000)'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
-      : spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      : spawn(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const attempt = attempts; helper.stdout.on('data', bytes => events.push({ attempt, text: bytes.toString().slice(0, 128) }));
     helpers.push(helper); return helper;
   } });

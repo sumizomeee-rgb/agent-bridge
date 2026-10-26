@@ -145,7 +145,7 @@ export class JsonLineProcess {
   private stopConfirmed = false;
 
   constructor(command: AgentCommand, extraArgs: string[], cwd: string, env: NodeJS.ProcessEnv,
-    private readonly stopHelper?: (script: string) => ChildProcessWithoutNullStreams) {
+    private readonly stopHelper?: (script: string, command: string) => ChildProcessWithoutNullStreams) {
     this.child = spawn(command.command, [...command.args, ...extraArgs], {
       cwd, env: { ...process.env, ...env }, shell: false, windowsHide: true,
       detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
@@ -326,7 +326,7 @@ export class JsonLineProcess {
     // A helper that never acquired authorization may be replaced safely. Once
     // STOP was sent, keep its holder alive and never overlap another tree kill.
     const modern = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
-    const commands = existsSync(modern) ? [{ command: modern, readyMs: 5000 }, { command: 'powershell.exe', readyMs: 30000 }]
+    const commands = existsSync(modern) ? [{ command: modern, readyMs: 5000 }, { command: modern, readyMs: 30000 }]
       : [{ command: 'powershell.exe', readyMs: 30000 }, { command: 'powershell.exe', readyMs: 30000 }];
     for (const { command, readyMs } of commands) {
       if (this.exited.settled || await this.stopWindowsTreeAttempt(pid, command, readyMs)) return;
@@ -354,7 +354,7 @@ try {
   [Console]::Out.WriteLine('EXIT:'+[string]$treeKiller.ExitCode)
 } catch {[Console]::Out.WriteLine('FAILED')}
 finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProcess.Dispose()}}`;
-    const helper = this.stopHelper?.(script) ?? spawn(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    const helper = this.stopHelper?.(script, command) ?? spawn(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
       { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const finished = deferred<void>(), ready = deferred<void>(); let buffer = '', permissionOpen = true, authorized = false;
     helper.stdin.on('error', () => {}); helper.stderr.on('data', () => {});
