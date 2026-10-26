@@ -71,6 +71,55 @@ async function reply(transport: Transport) {
   transport.complete();
 }
 
+
+
+for (const boundary of ['private-update', 'group-refresh', 'reply-recovery'] as const) {
+  for (const evidence of ['accepted', 'old-turn-only', 'explicit-error'] as const) test(boundary + ': missing RPC response uses only the current acceptance evidence (' + evidence + ')', async t => {
+    const s = fixture(t, transport => {
+      transport.intercept = message => {
+        if (message.method !== 'turn/start' || transport.turns === 0) return false;
+        transport.turns++;
+        transport.emit({ method: 'turn/started', params: { threadId: transport.nativeId, turn: { id: 'turn-1' } } });
+        if (evidence !== 'old-turn-only') transport.emit({ method: 'turn/started', params: { threadId: transport.nativeId, turn: { id: 'turn-2' } } });
+        if (evidence === 'explicit-error') transport.emit({ id: message.id, error: { code: -1, message: 'explicit refusal' } });
+        return true;
+      };
+    });
+    let refresh = true;
+    if (boundary === 'private-update') s.turn.onPrivateInputCheck = async () => {
+      if (!refresh) return { refreshRequired: false }; refresh = false;
+      return { refreshRequired: true, input: { version: 1, messages: [{ id: 'new-message', userId: 'owner', channelId: 'dm', text: 'updated instruction', imagePaths: [] }] } };
+    };
+    if (boundary === 'group-refresh') {
+      s.turn.onPrivateInputCheck = undefined;
+      s.turn.groupContext = { eventId: 'event', rootId: 'root', botId: 'bot', spaceId: 'group', generation: 1, bindingEpoch: 1, originChannelId: 'group', principalId: 'owner', scene: '{}' };
+      s.turn.onSceneCheck = async () => { const result = refresh; refresh = false; return { refreshRequired: result, scene: '{}' }; };
+    }
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const running = s.adapter.run(s.turn); void running.catch(() => {});
+    const rejected = evidence === 'accepted' ? undefined : assert.rejects(running);
+    await until(() => s.transports[0]?.turns === 1);
+    const transport = s.transports[0]!;
+    if (boundary !== 'reply-recovery') {
+      transport.tool('bridge_start_worker', { title: 'stale plan', prompt: 'must not execute' }, 401);
+      await until(() => transport.written.some(message => message.id === 401));
+    }
+    transport.complete();
+    await until(() => transport.turns === 2);
+    await new Promise(resolve => setImmediate(resolve));
+    t.mock.timers.tick(20001);
+    await new Promise(resolve => setImmediate(resolve));
+    if (evidence === 'accepted') {
+      assert.equal(transport.stopped, false, 'a live accepted continuation must survive a lost RPC response');
+      transport.intercept = undefined;
+      await reply(transport); await running;
+      assert.deepEqual(s.published, ['confirmed reply']);
+      assert.deepEqual(s.management, [], 'a paused old action must never be replayed');
+    } else { await rejected; assert.equal(transport.stopped, true); assert.deepEqual(s.published, []); }
+    t.mock.timers.reset();
+    assert.equal(s.transports.length, 1); assert.equal(transport.turns, 2);
+  });
+}
 test('startup failure: retry once before submission, preserve native session and persist before I/O', async t => {
   const s = fixture(t, (transport, index) => {
     transport.intercept = message => {

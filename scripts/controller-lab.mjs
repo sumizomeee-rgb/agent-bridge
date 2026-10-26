@@ -34,7 +34,7 @@ try {
   try {
   if (!values.live) {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
-    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain'];
+    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement'];
     const output = [];
     const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...['faults', 'parity'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });

@@ -405,7 +405,9 @@ export class SessionManager {
     this.setLatestMessage(message, active.id);
     if (this.draining) return;
     const head = this.store.nextQueued(active.id);
-    if (!head || this.canProcessQueued(head)) this.initializeWorkspace(active, message);
+    // Ordinary group participation must not bootstrap a private workspace flow.
+    // Explicit group /new uses ensureCommittedResetInitialized separately.
+    if (!message.groupContext && (!head || this.canProcessQueued(head))) this.initializeWorkspace(active, message);
     this.refreshTaskCounts(active.id);
     this.wake(active.id);
     const running = this.running.get(message.userId);
@@ -491,6 +493,8 @@ export class SessionManager {
 
   /** Start a real read-only child without occupying the conversational turn or inventing a user prompt. */
   private initializeWorkspace(target: Conversation, source: BridgeMessage): void {
+    // Group /new has its own explicit reset source; ordinary group events never bootstrap a private flow.
+    if (source.groupContext) return;
     const recorded = this.readInitializationJournal(target);
     if (this.closed || this.draining) return;
     if (recorded?.outcome === 'ready' && target.nativeId && recorded.nativeId === target.nativeId) return;

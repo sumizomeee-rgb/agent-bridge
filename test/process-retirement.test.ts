@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { AgentProcessStopError, JsonLineProcess, processStopFailure, stopEvidenceFromError, type JsonObject } from '../src/agents/process.js';
 import { ownTemporaryDirectory } from './temp-directory.js';
@@ -23,7 +24,7 @@ const ready=setInterval(()=>{
  process.stdout.write(JSON.stringify({type:'completed',nativePid:process.pid,backgroundPid:child?.pid})+'\n',()=>{if(options.exitOnReport)process.exit(0);});
 },10);
 process.stdin.resume();process.stdin.on('end',()=>{if(!options.ignoreEof)setTimeout(()=>process.exit(0),options.exitDelay??0);});
-setTimeout(()=>process.exit(0),20000).unref();
+setTimeout(()=>process.exit(0),options.nativeMs??20000).unref();
 `;
 const background = String.raw`
 const fs=require('node:fs'),path=require('node:path'),root=process.argv[2],options=JSON.parse(fs.readFileSync(path.join(root,'options.json'),'utf8'));
@@ -42,10 +43,10 @@ function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; }
 }
-function fixture(options: { background?: boolean; backgroundMs?: number; backgroundStdioIgnore?: boolean; ignoreTerm?: boolean; detached?: boolean; ignoreEof?: boolean; exitDelay?: number; exitOnReport?: boolean } = {}) {
+function fixture(options: { background?: boolean; backgroundMs?: number; backgroundStdioIgnore?: boolean; ignoreTerm?: boolean; detached?: boolean; ignoreEof?: boolean; exitDelay?: number; exitOnReport?: boolean; nativeMs?: number; stopHelper?: ConstructorParameters<typeof JsonLineProcess>[4] } = {}) {
   const root = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-process-retirement-')), 'bridge-process-retirement-');
   for (const [name, contents] of [['launcher.cjs', launcher], ['native.cjs', native], ['background.cjs', background], ['options.json', JSON.stringify(options)]]) writeFileSync(join(root, name!), contents!);
-  const transport = new JsonLineProcess({ command: process.execPath, args: [join(root, 'launcher.cjs'), root] }, [], root, {});
+  const transport = new JsonLineProcess({ command: process.execPath, args: [join(root, 'launcher.cjs'), root] }, [], root, {}, options.stopHelper);
   const messages: JsonObject[] = [];
   const report = new Promise<{ nativePid: number; backgroundPid?: number }>(resolve => transport.onMessage(message => {
     messages.push(message); if (message.type === 'completed') resolve(message as { nativePid: number; backgroundPid?: number });
@@ -140,6 +141,26 @@ test('an unexpected launcher close cannot prove its detached CLI descendant stop
   } finally { await f.cleanup(); }
 });
 
+
+
+test('Windows unresponsive unauthorized stop helper is replaced once; next helper proves tree stop', { skip: process.platform !== 'win32', timeout: 45000 }, async t => {
+  let attempts = 0; const helpers: ReturnType<typeof spawn>[] = []; const events: Array<{ attempt: number; text: string }> = [];
+  const f = fixture({ ignoreEof: true, nativeMs: 60000, stopHelper: script => {
+    const helper = ++attempts === 1
+      ? spawn(process.execPath, ['-e', 'process.stdin.resume();setInterval(()=>{},1000)'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+      : spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const attempt = attempts; helper.stdout.on('data', bytes => events.push({ attempt, text: bytes.toString().slice(0, 128) }));
+    helpers.push(helper); return helper;
+  } });
+  try {
+    await f.report; await f.transport.stop(false);
+    assert.equal(attempts, 2); assert.equal(f.transport.confirmStopped(), true);
+    assert.equal(f.transport.stopEvidence.taskkillAttempted, true);
+    assert.equal(f.transport.stopEvidence.taskkillExitCode, 0);
+    assert(helpers[0]!.exitCode !== null || helpers[0]!.signalCode !== null, 'unauthorized stuck helper was retired');
+    await f.transport.stop(false); assert.equal(attempts, 2, 'confirmed exit needs no further helper');
+  } catch (error) { t.diagnostic(JSON.stringify({ attempts, events, stopEvidence: f.transport.stopEvidence })); throw error; } finally { for (const h of helpers) if (h.exitCode === null && h.signalCode === null) h.kill(); await f.cleanup(); }
+});
 test('POSIX root exit cannot prove that a same-group descendant ignoring SIGTERM stopped', { skip: process.platform === 'win32' }, async () => {
   const f = fixture({ background: true, detached: false, ignoreEof: true, ignoreTerm: true });
   try {

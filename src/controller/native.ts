@@ -639,8 +639,8 @@ export class NativeControllerAdapter implements AgentAdapter {
           + JSON.stringify({ scene: this.groupScene(pending.scene), rule: 'The original owner, root, authorization and delivery scope are unchanged. Actions with performed=false did not execute. Earlier successful tool receipts remain valid: do not replay them. Reconsider the new evidence, choose useful remaining work or silence, and use existing tools normally. This is the only automatic reassessment for this request.' })
           + '\n' + bridgeClock();
         if (session.rpc) {
-          const started = await session.rpc.request('turn/start', { threadId: session.nativeId, environments: [], input: [],
-            toolOutput: { name: 'bridge_scene_refresh', namespace: null, output: evidence }, ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) }, 20000);
+          const started = await this.startCodexTurn(session, active, { threadId: session.nativeId, environments: [], input: [],
+            toolOutput: { name: 'bridge_scene_refresh', namespace: null, output: evidence }, ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) });
           if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 现场重判没有返回轮次标识。');
           if (active.nativeTurnId && active.nativeTurnId !== started.turn.id) throw new Error('Codex 现场重判轮次确认不一致。');
           active.nativeTurnId = started.turn.id;
@@ -667,9 +667,9 @@ export class NativeControllerAdapter implements AgentAdapter {
           rule: 'This is the only recovery decision. Earlier successful actions and workers remain valid. Do not repeat, continue, cancel or dispatch work. Read existing worker/feedback receipts if needed and send one honest final reply to the original private chat using bridge_send_user or bridge_send_message targetId=private. If the task is incomplete, explain its actual status. Never claim completion without evidence. Other actions are blocked.'
         });
         if (session.rpc) {
-          const started = await session.rpc.request('turn/start', { threadId: session.nativeId, environments: [], input: [],
+          const started = await this.startCodexTurn(session, active, { threadId: session.nativeId, environments: [], input: [],
             toolOutput: { name: 'bridge_reply_recovery', namespace: null, output: evidence },
-            ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) }, 20000);
+            ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) });
           if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('回复补救没有返回轮次标识。');
           if (active.nativeTurnId && active.nativeTurnId !== started.turn.id) throw new Error('回复补救轮次确认不一致。');
           active.nativeTurnId = started.turn.id;
@@ -710,9 +710,9 @@ export class NativeControllerAdapter implements AgentAdapter {
     const manifest = imageManifest(active.turn); if (manifest) values.push({ type: 'text', text: manifest });
     values.push({ type: 'text', text: '[Bridge private input update; program facts] The preceding messages are actual new private owner inputs and may revise the previous request. Respect their real source and audience. Actions with performed=false did not execute; earlier successful actions remain in the native history and must not be replayed automatically. Existing workers continue. This is the only automatic private-input reassessment. A final response is still required at the private input destination; authorized group sends use finish=false.\n' + this.runtimeContext(active.turn, session) });
     if (session.rpc) {
-      const started = await session.rpc.request('turn/start', { threadId: session.nativeId, environments: [],
+      const started = await this.startCodexTurn(session, active, { threadId: session.nativeId, environments: [],
         input: values.map(value => value.type === 'text' ? { ...value, text_elements: [] } : value),
-        ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) }, 20000);
+        ...(selectedEffort(active.turn) ? { effort: selectedEffort(active.turn) } : {}) });
       if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 私聊续决策没有返回轮次标识。');
       if (active.nativeTurnId && active.nativeTurnId !== started.turn.id) throw new Error('Codex 私聊续决策轮次确认不一致。');
       active.nativeTurnId = started.turn.id;

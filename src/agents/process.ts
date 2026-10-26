@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { AgentCommand, AgentResult } from '../types.js';
 
 export type JsonObject = Record<string, unknown>;
@@ -321,6 +323,17 @@ export class JsonLineProcess {
   }
 
   private async stopWindowsTree(pid: number): Promise<void> {
+    // A helper that never acquired authorization may be replaced safely. Once
+    // STOP was sent, keep its holder alive and never overlap another tree kill.
+    const modern = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
+    const commands = existsSync(modern) ? [{ command: modern, readyMs: 5000 }, { command: 'powershell.exe', readyMs: 30000 }]
+      : [{ command: 'powershell.exe', readyMs: 30000 }, { command: 'powershell.exe', readyMs: 30000 }];
+    for (const { command, readyMs } of commands) {
+      if (this.exited.settled || await this.stopWindowsTreeAttempt(pid, command, readyMs)) return;
+    }
+  }
+
+  private async stopWindowsTreeAttempt(pid: number, command: string, readyMs: number): Promise<boolean> {
     // READY/STOP pins the original process object before authorizing a PID-based
     // operation. Our original ChildProcess handle is still alive until exit, so
     // a READY accepted before that event cannot refer to a reused PID. The helper
@@ -341,9 +354,9 @@ try {
   [Console]::Out.WriteLine('EXIT:'+[string]$treeKiller.ExitCode)
 } catch {[Console]::Out.WriteLine('FAILED')}
 finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProcess.Dispose()}}`;
-    const helper = this.stopHelper?.(script) ?? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    const helper = this.stopHelper?.(script) ?? spawn(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
       { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    const finished = deferred<void>(); let buffer = '', permissionOpen = true, authorized = false;
+    const finished = deferred<void>(), ready = deferred<void>(); let buffer = '', permissionOpen = true, authorized = false;
     helper.stdin.on('error', () => {}); helper.stderr.on('data', () => {});
     helper.stdout.setEncoding('utf8');
     helper.stdout.on('data', (part: string) => {
@@ -353,7 +366,7 @@ finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProces
         const line = buffer.slice(0, at).trim(); buffer = buffer.slice(at + 1);
         if (line === 'READY') {
           authorized = permissionOpen && !this.exited.settled;
-          helper.stdin.end(authorized ? 'STOP\n' : 'SKIP\n');
+          helper.stdin.end(authorized ? 'STOP\n' : 'SKIP\n'); ready.resolve();
         } else if (line === 'ATTEMPT' && authorized) this.taskkillAttempted = true;
         else if (authorized && /^EXIT:-?\d+$/.test(line)) {
           this.taskkillExitCode = Number(line.slice(5)); this.treeKillSucceeded = this.taskkillAttempted && this.taskkillExitCode === 0;
@@ -363,6 +376,17 @@ finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProces
       if (buffer.length > 128) buffer = '';
     });
     helper.once('error', () => finished.resolve()); helper.once('close', () => finished.resolve());
+    await within(Promise.race([ready.promise, finished.promise]), readyMs);
+    if (!authorized) {
+      permissionOpen = false;
+      // The helper has never received STOP. Kill only our still-owned helper
+      // process handle; late READY cannot authorize it to touch the target.
+      if (!finished.settled) { helper.stdin.end(); helper.kill(); }
+      await within(finished.promise, 1000);
+      helper.unref();
+      for (const stream of [helper.stdin, helper.stdout, helper.stderr]) (stream as typeof helper.stdout & { unref?: () => void }).unref?.();
+      return false;
+    }
     if (!(await within(finished.promise, 30_000))) {
       permissionOpen = false; helper.stdin.end();
       // Do not kill the holder while its taskkill might still be running: that
@@ -371,6 +395,7 @@ finally {if($treeKiller){$treeKiller.Dispose()};if($targetProcess){$targetProces
       for (const stream of [helper.stdin, helper.stdout, helper.stderr]) (stream as typeof helper.stdout & { unref?: () => void }).unref?.();
     }
     permissionOpen = false;
+    return true;
   }
 
   private async stopForced(): Promise<void> {
