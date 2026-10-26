@@ -22,7 +22,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
   constructor(readonly binding: ExecutionTargetBinding, private readonly config: BridgeConfig, private readonly options: RemoteAdapterOptions = {}) {}
   private connection(): RemoteClient {
     if (this.closed) throw new Error('远端适配器已关闭。');
-    return this.client ??= this.options.clientFactory?.(this.binding) ?? new SshRemoteClient(this.binding, this.config.workspace);
+    return this.client ??= this.options.clientFactory?.(this.binding) ?? new SshRemoteClient(this.binding, this.config.contextWorkspace ?? this.config.workspace);
   }
   private async validate(allowPreparingRecovery = false, retry = true): Promise<void> {
     if (retry && this.reconnecting) await this.reconnecting;

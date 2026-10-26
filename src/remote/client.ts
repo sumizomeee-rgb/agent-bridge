@@ -110,7 +110,11 @@ export class SshRemoteClient implements RemoteClient {
   async request<T = unknown>(method: string, args: unknown): Promise<T> {
     if (this.closed) throw new Error('远端隧道客户端已关闭。');
     // Cached tunnels must also wait for a concurrent deployment before their next dispatch handshake.
-    if (method === 'hello' && !this.options.createProcess) await deploymentHook?.(this.binding, this.cwd);
+    if ((method === 'hello' || method === 'preset/describe') && !this.options.createProcess) {
+      const prepared = await deploymentHook?.(this.binding, this.cwd);
+      if (method === 'preset/describe' && isObject(prepared) && prepared.state === 'configuration-error')
+        throw Object.assign(new Error('该电脑的预设自动配置尚未完成；普通派工和已有助手保持独立。'), { code: 'REMOTE_REJECTED' });
+    }
     this.startup ??= this.initialize().catch(async error => {
       // Keep concurrent callers on one failure; a later call must reread the endpoint.
       await this.clearConnection(); this.startup = null;

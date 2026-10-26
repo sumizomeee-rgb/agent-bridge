@@ -9,6 +9,7 @@ import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
 import type { Conversation, AgentAdapter, SessionVisibility, AgentCommand, AgentName, AgentResult, AgentTurn, AgentSupplement, SteerResult } from '../types.js';
 import { presetId, readPrivateJson } from './registry.js';
+import { readMaterials } from './materials.js';
 import { exposeCodexHistory, pinSessionLocation } from '../agents/worker-session.js';
 import { startPresetConnect } from './connect.js';
 import type { LaunchProfile, PresetBinding } from './types.js';
@@ -55,6 +56,9 @@ export interface PreparedPreset { command: AgentCommand; env: NodeJS.ProcessEnv;
 export class PresetRuntime {
   constructor(readonly privateRoot: string, readonly dataRoot: string, private readonly userHome = homedir()) {}
   private async current(profileId: string): Promise<LaunchProfile> {
+    const managed = (await readMaterials(this.privateRoot, parseLaunchProfiles)).flatMap(source => source.profiles).filter(profile => profile.id === profileId);
+    if (managed.length > 1) throw new Error('不同工作区的预设配置 ID 冲突。');
+    if (managed[0]) return managed[0];
     const profile = parseLaunchProfiles(await readPrivateJson(join(this.privateRoot, 'profiles.json'))).find(value => value.id === profileId);
     if (!profile) throw new Error('目标机未登记此预设启动配置。'); return profile;
   }
@@ -94,9 +98,14 @@ export class PresetRuntime {
   async prepare(binding: PresetBinding, workerId: string, nativeId: string | null, original: AgentCommand, baseEnv: NodeJS.ProcessEnv, visibility?: SessionVisibility): Promise<PreparedPreset> {
     const profile = await this.profile(binding, workerId, nativeId, true);
     const location = pinSessionLocation(this.home(workerId, binding), binding.agent, visibility, nativeId, { ...process.env, ...baseEnv }, this.userHome);
-    const raw = await readPrivateJson(join(this.privateRoot, 'credentials.json'));
-    if (!isObject(raw) || raw.version !== 1 || !isObject(raw.credentials) || !isObject(raw.credentials[profile.credentialId])) throw new Error('目标机预设凭据引用不可用。');
-    const credential = raw.credentials[profile.credentialId] as Record<string, unknown>;
+    const managed = (await readMaterials(this.privateRoot, parseLaunchProfiles)).map(source => source.credentials[profile.credentialId]).filter(value => value !== undefined);
+    if (managed.length > 1) throw new Error('不同工作区的预设凭据引用冲突。');
+    let credential: Record<string, unknown> | undefined = managed[0];
+    if (!credential) {
+      const raw = await readPrivateJson(join(this.privateRoot, 'credentials.json'));
+      if (!isObject(raw) || raw.version !== 1 || !isObject(raw.credentials) || !isObject(raw.credentials[profile.credentialId])) throw new Error('目标机预设凭据引用不可用。');
+      credential = raw.credentials[profile.credentialId] as Record<string, unknown>;
+    }
     const key = binding.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey;
     if (typeof key !== 'string' || !key || /[\r\n\0]/.test(key)) throw new Error('目标机预设认证材料无效。');
     const env: NodeJS.ProcessEnv = { ...process.env, ...baseEnv };

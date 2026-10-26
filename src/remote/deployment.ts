@@ -4,14 +4,15 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, lstatSy
 import { dirname, join, resolve } from 'node:path';
 import { projectRoot } from '../config.js';
 import type { ExecutionTargetBinding } from './types.js';
+import { deployPresets } from '../presets/deployment.js';
 
-export interface DeploymentResult { state: 'ready' | 'busy' | 'offline'; release?: string; reason?: string }
+export interface DeploymentResult { state: 'ready' | 'busy' | 'offline' | 'configuration-error'; release?: string; reason?: string; presetCount?: number }
 export interface ExecutorRelease { id: string; archive: string; sha256: string; helper: string; installer: string; launcher: string }
 const hash = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 export function executorKey(target: ExecutionTargetBinding): string {
   return JSON.stringify([resolve(target.sshConfig!), target.alias, target.expectedHostname?.toLowerCase(), target.remoteRoot?.replaceAll('\\', '/').toLowerCase()]);
 }
-function command(executable: string, args: string[], cwd: string, timeout = 90_000): Promise<string> {
+export function command(executable: string, args: string[], cwd: string, timeout = 90_000): Promise<string> {
   return new Promise((done, fail) => execFile(executable, args, { cwd, windowsHide: true, timeout, maxBuffer: 512 * 1024 }, (error, stdout, stderr) => {
     // Do not expose command arguments, SSH diagnostics or connection credentials in status messages.
     if (error) fail(Object.assign(new Error(`执行器更新命令未完成：${executable} (${error.code ?? 'failed'})`), { detail: stderr.slice(0, 3000) })); else done(stdout.trim());
@@ -51,8 +52,8 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
     renameSync(temporary, archive); return { id, archive, sha256: hash(readFileSync(archive)), helper, installer, launcher };
   });
 }
-function ps(value: string): string { return "'" + value.replaceAll("'", "''") + "'"; }
-function remotePowerShell(target: ExecutionTargetBinding, script: string, cwd: string): Promise<string> {
+export function ps(value: string): string { return "'" + value.replaceAll("'", "''") + "'"; }
+export function remotePowerShell(target: ExecutionTargetBinding, script: string, cwd: string): Promise<string> {
   return command('ssh', ['-F', target.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', target.alias!,
     'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';" + script, 'utf16le').toString('base64')], cwd);
 }
@@ -83,10 +84,10 @@ export class RemoteDeploymentService {
   private closed = false;
   constructor(private readonly list: () => Promise<Array<{ target: ExecutionTargetBinding; cwd: string }>>,
     private readonly log: (text: string) => void, private readonly deploy = deployExecutor, private readonly build = executorRelease,
-    private readonly now = Date.now) {}
+    private readonly now = Date.now, private readonly configure = deployPresets) {}
   ensure(target: ExecutionTargetBinding, cwd: string): Promise<DeploymentResult> {
     if (this.closed) return Promise.resolve({ state: 'offline', reason: '宿主正在关闭' });
-    const key = executorKey(target), running = this.flights.get(key); if (running) return running;
+    const key = executorKey(target) + ':' + resolve(cwd), running = this.flights.get(key); if (running) return running;
     const cached = this.recent.get(key);
     if (cached && this.now() - cached.at < (cached.result.state === 'ready' ? 30_000 : 10_000)) return Promise.resolve(cached.result);
     const flight = Promise.resolve().then(async () => {
@@ -94,9 +95,13 @@ export class RemoteDeploymentService {
       let result: DeploymentResult;
       try { result = await this.deploy(target, await this.release, cwd); }
       catch (error) { this.release = undefined; result = { state: 'offline', reason: error instanceof Error ? error.message : '更新未完成' }; }
+      if (result.state === 'ready') {
+        try { result = { ...result, presetCount: await this.configure(target, cwd) }; }
+        catch { result = { state: 'configuration-error', release: result.release, reason: '工作区预设自动准备未完成，未报告预设就绪' }; }
+      }
       this.recent.set(key, { at: this.now(), result });
       const state = JSON.stringify(result);
-      if (this.states.get(key) !== state) { this.states.set(key, state); this.log(`EXECUTOR_UPDATE target=${target.id} state=${result.state} release=${result.release ?? '-'}${result.reason ? ' reason=' + result.reason : ''}`); }
+      if (this.states.get(key) !== state) { this.states.set(key, state); this.log(`EXECUTOR_UPDATE target=${target.id} state=${result.state} release=${result.release ?? '-'}${result.presetCount !== undefined ? ' presets=' + result.presetCount : ''}${result.reason ? ' reason=' + result.reason : ''}`); }
       return result;
     }).finally(() => this.flights.delete(key));
     this.flights.set(key, flight); return flight;

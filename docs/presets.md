@@ -6,7 +6,7 @@
 
 上下文工作区 `agent-presets/registry.json` 使用 `workspace-template/agent-presets/example.json` 的格式。每条记录包含稳定 `id`、口语 `aliases`、`targetId`、`agent`、固定 `model`、目标私有 `profileId`、`revision`、`enabled` 和可选停用原因。本机目标为 `local`，远端目标引用现有 `remote-agents/registry.json`。个人目录在代码仓库外维护，不提交 Git。
 
-执行电脑持有两份独立私有文件：本机执行放 `<contextWorkspace>/agent-presets/private/`，远端执行放 `<remoteRoot>/.local/agent-presets/`。`profiles.json` 不含密钥：
+预设清单和启动配置统一在上下文工作区维护：`agent-presets/registry.json`、`agent-presets/private/profiles.json` 和 `credentials.json`。桥启动后复用已有电脑登记与执行器自动部署，按目标筛选已启用预设，自动准备远端运行资料；离线或忙碌时后续重试，不要求用户逐台复制文件。`profiles.json` 不含密钥：
 
 ```json
 {
@@ -19,7 +19,11 @@
 }
 ```
 
-`credentials.json` 格式为 `{"version":1,"credentials":{"gateway-codex":{"apiKey":"由目标机私下填写"}}}`；Claude 支持 `authToken` 或 `apiKey`。限制文件权限，禁止将实际凭据写入目录清单、CLI 参数、主控对话、远端派发或 Git。目标机直接维护这些文件即可，无需安装 CC Switch。
+远端资料存放在 `<remoteRoot>/.local/agent-presets/managed/`，由桥维护，模型线路与凭据以同一个文件原子更新。只向对应目标提供其已启用预设需要的资料，不复制整个工作区或预设清单。旧执行器的手工配置保留兼容，旧助手继续使用自己的线路快照。
+
+`profiles.json` 的单个启动配置可选 `targets: {"home": {"transport": {"kind": "ssh-connect", "sshConfig": "目标机已有 SSH 配置绝对路径", "alias": "fixed-alias"}}, "workstation": {"transport": {"kind": "direct"}}}`，集中描述已有目标的线路差异。未覆盖时沿用默认 `transport`；目标 SSH 路径不存在会明确失败，不能把源电脑路径直接当作目标机已就绪。
+
+`credentials.json` 格式为 `{"version":1,"credentials":{"gateway-codex":{"apiKey":"在工作区私有目录填写"}}}`；Claude 支持 `authToken` 或 `apiKey`。限制文件权限，禁止将实际凭据写入目录清单、CLI 参数、主控对话、派工记录、普通发布包或 Git。桥通过已登记的 SSH/SCP 通道向受限私有目录传输所需凭据，传输临时文件在完成或失败后清理；远端无需用户另配预设或安装 CC Switch。
 
 已有 CC Switch 配置可通过 `scripts/import-preset-profiles.mjs` 一次性导入。构建后，提供**非秘密**导入清单：绝对 `privateRoot`、完整 `profiles` 数组和 `imports:[{"credentialId":"gateway-codex","appType":"codex","providerId":"明确的供应商 ID","dbPath":"目标机数据库绝对路径"}]`。脚本只读明确 ID，不选取当前供应商、不修改物理配置；Windows 先限制目录 ACL。运行 `node scripts/import-preset-profiles.mjs <清单路径>`，更新已有私有资料需追加 `--replace`。启动配置使用清单明确填写的真实入口，不沿用会随 CC Switch 切换而改写请求的代理入口。导入后运行时不再读取 CC Switch。
 
@@ -57,4 +61,4 @@ Claude 预设主模型通过 `--model` 指定，同时在进程环境设置 `ANT
 
 ## 验证边界
 
-自动化覆盖目录校验、冲突拒绝、认证隔离、线路快照、预约恢复、旧协议拒绝、TLS 原样转发及进程关闭。真实网关冒烟只能确认指定线路接受了相应模型请求和续接；CLI 回报模型名不能独立证明网关底层实际使用的模型。离线电脑须保持停用，待上线后另行验收。
+自动化覆盖目录校验、冲突拒绝、认证隔离、线路快照、预约恢复、旧协议拒绝、TLS 原样转发及进程关闭。真实网关冒烟只能确认指定线路接受了相应模型请求和续接；CLI 回报模型名不能独立证明网关底层实际使用的模型。`enabled` 表示用户是否配置启用，不用于记录临时离线状态；桥不会擅自启用明确禁用的预设。已启用的离线目标在上线后自动准备并重试。程序已更新但预设配置准备失败时记录独立错误状态，不把执行器在线等同于模型可调用；启动静态检查也不冒充真实网关验收。
