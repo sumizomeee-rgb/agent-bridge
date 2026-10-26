@@ -10,7 +10,7 @@ import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms/lark.md', 'chat-platforms/discord.md'];
+const templates = ['MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'agent-presets/private/profiles.json', 'agent-presets/private/credentials.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms/lark.md', 'chat-platforms/discord.md'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 
@@ -54,6 +54,8 @@ test('workspace initializer generates usable templates from another working dire
     assert.deepEqual(readdirSync(join(workspace, '.local')).sort(), ['deliveries', 'tmp']);
     assert.deepEqual(readdirSync(join(workspace, '.local', 'tmp')), []);
     assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').trim());
+    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'agent-presets/private/profiles.json'), 'utf8')), { version: 1, profiles: [] });
+    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'agent-presets/private/credentials.json'), 'utf8')), { version: 1, credentials: {} });
     assert.equal(existsSync(join(workspace, 'AGENTS.md')), false, 'New skeleton has only README, MEMORY and platform Markdown.');
     assert.match(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), /README\.md/);
   } finally { cleanup(); }
@@ -74,7 +76,13 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     writeFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'unfinished task evidence');
     mkdirSync(join(workspace, 'chat-platforms'));
     writeFileSync(join(workspace, 'chat-platforms', 'lark.md'), custom);
+    const privateRoot = join(workspace, 'agent-presets', 'private'); mkdirSync(privateRoot, { recursive: true });
+    const privateConfig = Buffer.from('{\r\n  "version": 1, "profiles": [], "note": "保留用户配置"\r\n}\r\n');
+    const credentials = Buffer.from('{\r\n  "version": 1, "credentials": {"fixture": {"apiKey": "fixture-only"}}\r\n}\r\n');
+    writeFileSync(join(privateRoot, 'profiles.json'), privateConfig); writeFileSync(join(privateRoot, 'credentials.json'), credentials);
     requireSuccess(run(workspace, root));
+    assert.deepEqual(readFileSync(join(privateRoot, 'profiles.json')), privateConfig);
+    assert.deepEqual(readFileSync(join(privateRoot, 'credentials.json')), credentials);
     const before = new Map([...templates, 'private.txt'].map(file => [file, readFileSync(join(workspace, file))]));
     requireSuccess(run(workspace, root));
     assert.deepEqual(readFileSync(join(workspace, 'README.md')), custom);
@@ -188,6 +196,22 @@ test('legacy root registries require migration before any skeleton is generated'
       assert.notEqual(result.status, 0, result.stdout + result.stderr);
       assert.deepEqual(readdirSync(workspace), [legacy]);
       assert.equal(readFileSync(join(workspace, legacy), 'utf8'), 'user registration must survive');
+    } finally { cleanup(); }
+  }
+});
+
+test('预设私有目录或配置文件名发生碰撞时，生成前失败并保留原有资料', windowsOnly, () => {
+  for (const collision of ['agent-presets/private', 'agent-presets/private/credentials.json']) {
+    const { root, cleanup } = fixture();
+    try {
+      const workspace = join(root, '预设目录碰撞'), destination = join(workspace, collision);
+      mkdirSync(dirname(destination), { recursive: true });
+      if (collision.endsWith('.json')) mkdirSync(destination); else writeFileSync(destination, '用户已有资料');
+      const result = run(workspace, root);
+      assert.notEqual(result.status, 0, result.stdout + result.stderr);
+      assert.equal(existsSync(join(workspace, 'README.md')), false);
+      assert.equal(existsSync(join(workspace, 'agent-presets', 'registry.json')), false);
+      if (!collision.endsWith('.json')) assert.equal(readFileSync(destination, 'utf8'), '用户已有资料');
     } finally { cleanup(); }
   }
 });

@@ -37,7 +37,7 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms\lark.md', 'chat-platforms\discord.md')
+    $files = @('MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'agent-presets/private/profiles.json', 'agent-presets/private/credentials.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms\lark.md', 'chat-platforms\discord.md')
     # 不在旧登记仍位于根目录时生成空表，以免真实配置被静默忽略。
     foreach ($legacy in @('agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')) {
         if (Test-Path -LiteralPath (Join-Path $workspace $legacy)) {
@@ -45,7 +45,7 @@ try {
         }
     }
     # 先检查父目录及完整清单，避免碰撞时只生成一部分模板。
-    $directories = @('chat-platforms', 'remote-agents', 'agent-presets', 'capabilities', '.local', '.local\tmp', '.local\deliveries')
+    $directories = @('chat-platforms', 'remote-agents', 'agent-presets', 'agent-presets\private', 'capabilities', '.local', '.local\tmp', '.local\deliveries')
     foreach ($name in $directories) {
         $directory = Join-Path $workspace $name
         if ([IO.File]::Exists($directory)) {
@@ -63,9 +63,24 @@ try {
         }
     }
 
+    $privateRoot = Join-Path $workspace 'agent-presets\private'
+    $protectPrivate = ![IO.Directory]::Exists($privateRoot)
     [void][IO.Directory]::CreateDirectory($workspace)
     foreach ($name in $directories) {
         [void][IO.Directory]::CreateDirectory((Join-Path $workspace $name))
+    }
+    # 新建私有目录仅授予当前用户和 SYSTEM；已有目录的权限与文件保持原样。
+    if ($protectPrivate) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetOwner($sid)
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($identity in @($sid.Value, 'S-1-5-18')) {
+            $principal = New-Object Security.Principal.SecurityIdentifier($identity)
+            $rule = New-Object Security.AccessControl.FileSystemAccessRule($principal, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            $acl.AddAccessRule($rule)
+        }
+        [IO.Directory]::SetAccessControl($privateRoot, $acl)
     }
     $created = 0
     $preserved = 0
@@ -85,7 +100,8 @@ try {
     }
     Write-Host "工作区：$workspace"
     Write-Host "完成：生成 $created 个文件，保留 $preserved 个已存在文件。"
-    Write-Host '填写工作区说明和远端登记后，再将桥配置的 workspace 指向此目录。'
+    Write-Host '填写工作区说明、电脑登记及所需预设配置，再将桥配置的 workspace 指向此目录。'
+    Write-Host '预设启动配置和凭据只在本工作区维护；桥启动后自动准备各电脑所需文件，无需逐台复制。'
     exit 0
 } catch {
     Write-Error $_.Exception.Message -ErrorAction Continue

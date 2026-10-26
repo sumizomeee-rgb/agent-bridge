@@ -25,7 +25,7 @@
 
 `credentials.json` 格式为 `{"version":1,"credentials":{"gateway-codex":{"apiKey":"在工作区私有目录填写"}}}`；Claude 支持 `authToken` 或 `apiKey`。限制文件权限，禁止将实际凭据写入目录清单、CLI 参数、主控对话、派工记录、普通发布包或 Git。桥通过已登记的 SSH/SCP 通道向受限私有目录传输所需凭据，传输临时文件在完成或失败后清理；远端无需用户另配预设或安装 CC Switch。
 
-已有 CC Switch 配置可通过 `scripts/import-preset-profiles.mjs` 一次性导入。构建后，提供**非秘密**导入清单：绝对 `privateRoot`、完整 `profiles` 数组和 `imports:[{"credentialId":"gateway-codex","appType":"codex","providerId":"明确的供应商 ID","dbPath":"目标机数据库绝对路径"}]`。脚本只读明确 ID，不选取当前供应商、不修改物理配置；Windows 先限制目录 ACL。运行 `node scripts/import-preset-profiles.mjs <清单路径>`，更新已有私有资料需追加 `--replace`。启动配置使用清单明确填写的真实入口，不沿用会随 CC Switch 切换而改写请求的代理入口。导入后运行时不再读取 CC Switch。
+生成器预建 `profiles.json` 和 `credentials.json` 两份空表，不包含真实启动配置或凭据；重复运行保留已有文件。已有 CC Switch 配置可通过 `scripts/import-preset-profiles.mjs` 一次性导入，生成器已创建空文件时使用该脚本现有的 `--replace` 选项填充。构建后，提供**非秘密**导入清单：绝对 `privateRoot`、完整 `profiles` 数组和 `imports:[{"credentialId":"gateway-codex","appType":"codex","providerId":"明确的供应商 ID","dbPath":"目标机数据库绝对路径"}]`。脚本只读明确 ID，不选取当前供应商、不修改物理配置；Windows 先限制目录 ACL。运行 `node scripts/import-preset-profiles.mjs <清单路径>`，更新已有私有资料需追加 `--replace`。启动配置使用清单明确填写的真实入口，不沿用会随 CC Switch 切换而改写请求的代理入口。导入后运行时不再读取 CC Switch。
 
 无法直连的电脑可将 `transport` 改为 `{"kind":"ssh-connect","sshConfig":"本机 SSH 配置绝对路径","alias":"fixed-alias"}`，可选绝对 `sshCommand`。程序为每次 CLI 启动建立 loopback CONNECT，仅允许固定供应商主机和端口，执行固定目的地的 SSH `-L` 本地端口转发，原样转发 TLS；不解密或改写认证、模型和正文。关闭 CLI 时关闭通道及其 SSH 子进程。线路选择由数据决定，不判断机器名。
 

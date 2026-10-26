@@ -19,7 +19,7 @@
 4. 现有 v2 数据先按[宿主迁移](docs/profiles.md#现有部署迁移到-v3)预览、正常停桥并离线应用。运行 `.\start.ps1 -Check` 做离线配置和路径检查，再运行 `.\start.ps1` 启动完整集合；代理按各 Profile 的 `network.proxyPort` 配置，也可显式临时用 `.\start.ps1 -ProxyPort 7898`。
 5. 需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。
 
-生成脚本不需要 Node 或联网，只补缺失文件（包括按职责划分的子目录），已有文件原样保留。空 `remote-agents/registry.json`、`capabilities/registry.json` 可以直接使用；远端和能力登记参考各自的 `.example.json` 填写。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
+生成脚本不需要 Node 或联网，只补缺失文件（包括按职责划分的子目录），已有文件原样保留。空的电脑、能力和预设清单可以直接使用；生成器也预建 `agent-presets/private/profiles.json`、`credentials.json` 两份空配置，新建私有目录仅当前用户和 SYSTEM 可访问。电脑、能力和预设清单参考对应 `example.json`；预设启动配置与凭据只在工作区填写，桥启动后按目标自动准备远端文件，离线目标后续重试。详细前置条件、迁移及登记步骤见 [部署说明](docs/deployment.md)。
 
 ## 目录导航
 
@@ -51,6 +51,10 @@ D:\Agent Workspace/
 ├─ remote-agents/             远程电脑及 Agent 的非秘密登记
 │  ├─ registry.json           实际登记，默认空表
 │  └─ example.json            填写示例，不自动启用
+├─ agent-presets/             固定电脑、供应商和模型的派工预设
+│  ├─ registry.json           实际预设清单，默认空表
+│  ├─ example.json            清单示例，不自动启用
+│  └─ private/                profiles.json 启动配置、credentials.json 凭据
 ├─ capabilities/              浏览器／应用能力及历史验收登记
 │  ├─ registry.json           实际登记，默认空表
 │  └─ example.json            填写示例，不自动启用
@@ -63,7 +67,7 @@ D:\Agent Workspace/
 
 ### 工作区职责与生成原理
 
-工作区根目录保留 `README.md`、`MEMORY.md` 和按职责命名的目录。README 保存跨电脑、跨机器人通用的主控规则与初始化约定；MEMORY 分为“用户偏好”“本地工作约定”“环境与入口”，保存本地可变上下文；`chat-platforms/` 提供按当前平台选择的操作指南。`remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。这两类 JSON 由程序按需读取，不作为初始化全文注入；示例不会自动启用，任何登记都不包含凭据。
+工作区根目录保留 `README.md`、`MEMORY.md` 和按职责命名的目录。README 保存跨电脑、跨机器人通用的主控规则与初始化约定；MEMORY 分为“用户偏好”“本地工作约定”“环境与入口”，保存本地可变上下文；`chat-platforms/` 提供按当前平台选择的操作指南。`remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。`agent-presets/registry.json` 保存预设及目标引用，`agent-presets/private/` 保存启动配置和凭据，由桥按目标自动准备远端运行资料。清单由程序按需读取，不作为初始化全文注入；示例不会自动启用，非秘密登记表不含凭据，私有凭据也不注入主控正文。
 
 `workspace-template/` 是随代码维护的公共骨架，`init-workspace.ps1 -Path <绝对目录>` 按固定清单复制缺失文件并预建职能目录和 `.local/tmp/`、`.local/deliveries/`。生成前先检查目录／文件碰撞；已有用户文件保持原字节，不覆盖、不自动同步模板，也不扫描任意新增目录。桥运行时不生成工作区；初始化只读 README 指定的 MEMORY 和当前平台文档，其余资料按任务和工具需要读取。更新已有工作区时先核对并备份，将有效本地内容归入 MEMORY，再同步通用 README；不覆盖用户手动修改，新会话重新初始化后生效。
 
@@ -85,4 +89,4 @@ D:\Agent Workspace/
 
 新增或改变主控工具声明后，已有 Codex 原生会话的工具表不会随普通重启更新；需要时用私聊 `/new continue` 提炼最新上下文并建立新工具会话，该命令仍会取消旧预约。Claude 主控重启时按当前 MCP 工具及提示重建进程并续接原生会话，是否免于 `/new` 须用新工具实际调用及相同 nativeId 验证，不能只看普通回复。模板更新不会覆盖用户资料，更新个人上下文后用 `/new` 重新初始化。私聊 `/new continue` 仅提炼本 Bot 当前主控，并取消旧预约；真实 `/agent` 切换自动交接最新上下文，保留助手和计划，目标准备失败时保持旧主控。普通模型、强度切换保留当前会话。
 
-执行助手的固定电脑、供应商与模型预设见 [派发预设](docs/presets.md)。上下文工作区增加 `agent-presets/registry.json`；个人清单和目标机密钥不入 Git，主控通过现有目标查询接口按需读取。
+执行助手的固定电脑、供应商与模型预设见 [派发预设](docs/presets.md)。上下文工作区统一维护预设清单及 `agent-presets/private/` 下的启动配置和凭据；桥复用已登记电脑与执行器，启动后自动准备相应文件，不要求用户逐台维护预设。个人清单和凭据不入 Git，主控通过现有目标查询接口按需发现预设。生成器只创建空结构，不包含真实凭据；已有工作区补缺时也不覆盖现有配置。

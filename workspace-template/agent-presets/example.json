@@ -10,7 +10,7 @@
       "profileId": "gateway-sol",
       "revision": 1,
       "enabled": false,
-      "reason": "示例；目标机私有启动配置和认证尚未登记并验收"
+      "reason": "示例；请先在工作区填写预设启动配置和凭据，再按需启用"
     }
   ]
 }
