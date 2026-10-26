@@ -14,7 +14,7 @@ import { DeliveryPreparationError, executionErrorEvidence } from '../delivery-er
 import { FEEDBACK_RULE } from '../controller-feedback.js';
 import type { ControllerSubmission, ControllerTurnState } from '../controller-lifecycle.js';
 import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
-import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, processStopFailure, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
+import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcTimeoutError, processStopFailure, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
 
 const object = (properties: JsonObject): JsonObject => ({ type: 'object', properties, additionalProperties: false });
 const string = (description: string): JsonObject => ({ type: 'string', description });
@@ -958,6 +958,20 @@ export class NativeControllerAdapter implements AgentAdapter {
       }
     }
   }
+  private async startCodexTurn(session: ControllerSession, active: ActiveTurn, params: JsonObject): Promise<JsonObject> {
+    try { return await session.rpc!.request('turn/start', params, 20000); }
+    catch (error) {
+      // A matching native turn event is independent acceptance evidence. Losing
+      // only the RPC response must not retire a controller that is still working.
+      // Unknown submission, explicit rejection and transport failures stay errors.
+      if (error instanceof JsonRpcTimeoutError && error.method === 'turn/start'
+        && session.active === active && active.submissionAcknowledged && active.nativeTurnId
+        && !session.closed && !session.transportFailure && !active.turn.signal.aborted) {
+        return { turn: { id: active.nativeTurnId } };
+      }
+      throw error;
+    }
+  }
   private async runAttempt(turn: AgentTurn, submitted: (state: ControllerSubmission) => void, reportRecovery = false): Promise<AgentResult> {
     if (this.closed) throw new Error('主控适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
@@ -1000,7 +1014,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         const params: JsonObject = { threadId: session.nativeId, environments: [], input: turn.event ? [] : input, ...(effort ? { effort } : {}) };
         if (turn.event) params.toolOutput = { name: turn.event.toolName ?? (turn.event.kind === 'wake' ? 'bridge_schedule_controller' : 'bridge_worker_result'), namespace: null, output: `${clock}\n\n${turn.event.text}` };
         submitted('unknown'); // Persist before I/O: a lost acknowledgement must never cause a replay.
-        const started = await session.rpc.request('turn/start', params, 20000);
+        const started = await this.startCodexTurn(session, active, params);
         if (!isObject(started.turn) || typeof started.turn.id !== 'string') throw new Error('Codex 主控没有返回轮次标识。');
         if (active.nativeTurnId && active.nativeTurnId !== started.turn.id) throw new Error('Codex 主控轮次确认不一致。');
         active.nativeTurnId = started.turn.id;

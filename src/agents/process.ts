@@ -413,6 +413,10 @@ export class JsonRpcError extends Error {
   constructor(readonly code: number | null, message: string) { super(message); }
 }
 
+export class JsonRpcTimeoutError extends Error {
+  constructor(readonly method: string) { super(`Codex ${method} 等待响应超时。`); this.name = 'JsonRpcTimeoutError'; }
+}
+
 export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'canRetryStop'>>;
 
 export class JsonRpcClient {
@@ -443,7 +447,7 @@ export class JsonRpcClient {
     return new Promise<JsonObject>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Codex ${method} 等待响应超时。`));
+        reject(new JsonRpcTimeoutError(method));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timeout });
       try { this.transport.write({ id, method, params }); }

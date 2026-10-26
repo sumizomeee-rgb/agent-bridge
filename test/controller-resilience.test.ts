@@ -134,6 +134,28 @@ test('accepted native failure does not resubmit the original task', async t => {
   assert.equal(s.transports.length, 1); assert.equal(s.transports[0]!.turns, 1); assert.equal(s.states.at(-1)?.submission, 'accepted');
 });
 
+test('turn started event survives a lost RPC response without retiring the working controller', async t => {
+  const s = fixture(t, transport => {
+    transport.intercept = message => {
+      if (message.method !== 'turn/start') return false;
+      transport.turns++;
+      transport.emit({ method: 'turn/started', params: { threadId: transport.nativeId, turn: { id: `turn-${transport.turns}` } } });
+      return true; // Real turn accepted; only the RPC response is absent.
+    };
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = s.adapter.run(s.turn); void running.catch(() => {});
+  await until(() => s.states.some(state => state.phase === 'accepted'));
+  t.mock.timers.tick(20001);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(s.transports[0]!.stopped, false, 'accepted live turn must not be killed for a missing RPC response');
+  // Optional thread metadata also has a bounded wait.
+  t.mock.timers.tick(15001);
+  await reply(s.transports[0]!); await running; t.mock.timers.reset();
+  assert.equal(s.transports.length, 1); assert.equal(s.transports[0]!.turns, 1);
+  assert.deepEqual(s.published, ['confirmed reply']);
+});
+
 test('an independent unconfirmed metadata probe never retires the healthy controller or starts another probe', async t => {
   for (const warm of [false, true]) {
     const s = fixture(t); let probes = 0;
