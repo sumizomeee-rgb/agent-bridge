@@ -80,7 +80,6 @@ export class RemoteDeploymentService {
   private readonly recent = new Map<string, { at: number; result: DeploymentResult }>();
   private readonly states = new Map<string, string>();
   private release?: Promise<ExecutorRelease>;
-  private timer?: ReturnType<typeof setInterval>;
   private closed = false;
   constructor(private readonly list: () => Promise<Array<{ target: ExecutionTargetBinding; cwd: string }>>,
     private readonly log: (text: string) => void, private readonly deploy = deployExecutor, private readonly build = executorRelease,
@@ -111,6 +110,6 @@ export class RemoteDeploymentService {
     try { await Promise.all((await this.list()).map(({ target, cwd }) => this.ensure(target, cwd))); }
     catch { this.log('EXECUTOR_UPDATE registry-unavailable'); }
   }
-  start(): void { void this.check(); this.timer = setInterval(() => void this.check(), 30_000); this.timer.unref(); }
-  async close(): Promise<void> { this.closed = true; if (this.timer) clearInterval(this.timer); await Promise.allSettled([...this.flights.values()]); }
+  start(): void { void this.check(); }
+  async close(): Promise<void> { this.closed = true; await Promise.allSettled([...this.flights.values()]); }
 }

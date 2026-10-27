@@ -13,7 +13,7 @@ const target: ExecutionTargetBinding = { id: 'test', label: 'test', transport: '
   remoteRoot: 'G:\\Executor', nodePath: 'G:\\node.exe', agent: 'codex', agentCommand: { command: 'codex', args: [] }, cwd: 'G:\\Workspace' };
 const release: ExecutorRelease = { id: 'a'.repeat(64), archive: '', sha256: '', helper: '', installer: '', launcher: '' };
 
-test('启动即检查，多个 Bot 和派工共享一次更新；在线后及忙碌结束自动重试，关闭停止检查', async () => {
+test('启动即检查，多个 Bot 和派工共享一次更新；后续检查可重试，关闭停止检查', async () => {
   let now = 0, calls = 0, builds = 0, state: DeploymentResult['state'] = 'offline'; const logs: string[] = [];
   let finish!: (value: DeploymentResult) => void;
   const service = new RemoteDeploymentService(async () => [{ target, cwd: '.' }, { target: { ...target, agent: 'claude' }, cwd: '.' }], s => logs.push(s),
@@ -26,6 +26,21 @@ test('启动即检查，多个 Bot 和派工共享一次更新；在线后及忙
   now += 11_000; state = 'ready'; const ready = service.check(); await new Promise(done => setImmediate(done)); finish({ state, release: release.id }); await ready;
   assert.equal(calls, 3); assert.equal((await service.ensure(target, '.')).state, 'ready');
   assert.equal(logs.length, 3); await service.close(); now += 60_000; await service.check(); assert.equal(calls, 3);
+});
+
+test('启动后空闲不轮询，离线电脑恢复后由下一次派工检查', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let now = 0, calls = 0, scans = 0, online = false;
+  const service = new RemoteDeploymentService(async () => { scans++; return [{ target, cwd: '.' }]; }, () => {},
+    async () => { calls++; return { state: online ? 'ready' : 'offline' }; }, async () => release, () => now, async () => 0);
+  try {
+    service.start(); assert.equal((await service.ensure(target, '.')).state, 'offline');
+    assert.equal(calls, 1); assert.equal(scans, 1);
+    online = true; now = 60_000; t.mock.timers.tick(60_000);
+    await new Promise(done => setImmediate(done));
+    assert.equal(calls, 1); assert.equal(scans, 1);
+    assert.equal((await service.ensure(target, '.')).state, 'ready'); assert.equal(calls, 2);
+  } finally { await service.close(); }
 });
 
 test('更新失败只记状态，保留后续重试，不阻塞或伪造整个宿主启动失败', async () => {
