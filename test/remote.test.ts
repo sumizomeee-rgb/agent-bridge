@@ -589,3 +589,32 @@ test('proof arriving between close eligibility checks retires the pending handle
     try { assert.equal(reopened.job(request.dispatchId)!.status, 'completed'); } finally { reopened.close(); }
   } finally { await f.daemon.close(); }
 });
+
+test('failed deployment preparation rejects a new task once without dispatch or redundant handshake', async () => {
+  const f = fixture(), methods: string[] = [];
+  const adapter = new RemoteAgentAdapter(f.binding, f.config, { clientFactory: () => ({ request: async () => {
+    methods.push('hello'); throw Object.assign(new Error('readiness unavailable'), { code: 'REMOTE_PREPARATION_FAILED' });
+  }, close: async () => {} }) });
+  try {
+    await assert.rejects(adapter.run(f.turn()), error => !!error && typeof error === 'object' && 'code' in error && error.code === 'REMOTE_PREPARATION_FAILED');
+    assert.deepEqual(methods, ['hello']); assert.equal(f.natives.length, 0);
+  } finally { await adapter.close(); await f.adapter.close(); await f.daemon.close(); }
+});
+test('failed deployment preparation during accepted dispatch recovery preserves unknown execution and never redispatches', async () => {
+  const f = fixture(), methods: string[] = []; let submitted = false;
+  const adapter = new RemoteAgentAdapter(f.binding, f.config, { reconnectDeadlineMs: 20, reconnectDelayMs: 1, clientFactory: () => ({
+    request: async <T>(method: string) => {
+      methods.push(method);
+      if (method === 'hello') {
+        if (submitted) throw Object.assign(new Error('readiness unavailable'), { code: 'REMOTE_PREPARATION_FAILED' });
+        return { hostname: hostname(), version: 1, engines: ['codex'] } as T;
+      }
+      if (method === 'dispatch') submitted = true;
+      throw new Error('acknowledgement lost');
+    }, close: async () => {},
+  }) });
+  try {
+    await assert.rejects(adapter.run(f.turn()), error => error instanceof RemoteDispatchUncertain);
+    assert.equal(methods.filter(method => method === 'dispatch').length, 1); assert(methods.filter(method => method === 'hello').length > 1);
+  } finally { await adapter.close(); await f.adapter.close(); await f.daemon.close(); }
+});

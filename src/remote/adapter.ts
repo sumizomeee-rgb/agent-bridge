@@ -32,7 +32,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
     catch (error) {
       const idle = this.jobs.size === 0 || (allowPreparingRecovery && this.jobs.size === 1 && [...this.jobs.values()].every(job => !job.submitted));
       // Only a failed handshake may be retried before dispatch; probes cannot detach busy work.
-      if (!retry || !idle || this.knownRejection(error)) throw error;
+      if (!retry || !idle || this.knownRejection(error) || error && typeof error === 'object' && 'code' in error && error.code === 'REMOTE_PREPARATION_FAILED') throw error;
       await this.reconnect(client); return;
     }
     if (this.binding.sessionVisibility !== undefined && hello.sessionVisibility !== 1) throw Object.assign(new Error('目标执行器未支持会话可见性协议，未忽略参数或回退。'), { code: 'REMOTE_REJECTED' });
