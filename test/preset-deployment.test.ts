@@ -203,7 +203,8 @@ send({method:'turn/completed',params:{threadId:thread,turn:{id:'turn',status:'co
     const context = registry.createContext({ conversationId: 'parent', userId: 'owner', channelId: 'local-sink', originMessageId: 'test-message', nativeId: 'controller', agent: 'codex', cwd: engineering });
     const turn: AgentTurn = { conversation: { id: 'parent', userId: 'owner', agent: 'codex', nativeId: 'controller', cwd: engineering, model: f.profile.model, title: '隔离主控', createdAt: '', updatedAt: '' },
       text: '仅隔离测试', imagePaths: [], taskContextPath: context.contextPath, signal: new AbortController().signal, onProgress: () => {} };
-    const first = await runtime.invoke(turn, 'bridge_start_worker', { presetId: f.entry.id, title: '自动准备与派工', prompt: '仅验证隔离环境' }) as { workerId: string; jobId: string };
+    await runtime.workerDefaultCommand(`agentworker home preset ${f.entry.id}`);
+    const first = await runtime.invoke(turn, 'bridge_start_worker', { targetId: 'home', assistant: { kind: 'default' }, title: '自动准备与派工', prompt: '仅验证隔离环境' }) as { workerId: string; jobId: string };
     const completed = async (id: string) => {
       const deadline = Date.now() + 15000;
       for (;;) {

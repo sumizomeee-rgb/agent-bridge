@@ -32,6 +32,9 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'boolean', name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
     { type: 'boolean', name: 'details', description: '展开完整检查信息；默认简要展示' },
   ] },
+  { name: 'default', help: '/default agentworker [电脑ID] [follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]：查看或设置各电脑默认助手', description: '查看或设置当前 Bot 各电脑的默认助手', options: [
+    { type: 'string', name: 'args', description: 'agentworker [电脑ID] [follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]', min_length: 1, max_length: 400 },
+  ] },
   { name: 'presetlist', help: '/presetlist：查看可派发预设的口语别名，一行一条', description: '可派发预设清单与别名速查' },
   { name: 'workers', help: "/workers [history] [all] [details]：默认查看未结束助手；history 查看历史", description: '查看执行中的直属助手，或单独查询历史', options: [
     { type: 'string', name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [

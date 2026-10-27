@@ -18,6 +18,8 @@ node scripts/controller-lab.mjs
 ```powershell
 node scripts/controller-lab.mjs --live --config .local/config.json --agent codex
 node scripts/controller-lab.mjs --live --config .local/config.json --agent claude
+# 本轮默认助手专项：两个低价后端，生产主控/派工/斜杠路径，独立数据与本地接收器
+node scripts/controller-lab.mjs --live --selection-only --config .local/config.json --agent both
 ```
 
 Claude 请求 `haiku` + `xhigh`。模型别名按用户现有网关偏好解析；测试只记录 CLI 回报，不阻止用户的模型映射，不修改路由或自动换模型。先向实际 CLI 查询 effort 能力。`--agent both` 顺序测试两个后端；并发压力不是这套默认验收的目的。

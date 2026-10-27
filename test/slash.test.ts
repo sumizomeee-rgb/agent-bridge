@@ -90,8 +90,8 @@ test('fast 原生菜单与文本参数一致，非法值拒绝', () => {
   assert.equal(GROUP_SLASH_COMMANDS.some(c => c.name === 'fast'), false);
 });
 
-test('native registry contains fifteen supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'presetlist', 'workers', 'stop', 'restart', 'help']);
+test('native registry contains the supported DM-only commands, never resume/startup', () => {
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'default', 'presetlist', 'workers', 'stop', 'restart', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);

@@ -4,6 +4,7 @@ import { isAbsolute, resolve } from 'node:path';
 import type { AgentAdapter, AgentName, AgentTurn, BridgeConfig, Conversation } from '../types.js';
 import { rebindTaskOrigin, type TaskContextFile, type TaskOrigin, type TaskRegistry, type TaskTerminalStatus } from '../tasks.js';
 import { ControllerStore } from './store.js';
+import { parseWorkerDefaultCommand, workerChoice, workerChoiceText, workerDefaultUsage, workerTargetId, type WorkerChoice } from './worker-selection.js';
 import { isModelId } from '../config.js';
 import { resolveDefaultModel, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
@@ -464,6 +465,70 @@ export class ControllerRuntime {
     }, this.callbacks.pollIntervalMs ?? 1000);
     this.timer.unref();
   }
+  /** One compact, machine-grouped discovery call; registration is not live model availability. */
+  async workerChoices(filter: { targetId?: string; agent?: AgentName; query?: string; includePresets?: boolean; refresh?: boolean; details?: boolean } = {}) {
+    const workspace = this.config.contextWorkspace ?? this.config.workspace;
+    const targets = this.callbacks.targetCatalog ? await this.callbacks.targetCatalog.listTargets(workspace, filter.refresh !== false)
+      : [{ id: 'local', label: '桥电脑', transport: 'local' as const, engines: ['codex', 'claude'] as AgentName[], availability: 'local' as const }];
+    if (filter.targetId && !targets.some(target => target.id === filter.targetId)) throw new Error('所选电脑未登记，请查看电脑清单。');
+    const presets = filter.includePresets === false ? [] : await this.callbacks.targetCatalog?.listPresets?.(workspace, filter) ?? [];
+    const computers = targets.filter(target => !filter.targetId || target.id === filter.targetId).map(target => ({
+      targetId: target.id, label: target.label, availability: target.availability, defaultAssistant: this.store.workerDefault(target.id),
+      assistants: [
+        ...target.engines.filter(agent => !filter.agent || agent === filter.agent).map(agent => ({ kind: 'ordinary' as const, agent, modelRequired: true })),
+        ...presets.filter(preset => preset.targetId === target.id && (filter.details || preset.enabled)).map(preset => ({
+          kind: 'preset' as const, presetId: preset.id, label: preset.aliases[0], agent: preset.agent, model: preset.model,
+          ...(filter.details ? { aliases: preset.aliases, enabled: preset.enabled, ...(preset.reason ? { reason: preset.reason } : {}) } : {}),
+        })),
+      ],
+    }));
+    return { computers, note: '电脑与助手是登记清单，不代表实时在线或模型调用已验证。default 使用该电脑保存的选择；远端未设置时拒绝。普通助手明确指定模型；详情与实时检查按需查询。' };
+  }
+  async workerDefaultCommand(argument: string): Promise<string> {
+    if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或重启，暂不能修改默认助手。');
+    const command = parseWorkerDefaultCommand(argument);
+    let view = await this.workerChoices({ targetId: command.targetId });
+    if ('choice' in command) {
+      const target = view.computers[0]!;
+      const choice = command.choice!;
+      if (choice?.kind === 'ordinary' && !target.assistants.some(item => item.kind === 'ordinary' && item.agent === choice.agent)) throw new Error('该电脑未登记所选普通引擎，默认设置未改变。');
+      if (choice?.kind === 'preset' && !target.assistants.some(item => item.kind === 'preset' && item.presetId === choice.presetId)) throw new Error('预设未启用或不属于所选电脑，默认设置未改变。');
+      this.store.setWorkerDefault(command.targetId!, choice);
+      view = await this.workerChoices({ targetId: command.targetId });
+    }
+    const lines = view.computers.map(computer => [
+      `${computer.label} [${computer.targetId}] · 默认：${workerChoiceText(computer.defaultAssistant)}`,
+      `普通助手：${computer.assistants.filter(item => item.kind === 'ordinary').map(item => item.agent).join('、') || '无'}（明确选择模型与强度）`,
+      ...computer.assistants.filter(item => item.kind === 'preset').map(item => `预设：${item.label} [${item.presetId}] · ${item.agent} · ${item.model}`),
+    ].join('\n'));
+    return [('choice' in command ? '默认助手已保存，仅影响此后新建派工。' : '各电脑默认助手与登记候选'), ...lines, workerDefaultUsage].join('\n\n');
+  }
+  private normalizeWorkerArgs(input: Record<string, unknown>, initialization: boolean): Record<string, unknown> {
+    const { assistant, ...args } = input;
+    if (initialization) return args; // Internal workspace reading is pinned to the original local/follow path.
+    const targetId = workerTargetId(args.targetId ?? 'local');
+    if (assistant !== undefined && ['agent', 'model', 'presetId'].some(key => args[key] !== undefined)) throw new Error('assistant 与旧版 agent/model/presetId 参数不能混用。');
+    if (assistant === undefined && args.presetId !== undefined) return args; // Cached old tools may infer the machine from an explicit preset.
+    if (assistant === undefined && (args.agent !== undefined || args.model !== undefined)) {
+      if (targetId !== 'local' && (args.agent === undefined || typeof args.model !== 'string' || args.model === 'default'))
+        throw new Error('远端普通助手必须明确指定 agent 和 model；或使用 assistant.kind=default 选择该电脑已设置的默认。');
+      return targetId === 'local' ? args : { ...args, effort: args.effort ?? 'default' };
+    }
+    let choice: WorkerChoice | null;
+    if (assistant === undefined || isObject(assistant) && assistant.kind === 'default') {
+      if (assistant !== undefined && Object.keys(assistant as object).some(key => key !== 'kind')) throw new Error('default 助手不能混入普通或预设选择字段。');
+      choice = this.store.workerDefault(targetId);
+      if (!choice) throw new Error(`电脑 ${targetId} 尚未设置默认助手，未派发；请从 bridge_list_targets 的该电脑清单明确选择 ordinary 或 preset。`);
+    } else choice = workerChoice(assistant);
+    if (choice.kind === 'follow') {
+      if (targetId !== 'local') throw new Error('远端不支持隐式跟随主控。');
+      return { ...args, targetId };
+    }
+    if (isObject(assistant) && assistant.effort !== undefined && args.effort !== undefined) throw new Error('effort 只能指定一次。');
+    const effort = args.effort ?? choice.effort ?? 'default';
+    return choice.kind === 'preset' ? { ...args, targetId, presetId: choice.presetId, effort }
+      : { ...args, targetId, agent: choice.agent, model: choice.model, effort };
+  }
   /** One trusted, silent workspace-reading child per parent, including parents created before this feature. */
   async initializeWorkspace(turn: AgentTurn): Promise<unknown> {
     const platform = this.config.platform ?? null;
@@ -603,15 +668,14 @@ export class ControllerRuntime {
       });
     }
     if (name === 'bridge_list_targets') {
-      const args = object(input, ['refresh', 'targetId', 'agent', 'query', 'includePresets']);
+      const args = object(input, ['refresh', 'targetId', 'agent', 'query', 'includePresets', 'details']);
       if (args.refresh !== undefined && typeof args.refresh !== 'boolean') throw new Error('refresh 必须是布尔值');
-      const result = { targets: this.callbacks.targetCatalog ? await this.callbacks.targetCatalog.listTargets(this.config.contextWorkspace ?? this.config.workspace, args.refresh !== false)
-        : [{ id: 'local', label: '本机', transport: 'local', engines: ['codex', 'claude'], availability: 'local' }] };
       if (args.agent !== undefined && args.agent !== 'codex' && args.agent !== 'claude') throw new Error('agent 无效');
       if (args.includePresets !== undefined && typeof args.includePresets !== 'boolean') throw new Error('includePresets 必须是布尔值');
-      const view = { ...result, presets: args.includePresets === false ? [] : await this.callbacks.targetCatalog?.listPresets?.(this.config.contextWorkspace ?? this.config.workspace,
-        { ...(args.targetId === undefined ? {} : { targetId: text(args.targetId, '执行目标', 256) }), ...(args.agent === undefined ? {} : { agent: args.agent as AgentName }),
-          ...(args.query === undefined ? {} : { query: text(args.query, '预设查询', 200) }) }) ?? [] };
+      if (args.details !== undefined && typeof args.details !== 'boolean') throw new Error('details 必须是布尔值');
+      const view = await this.workerChoices({ ...(args.targetId === undefined ? {} : { targetId: workerTargetId(args.targetId) }),
+        ...(args.agent === undefined ? {} : { agent: args.agent as AgentName }), ...(args.query === undefined ? {} : { query: text(args.query, '预设查询', 200) }),
+        includePresets: args.includePresets !== false, refresh: args.refresh !== false, details: args.details === true });
       if (key) this.store.saveCall(key, fingerprint, view);
       return view;
     }
@@ -783,10 +847,16 @@ export class ControllerRuntime {
     let target: ExecutionTargetBinding | undefined;
     let preparedWorker: ControllerWorker | undefined;
     if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-      const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
+      const args = this.normalizeWorkerArgs(object(input, ['title', 'prompt', 'cwd', 'assistant', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]), workspaceInitialization);
       const presetTarget = args.presetId === undefined ? undefined : await (async () => {
         if (!this.callbacks.targetCatalog?.resolvePreset) throw new Error('当前执行器未支持预设派发。');
-        return this.callbacks.targetCatalog.resolvePreset(this.config.contextWorkspace ?? this.config.workspace, text(args.presetId, '预设 ID', 96), args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
+        const workspace = this.config.contextWorkspace ?? this.config.workspace, id = text(args.presetId, '预设 ID', 96);
+        if (args.targetId !== undefined && this.callbacks.targetCatalog.listPresets) {
+          const registered = (await this.callbacks.targetCatalog.listPresets(workspace)).find(preset => preset.id === id);
+          if (!registered || registered.targetId !== args.targetId) throw new Error('预设与所选电脑冲突或未登记，未连接远端、未派发。');
+          if (!registered.enabled) throw new Error('预设尚未启用，未连接远端、未派发。');
+        }
+        return this.callbacks.targetCatalog.resolvePreset(workspace, id, args.cwd === undefined ? undefined : text(args.cwd, '工作目录', 8192));
       })();
       if (presetTarget && (!presetTarget.preset || (args.targetId !== undefined && args.targetId !== presetTarget.id)
         || (args.agent !== undefined && args.agent !== presetTarget.agent) || (args.model !== undefined && args.model !== presetTarget.preset.model))) throw new Error('预设与显式电脑、后端或模型参数冲突，未派发。');
@@ -813,7 +883,7 @@ export class ControllerRuntime {
     const result = this.store.transaction(() => {
       let result: unknown;
       if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-        const args = object(input, ['title', 'prompt', 'cwd', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
+        const args = object(input, ['title', 'prompt', 'cwd', 'assistant', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]);
         const worker = preparedWorker!;
         const job = this.makeJob(worker, origin, text(args.prompt, '任务内容', 128 * 1024), worker.imagePaths);
         if (name === 'bridge_schedule_worker') {

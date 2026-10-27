@@ -135,6 +135,7 @@ export class BotRuntime {
       onRequestRestart: origin => hooks.requestRestart(origin) as ReturnType<NonNullable<SessionManagerOptions['onRequestRestart']>>,
       ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
       ...(this.controller ? {
+        onWorkerDefaults: argument => this.controller!.workerDefaultCommand(argument),
         onStop: (id: string) => this.controller!.cancelConversation(id),
         onDetach: (id: string) => this.controller!.detachConversation(id),
         onInitializeWorkspace: (turn: AgentTurn) => this.controller!.initializeWorkspace(turn),

@@ -117,7 +117,11 @@
 
 核实后用 `bridge_adopt_native_session` 传入真实原生 ID 和检查版本，建立空闲直属 Agent。它保持原 ID、原目录和完整原生历史；只有随后明确续接才运行 CLI，不会用摘要新建替代会话。`bridge_handoff_worker` 可将空闲会话交还用户，用户结束 CLI 后可再接管，旧 worker 只保留历史，不再派工。正在使用、结果未知、供应商不匹配或检查后已变化的会话会返回具体原因；先处理原因再重新查询。不要同时用人工 CLI 和桥操作同一会话。
 
-`bridge_start_worker` 和 `bridge_continue_worker` 支持独立的 `model`、`effort`，例如派发 `codex`、`gpt-6-astra`、`low`，或 `claude`、`haiku`。参数原样提交对应目标 CLI，沿用用户的供应商与模型别名路由；不修改主控选择或全局配置。续接空闲会话时直接指定；忙碌时用 `delivery: "next"` 为下一轮选择，已运行的一轮不受影响。后续排队轮次不写参数时继承前一条排队选择。新建助手的 `model` 省略或填 `default` 时，同后端优先沿用主控显式选择，再取已确认的实际模型；跨后端使用桥的 `defaultModels`。未配置时仅查询桥本机对应 CLI 的默认元数据，无法确定则拒绝派发，不交给远端 CLI 决定。续接省略 `model` 保留该助手或最近排队轮的选择，显式 `default` 重新应用桥的上述规则；`effort: "default"` 仍清除强度覆盖。用户的模型别名原样提交，不根据实际网关模型改写别名。
+新建助手按“电脑 → 助手选择 → 执行参数”派工。`bridge_list_targets` 一次返回按电脑分组的普通引擎、已启用预设和保存的默认；只在信息不足时筛选或查询详情，登记不代表实时可用。`targetId` 省略为桥电脑 `local`；`assistant` 省略或 `{kind:"default"}` 使用该 Bot 为该电脑保存的默认。桥电脑初次动态跟随主控后端、模型与同后端强度；远端初始未设置，default 派工拒绝，不偷偷跟随或跨电脑回退。`assistant:{kind:"ordinary",agent:"codex",model:"gpt-6-luna",effort:"xhigh"}` 明确选择普通助手；`assistant:{kind:"preset",presetId:"预设ID"}` 使用属于所选电脑的已启用预设。固定普通／预设助手省略强度使用该 CLI 默认，不继承主控强度。
+
+`/default agentworker` 查看全部电脑的默认与候选；`/default agentworker home` 查看该电脑；`/default agentworker home preset home-kuro-sol61 [强度]` 或 `/default agentworker home codex gpt-6-luna xhigh` 保存选择；`/default agentworker local follow` 恢复跟随主控。`clear` 清除显式设置：桥电脑恢复初始 follow，远端恢复未设置。设置按 Bot 与电脑持久保存，不因重启、`/new` 或 `/agent` 重置，仅影响此后新建的助手和预约。设定检查登记归属与参数格式，实际模型／强度兼容性在派工时核验。既有助手续聊与已排队、预约轮次保留保存的参数。
+
+旧会话缓存的平铺 `agent/model/presetId` 继续兼容，但不能与新 `assistant` 混用；远端普通派工必须明确 agent/model，旧 `model=default` 不能代替远端助手默认。`bridge_continue_worker` 省略模型／强度继续保留原助手或最近排队轮的选择；旧 `model=default` 仍按原来的父模型／桥默认规则重新选择下一轮，不改成新建助手的默认设置。用户模型别名、CLI／网关配置原样沿用。
 
 工具更新必须按后端核验：Codex 旧原生会话的动态工具表仍需通过新会话加载，私聊 `/new continue` 可提炼最新上下文，但仍属于重置并取消旧预约；Claude 正常重启会重新提供当前 MCP 工具并续接原生会话，免于 `/new` 的结论须以相同 nativeId 实际调用新工具为证。接管的执行会话本身保持原 ID，不需新建。
 
@@ -221,7 +225,7 @@ Codex 使用原生 thread/start 或 thread/resume 的配置覆盖和 turn/start.
 
 `/model default` 同样清除显式覆盖，保存 `cli-default` 策略，不把查询到的模型 ID 固化；续接时只临时解析目标 CLI 当前默认，无法确认则明确失败。新可空 `model_policy` 列只标记新设置，旧原生会话未设置策略的记录保持原续接行为。Claude 主控读取外部 settings 时，仅透传本机已核对合法的持久 `effortLevel` low/medium/high；无效 xhigh 等字段不进入 `--settings`，源文件不改，max 仍只能在支持它的模型上作为会话参数使用。
 
-同后端的新桥子任务按派发轮次显式 effort、父对话保存的 effort、父对话最近 CLI 实际回报的顺序继承；都未知时沿用目标 CLI 默认。跨后端新任务不复制父强度，使用目标 CLI 原生默认，不修改父会话或用户全局配置。`bridge_start_worker` 和 `bridge_continue_worker` 的新轮在入队与持久化前校验最终后端/模型/强度，不兼容不留新 worker/job，也不污染已有选择；执行前再次校验动态能力。忙时 current 补充不能改变模型或强度，只有显式 next 新轮使用独立参数快照；default 清除对应覆盖，后续省略继承最后排队快照。执行结果未知及未确认接管不自动重放。显式强度不兼容则明确失败，不强行提交参数。现有子任务和续接保留保存的指定强度，CLI 实际回报单独记录。旧版本把两者混存到 worker.effort，导致 CLI 回报可改变后续续接值；升级后以旧已保存值作为指定值，实际值先保持未知，首次新回报再记录。不能把近期某个 child 显示 xhigh 解释成所有旧任务已跟随父强度改变。同后端 /new、/cwd 沿用显式选择。
+桥电脑使用跟随主控策略的新助手，按派发轮次显式 effort、父对话保存的 effort、父对话最近 CLI 实际回报的顺序继承；都未知时沿用目标 CLI 默认。跨后端新任务不复制父强度，使用目标 CLI 原生默认，不修改父会话或用户全局配置。`bridge_start_worker` 和 `bridge_continue_worker` 的新轮在入队与持久化前校验最终后端/模型/强度，不兼容不留新 worker/job，也不污染已有选择；执行前再次校验动态能力。忙时 current 补充不能改变模型或强度，只有显式 next 新轮使用独立参数快照；default 清除对应覆盖，后续省略继承最后排队快照。执行结果未知及未确认接管不自动重放。显式强度不兼容则明确失败，不强行提交参数。现有子任务和续接保留保存的指定强度，CLI 实际回报单独记录。旧版本把两者混存到 worker.effort，导致 CLI 回报可改变后续续接值；升级后以旧已保存值作为指定值，实际值先保持未知，首次新回报再记录。不能把近期某个 child 显示 xhigh 解释成所有旧任务已跟随父强度改变。同后端 /new、/cwd 沿用显式选择。
 
 升级只编译不会改变已运行桥。待桥任务、排队消息和本轮控制器工作完成后，备份运行数据库，安排正常停启一次；启动会按当前统一命令表同步菜单。重启期间执行中任务会被取消或记为结果未知，因此不要在长任务运行中重启。上线后在机器人私聊用 /effort 查询，再设置 level 并发送普通消息，核对实际回报和原生会话尾号；Claude 未确认状态不能充作成功遥测。
 

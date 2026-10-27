@@ -63,6 +63,7 @@ export interface SessionManagerOptions {
   onInitializeWorkspace?: (turn: AgentTurn) => Promise<unknown>;
   onInitializationError?: (conversation: Conversation, error: unknown) => void;
   onInitializationState?: (conversation: Conversation, outcome: WorkspaceNoticeOutcome) => void | Promise<void>;
+  onWorkerDefaults?: (argument: string) => Promise<string>;
   onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
   onDiagnostic?: (message: string) => void;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
@@ -834,6 +835,10 @@ export class SessionManager {
       }
       case 'model': await this.handleModel(message, argument, reply); return;
       case 'fast': await this.handleFast(message, argument, reply); return;
+      case 'default': {
+        if (!this.config.controllerMode || !this.options.onWorkerDefaults) { await reply('默认助手设置仅支持主控模式。'); return; }
+        await reply(await this.options.onWorkerDefaults(argument)); return;
+      }
       case 'effort': await this.handleEffort(message, argument, reply); return;
       case 'models': await this.handleModel(message, '', reply, true); return;
       case 'new':

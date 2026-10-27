@@ -82,7 +82,7 @@ for (const platform of ['feishu', 'discord'] as const) test(platform + ': isolat
         createTransport: () => { const p = new Protocol(); processes.push(p); return p; } });
       return { codex: native, claude: native };
     },
-    createTargetCatalog: () => ({ listTargets: async () => [], resolveTarget: async (_workspace, id, agent, cwd) => ({ id, agent, label: id, transport: 'local', cwd: cwd ?? c.workspace, agentCommand: c.commands[agent] }), adapterFor: () => worker, handoff: async () => { throw new Error('not used'); }, computerOverview: async () => [], close: async () => {} }),
+    createTargetCatalog: () => ({ listTargets: async () => [{ id: 'local', label: '隔离桥电脑', transport: 'local', engines: ['codex', 'claude'], availability: 'local' }], resolveTarget: async (_workspace, id, agent, cwd) => ({ id, agent, label: id, transport: 'local', cwd: cwd ?? c.workspace, agentCommand: c.commands[agent] }), adapterFor: () => worker, handoff: async () => { throw new Error('not used'); }, computerOverview: async () => [], close: async () => {} }),
     createHealth: () => ({ refresh: async (workspace = c.workspace) => ({ version: 1, workspace, checkedAt: 'now', stale: false, scope: 'static-prerequisites', items: [], total: 0, omitted: 0 }), query: async () => { throw new Error('not used'); }, startupSummary: () => 'lab' }),
   });
   host.attach(bot);
@@ -114,13 +114,15 @@ for (const platform of ['feishu', 'discord'] as const) test(platform + ': isolat
     } else assert.equal((p.writes.find(m => m.id === id)!.result as JsonObject).success, true, response);
     await until(() => sent.some(s => s.text.includes(text))); p.complete();
   };
+  await bot.controller!.workerDefaultCommand('agentworker local codex worker-model');
   await host.receive(botId, input('Inspect once and report in this group'));
   await until(() => processes[0]?.turns === 1).catch(error => { t.diagnostic(JSON.stringify({ methods: processes.map(p => p.writes.map(m => m.method)), sent, events: host.store.listEvents() })); throw error; }); const p = processes[0]!;
-  p.tool('bridge_start_worker', { title: 'isolated inspection', prompt: 'read fixture only' }, 101);
+  p.tool('bridge_start_worker', { targetId: 'local', assistant: { kind: 'default' }, title: 'isolated inspection', prompt: 'read fixture only' }, 101);
   await until(() => executions.length === 1);
   await until(() => p.writes.some(m => m.id === 101));
   assert.ok(bot.controller!.store.jobs()[0]!.origin.groupContext, 'worker must retain group origin');
-  assert.equal(executions[0]!.conversation.model, 'fixture-model');
+  assert.equal(executions[0]!.conversation.model, 'worker-model');
+  assert.equal(store.getConversation(conversation.id)!.model, 'fixture-model');
   await publish(p, 'inspection started', 102);
   await until(() => bot.manager.isIdle()); finishWorker();
   await until(() => p.turns === 2);

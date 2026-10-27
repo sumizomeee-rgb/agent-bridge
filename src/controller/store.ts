@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { rebindTaskOrigin } from '../tasks.js';
 import type { Conversation } from '../types.js';
+import { workerChoice, type WorkerChoice } from './worker-selection.js';
 import type { ControllerJob, ControllerJobStatus, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
@@ -39,6 +40,7 @@ export class ControllerStore {
       CREATE INDEX IF NOT EXISTS controller_schedule_due ON controller_schedules(status,due_at);
       CREATE TABLE IF NOT EXISTS controller_supplements (
         id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, job_id TEXT NOT NULL, value_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS controller_worker_defaults (target_id TEXT PRIMARY KEY, value_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS controller_paused_parents (id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS controller_parent_rebindings (source_id TEXT PRIMARY KEY, target_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS controller_calls (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL);`);
@@ -56,6 +58,16 @@ export class ControllerStore {
         this.db.exec('DROP TABLE controller_wakes');
       });
     }
+  }
+  workerDefault(targetId: string): WorkerChoice | null {
+    const row = this.db.prepare('SELECT value_json FROM controller_worker_defaults WHERE target_id=?').get(targetId);
+    return row ? workerChoice(JSON.parse(String(row.value_json)), targetId === 'local') : targetId === 'local' ? { kind: 'follow' } : null;
+  }
+  setWorkerDefault(targetId: string, choice: WorkerChoice | null): void {
+    if (!choice) { this.db.prepare('DELETE FROM controller_worker_defaults WHERE target_id=?').run(targetId); return; }
+    const selected = workerChoice(choice, targetId === 'local');
+    this.db.prepare('INSERT INTO controller_worker_defaults(target_id,value_json) VALUES(?,?) ON CONFLICT(target_id) DO UPDATE SET value_json=excluded.value_json')
+      .run(targetId, JSON.stringify(selected));
   }
   close(): void { this.db.close(); }
   pauseConversation(id: string): void { this.db.prepare('INSERT OR IGNORE INTO controller_paused_parents (id) VALUES (?)').run(id); }

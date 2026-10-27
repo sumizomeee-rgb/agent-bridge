@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import { verifyParity } from './controller-lab/parity.mjs';
 
 const { values } = parseArgs({ options: {
+  'selection-only': { type: 'boolean', default: false },
   live: { type: 'boolean', default: false }, config: { type: 'string' },
   agent: { type: 'string', default: 'codex' }, 'runtime-root': { type: 'string' },
   'source-root': { type: 'string' },
@@ -23,7 +24,7 @@ const evidence = { version: 1, startedAt: new Date().toISOString(), mode: values
 for (const file of ['controller/native.js', 'controller/runtime.js', 'manager.js', 'store.js', 'agents/process.js']) {
   evidence.runtimeHashes[file] = createHash('sha256').update(readFileSync(join(root, 'dist/src', file))).digest('hex');
 }
-for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/faults.mjs', 'controller-lab/parity.mjs']) {
+for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/worker-selection-live.mjs', 'controller-lab/faults.mjs', 'controller-lab/parity.mjs']) {
   evidence.harnessHashes[file] = createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), file))).digest('hex');
 }
 const save = () => writeFileSync(join(runDir, 'report.json'), JSON.stringify(evidence, null, 2));
@@ -34,7 +35,7 @@ try {
   try {
   if (!values.live) {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
-    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement', 'slash', 'overview', 'overview-runtime', 'overview-discord', 'worker-result-overview', 'restart-command', 'restart-ingress', 'restart', 'worker-restart-recovery', 'worker-session', 'controller-runtime', 'controller-worker-archive', 'controller-recovery'];
+    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement', 'slash', 'overview', 'overview-runtime', 'overview-discord', 'worker-result-overview', 'restart-command', 'restart-ingress', 'restart', 'worker-restart-recovery', 'worker-session', 'controller-runtime', 'worker-selection', 'controller-worker-archive', 'controller-recovery'];
     const output = [];
     const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...['faults', 'parity'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -47,7 +48,7 @@ try {
   } else {
     const { runLive } = await import('./controller-lab/live.mjs');
     for (const agent of values.agent === 'both' ? ['codex', 'claude'] : [values.agent]) {
-      await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save });
+      await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save, selectionOnly: values['selection-only'] });
     }
   }
   } finally { parity.assertUnchanged(); evidence.parity.unchangedAtEnd = true; }
