@@ -30,6 +30,8 @@ while ($true) {
         $env:BRIDGE_EXECUTOR_RELEASE = $release.id
     } else { Remove-Item Env:\BRIDGE_EXECUTOR_RELEASE -ErrorAction SilentlyContinue }
     $arguments = @((Quote-NativeArgument $selectedEntry), '--serve', '--root', (Quote-NativeArgument $resolvedRoot))
-    $daemonProcess = Start-Process -FilePath $NodePath -ArgumentList $arguments -WorkingDirectory $resolvedRoot -WindowStyle Hidden -RedirectStandardError $errorLog -PassThru -Wait
+    $daemonProcess = Start-Process -FilePath $NodePath -ArgumentList $arguments -WorkingDirectory $resolvedRoot -WindowStyle Hidden -RedirectStandardError $errorLog -PassThru
+    # Wait for the daemon itself, not its descendant job/conhost tree.
+    $daemonProcess.WaitForExit()
     Start-Sleep -Seconds $(if ($daemonProcess.ExitCode -eq 0) { 1 } else { 5 })
 }

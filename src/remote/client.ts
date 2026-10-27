@@ -112,6 +112,7 @@ export class SshRemoteClient implements RemoteClient {
     // Cached tunnels must also wait for a concurrent deployment before their next dispatch handshake.
     if ((method === 'hello' || method === 'preset/describe') && !this.options.createProcess) {
       const prepared = await deploymentHook?.(this.binding, this.cwd);
+      if (isObject(prepared) && prepared.state === 'offline') throw Object.assign(new Error('目标执行器尚未就绪，本次准备失败，未提交远端任务。'), { code: 'REMOTE_REJECTED' });
       if (method === 'preset/describe' && isObject(prepared) && prepared.state === 'configuration-error')
         throw Object.assign(new Error('该电脑的预设自动配置尚未完成；普通派工和已有助手保持独立。'), { code: 'REMOTE_REJECTED' });
     }

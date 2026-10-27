@@ -167,7 +167,7 @@ interface ActiveTurn {
   submissionAcknowledged?: boolean;
   retiredNativeTurnIds: Set<string>;
   seenClaudeTools: Set<string>;
-  inFlightTools: Map<string, { name: string; signature: string; promise: Promise<unknown>; succeeded: boolean }>;
+  inFlightTools: Map<string, { name: string; signature: string; promise: Promise<unknown>; succeeded: boolean; settled: boolean }>;
 }
 interface ControllerSession {
   transport: RpcTransport;
@@ -422,9 +422,9 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (active.privateFinalCallId === callId && !active.sealed) active.privateFinalCallId = undefined;
       });
     })();
-    const receipt = { name, signature, promise: work, succeeded: false };
+    const receipt = { name, signature, promise: work, succeeded: false, settled: false };
     active.inFlightTools.set(callId, receipt);
-    void work.then(() => { receipt.succeeded = true; }, () => {});
+    void work.then(() => { receipt.succeeded = true; receipt.settled = true; }, () => { receipt.settled = true; });
     if ((name === 'bridge_send_message' || name === 'bridge_send_private') && args.finish === false) active.deliveryPromise = Promise.allSettled([...(active.deliveryPromise ? [active.deliveryPromise] : []), work]);
     if (name === 'bridge_start_collaboration') active.collaborationPromise = Promise.allSettled([...(active.collaborationPromise ? [active.collaborationPromise] : []), work]);
     return work;
@@ -551,12 +551,22 @@ export class NativeControllerAdapter implements AgentAdapter {
     // settle, but a parallel new call cannot overtake an in-flight publication.
     const admitted = [...active.inFlightTools.entries()].filter(([id]) => id !== callId).map(([, tool]) => tool.promise);
     active.sealed = true;
+    const pendingManagement = [...active.inFlightTools.entries()].filter(([id, tool]) => id !== callId && !tool.settled
+      && !['bridge_send_user', 'bridge_send_message', 'bridge_send_private', 'bridge_silent'].includes(tool.name));
     const publication = (async () => {
+      const outcomes = await Promise.allSettled(pendingManagement.map(([, tool]) => tool.promise));
       await Promise.allSettled(admitted);
       if (active.turn.signal.aborted) throw abortError();
       if (active.replyPausePromise) return active.replyPausePromise;
       if (active.sceneRefreshPending) { active.sealed = false; return this.scenePausedResult(active); }
-      try { await active.turn.onPublicMessage!(args.text as string, paths as string[] | undefined, callId, args.targetId as string | undefined, true); }
+      try {
+        if (pendingManagement.length) {
+          const receipts = pendingManagement.map(([id, tool], index) => ({ callId: id, tool: tool.name, status: outcomes[index]!.status }));
+          throw new DeliveryPreparationError('最终回复写于管理工具返回之前，尚未发送。工具现已结束：' + JSON.stringify(receipts)
+            + '。请读取原调用的实际回执后重新写最终回复；失败须明确说明失败，不能沿用“仍在等待”，不要重派或重复已执行操作。');
+        }
+        await active.turn.onPublicMessage!(args.text as string, paths as string[] | undefined, callId, args.targetId as string | undefined, true);
+      }
       catch (error) {
         const paused = this.pauseGroupReply(active, error, callId, args.targetId as string | undefined); if (paused) return paused;
         if (error instanceof DeliveryPreparationError && !('deliveryUncertain' in error)) {
@@ -672,11 +682,12 @@ export class NativeControllerAdapter implements AgentAdapter {
         active.nativeTurnId = null;
         active.completingNativeTurn = false;
         const reason = active.publicationPreparationError ? 'final delivery rejected before any send' : 'native decision completed without a private final reply';
+        const preparationError = active.publicationPreparationError?.message;
         active.publicationPreparationError = undefined;
         active.turn.onControllerState?.({ attempt: 1, phase: 'reply-recovery', submission: 'accepted' });
         if (active.turn.signal.aborted) throw abortError();
         const evidence = '[Bridge reply recovery; program evidence, not a new user request] ' + JSON.stringify({
-          reason, previousDecisionCompleted: true, finalReplySent: false,
+          reason, preparationError, previousDecisionCompleted: true, finalReplySent: false,
           rule: 'This is the only recovery decision. Earlier successful actions and workers remain valid. Do not repeat, continue, cancel or dispatch work. Read existing worker/feedback receipts if needed and send one honest final reply to the original private chat using bridge_send_user or bridge_send_message targetId=private. If the task is incomplete, explain its actual status. Never claim completion without evidence. Other actions are blocked.'
         });
         if (session.rpc) {

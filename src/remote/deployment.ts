@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, lstatSync, renameSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, lstatSync, renameSync, writeFileSync, mkdtempSync, openSync, closeSync, statSync, unlinkSync, rmdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { projectRoot } from '../config.js';
 import type { ExecutionTargetBinding } from './types.js';
@@ -13,10 +14,26 @@ export function executorKey(target: ExecutionTargetBinding): string {
   return JSON.stringify([resolve(target.sshConfig!), target.alias, target.expectedHostname?.toLowerCase(), target.remoteRoot?.replaceAll('\\', '/').toLowerCase()]);
 }
 export function command(executable: string, args: string[], cwd: string, timeout = 90_000): Promise<string> {
-  return new Promise((done, fail) => execFile(executable, args, { cwd, windowsHide: true, timeout, maxBuffer: 512 * 1024 }, (error, stdout, stderr) => {
-    // Do not expose command arguments, SSH diagnostics or connection credentials in status messages.
-    if (error) fail(Object.assign(new Error(`执行器更新命令未完成：${executable} (${error.code ?? 'failed'})`), { detail: stderr.slice(0, 3000) })); else done(stdout.trim());
-  }));
+  // Windows OpenSSH may retain redirected pipe handles after its parent exits.
+  // Ordinary files give us the real process exit without waiting on an inherited pipe.
+  const temporary = mkdtempSync(join(tmpdir(), 'bridge-command-'));
+  const out = join(temporary, 'stdout'), err = join(temporary, 'stderr');
+  const descriptors = [openSync(out, 'wx', 0o600), openSync(err, 'wx', 0o600)];
+  return new Promise<string>((done, fail) => {
+    const child = spawn(executable, args, { cwd, windowsHide: true, stdio: ['ignore', descriptors[0]!, descriptors[1]!] });
+    for (const fd of descriptors) closeSync(fd);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
+    const cleanup = () => { clearTimeout(timer); for (const path of [out, err]) try { unlinkSync(path); } catch {} try { rmdirSync(temporary); } catch {} };
+    child.once('error', () => { cleanup(); fail(new Error(`执行器更新命令无法启动：${executable}`)); });
+    child.once('exit', code => {
+      try {
+        if (timedOut || code !== 0) throw new Error(`执行器更新命令未完成：${executable} (${timedOut ? 'timeout' : code})`);
+        if (statSync(out).size > 512 * 1024) throw new Error('执行器更新回执超过大小限制。');
+        done(readFileSync(out, 'utf8').trim());
+      } catch (error) { fail(error); } finally { cleanup(); }
+    });
+  });
 }
 export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
   const files = new Map<string, string>();
@@ -55,7 +72,7 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
 export function ps(value: string): string { return "'" + value.replaceAll("'", "''") + "'"; }
 export function remotePowerShell(target: ExecutionTargetBinding, script: string, cwd: string): Promise<string> {
   return command('ssh', ['-F', target.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', target.alias!,
-    'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';" + script, 'utf16le').toString('base64')], cwd);
+    'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$env:NODE_NO_WARNINGS='1';" + script, 'utf16le').toString('base64')], cwd);
 }
 export async function deployExecutor(target: ExecutionTargetBinding, release: ExecutorRelease, cwd: string): Promise<DeploymentResult> {
   if (!/^[A-Za-z]:[\\/]/.test(target.remoteRoot!)) throw new Error('自动执行器更新目前支持已登记的 Windows 目标。');

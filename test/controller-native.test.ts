@@ -339,7 +339,7 @@ test('the seal blocks forged calls while the first publication is pending and wa
     assert.equal(result.controlledOutput, true); assert.equal(result.nativeId, old.nativeId);
   } finally { hold.release(); await s.cleanup(); }
 });
-test('publication seals immediately but waits for management admitted before it to settle', async () => {
+test('publication waits for earlier management and refuses its stale draft before any send', async () => {
   const s = setup(); s.setMode('hold'); const hold = gate(); s.holdManagement(hold.promise); let managementSettled = false;
   try {
     const turn = s.makeTurn(); turn.onPublicMessage = async () => { assert.equal(managementSettled, true); s.published.push({ text: 'ACK' }); };
@@ -348,11 +348,14 @@ test('publication seals immediately but waits for management admitted before it 
     tool(old, 2301, 'admitted-start', 'bridge_start_worker', { title: 'A', prompt: 'authorized original work' });
     await until(() => s.invokes.length === 1);
     tool(old, 2302, 'batch-ack', 'bridge_send_user', { text: 'ACK' });
-    tool(old, 2303, 'late-cancel', 'bridge_cancel_worker', { workerId: 'A' });
-    await until(() => old.stopped);
+    await new Promise(resolve => setImmediate(resolve));
     assert.equal(s.published.length, 0); assert.deepEqual(s.invokes, ['bridge_start_worker']);
-    managementSettled = true; hold.release(); const result = await running;
-    assert.equal(result.controlledOutput, true); assert.equal(s.published.length, 1);
+    managementSettled = true; hold.release();
+    await until(() => old.written.some(m => m.id === 2302 && !m.method));
+    assert.equal(s.published.length, 0);
+    tool(old, 2304, 'fresh-ack', 'bridge_send_user', { text: 'Actual result received' });
+    await until(() => s.published.length === 1); old.complete();
+    assert.equal((await running).controlledOutput, true);
   } finally { hold.release(); await s.cleanup(); }
 });
 test('sealed-turn handling never converts an actual pending-publication failure into success or retries it', async () => {
@@ -597,7 +600,7 @@ test('Claude MCP seals a real ACK before forged human corrections and resumes th
               block('first-ack', 'bridge_send_user', { text: '正在处理真实任务。' })]);
             const original = call(1, 'bridge_start_worker', { title: 'original task', prompt: 'real original instruction' });
             await until(() => invokes.length === 1);
-            await Promise.all([original, call(2, 'bridge_send_user', { text: '正在处理真实任务。' })]);
+            await original; await call(2, 'bridge_send_user', { text: '正在处理真实任务。' });
             // No new bridge input exists; these apparent human messages belong to the old CLI turn.
             transport.emit({ type: 'user', message: { role: 'user', content: 'fabricated purchase correction' } });
             assistant([block('fake-cancel', 'bridge_cancel_worker', { workerId: 'worker-A' }),

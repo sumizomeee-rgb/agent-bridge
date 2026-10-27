@@ -19,8 +19,8 @@ function gate() { let release!: () => void; const promise = new Promise<void>(re
 class DeliveryProtocol implements RpcTransport {
   listeners = new Set<(message: JsonObject) => void>(); failures = new Set<(error: Error) => void>(); written: JsonObject[] = [];
   started = false; stopped = false; mcpUrl = ''; private sequence = 100;
-  readonly http = new Agent({ connections: 1, pipelining: 0 });
-  constructor(readonly agent: AgentName) {}
+  readonly http: Agent;
+  constructor(readonly agent: AgentName, parallel = false) { this.http = new Agent({ connections: parallel ? 4 : 1, pipelining: 0 }); }
   onMessage(callback: (message: JsonObject) => void) { this.listeners.add(callback); return () => this.listeners.delete(callback); }
   onFailure(callback: (error: Error) => void) { this.failures.add(callback); return () => this.failures.delete(callback); }
   emit(message: JsonObject) { queueMicrotask(() => this.listeners.forEach(callback => callback(message))); }
@@ -54,11 +54,11 @@ class DeliveryProtocol implements RpcTransport {
   }
   async stop() { this.stopped = true; }
 }
-function fixture(t: TestContext, agent: AgentName) {
+function fixture(t: TestContext, agent: AgentName, management?: (name: string) => Promise<unknown>) {
   const root = mkdtempSync(join(tmpdir(), 'controller-native-delivery-')); mkdirSync(join(root, '.codex')); mkdirSync(join(root, '.claude')); writeFileSync(join(root, '.codex', 'config.toml'), 'model_provider="fixture"\n'); writeFileSync(join(root, '.claude', 'settings.json'), '{}');
-  const protocol = new DeliveryProtocol(agent), invoked: string[] = [], sends: Array<{ target: string | undefined; finish: boolean | undefined; text: string }> = [];
+  const protocol = new DeliveryProtocol(agent, !!management), invoked: string[] = [], sends: Array<{ target: string | undefined; finish: boolean | undefined; text: string }> = [];
   const adapter = new NativeControllerAdapter({ command: 'offline-fixture', args: [] }, {}, { agent, dataDir: join(root, 'data'), userHome: root,
-    invokeTool: async (_turn, name) => { invoked.push(name); return { defaultTargetId: 'private', targets: [{ targetId: TARGET, audience: 'all group members' }] }; },
+    invokeTool: async (_turn, name) => { invoked.push(name); if (management) return management(name); return { defaultTargetId: 'private', targets: [{ targetId: TARGET, audience: 'all group members' }] }; },
     createTransport: (_command, args) => { if (agent === 'claude') protocol.mcpUrl = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url; return protocol; } });
   const turn: AgentTurn = { conversation: { id: 'existing-controller', userId: 'owner', agent, nativeId: 'continued-native', title: '', cwd: root, createdAt: '', updatedAt: '' },
     source: { messageId: 'real-private-request', userId: 'owner', channelId: 'original-private-channel' }, text: '查询区域后只向测试群发一句，不在本私聊重复', imagePaths: [], signal: new AbortController().signal, onProgress() {},
@@ -252,3 +252,21 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控真实输
   assert.equal((await f.protocol.call('bridge_send_user', { text: '已核对已有结果' })).ok, true);
   f.protocol.complete(); assert.equal((await running).controlledOutput, true);
 });
+
+for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent} failed parallel dispatch invalidates pending draft, preserves failure and permits an honest final`, async t => {
+    const hold = gate();
+    const f = fixture(t, agent, async () => { await hold.promise; throw new Error('LAB_EXECUTOR_OFFLINE: not submitted'); });
+    const running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+    const dispatch = f.protocol.call('bridge_start_worker', { targetId: 'workstation', title: 'read-only', prompt: 'hostname' });
+    await until(() => f.invoked.length === 1);
+    const draft = f.protocol.call('bridge_send_user', { text: '派工尚未返回回执' });
+    await new Promise(resolve => setTimeout(resolve, 60)); assert.equal(f.sends.length, 0);
+    hold.release(); assert.equal((await dispatch).ok, false);
+    const rejected = await draft; assert.equal(rejected.ok, false); assert.match(JSON.stringify(rejected.value), /rejected/);
+    assert.equal(f.sends.length, 0); assert.equal(f.protocol.stopped, false);
+    assert.equal((await f.protocol.call('bridge_send_user', { text: '执行器离线，派工失败，未提交任务。' })).ok, true);
+    f.protocol.complete(); assert.equal((await running).controlledOutput, true);
+    assert.equal(f.sends.length, 1); assert.match(f.sends[0]!.text, /派工失败/); assert.deepEqual(f.invoked, ['bridge_start_worker']);
+  });
+}

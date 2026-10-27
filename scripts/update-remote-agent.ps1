@@ -51,8 +51,28 @@ try {
   # Stop only this proven-idle daemon, never its process tree or any worker.
   Stop-Process -Id $before.ProcessId -ErrorAction Stop
  }
- for($attempt=0;$attempt -lt 45;$attempt++){
+ # An old launcher may still be waiting on Start-Process -Wait's descendant job.
+ # Only recycle that exact launcher when the daemon is offline and its journal is idle.
+ function Recover-IdleLauncher {
+  $check=Probe;if($check.online -or !$check.idle){return}
+  $all=@(Get-CimInstance Win32_Process)
+  $supervisors=@($all|Where-Object {$_.Name -ieq 'powershell.exe' -and $_.CommandLine -like ('*'+$launcher+'*') -and $_.CommandLine -like ('*'+$resolvedRoot+'*')})
+  if($supervisors.Count -gt 1){throw 'Ambiguous executor launchers'}
+  if($supervisors.Count -eq 1){
+   $supervisor=$supervisors[0]
+   $children=@($all|Where-Object {$_.ParentProcessId -eq $supervisor.ProcessId -and $_.Name -ine 'conhost.exe'})
+   if($children.Count){return}
+   $current=Get-CimInstance Win32_Process -Filter ('ProcessId='+$supervisor.ProcessId)
+   if(!$current -or $current.CreationDate -ne $supervisor.CreationDate -or $current.CommandLine -ne $supervisor.CommandLine){throw 'Executor launcher identity changed'}
+   Stop-Process -Id $supervisor.ProcessId -ErrorAction Stop
+   Start-Sleep -Milliseconds 300
+  }
+  if((Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath).State -ne 'Running'){Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath}
+ }
+ $deadline=[DateTime]::UtcNow.AddSeconds(35)
+ for($attempt=0;[DateTime]::UtcNow -lt $deadline;$attempt++){
   Start-Sleep -Seconds 1
+  if($attempt -eq 2){Recover-IdleLauncher}
   if((Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath).State -ne 'Running'){Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath}
   $ready=Probe;if($ready.online -and $ready.release -eq $Release){@{state='ready';release=$Release}|ConvertTo-Json -Compress;return}
  }

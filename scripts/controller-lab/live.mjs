@@ -5,10 +5,9 @@ import { join, resolve, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Faults } from './faults.mjs';
-import { runWorkerSelectionLive } from './worker-selection-live.mjs';
 
 // Live tests run real CLI generations. Every test object is created in a fresh lab directory.
-export async function runLive({ root, runDir, configPath, agent, evidence, save, selectionOnly = false }) {
+export async function runLive({ root, runDir, configPath, agent, evidence, save }) {
   const load = file => import(pathToFileURL(join(root, 'dist/src', file)));
   const { loadHostConfig, agentEnvironment } = await load('config.js');
   const { NativeControllerAdapter, isolatedCodexConfig, codexControllerOverrides } = await load('controller/native.js');
@@ -135,33 +134,10 @@ export async function runLive({ root, runDir, configPath, agent, evidence, save,
     const open = async () => {
       instance++;
       runtime = new ControllerRuntime(config, { [agent]: worker, [other]: deny }, registry, { onCompletion: () => manager.completionAvailable(), pollIntervalMs: 100,
-        ...(selectionOnly ? { targetCatalog: {
-          listTargets: async () => [{ id: 'local', label: '隔离桥电脑', transport: 'local', engines: [agent], availability: 'local' }, { id: 'lab-remote', label: '隔离远端登记', transport: 'ssh', engines: [other], availability: 'registered' }],
-          listPresets: async () => [],
-          resolveTarget: async (_workspace, id, selected, directory) => { if (id !== 'local' || selected !== agent) throw new Error('该电脑未登记所选引擎，未派发或回退'); return { id, label: '隔离桥电脑', transport: 'local', agent: selected, cwd: directory ?? cwd, agentCommand: command }; },
-          adapterFor: () => worker,
-        } } : {}),
         onError: error => { receipt.runtimeErrors ??= []; receipt.runtimeErrors.push(String(error.message).slice(0, 200)); save(); } });
       native = new NativeControllerAdapter(command, env, { agent, dataDir: config.dataDir, userHome, metadataAdapter: execution,
         invokeTool: async (turn, name, args, callId) => {
           receipt.tools.push({ name, at: new Date().toISOString() }); save();
-          if (selectionOnly) {
-            assert(['bridge_start_worker', 'bridge_list_workers', 'bridge_list_targets'].includes(name), 'Unauthorized selection lab tool');
-            if (name === 'bridge_start_worker') {
-              assert(!args.cwd || resolve(args.cwd) === cwd); assert(!args.presetId);
-              assert(!args.assistant || ['default', 'ordinary'].includes(args.assistant.kind));
-              if (args.assistant?.kind === 'ordinary') { assert.equal(args.assistant.agent, agent); assert.equal(args.assistant.model, model); }
-              try {
-                if ((args.targetId ?? 'local') === 'local') assert(receipt.workerRuns.length < 2, 'Only two real isolated workers allowed');
-                const result = await runtime.invoke(turn, name, args, callId);
-                assert.equal(result.agent, agent); assert.equal(result.model, model); assert.equal(result.effort, 'xhigh');
-                receipt.selectionDispatches ??= []; receipt.selectionDispatches.push(result); save(); return result;
-              } catch (error) { receipt.selectionRejections ??= []; receipt.selectionRejections.push(String(error.message).slice(0, 250)); save(); throw error; }
-            }
-            const result = await runtime.invoke(turn, name, args, callId);
-            if (name === 'bridge_list_targets') { receipt.groupedOverview = result; save(); }
-            return result;
-          }
           if (!['bridge_start_worker', 'bridge_list_workers'].includes(name)) throw new Error('Lab tool not authorized: ' + name);
           if (name === 'bridge_start_worker') {
             assert.equal(dispatches++, 0, 'Only one worker dispatch allowed');
@@ -202,11 +178,6 @@ export async function runLive({ root, runDir, configPath, agent, evidence, save,
     };
     const prefix = '这是隔离测试，所有发送都进入本地接收器。不要做其他工作。';
     await open();
-    if (selectionOnly) {
-      await runWorkerSelectionLive({ agent, model, checkpoints, send, finished, wait, receipt, getRuntime: () => runtime, getStore: () => store, getConversationId: () => conversationId,
-        reopen: async () => { await manager.close(); manager = undefined; await runtime.close(); runtime = undefined; await open(); }, save });
-      return;
-    }
     await checkpoints('cold start and real worker completion round trip', async () => {
       await send('dispatch', prefix + '调用 bridge_start_worker 一次，必须省略 agent、model、effort 参数，使用主控默认继承；任务是“禁止使用任何工具；仅计算 17+25，输出 LAB_WORKER_42”，然后通过 bridge_send_user 回复 LAB_DISPATCHED。收到后续助手结果时，只回复包含真实结果的 LAB_RESULT，不要再次派工。');
       await finished('dispatch');

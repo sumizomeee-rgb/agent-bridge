@@ -8,23 +8,24 @@ import { verifyParity } from './controller-lab/parity.mjs';
 
 const { values } = parseArgs({ options: {
   'selection-only': { type: 'boolean', default: false },
+  targets: { type: 'string' }, 'controller-model': { type: 'string' }, 'controller-effort': { type: 'string', default: 'xhigh' },
   live: { type: 'boolean', default: false }, config: { type: 'string' },
   agent: { type: 'string', default: 'codex' }, 'runtime-root': { type: 'string' },
   'source-root': { type: 'string' },
 } });
 const root = resolve(values['runtime-root'] ?? join(dirname(fileURLToPath(import.meta.url)), '..'));
 if (!['codex', 'claude', 'both'].includes(values.agent)) throw new Error('--agent must be codex, claude or both');
-if (values.live && !values.config) throw new Error('--live requires an explicit --config (routing only; production databases are never opened)');
+if (values.live && !values.config) throw new Error('--live requires an explicit --config (real configured paths; production defaults read-only)');
 const runDir = join(root, '.local', 'controller-lab', new Date().toISOString().replace(/[:.]/g, '-') + '-' + process.pid);
 mkdirSync(runDir, { recursive: true });
 const evidence = { version: 1, startedAt: new Date().toISOString(), mode: values.live ? 'live' : 'deterministic',
   runDir, runtimeHashes: {}, harnessHashes: {}, cases: [], status: 'running',
-  scope: { platform: 'local receipt sink; no Feishu/Discord connection', isolation: 'fresh databases, native homes and workspace; same CLI/auth/provider routing',
-    excluded: ['production conversation history', 'real platform delivery', 'cross-machine execution', 'business tools', 'cross-day stability'] } };
+  scope: { platform: 'local receipt sink; no Feishu/Discord network connection', isolation: 'fresh conversations and journals; actual configured catalog, defaults, SSH, deployment and executors',
+    configuredPathsRequired: values.live, excluded: ['production conversation history', 'real platform delivery', 'business tools', 'cross-day stability'] } };
 for (const file of ['controller/native.js', 'controller/runtime.js', 'manager.js', 'store.js', 'agents/process.js']) {
   evidence.runtimeHashes[file] = createHash('sha256').update(readFileSync(join(root, 'dist/src', file))).digest('hex');
 }
-for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/worker-selection-live.mjs', 'controller-lab/faults.mjs', 'controller-lab/parity.mjs']) {
+for (const file of ['controller-lab.mjs', 'controller-lab/live.mjs', 'controller-lab/configured-live.mjs', 'controller-lab/faults.mjs', 'controller-lab/parity.mjs']) {
   evidence.harnessHashes[file] = createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), file))).digest('hex');
 }
 const save = () => writeFileSync(join(runDir, 'report.json'), JSON.stringify(evidence, null, 2));
@@ -35,9 +36,9 @@ try {
   try {
   if (!values.live) {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
-    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement', 'slash', 'overview', 'overview-runtime', 'overview-discord', 'worker-result-overview', 'restart-command', 'restart-ingress', 'restart', 'worker-restart-recovery', 'worker-session', 'controller-runtime', 'worker-selection', 'controller-worker-archive', 'controller-recovery'];
+    const files = ['controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement', 'slash', 'overview', 'overview-runtime', 'overview-discord', 'worker-result-overview', 'restart-command', 'restart-ingress', 'restart', 'worker-restart-recovery', 'worker-session', 'controller-runtime', 'worker-selection', 'remote', 'remote-deployment', 'deployment-command', 'executor-supervisor', 'presets', 'preset-pipeline', 'preset-deployment', 'controller-worker-archive', 'controller-recovery'];
     const output = [];
-    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...['faults', 'parity'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
+    const child = spawn(process.execPath, ['--test', '--test-concurrency=2', '--test-reporter=tap', ...['faults', 'parity'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', bytes => output.push(bytes)); child.stderr.on('data', bytes => output.push(bytes));
     const code = await new Promise((accept, reject) => { child.on('error', reject); child.on('close', accept); });
@@ -47,8 +48,11 @@ try {
       exitCode: code, tests: count('tests'), passed: count('pass'), failed: count('fail'), skipped: count('skipped') });
   } else {
     const { runLive } = await import('./controller-lab/live.mjs');
+    const { runConfigured } = await import('./controller-lab/configured-live.mjs');
     for (const agent of values.agent === 'both' ? ['codex', 'claude'] : [values.agent]) {
-      await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save, selectionOnly: values['selection-only'] });
+      if (!values['selection-only']) await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save });
+      await runConfigured({ root, runDir, configPath: resolve(values.config), agent, evidence, save, targets: values.targets?.split(','),
+        controllerModel: values['controller-model'], controllerEffort: values['controller-effort'] });
     }
   }
   } finally { parity.assertUnchanged(); evidence.parity.unchangedAtEnd = true; }
