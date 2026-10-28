@@ -523,9 +523,8 @@ export class ControllerRuntime {
     ].join('\n'));
     return [('choice' in command ? '默认助手已保存，仅影响此后新建派工。' : '各电脑默认助手与登记候选'), ...lines, workerDefaultUsage].join('\n\n');
   }
-  private normalizeWorkerArgs(input: Record<string, unknown>, initialization: boolean): Record<string, unknown> {
+  private normalizeWorkerArgs(input: Record<string, unknown>): Record<string, unknown> {
     const { assistant, ...args } = input;
-    if (initialization) return args; // Internal workspace reading is pinned to the original local/follow path.
     const targetId = workerTargetId(args.targetId ?? 'local');
     if (assistant !== undefined && ['agent', 'model', 'presetId'].some(key => args[key] !== undefined)) throw new Error('assistant 与旧版 agent/model/presetId 参数不能混用。');
     if (assistant === undefined && args.presetId !== undefined) return args; // Cached old tools may infer the machine from an explicit preset.
@@ -867,7 +866,7 @@ export class ControllerRuntime {
     let target: ExecutionTargetBinding | undefined;
     let preparedWorker: ControllerWorker | undefined;
     if (name === 'bridge_start_worker' || name === 'bridge_schedule_worker') {
-      const args = this.normalizeWorkerArgs(object(input, ['title', 'prompt', 'cwd', 'assistant', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]), workspaceInitialization);
+      const args = this.normalizeWorkerArgs(object(input, ['title', 'prompt', 'cwd', 'assistant', 'agent', 'model', 'effort', 'imagePaths', 'targetId', 'presetId', 'sessionVisibility', ...(name === 'bridge_schedule_worker' ? ['afterSeconds', 'dueAt'] : [])]));
       const presetTarget = args.presetId === undefined ? undefined : await (async () => {
         if (!this.callbacks.targetCatalog?.resolvePreset) throw new Error('当前执行器未支持预设派发。');
         const workspace = this.config.contextWorkspace ?? this.config.workspace, id = text(args.presetId, '预设 ID', 96);

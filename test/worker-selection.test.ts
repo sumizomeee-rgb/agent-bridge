@@ -30,9 +30,10 @@ function fixture() {
     id, label: id, expectedHostname: 'fixture', sshConfig: join(dir, 'ssh-config'), alias: 'fixture', remoteRoot: dir, nodePath: process.execPath,
     engines: Object.fromEntries((id === 'home' ? ['codex', 'claude'] : ['claude']).map(agent => [agent, { agentCommand: config.commands.codex, defaultCwd: dir }])),
   })) }));
-  let enabled = true, presetConnections = 0;
+  let enabled = true, presetConnections = 0, localPreset = false;
   const presets = () => [
     { id: 'home-luna', aliases: ['家用 Luna'], targetId: 'home', agent: 'codex' as const, model: 'gpt-6-luna', profileId: 'luna', revision: 1, enabled },
+    ...(localPreset ? [{ id: 'local-sol', aliases: ['本机 SOL'], targetId: 'local', agent: 'codex' as const, model: 'gpt-6.1-sol', profileId: 'sol', revision: 1, enabled }] : []),
     { id: 'disabled-local', aliases: ['停用'], targetId: 'local', agent: 'codex' as const, model: 'gpt-6-luna', profileId: 'luna', revision: 1, enabled: false },
   ];
   writeFileSync(join(dir, 'agent-presets/registry.json'), JSON.stringify({ version: 1, presets: presets() }));
@@ -56,7 +57,7 @@ function fixture() {
     title: 'parent', cwd: dir, createdAt: '2026-10-27', updatedAt: '2026-10-27' }, text: 'test', imagePaths: [], taskContextPath: context.contextPath,
     signal: new AbortController().signal, onProgress() {} };
   const launch = async (args: Record<string, unknown> = {}, name = 'bridge_start_worker') => runtime.invoke(turn, name, { title: '隔离选择测试', prompt: 'test', ...args }) as Promise<{ workerId: string; jobId: string; scheduleId?: string }>;
-  return { dir, turns, config, registry, runtime, catalog, turn, launch, presetConnections: () => presetConnections, disablePreset() { enabled = false; },
+  return { dir, turns, config, registry, runtime, catalog, turn, launch, presetConnections: () => presetConnections, enableLocalPreset() { localPreset = true; }, disablePreset() { enabled = false; },
     async close() { await runtime.close(); await catalog.close(); registry.close(); } };
 }
 const flush = () => new Promise<void>(done => setImmediate(done));
@@ -132,14 +133,46 @@ test('默认按 Bot 持久保存，重开及新父会话不覆盖；已有续聊
     const other = new ControllerStore(join(f.dir, 'other-bot')); assert.deepEqual(other.workerDefault('local'), { kind: 'follow' }); assert.equal(other.workerDefault('home'), null); other.close();
   } finally { await f.close(); }
 });
-test('初始化读工作区不受用户默认远端/预设影响；旧平铺明确参数仍可用', async () => {
+test('初始化读取桥电脑指定默认模型和强度；旧平铺明确参数仍可用', async () => {
   const f = fixture(); try {
     await f.runtime.workerDefaultCommand('agentworker local codex gpt-6-luna xhigh');
     const initialized = await f.runtime.initializeWorkspace(f.turn) as { workerId: string };
-    const worker = f.runtime.store.getWorker(initialized.workerId)!; assert.equal(worker.model, 'gpt-6.1-sol'); assert.equal(worker.target!.id, 'local');
+    const worker = f.runtime.store.getWorker(initialized.workerId)!; assert.equal(worker.model, 'gpt-6-luna'); assert.equal(worker.effort, 'xhigh'); assert.equal(worker.target!.id, 'local');
     const legacy = await f.launch({ targetId: 'home', agent: 'codex', model: 'gpt-6-luna', effort: 'xhigh' }); assert.equal(f.runtime.store.getWorker(legacy.workerId)!.target!.id, 'home');
   } finally { await f.close(); }
 });
+test('初始化使用桥电脑默认预设并固定本轮选择；修改默认不重复初始化', async () => {
+  const f = fixture(); try {
+    f.enableLocalPreset(); f.turn.conversation.model = 'gpt-6-luna'; f.turn.conversation.effort = 'xhigh';
+    await f.runtime.workerDefaultCommand('agentworker local preset local-sol');
+    const [first, duplicate] = await Promise.all([f.runtime.initializeWorkspace(f.turn), f.runtime.initializeWorkspace(f.turn)]) as Array<{ workerId: string; jobId: string }>;
+    assert.deepEqual(first, duplicate);
+    const worker = f.runtime.store.getWorker(first!.workerId)!;
+    assert.equal(worker.target!.id, 'local'); assert.equal(worker.target!.preset!.id, 'local-sol');
+    assert.equal(worker.model, 'gpt-6.1-sol'); assert.equal(worker.effort, null); assert.equal(worker.cwd, f.dir);
+    assert.equal(worker.origin.purpose, 'workspace-context'); assert.equal(worker.target!.sessionVisibility, 'hidden');
+    await f.runtime.workerDefaultCommand('agentworker local codex gpt-6-luna low');
+    assert.deepEqual(await f.runtime.initializeWorkspace(f.turn), first);
+    assert.equal(f.runtime.store.workers().length, 1); assert.equal(f.presetConnections(), 1);
+  } finally { await f.close(); }
+});
+
+test('初始化支持默认切换后端；默认预设不可用时明确失败且不回退主控', async () => {
+  const ordinary = fixture(); try {
+    await ordinary.runtime.workerDefaultCommand('agentworker local claude haiku xhigh');
+    const handle = await ordinary.runtime.initializeWorkspace(ordinary.turn) as { workerId: string }; await flush();
+    const worker = ordinary.runtime.store.getWorker(handle.workerId)!;
+    assert.equal(worker.agent, 'claude'); assert.equal(worker.model, 'haiku'); assert.equal(worker.effort, 'xhigh');
+    assert.equal(ordinary.turns[0]!.conversation.agent, 'claude'); assert.equal(worker.origin.agent, 'codex');
+  } finally { await ordinary.close(); }
+  const unavailable = fixture(); try {
+    unavailable.enableLocalPreset(); await unavailable.runtime.workerDefaultCommand('agentworker local preset local-sol');
+    unavailable.disablePreset(); await assert.rejects(unavailable.runtime.initializeWorkspace(unavailable.turn), /尚未启用/);
+    assert.equal(unavailable.runtime.store.workers().length, 0); assert.equal(unavailable.runtime.store.jobs().length, 0);
+    assert.equal(unavailable.turns.length, 0); assert.equal(unavailable.runtime.store.getWorkspaceInitialization('parent'), undefined);
+  } finally { await unavailable.close(); }
+});
+
 test('斜杠菜单、私聊命令与实际默认设置同路；无模型回合、不改群命令', async () => {
   const f = fixture(); const replies: string[] = [];
   const commandAdapter: AgentAdapter = { run: async () => { throw new Error('command must not invoke LLM'); }, interrupt: async () => {}, close: async () => {} };
