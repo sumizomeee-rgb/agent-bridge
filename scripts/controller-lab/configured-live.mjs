@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort = 'xhigh' }) {
   const load = file => import(pathToFileURL(join(root, 'dist/src', file)));
   const { loadHostConfig, agentEnvironment } = await load('config.js');
+  const { workspaceFile } = await load('workspace-layout.js');
   const { HostRuntime } = await load('host-runtime.js');
   const { BotRuntime } = await load('bot-runtime.js');
   const { TargetCatalogService } = await load('remote/catalog.js');
@@ -61,8 +62,10 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
     const computers = await catalog.listTargets(context, true);
     const selected = targets?.length ? computers.filter(c => targets.includes(c.id)) : computers;
     assert(selected.length && (!targets || targets.every(id => selected.some(c => c.id === id))), 'Unknown configured target');
-    receipt.configurationHashes = Object.fromEntries(['remote-agents/registry.json', 'agent-presets/registry.json'].map(name => [name,
-      existsSync(join(context, name)) ? createHash('sha256').update(readFileSync(join(context, name))).digest('hex') : null]));
+    receipt.configurationHashes = Object.fromEntries(['remote-agents', 'agent-presets'].map(role => {
+      const file = workspaceFile(context, role, 'registry.json');
+      return [role, existsSync(file) ? createHash('sha256').update(readFileSync(file)).digest('hex') : null];
+    }));
     receipt.targets = selected;
     const bindings = [];
     for (const target of selected.filter(c => c.transport === 'ssh')) bindings.push({ cwd: context, target: await catalog.resolveTarget(context, target.id, target.engines[0]) });

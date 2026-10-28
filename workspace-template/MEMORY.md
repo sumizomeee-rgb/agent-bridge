@@ -10,4 +10,4 @@
 
 ## 环境与入口
 
-填写实际工作区、机器用途和权威技能入口；连接、能力和预设明细分别维护在 `remote-agents/registry.json`、`capabilities/registry.json`、`agent-presets/registry.json`。尚未填写的内容视为未知，不使用示例或目录名猜测。
+填写实际工作区、机器用途和权威技能入口；连接、能力和预设明细分别维护在 `bridge-remote-agents/registry.json`、`bridge-capabilities/registry.json`、`bridge-agent-presets/registry.json`。尚未填写的内容视为未知，不使用示例或目录名猜测。

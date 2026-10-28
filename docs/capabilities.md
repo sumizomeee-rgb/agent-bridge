@@ -2,11 +2,11 @@
 
 [返回项目首页](../README.md)
 
-工作区的 `capabilities/registry.json` 保存能力入口和验收记录，桥的 `.local/data/capability-health` 保存当前检查缓存。登记属于用户上下文；检查和任务观测由桥提供。启动、重启做轻检查，主控按需调用 `bridge_check_capabilities`；新会话以 `README.md` 为唯一入口，并只读 README 明确要求的 MEMORY 及当前平台文档；桥提供 platform、固定应用 ID 和 Profile，未知时不猜测。不会为初始化远连或探测业务页面，也不逐轮注入完整报告。
+工作区的 `bridge-capabilities/registry.json` 保存能力入口和验收记录，桥的 `.local/data/capability-health` 保存当前检查缓存。登记属于用户上下文；检查和任务观测由桥提供。启动、重启做轻检查，主控按需调用 `bridge_check_capabilities`；新会话以 `README.md` 为唯一入口，并只读 README 明确要求的 MEMORY 及当前平台文档；桥提供 platform、固定应用 ID 和 Profile，未知时不猜测。不会为初始化远连或探测业务页面，也不逐轮注入完整报告。
 
 ## 登记
 
-生成器提供有效空表和独立的 `capabilities/example.json`，示例不会自动启用。填入真实值后放到实际表；不存密码、Token、Cookie 或截图。远端 `targetId` 对应工作区 `remote-agents/registry.json`，本机使用保留值 `local`。
+生成器提供有效空表和独立的 `bridge-capabilities/example.json`，示例不会自动启用。填入真实值后放到实际表；不存密码、Token、Cookie 或截图。远端 `targetId` 对应工作区 `bridge-remote-agents/registry.json`，本机使用保留值 `local`。
 
 | 字段 | 内容 |
 | --- | --- |
@@ -35,7 +35,7 @@ Claude 接管现有 Chrome 的连接路线需要独立验收；可能涉及远�
 
 ## 按聊天平台初始化
 
-工作区骨架提供 `chat-platforms/lark.md` 和 `chat-platforms/discord.md`。生成器只补缺失文件；README 指定只读取桥配置对应的一份。平台文档维护接口与网页／桌面选路、工具入口、身份边界和核对方法，不保存认证、不证明当前就绪，也不增加主控工具。
+工作区骨架提供 `bridge-chat-platforms/lark.md` 和 `bridge-chat-platforms/discord.md`。生成器只补缺失文件；README 指定只读取桥配置对应的一份。平台文档维护接口与网页／桌面选路、工具入口、身份边界和核对方法，不保存认证、不证明当前就绪，也不增加主控工具。
 
 `/new` 默认助手把适用入口和未知项提炼给主控；配置中的固定 Bot 身份与可变显示名分开，多个同平台 Bot 可共用同一指南，实际权限和验收按 Bot 分别判断。初始化不读取私有凭据、不调用 API 探测或发送消息。真正操作由已有工具或获任务授权的执行 Agent 完成。
 

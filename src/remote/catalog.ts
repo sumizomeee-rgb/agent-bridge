@@ -1,5 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { workspaceFile } from '../workspace-layout.js';
 import { isAbsolute, join, win32, posix } from 'node:path';
 import { isObject } from '../agents/process.js';
 import type { AgentAdapter, AgentCommand, AgentName, BridgeConfig } from '../types.js';
@@ -28,7 +29,7 @@ function command(value: unknown): AgentCommand {
   return { command: remoteAbsolute(value.command, 'CLI 命令'), args: value.args as string[] };
 }
 export function parseTargetRegistry(raw: unknown): RemoteTargetRegistration[] {
-  if (!isObject(raw) || raw.version !== 1 || !Array.isArray(raw.targets) || raw.targets.length > 100) throw new Error('remote-agents/registry.json 需要 version:1 和 targets 数组。');
+  if (!isObject(raw) || raw.version !== 1 || !Array.isArray(raw.targets) || raw.targets.length > 100) throw new Error('bridge-remote-agents/registry.json 需要 version:1 和 targets 数组。');
   const ids = new Set<string>();
   return raw.targets.map(value => {
     if (!isObject(value)) throw new Error('远端登记格式无效。');
@@ -63,7 +64,7 @@ export class TargetCatalogService {
   private readonly nativeSessions: NativeSessionService;
   constructor(private readonly config: BridgeConfig, private readonly localAdapters: Record<AgentName, AgentAdapter>, private readonly options: RemoteAdapterOptions & { nativeSessions?: NativeSessionService } = {}) {
     this.workerSessions = new WorkerSessionRuntime(config.dataDir);
-    this.presetRuntime = new PresetRuntime(join(config.contextWorkspace ?? config.workspace, 'agent-presets', 'private'), config.dataDir);
+    this.presetRuntime = new PresetRuntime(workspaceFile(config.contextWorkspace ?? config.workspace, 'agent-presets', 'private'), config.dataDir);
     this.nativeSessions = options.nativeSessions ?? new NativeSessionService(config.dataDir, {
       codex: { agentCommand: config.commands.codex, defaultCwd: config.workspace }, claude: { agentCommand: config.commands.claude, defaultCwd: config.workspace },
     });
@@ -72,7 +73,7 @@ export class TargetCatalogService {
     const cached = this.cache.get(workspace); if (!refresh && cached) return cached;
     let entries: RemoteTargetRegistration[];
     try {
-      const path = join(workspace, 'remote-agents/registry.json'); const info = await stat(path); if (!info.isFile() || info.size > 512 * 1024) throw new Error('remote-agents/registry.json 不是普通小型登记文件。');
+      const path = workspaceFile(workspace, 'remote-agents', 'registry.json'); const info = await stat(path); if (!info.isFile() || info.size > 512 * 1024) throw new Error('bridge-remote-agents/registry.json 不是普通小型登记文件。');
       entries = parseTargetRegistry(JSON.parse((await readFile(path, 'utf8')).replace(/^\uFEFF/, '')));
     } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') entries = []; else throw error; }
     this.cache.set(workspace, entries); return entries;
@@ -88,7 +89,7 @@ export class TargetCatalogService {
       const localCwd = cwd ?? workspace; if (!isAbsolute(localCwd) || !(await stat(localCwd)).isDirectory()) throw new Error('本机工作目录无效。');
       return { id: 'local', label: '当前桥电脑', transport: 'local', agent, agentCommand: this.config.commands[agent], cwd: localCwd };
     }
-    const registration = (await this.registrations(workspace)).find(value => value.id === id); if (!registration) throw new Error('目标电脑未在 remote-agents/registry.json 登记。');
+    const registration = (await this.registrations(workspace)).find(value => value.id === id); if (!registration) throw new Error('目标电脑未在 bridge-remote-agents/registry.json 登记。');
     const engine = registration.engines[agent]; if (!engine) throw new Error('此目标电脑未登记所选引擎。');
     const remoteCwd = cwd === undefined ? engine.defaultCwd : remoteAbsolute(cwd, '远端工作目录');
     return { id: registration.id, label: registration.label, transport: 'ssh', expectedHostname: registration.expectedHostname,

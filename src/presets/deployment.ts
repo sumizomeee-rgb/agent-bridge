@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { isObject } from '../agents/process.js';
+import { workspaceFile } from '../workspace-layout.js';
 import { listPresets, readPrivateJson } from './registry.js';
 import { parseLaunchProfiles } from './runtime.js';
 import { materialsHash, parseMaterials, privateDirectory, type PresetMaterials } from './materials.js';
@@ -10,7 +11,7 @@ import { command, remotePowerShell, ps } from '../remote/deployment.js';
 export async function presetMaterials(workspace: string, target: ExecutionTargetBinding): Promise<PresetMaterials | null> {
   const entries = (await listPresets(workspace, { targetId: target.id })).filter(entry => entry.enabled);
   if (!entries.length) return null;
-  const directory = join(workspace, 'agent-presets', 'private');
+  const directory = workspaceFile(workspace, 'agent-presets', 'private');
   const raw = await readPrivateJson(join(directory, 'profiles.json')), secrets = await readPrivateJson(join(directory, 'credentials.json'));
   if (!isObject(raw) || !Array.isArray(raw.profiles) || !isObject(secrets) || secrets.version !== 1 || !isObject(secrets.credentials)) throw new Error('工作区预设启动配置或凭据无效。');
   const owner = materialsHash(process.platform === 'win32' ? resolve(workspace).toLowerCase() : resolve(workspace));
@@ -39,7 +40,7 @@ export async function deployPresets(target: ExecutionTargetBinding, workspace: s
   // 相同配置只做远端核验；凭据不进入发布包、参数、日志或派工记录。
   const probe = JSON.parse(await remotePowerShell(target, `$r=Get-Content -LiteralPath (Join-Path ${ps(target.remoteRoot!)} '.local/remote/active-release.json') -Raw -Encoding UTF8|ConvertFrom-Json;& ${ps(target.nodePath!)} (Join-Path $r.path 'dist/src/presets/install.js') verify ${ps(target.remoteRoot!)} ${ps(target.expectedHostname!)} ${ps(materials.owner)} ${ps(digest)};if($LASTEXITCODE -ne 0){throw 'Preset verification failed'}`, workspace));
   if (probe.ready === true && probe.count === materials.profiles.length) return materials.profiles.length;
-  const temporary = mkdtempSync(join(workspace, 'agent-presets', '.deploy-')); privateDirectory(temporary);
+  const temporary = mkdtempSync(workspaceFile(workspace, 'agent-presets', '.deploy-')); privateDirectory(temporary);
   const file = join(temporary, 'payload.json'), remote = target.remoteRoot!.replaceAll('\\', '/') + '/.local/agent-presets/inbox/' + temporary.split(/[\\/]/).pop() + '.json';
   try {
     writeFileSync(file, payload, { mode: 0o600, flag: 'wx' });

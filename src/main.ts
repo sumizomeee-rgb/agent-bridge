@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { workspaceFile } from './workspace-layout.js';
 import { loadHostConfig, projectRoot, safeError } from './config.js';
 import { ensureHostSemanticData } from './host-migration.js';
 import { acquireInstanceLock } from './instance-lock.js';
@@ -58,7 +59,7 @@ try {
   deployments = new RemoteDeploymentService(async () => {
     const targets = [];
     for (const selected of config.configs) {
-      const cwd = selected.contextWorkspace ?? selected.workspace, path = join(cwd, 'remote-agents', 'registry.json');
+      const cwd = selected.contextWorkspace ?? selected.workspace, path = workspaceFile(cwd, 'remote-agents', 'registry.json');
       if (!existsSync(path)) continue;
       for (const registration of parseTargetRegistry(JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')))) {
         const agent = registration.engines.codex ? 'codex' as const : 'claude' as const, engine = registration.engines[agent]!;

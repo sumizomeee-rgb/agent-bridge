@@ -4,9 +4,9 @@
 
 ## 私有目录
 
-上下文工作区 `agent-presets/registry.json` 使用 `workspace-template/agent-presets/example.json` 的格式。每条记录包含稳定 `id`、口语 `aliases`、`targetId`、`agent`、固定 `model`、目标私有 `profileId`、`revision`、`enabled` 和可选停用原因。本机目标为 `local`，远端目标引用现有 `remote-agents/registry.json`。个人目录在代码仓库外维护，不提交 Git。
+上下文工作区 `bridge-agent-presets/registry.json` 使用 `workspace-template/bridge-agent-presets/example.json` 的格式。每条记录包含稳定 `id`、口语 `aliases`、`targetId`、`agent`、固定 `model`、目标私有 `profileId`、`revision`、`enabled` 和可选停用原因。本机目标为 `local`，远端目标引用现有 `bridge-remote-agents/registry.json`。个人目录在代码仓库外维护，不提交 Git。
 
-预设清单和启动配置统一在上下文工作区维护：`agent-presets/registry.json`、`agent-presets/private/profiles.json` 和 `credentials.json`。桥启动后复用已有电脑登记与执行器自动部署，按目标筛选已启用预设，自动准备远端运行资料；离线或忙碌时后续重试，不要求用户逐台复制文件。`profiles.json` 不含密钥：
+预设清单和启动配置统一在上下文工作区维护：`bridge-agent-presets/registry.json`、`bridge-agent-presets/private/profiles.json` 和 `credentials.json`。桥启动后复用已有电脑登记与执行器自动部署，按目标筛选已启用预设，自动准备远端运行资料；离线或忙碌时后续重试，不要求用户逐台复制文件。`profiles.json` 不含密钥：
 
 ```json
 {
@@ -19,7 +19,7 @@
 }
 ```
 
-远端资料存放在 `<remoteRoot>/.local/agent-presets/managed/`，由桥维护，模型线路与凭据以同一个文件原子更新。只向对应目标提供其已启用预设需要的资料，不复制整个工作区或预设清单。旧执行器的手工配置保留兼容，旧助手继续使用自己的线路快照。
+远端资料存放在 `<remoteRoot>/.local/bridge-agent-presets/managed/`，由桥维护，模型线路与凭据以同一个文件原子更新。只向对应目标提供其已启用预设需要的资料，不复制整个工作区或预设清单。旧执行器的手工配置保留兼容，旧助手继续使用自己的线路快照。
 
 `profiles.json` 的单个启动配置可选 `targets: {"home": {"transport": {"kind": "ssh-connect", "sshConfig": "目标机已有 SSH 配置绝对路径", "alias": "fixed-alias"}}, "workstation": {"transport": {"kind": "direct"}}}`，集中描述已有目标的线路差异。未覆盖时沿用默认 `transport`；目标 SSH 路径不存在会明确失败，不能把源电脑路径直接当作目标机已就绪。
 

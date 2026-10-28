@@ -46,7 +46,7 @@
 
 ## 主控与后台执行
 
-能力入口由本 Bot 固定上下文工作区的 `capabilities/registry.json` 登记。桥启动或重启做本机静态前提检查，主控按需用 `bridge_check_capabilities` 过滤查询或刷新；网站登录、运行连接和交付另行实测，历史验收不代表实时就绪。任务进度来自真实工具活动，停滞提醒去重后交给主控判断，不自动取消或增加整体硬超时。细节见[能力登记与就绪检查](capabilities.md)。
+能力入口由本 Bot 固定上下文工作区的 `bridge-capabilities/registry.json` 登记。桥启动或重启做本机静态前提检查，主控按需用 `bridge_check_capabilities` 过滤查询或刷新；网站登录、运行连接和交付另行实测，历史验收不代表实时就绪。任务进度来自真实工具活动，停滞提醒去重后交给主控判断，不自动取消或增加整体硬超时。细节见[能力登记与就绪检查](capabilities.md)。
 
 在 `.local/config.json` 设置 `"controllerMode": true` 启用主控模式。主控直接处理聊天和读图；检查环境、操作浏览器、SSH、改代码等工作交给独立的 Codex / Claude 执行子 Agent。主控仅有桥提供的派发、续接、取消、查看、预约和公开回复工具；供应商、认证、模型别名沿用用户配置，电脑工具及用户 MCP 不加载到主控。
 
@@ -113,7 +113,7 @@
 
 ## 原生会话接管与单个 Agent 的选择
 
-主控可用 `bridge_list_native_sessions` 查询当前桥电脑或 `remote-agents/registry.json` 登记电脑上的 Codex / Claude 原生会话，再用 `bridge_read_native_session` 查看有界摘要及状态。两者只读，不调用模型，也不派任务。原生历史默认只向桥的首个白名单用户开放；其他用户须在目标电脑登记的 `allowedUserIds` 获授权，机器人白名单本身不授予他人会话的访问权。
+主控可用 `bridge_list_native_sessions` 查询当前桥电脑或 `bridge-remote-agents/registry.json` 登记电脑上的 Codex / Claude 原生会话，再用 `bridge_read_native_session` 查看有界摘要及状态。两者只读，不调用模型，也不派任务。原生历史默认只向桥的首个白名单用户开放；其他用户须在目标电脑登记的 `allowedUserIds` 获授权，机器人白名单本身不授予他人会话的访问权。
 
 核实后用 `bridge_adopt_native_session` 传入真实原生 ID 和检查版本，建立空闲直属 Agent。它保持原 ID、原目录和完整原生历史；只有随后明确续接才运行 CLI，不会用摘要新建替代会话。`bridge_handoff_worker` 可将空闲会话交还用户，用户结束 CLI 后可再接管，旧 worker 只保留历史，不再派工。正在使用、结果未知、供应商不匹配或检查后已变化的会话会返回具体原因；先处理原因再重新查询。不要同时用人工 CLI 和桥操作同一会话。
 

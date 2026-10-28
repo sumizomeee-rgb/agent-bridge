@@ -1,5 +1,5 @@
 import { readFile, lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { workspaceFile } from '../workspace-layout.js';
 import { isObject } from '../agents/process.js';
 import { isModelId } from '../config.js';
 import type { DispatchPreset, PresetFilter } from './types.js';
@@ -14,7 +14,7 @@ export async function readPrivateJson(path: string): Promise<unknown> {
   return JSON.parse((await readFile(path, 'utf8')).replace(/^\uFEFF/, ''));
 }
 export function parsePresetRegistry(raw: unknown): DispatchPreset[] {
-  if (!isObject(raw) || raw.version !== 1 || !Array.isArray(raw.presets) || raw.presets.length > 100) throw new Error('agent-presets/registry.json 格式无效。');
+  if (!isObject(raw) || raw.version !== 1 || !Array.isArray(raw.presets) || raw.presets.length > 100) throw new Error('bridge-agent-presets/registry.json 格式无效。');
   const ids = new Set<string>(), aliases = new Set<string>();
   return raw.presets.map(item => {
     if (!isObject(item)) throw new Error('预设条目无效。');
@@ -34,7 +34,7 @@ export function parsePresetRegistry(raw: unknown): DispatchPreset[] {
 }
 export async function listPresets(workspace: string, filter: PresetFilter = {}): Promise<DispatchPreset[]> {
   let entries: DispatchPreset[];
-  try { entries = parsePresetRegistry(await readPrivateJson(join(workspace, 'agent-presets', 'registry.json'))); }
+  try { entries = parsePresetRegistry(await readPrivateJson(workspaceFile(workspace, 'agent-presets', 'registry.json'))); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   const query = filter.query?.trim().toLocaleLowerCase();
   return entries.filter(item => (!filter.targetId || item.targetId === filter.targetId) && (!filter.agent || item.agent === filter.agent)

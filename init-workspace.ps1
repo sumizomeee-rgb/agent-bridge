@@ -37,15 +37,21 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'agent-presets/private/profiles.json', 'agent-presets/private/credentials.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms\lark.md', 'chat-platforms\discord.md')
+    $files = @('MEMORY.md', 'README.md', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms\lark.md', 'bridge-chat-platforms\discord.md')
     # 不在旧登记仍位于根目录时生成空表，以免真实配置被静默忽略。
     foreach ($legacy in @('agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')) {
         if (Test-Path -LiteralPath (Join-Path $workspace $legacy)) {
-            throw "检测到旧版根目录登记 $legacy；请按部署说明先迁移至 remote-agents/ 或 capabilities/，再生成骨架。"
+            throw "检测到旧版根目录登记 $legacy；请按部署说明先迁移至 bridge-remote-agents/ 或 bridge-capabilities/，再生成骨架。"
+        }
+    }
+    # 旧职能目录必须先迁移，不能新建空登记表遮住用户原配置。
+    foreach ($legacyDirectory in @('remote-agents', 'capabilities', 'agent-presets', 'chat-platforms')) {
+        if ((Test-Path -LiteralPath (Join-Path $workspace $legacyDirectory)) -and !(Test-Path -LiteralPath (Join-Path $workspace ('bridge-' + $legacyDirectory)))) {
+            throw "检测到旧职能目录 $legacyDirectory；请先迁移，生成器不会覆盖或另建空表。"
         }
     }
     # 先检查父目录及完整清单，避免碰撞时只生成一部分模板。
-    $directories = @('chat-platforms', 'remote-agents', 'agent-presets', 'agent-presets\private', 'capabilities', '.local', '.local\tmp', '.local\deliveries')
+    $directories = @('bridge-chat-platforms', 'bridge-remote-agents', 'bridge-agent-presets', 'bridge-agent-presets\private', 'bridge-capabilities', 'tmp')
     foreach ($name in $directories) {
         $directory = Join-Path $workspace $name
         if ([IO.File]::Exists($directory)) {
@@ -63,7 +69,7 @@ try {
         }
     }
 
-    $privateRoot = Join-Path $workspace 'agent-presets\private'
+    $privateRoot = Join-Path $workspace 'bridge-agent-presets\private'
     $protectPrivate = ![IO.Directory]::Exists($privateRoot)
     [void][IO.Directory]::CreateDirectory($workspace)
     foreach ($name in $directories) {

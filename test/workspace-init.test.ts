@@ -10,14 +10,14 @@ import { parseCapabilityRegistry } from '../src/capabilities.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['MEMORY.md', 'README.md', 'remote-agents/registry.json', 'remote-agents/example.json', 'agent-presets/registry.json', 'agent-presets/example.json', 'agent-presets/private/profiles.json', 'agent-presets/private/credentials.json', 'capabilities/registry.json', 'capabilities/example.json', 'chat-platforms/lark.md', 'chat-platforms/discord.md'];
+const templates = ['MEMORY.md', 'README.md', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms/lark.md', 'bridge-chat-platforms/discord.md'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 
 test('workspace capability skeleton and inactive example use the current registry schema', () => {
-  const skeleton = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities/registry.json'), 'utf8')));
+  const skeleton = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'bridge-capabilities/registry.json'), 'utf8')));
   assert.deepEqual(skeleton, []);
-  const example = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'capabilities/example.json'), 'utf8')));
+  const example = parseCapabilityRegistry(JSON.parse(readFileSync(join(project, 'workspace-template', 'bridge-capabilities/example.json'), 'utf8')));
   assert.equal(example.length, 3);
   assert.ok(example.every(item => !item.acceptance), 'An untested example must not claim an accepted capability.');
 });
@@ -47,15 +47,15 @@ test('workspace initializer generates usable templates from another working dire
   try {
     const workspace = join(root, '上下文 空间', '新工作区[原样]');
     requireSuccess(run(workspace, root));
-    assert.deepEqual(readdirSync(workspace).sort(), [...new Set([...templates.map(file => file.split('/')[0]!), '.local'])].sort());
+    assert.deepEqual(readdirSync(workspace).sort(), [...new Set([...templates.map(file => file.split('/')[0]!), 'tmp'])].sort());
     for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), readFileSync(join(project, 'workspace-template', file)));
-    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
-    assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'capabilities/registry.json'), 'utf8'))), []);
-    assert.deepEqual(readdirSync(join(workspace, '.local')).sort(), ['deliveries', 'tmp']);
-    assert.deepEqual(readdirSync(join(workspace, '.local', 'tmp')), []);
+    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
+    assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-capabilities/registry.json'), 'utf8'))), []);
+    assert.deepEqual(readdirSync(join(workspace, 'tmp')), []);
+    assert.equal(existsSync(join(workspace, '.local')), false);
     assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').trim());
-    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'agent-presets/private/profiles.json'), 'utf8')), { version: 1, profiles: [] });
-    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'agent-presets/private/credentials.json'), 'utf8')), { version: 1, credentials: {} });
+    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'bridge-agent-presets/private/profiles.json'), 'utf8')), { version: 1, profiles: [] });
+    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'bridge-agent-presets/private/credentials.json'), 'utf8')), { version: 1, credentials: {} });
     assert.equal(existsSync(join(workspace, 'AGENTS.md')), false, 'New skeleton has only README, MEMORY and platform Markdown.');
     assert.match(readFileSync(join(workspace, 'MEMORY.md'), 'utf8'), /README\.md/);
   } finally { cleanup(); }
@@ -68,15 +68,15 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     mkdirSync(workspace);
     const custom = Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('用户工作习惯\r\n保留原样\r\n')]);
     writeFileSync(join(workspace, 'README.md'), custom);
-    mkdirSync(join(workspace, 'capabilities'));
+    mkdirSync(join(workspace, 'bridge-capabilities'));
     const capabilities = Buffer.from('{\r\n  \"version\": 1, \"capabilities\": [], \"note\": \"用户维护\"\r\n}\r\n');
-    writeFileSync(join(workspace, 'capabilities/registry.json'), capabilities);
+    writeFileSync(join(workspace, 'bridge-capabilities/registry.json'), capabilities);
     writeFileSync(join(workspace, 'private.txt'), 'existing unrelated context');
-    mkdirSync(join(workspace, '.local', 'tmp'), { recursive: true });
-    writeFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'unfinished task evidence');
-    mkdirSync(join(workspace, 'chat-platforms'));
-    writeFileSync(join(workspace, 'chat-platforms', 'lark.md'), custom);
-    const privateRoot = join(workspace, 'agent-presets', 'private'); mkdirSync(privateRoot, { recursive: true });
+    mkdirSync(join(workspace, 'tmp'), { recursive: true });
+    writeFileSync(join(workspace, 'tmp', 'keep.txt'), 'unfinished task evidence');
+    mkdirSync(join(workspace, 'bridge-chat-platforms'));
+    writeFileSync(join(workspace, 'bridge-chat-platforms', 'lark.md'), custom);
+    const privateRoot = join(workspace, 'bridge-agent-presets', 'private'); mkdirSync(privateRoot, { recursive: true });
     const privateConfig = Buffer.from('{\r\n  "version": 1, "profiles": [], "note": "保留用户配置"\r\n}\r\n');
     const credentials = Buffer.from('{\r\n  "version": 1, "credentials": {"fixture": {"apiKey": "fixture-only"}}\r\n}\r\n');
     writeFileSync(join(privateRoot, 'profiles.json'), privateConfig); writeFileSync(join(privateRoot, 'credentials.json'), credentials);
@@ -86,9 +86,9 @@ test('workspace initializer preserves edited files byte for byte and adds only m
     const before = new Map([...templates, 'private.txt'].map(file => [file, readFileSync(join(workspace, file))]));
     requireSuccess(run(workspace, root));
     assert.deepEqual(readFileSync(join(workspace, 'README.md')), custom);
-    assert.deepEqual(readFileSync(join(workspace, 'capabilities/registry.json')), capabilities);
-    assert.deepEqual(readFileSync(join(workspace, 'chat-platforms', 'lark.md')), custom);
-    assert.equal(readFileSync(join(workspace, '.local', 'tmp', 'keep.txt'), 'utf8'), 'unfinished task evidence');
+    assert.deepEqual(readFileSync(join(workspace, 'bridge-capabilities/registry.json')), capabilities);
+    assert.deepEqual(readFileSync(join(workspace, 'bridge-chat-platforms', 'lark.md')), custom);
+    assert.equal(readFileSync(join(workspace, 'tmp', 'keep.txt'), 'utf8'), 'unfinished task evidence');
     for (const [file, bytes] of before) assert.deepEqual(readFileSync(join(workspace, file)), bytes);
   } finally { cleanup(); }
 });
@@ -108,7 +108,7 @@ test('workspace initializer relocates with its templates to a project path conta
     assert.ok(!existsSync(join(relocated, 'node_modules')));
     const workspace = join(root, '目标 工作区');
     requireSuccess(run(workspace, root, join(relocated, 'init-workspace.ps1')));
-    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
+    assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
   } finally { cleanup(); }
 });
 
@@ -131,12 +131,12 @@ test('workspace initializer rejects relative paths, drive/share roots and a file
 test('workspace initializer fails before copying templates when a destination filename is already a directory', windowsOnly, () => {
   const { root, cleanup } = fixture();
   try {
-    const workspace = join(root, 'collision'); mkdirSync(join(workspace, 'remote-agents/registry.json'), { recursive: true });
+    const workspace = join(root, 'collision'); mkdirSync(join(workspace, 'bridge-remote-agents/registry.json'), { recursive: true });
     const result = run(workspace, root);
     assert.equal(result.error, undefined, result.error?.message);
     assert.notEqual(result.status, 0, result.stdout + result.stderr);
-    assert.deepEqual(readdirSync(workspace), ['remote-agents']);
-    assert.deepEqual(readdirSync(join(workspace, 'remote-agents')), ['registry.json']);
+    assert.deepEqual(readdirSync(workspace), ['bridge-remote-agents']);
+    assert.deepEqual(readdirSync(join(workspace, 'bridge-remote-agents')), ['registry.json']);
   } finally { cleanup(); }
 });
 
@@ -145,12 +145,12 @@ test('平台文档父路径被文件占用时，在复制任何模板前失败',
   const { root, cleanup } = fixture();
   try {
     const workspace = join(root, '平台目录碰撞'); mkdirSync(workspace);
-    writeFileSync(join(workspace, 'chat-platforms'), '用户已有文件');
+    writeFileSync(join(workspace, 'bridge-chat-platforms'), '用户已有文件');
     const result = run(workspace, root);
     assert.equal(result.error, undefined, result.error?.message);
     assert.notEqual(result.status, 0, result.stdout + result.stderr);
-    assert.deepEqual(readdirSync(workspace), ['chat-platforms']);
-    assert.equal(readFileSync(join(workspace, 'chat-platforms'), 'utf8'), '用户已有文件');
+    assert.deepEqual(readdirSync(workspace), ['bridge-chat-platforms']);
+    assert.equal(readFileSync(join(workspace, 'bridge-chat-platforms'), 'utf8'), '用户已有文件');
   } finally { cleanup(); }
 });
 
@@ -158,18 +158,18 @@ test('平台文档目标被目录占用时，不生成其他模板', windowsOnly
   const { root, cleanup } = fixture();
   try {
     const workspace = join(root, '平台文件碰撞');
-    mkdirSync(join(workspace, 'chat-platforms', 'lark.md'), { recursive: true });
+    mkdirSync(join(workspace, 'bridge-chat-platforms', 'lark.md'), { recursive: true });
     const result = run(workspace, root);
     assert.equal(result.error, undefined, result.error?.message);
     assert.notEqual(result.status, 0, result.stdout + result.stderr);
-    assert.deepEqual(readdirSync(workspace), ['chat-platforms']);
-    assert.deepEqual(readdirSync(join(workspace, 'chat-platforms')), ['lark.md']);
+    assert.deepEqual(readdirSync(workspace), ['bridge-chat-platforms']);
+    assert.deepEqual(readdirSync(join(workspace, 'bridge-chat-platforms')), ['lark.md']);
   } finally { cleanup(); }
 });
 
 
 test('临时及交付目录路径被文件占用时提前失败，不生成部分骨架', windowsOnly, () => {
-  for (const collision of ['.local', '.local/tmp', '.local/deliveries']) {
+  for (const collision of ['tmp']) {
     const { root, cleanup } = fixture();
     try {
       const workspace = join(root, '运行目录碰撞');
@@ -178,9 +178,8 @@ test('临时及交付目录路径被文件占用时提前失败，不生成部�
       const result = run(workspace, root);
       assert.equal(result.error, undefined, result.error?.message);
       assert.notEqual(result.status, 0, result.stdout + result.stderr);
-      assert.deepEqual(readdirSync(workspace), ['.local']);
+      assert.deepEqual(readdirSync(workspace), ['tmp']);
       assert.equal(readFileSync(join(workspace, collision), 'utf8'), '用户文件');
-      if (collision !== '.local') assert.deepEqual(readdirSync(join(workspace, '.local')), [collision.split('/')[1]!]);
     } finally { cleanup(); }
   }
 });
@@ -201,7 +200,7 @@ test('legacy root registries require migration before any skeleton is generated'
 });
 
 test('预设私有目录或配置文件名发生碰撞时，生成前失败并保留原有资料', windowsOnly, () => {
-  for (const collision of ['agent-presets/private', 'agent-presets/private/credentials.json']) {
+  for (const collision of ['bridge-agent-presets/private', 'bridge-agent-presets/private/credentials.json']) {
     const { root, cleanup } = fixture();
     try {
       const workspace = join(root, '预设目录碰撞'), destination = join(workspace, collision);
@@ -210,7 +209,7 @@ test('预设私有目录或配置文件名发生碰撞时，生成前失败并�
       const result = run(workspace, root);
       assert.notEqual(result.status, 0, result.stdout + result.stderr);
       assert.equal(existsSync(join(workspace, 'README.md')), false);
-      assert.equal(existsSync(join(workspace, 'agent-presets', 'registry.json')), false);
+      assert.equal(existsSync(join(workspace, 'bridge-agent-presets', 'registry.json')), false);
       if (!collision.endsWith('.json')) assert.equal(readFileSync(destination, 'utf8'), '用户已有资料');
     } finally { cleanup(); }
   }

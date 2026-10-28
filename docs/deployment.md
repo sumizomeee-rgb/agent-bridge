@@ -42,18 +42,18 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-生成 `MEMORY.md`、`README.md`、`remote-agents/registry.json`、`capabilities/registry.json` 和各目录的 `example.json`，以及 `chat-platforms/lark.md`、`chat-platforms/discord.md`；预建 `.local/tmp/` 和 `.local/deliveries/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
+生成 `MEMORY.md`、`README.md`、`bridge-remote-agents/registry.json`、`bridge-capabilities/registry.json` 和各目录的 `example.json`，以及 `bridge-chat-platforms/lark.md`、`bridge-chat-platforms/discord.md`；预建根目录 `tmp/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
 
 1. 保留生成的 `README.md` 作为桥通用规则，在 `MEMORY.md` 的“用户偏好”“本地工作约定”“环境与入口”中填写本地内容；长工作指南只保存权威入口，不复制到通用 README。
-2. `remote-agents/registry.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `remote-agents/example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。
-3. `capabilities/registry.json` 初始为空；按 `capabilities/example.json` 填写真正使用的浏览器 profile 和能力入口。验收记录注明范围，当前状态由桥按需查询，示例不会启用；见[能力登记与就绪检查](capabilities.md)。
+2. `bridge-remote-agents/registry.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `bridge-remote-agents/example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。
+3. `bridge-capabilities/registry.json` 初始为空；按 `bridge-capabilities/example.json` 填写真正使用的浏览器 profile 和能力入口。验收记录注明范围，当前状态由桥按需查询，示例不会启用；见[能力登记与就绪检查](capabilities.md)。
 4. 将该路径放在对应 Profile 的 `workspace`；或者按公共 `workspaceRoot` 下的 `<平台>/<应用ID>` 默认路径生成。多个 Bot 可以指向同一目录；这不会合并各自的账号、主控或任务数据。`workingCwd` 是默认工程目录；私聊 `/cwd 完整绝对路径` 会在工程目录新建主控，初始化仍读固定上下文工作区。已运行桥需安全重启加载配置。
 
 工作区文件属于用户资料，需要单独迁移；保留旧工作区就直接复制它，不必重新生成或覆盖。修改模板不会覆盖现有工作区。旧工作区的 AGENTS.md 如需收敛，应先把通用规则与本地内容分别归入 README、MEMORY，再备份并回收旧文件；生成器不会自动合并或删除用户已有文件，也不会重新生成 AGENTS.md。重复运行生成器会补齐缺失的平台文档，但已有 README 的初始化入口需要用户按模板定点更新；没有声明读取范围时，桥不会自行扫描或加载额外资料。
 
 ### 旧版根目录登记迁移
 
-升级读取路径前先停桥并备份用户工作区。将根目录 `agents.json`、`agents.example.json` 移到 `remote-agents/registry.json`、`remote-agents/example.json`；将 `capabilities.json`、`capabilities.example.json` 移到 `capabilities/registry.json`、`capabilities/example.json`。保持 JSON 原字节，目标已有文件时先核对合并，不直接覆盖。更新已有 README、MEMORY 和平台指南中的路径引用后，重新运行生成器核对，再重启桥。生成器检测到旧根目录登记会提前报错，不自动迁移用户文件或创建空表代替真实登记。
+升级读取路径前先安全停桥并核对用户工作区。将根目录 `agents.json`、`agents.example.json` 移到 `bridge-remote-agents/registry.json`、`bridge-remote-agents/example.json`；将 `capabilities.json`、`capabilities.example.json` 移到 `bridge-capabilities/registry.json`、`bridge-capabilities/example.json`。保持 JSON 原字节，目标已有文件时先核对合并，不直接覆盖。更新已有 README、MEMORY 和平台指南中的路径引用后，重新运行生成器核对，再重启桥。生成器检测到旧根目录登记会提前报错，不自动迁移用户文件或创建空表代替真实登记。
 
 职责与新增职能的模板、固定清单和读取逻辑约定见 [项目 README](../README.md#工作区职责与生成原理)。
 
@@ -86,7 +86,7 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 
 ## 跨电脑直属 Agent
 
-在实际工作区维护 `remote-agents/registry.json`（`version: 1`），格式见 `workspace-template/remote-agents/example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
+在实际工作区维护 `bridge-remote-agents/registry.json`（`version: 1`），格式见 `workspace-template/bridge-remote-agents/example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
 
 主控按需使用 `bridge_list_targets` 查询，再在 `bridge_start_worker` 指定 `targetId`。登记不等于实时在线，派发时核对目标电脑、引擎和远端目录；不会因目标失败而悄悄改在本机执行。远端执行器运行在目标电脑，在自己的 `.local/remote` 保存任务、原生会话与回执，管理接口仅监听目标机 127.0.0.1，通过 SSH 本地转发和私有认证连接；连接元数据由 SSH 内部读取，不写进登记表。断线重连和桥恢复查询同一派发编号，不重复提交原任务。续接、工作中补充、停止、任务数字表情、读图与文件回传共用既有能力；远端产物下载到该 Bot 的 `.local/data/bots/<平台>/<应用ID>/outgoing/remote` 后回传。
 

@@ -18,6 +18,7 @@ import { stoppedExecutionFailure as hasStoppedExecutionFailure } from '../agents
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
 import { workspaceDocuments } from './workspace-documents.js';
+import { workspaceOutputGuidance } from '../workspace-layout.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '按下面的任务及授权边界执行，向主控返回实际结果、必要证据、未完成项和阻塞。涉及截图或文件，说明真实绝对路径、所属电脑及用途。\n\n';
@@ -1121,7 +1122,8 @@ export class ControllerRuntime {
         createdAt: worker.createdAt, updatedAt: this.timestamp() };
       const previous = this.store.jobs(worker.id).filter(value => value.id !== job.id && !['queued', 'cancelled'].includes(value.status)).at(-1);
       const recovery = previous?.interrupted ? '\n上轮执行已中断，CLI 退出已确认，但业务结果未确认。保留原会话；先核对历史及已保存产物，避免重复已发生的操作。以下是新的续接指令，不是重放旧任务。\n' : '';
-      const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction) + recovery + job.prompt, imagePaths: job.imagePaths,
+      const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction
+          + (worker.target?.transport === 'ssh' ? '' : workspaceOutputGuidance(this.config.contextWorkspace ?? this.config.workspace))) + recovery + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
         onReady: () => { state.ready = true; this.pumpSupplements(workerId, state); },
         onActivity: activity => {

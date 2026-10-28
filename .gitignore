@@ -8,3 +8,5 @@ dist/
 
 # 个人派发目录位于独立上下文工作区；防止误放在代码根目录后提交。
 /agent-presets/
+/bridge-agent-presets/
+/tmp/
