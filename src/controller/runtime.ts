@@ -14,6 +14,7 @@ import { completedResultFromError, stopEvidenceFromError, isObject } from '../ag
 import { executionErrorEvidence } from '../delivery-errors.js';
 import { completedRetirementFailure } from '../agents/retirement.js';
 import { sessionVisibility } from '../agents/worker-session.js';
+import { stoppedExecutionFailure as hasStoppedExecutionFailure } from '../agents/interrupted-execution.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
@@ -54,6 +55,24 @@ function stopUnconfirmed(error: unknown): boolean {
 /** 仅恢复有原生成功回执、且唯一错误是正常退出超时的旧误分类。 */
 function completedRetirement(job: ControllerJob): boolean {
   return completedRetirementFailure({ result: job.nativeResult, stopEvidence: job.stopEvidence, executionError: job.executionError, cleanupError: job.cleanupError, cancelled: !!job.cancelReason });
+}
+
+/** Only a recorded CLI failure with observed exit is resumable; lost acknowledgements stay uncertain. */
+function stoppedExecutionFailure(job: ControllerJob): boolean {
+  return job.origin.purpose !== 'workspace-context' && hasStoppedExecutionFailure(job);
+}
+function latestWorkerJob(jobs: ControllerJob[]): ControllerJob | undefined {
+  const last = jobs.at(-1);
+  return last?.status === 'cancelled' && last.result === '前轮中断；旧队列未自动重放，请按最新进度重新续接。'
+    ? jobs.findLast(job => job.interrupted) ?? last : last;
+}
+function interruptedReport(job: ControllerJob): string {
+  let reason = job.executionError ?? '未取得最终结果';
+  try { const evidence = JSON.parse(reason); if (typeof evidence.message === 'string') reason = evidence.message; } catch {}
+  const next = /\b413\b|Payload Too Large/i.test(reason)
+    ? '请求体过大；不要原样重试。请核对最后进度与产物，再用 bridge_start_worker 在同一电脑、同一助手配置下带精简交接另起助手，只续做未完成部分。'
+    : '主控可用 bridge_continue_worker 按新的核查指令续接；先核对历史及产物，只续做未完成部分。';
+  return `本轮执行失败，CLI 退出已确认：${listText(reason, 1024)}\n未取得最终结果，已发生的操作仍需核对；旧任务及排队指令不会自动重放。\n${next}`;
 }
 
 /** The controller only dispatches; this service owns child processes and their durable routing. */
@@ -288,7 +307,7 @@ export class ControllerRuntime {
       && worker.origin.channelId && (scope === 'all' || worker.origin.conversationId === conversation.id)).map(worker => {
       const jobs = this.store.jobs(worker.id); const active = jobs.find(job => job.status === 'running');
       const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
-        : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? jobs.at(-1);
+        : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? latestWorkerJob(jobs);
       const nextQueued = jobs.find(job => job.status === 'queued');
       const currentJob = active ?? nextQueued ?? latest;
       const queued = jobs.filter(job => job.status === 'queued').length;
@@ -306,7 +325,8 @@ export class ControllerRuntime {
         ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
         ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
-          : latest?.cancelReason ? { statusReason: latest.cancelReason } : {}),
+          : latest?.cancelReason ? { statusReason: latest.cancelReason }
+          : latest?.interrupted ? { statusReason: latest.result ?? '本轮执行失败，退出已确认；主控可核对后续接。' } : {}),
         lastResultPreview: latest?.result == null ? null : listText(latest.result, 180),
         unresolvedSupplements: supplementCounts.get(worker.id) ?? 0,
         status, running: !!active, queued, startedAt: currentJob?.startedAt ?? null,
@@ -915,7 +935,7 @@ export class ControllerRuntime {
         result = { workers: workers.map(worker => {
           const jobs = this.store.jobs(worker.id);
           const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
-            : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? jobs.at(-1);
+            : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? latestWorkerJob(jobs);
           const currentJob = jobs.find(job => job.status === 'running') ?? latest;
           const progress = currentJob?.progress;
           const progressSummary = { observed: !!progress, stage: progress?.stage ?? 'unobserved', jobId: currentJob?.id ?? null,
@@ -937,7 +957,7 @@ export class ControllerRuntime {
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped, retiring: this.retirementPending(worker.id),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
-            ...(jobs.some(job => job.interrupted) ? { recovery: { previousExecutionInterrupted: true, canContinue: !worker.blocked && !worker.archivedAt && worker.ownership !== 'user', instruction: '旧轮次未重放；可以用 bridge_continue_worker 在原会话按最新指令续接，先核对已发生的操作。' } } : {}),
+            ...(jobs.some(job => job.interrupted) ? { recovery: { previousExecutionInterrupted: true, canContinue: !worker.blocked && !worker.archivedAt && worker.ownership !== 'user', instruction: latest?.interrupted ? latest.result : '旧轮次未重放；可以用 bridge_continue_worker 在原会话按最新指令续接，先核对已发生的操作。' } } : {}),
             ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
             startedAt: currentJob?.startedAt ?? null,
@@ -1157,7 +1177,14 @@ export class ControllerRuntime {
         executionError: isObject(error) && typeof error.executionError === 'string' ? error.executionError : executionErrorEvidence(error),
         ...(isObject(error) && typeof error.cleanupError === 'string' ? { cleanupError: error.cleanupError } : {}), processStopped: nativeResult?.processStopped === false ? false : !stopUnconfirmed(error) });
       if (nativeResult?.processStopped === false) this.unconfirmedStops.add(worker.id);
-      if (error && typeof error === 'object' && 'resultUncertain' in error) await this.finish(worker, current, 'uncertain', error instanceof Error ? error.message : '预设结果未知，未重放。');
+      if (error && typeof error === 'object' && 'resultUncertain' in error) {
+        const saved = this.store.getJob(job.id)!;
+        if (!state.closing && !state.cancelReason && !current.cancelReason && stoppedExecutionFailure(saved)) {
+          this.store.setJob(saved.id, saved.status, { interrupted: true });
+          this.cancelInterruptedQueue(worker.id);
+          await this.finish(worker, saved, 'failed', interruptedReport(saved));
+        } else await this.finish(worker, current, 'uncertain', error instanceof Error ? error.message : '预设结果未知，未重放。');
+      }
       else if (stopUnconfirmed(error)) {
         this.unconfirmedStops.add(worker.id);
         await this.finish(worker, current, 'uncertain',
@@ -1211,21 +1238,25 @@ export class ControllerRuntime {
   }
   private reconcileInterruptedWorker(workerId: string): void {
     const worker = this.store.getWorker(workerId);
-    if (!worker?.blocked || worker.target?.transport === 'ssh' || worker.archivedAt || worker.supersededBy || worker.ownership === 'user' || worker.handoffPending || worker.adoption?.status === 'pending'
+    if (!worker?.blocked || worker.archivedAt || worker.supersededBy || worker.ownership === 'user' || worker.handoffPending || worker.adoption?.status === 'pending'
       || !this.config.allowedUserIds.includes(worker.origin.userId) || this.active.has(workerId)) return;
     const jobs = this.store.jobs(workerId), uncertain = jobs.filter(job => job.status === 'uncertain');
-    if (!uncertain.length || uncertain.some(job => job.processStopped !== true || job.origin.purpose === 'workspace-context')) return;
+    if (!uncertain.length || uncertain.some(job => job.processStopped !== true || job.origin.purpose === 'workspace-context'
+      || worker.target?.transport === 'ssh' && !stoppedExecutionFailure(job))) return;
     this.store.transaction(() => {
       // A stopped execution is resumable, not retrospectively successful. Preserve its original result/evidence.
-      for (const job of uncertain) this.store.setJob(job.id, 'failed', { interrupted: true });
-      // Never replay pre-crash queued instructions when releasing the worker.
-      for (const job of jobs.filter(job => job.status === 'queued')) {
-        this.store.setJob(job.id, 'cancelled', { result: '前轮中断；旧队列未自动重放，请按最新进度重新续接。' });
-        if (job.scheduleId) { const plan = this.store.getSchedule(job.scheduleId); if (plan) { plan.status = 'cancelled'; this.store.saveSchedule(plan); } }
-      }
+      for (const job of uncertain) this.store.setJob(job.id, 'failed', { interrupted: true,
+        ...(stoppedExecutionFailure(job) ? { result: interruptedReport(job) } : {}) });
+      this.cancelInterruptedQueue(workerId);
       worker.blocked = false; this.store.saveWorker(worker);
     });
     this.unconfirmedStops.delete(workerId);
+  }
+  private cancelInterruptedQueue(workerId: string): void {
+    for (const job of this.store.jobs(workerId).filter(job => job.status === 'queued')) {
+      this.store.setJob(job.id, 'cancelled', { result: '前轮中断；旧队列未自动重放，请按最新进度重新续接。' });
+      if (job.scheduleId) { const plan = this.store.getSchedule(job.scheduleId); if (plan) { plan.status = 'cancelled'; this.store.saveSchedule(plan); } }
+    }
   }
   private requestCancellation(workerId: string, reason: string): void {
     for (const job of this.store.jobs(workerId)) {

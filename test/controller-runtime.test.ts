@@ -658,6 +658,74 @@ test('an unconfirmed process stop never reports stopped=true or a successful can
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
+test('observed preset execution failure releases local and remote workers without replaying queued work', async () => {
+  const { PresetResultUnknown } = await import('../src/presets/runtime.js');
+  const { isActiveWorker, workerOverview } = await import('../src/overview.js');
+  for (const remote of [false, true]) {
+    const f = fixture();
+    try {
+      const handle = await launch(f.runtime, f.turn); await flush();
+      if (remote) {
+        const worker = f.runtime.store.getWorker(handle.workerId)!;
+        worker.target = { id: 'station', label: '工位', transport: 'ssh', agent: 'codex', agentCommand: f.config.commands.codex, cwd: f.dir };
+        f.runtime.store.saveWorker(worker);
+        Object.assign(f.callbacks, { targetCatalog: { adapterFor: () => f.codex } });
+      }
+      const queued = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: 'stale instruction', delivery: 'next' }) as Handle;
+      const stopEvidence = { pid: 123, graceful: false, exitObserved: true, exitCode: 1, signalCode: null,
+        closeObserved: true, taskkillAttempted: true, taskkillExitCode: 0, durationMs: 10, phaseMs: {}, completion: 'tree-stop' as const };
+      f.codex.pending.get(handle.workerId)!.reject(new PresetResultUnknown(undefined, stopEvidence,
+        JSON.stringify({ name: 'Error', message: 'Codex 请求失败：unexpected status 413 Payload Too Large' })));
+      f.codex.pending.delete(handle.workerId); await flush(); await flush();
+      const failed = f.runtime.store.getJob(handle.jobId)!;
+      assert.equal(failed.status, 'failed'); assert.equal(failed.interrupted, true); assert.equal(failed.processStopped, true);
+      assert.equal(f.runtime.store.getWorker(handle.workerId)!.blocked, false);
+      assert.equal(f.runtime.store.getJob(queued.jobId)!.status, 'cancelled'); assert.equal(f.codex.turns.length, 1);
+      assert.equal(f.events.length, 1); assert.equal(f.events[0]!.status, 'failed');
+      assert.match(f.events[0]!.text, /413 Payload Too Large/); assert.match(f.events[0]!.text, /bridge_start_worker/);
+      assert.match(f.events[0]!.text, /只续做未完成部分/);
+      const list = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: handle.workerId }) as { workers: Array<{ blocked: boolean; recovery: { canContinue: boolean; instruction: string } }> };
+      assert.equal(list.workers[0]!.blocked, false); assert.equal(list.workers[0]!.recovery.canContinue, true);
+      assert.match(list.workers[0]!.recovery.instruction, /bridge_start_worker/);
+      assert.equal(f.runtime.queryWorkerOverview(f.turn.conversation, 'current').filter(isActiveWorker).length, 0);
+      const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: handle.workerId, prompt: '仅核对进度，不重复操作' }) as Handle;
+      await flush(); assert.equal(f.codex.turns.length, 2);
+      assert.match(f.codex.turns[1]!.text, /先核对历史及已保存产物/);
+      assert.doesNotMatch(f.codex.turns[1]!.text, /stale instruction/);
+      f.codex.finish(handle.workerId); await flush(); assert.equal(f.runtime.store.getJob(next.jobId)!.status, 'completed');
+      assert.equal(workerOverview([{ ...f.runtime.queryWorkerOverview(f.turn.conversation, 'current')[0]!,
+        status: 'failed', processStopped: true, statusReason: failed.result! }], 'current', Date.now(), false, 'history').blocks.some(b => 'text' in b && b.text.includes('失败原因：') && b.text.includes('413')), true);
+    } finally { await f.runtime.close(); f.registry.close(); }
+  }
+});
+
+test('restart repairs recorded remote execution failure but preserves absent exit evidence and unknown business reports', async () => {
+  for (const evidence of ['observed', 'missing', 'report', 'cleanup'] as const) {
+    const f = fixture(); let second: ControllerRuntime | undefined;
+    try {
+      const handle = await launch(f.runtime, f.turn); await flush();
+      f.codex.pending.get(handle.workerId)!.reject(new Error('CLI failed')); f.codex.pending.delete(handle.workerId); await flush(); await flush();
+      const worker = f.runtime.store.getWorker(handle.workerId)!;
+      worker.target = { id: 'station', label: '工位', transport: 'ssh', agent: 'codex', agentCommand: f.config.commands.codex, cwd: f.dir };
+      worker.blocked = true; f.runtime.store.saveWorker(worker);
+      const job = f.runtime.store.getJob(handle.jobId)!;
+      f.runtime.store.setJob(job.id, 'uncertain', { nativeResult: evidence === 'report' ? { nativeId: worker.nativeId!, text: 'partial business report' } : undefined,
+        processStopped: true, executionError: 'Codex 请求失败：413 Payload Too Large',
+        ...(evidence === 'cleanup' ? { cleanupError: 'profile cleanup not confirmed' } : {}),
+        stopEvidence: evidence === 'missing' ? undefined : { pid: 123, graceful: false, exitObserved: true, exitCode: 1,
+          signalCode: null, closeObserved: true, taskkillAttempted: false, taskkillExitCode: null, durationMs: 10, phaseMs: {}, completion: 'graceful-exit' } });
+      await f.runtime.close();
+      const adapter = new FakeAdapter();
+      second = new ControllerRuntime(f.config, { codex: adapter, claude: new FakeAdapter() }, f.registry, f.callbacks);
+      await second.start(); await flush();
+      assert.equal(second.store.getJob(job.id)!.status, evidence === 'observed' ? 'failed' : 'uncertain');
+      assert.equal(second.store.getWorker(worker.id)!.blocked, evidence !== 'observed');
+      assert.equal(second.store.getWorker(worker.id)!.nativeId, worker.nativeId); assert.equal(adapter.turns.length, 0);
+      if (evidence === 'observed') assert.match(second.store.getJob(job.id)!.result!, /413 Payload Too Large/);
+    } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
+  }
+});
+
 test('shutdown preserves interruption evidence; restart cancels stale queue and allows a fresh continuation', async () => {
   const f = fixture(); let second: ControllerRuntime | undefined;
   try {

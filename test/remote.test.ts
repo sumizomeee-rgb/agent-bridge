@@ -15,6 +15,43 @@ import { PresetRuntime, PresetResultUnknown } from '../src/presets/runtime.js';
 import { collectOutgoingAttachments } from '../src/artifacts.js';
 
 const tick = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
+
+test('controller failure recovery crosses the real remote adapter and daemon continuation guards', async () => {
+  const { ControllerRuntime } = await import('../src/controller/runtime.js');
+  const { TaskRegistry } = await import('../src/tasks.js');
+  const f = fixture();
+  const registry = new TaskRegistry(f.config.dataDir);
+  const context = registry.createContext({ conversationId: 'lab-parent', userId: 'user', channelId: 'lab-dm', originMessageId: 'lab-message', agent: 'codex', nativeId: 'lab-native', cwd: f.root });
+  const events: string[] = [];
+  // Only CLI model discovery and native output are fixtures; dispatch, journals, polling and both guards are production code.
+  Object.assign(f.adapter, { getModelInfo: async () => ({ defaultModel: 'gpt-6.1-sol', models: [{ id: 'gpt-6.1-sol', displayName: 'Sol' }] }) });
+  const runtime = new ControllerRuntime(f.config, { codex: f.adapter, claude: f.adapter }, registry, { pollIntervalMs: 60000,
+    onCompletion: event => { events.push(event.text); }, targetCatalog: { listTargets: async () => [], resolveTarget: async () => f.binding,
+      adapterFor: () => f.adapter, handoff: async () => { throw new Error('unused'); } } });
+  const turn: AgentTurn = { ...f.turn(), taskContextPath: context.contextPath,
+    conversation: { ...f.turn().conversation, id: 'lab-parent', userId: 'user', nativeId: 'lab-native', model: 'gpt-6.1-sol' } };
+  const until = async (predicate: () => boolean) => { const end = Date.now() + 3000; while (!predicate()) { assert(Date.now() < end, 'remote pipeline deadline'); await new Promise(resolve => setTimeout(resolve, 2)); } };
+  try {
+    const first = await runtime.invoke(turn, 'bridge_start_worker', { targetId: 'station', title: 'isolated failure', prompt: 'read only',
+      assistant: { kind: 'ordinary', agent: 'codex', model: 'gpt-6.1-sol' } }) as { workerId: string; jobId: string };
+    await until(() => f.natives.length === 1 && !!f.natives[0]!.turn);
+    const queued = await runtime.invoke(turn, 'bridge_continue_worker', { workerId: first.workerId, prompt: 'must not replay', delivery: 'next' }) as { jobId: string };
+    const proof = { pid: 123, graceful: false, exitObserved: true, exitCode: 1, signalCode: null, closeObserved: true,
+      taskkillAttempted: true, taskkillExitCode: 0, durationMs: 10, phaseMs: {}, completion: 'tree-stop' as const };
+    f.natives[0]!.reject(new PresetResultUnknown(undefined, proof, 'Codex 请求失败：413 Payload Too Large'));
+    await until(() => runtime.isIdle());
+    assert.equal(runtime.store.getJob(first.jobId)!.status, 'failed'); assert.equal(events.length, 1); assert.match(events[0]!, /413 Payload Too Large/);
+    assert.equal(runtime.store.getJob(queued.jobId)!.status, 'cancelled'); assert.equal(f.natives.length, 1);
+    const previousNative = runtime.store.getWorker(first.workerId)!.nativeId;
+    const next = await runtime.invoke(turn, 'bridge_continue_worker', { workerId: first.workerId, prompt: 'only check saved progress' }) as { jobId: string };
+    await until(() => f.natives.length === 2 || runtime.store.getJob(next.jobId)!.status === 'failed');
+    assert.equal(f.natives.length, 2, 'daemon must admit a new instruction after proven exit');
+    assert.equal(f.natives[1]!.turn!.conversation.nativeId, previousNative); assert.doesNotMatch(f.natives[1]!.turn!.text, /must not replay/);
+    f.natives[1]!.finish('progress checked'); await until(() => runtime.isIdle());
+    assert.equal(runtime.store.getJob(next.jobId)!.status, 'completed'); assert.equal(f.daemon.store.job(first.jobId)!.status, 'uncertain');
+  } finally { await runtime.close(); registry.close(); await f.adapter.close(); await f.daemon.close(); }
+});
+
 class FakeNative implements AgentAdapter {
   turn: AgentTurn | null = null;
   resolve!: (result: AgentResult) => void;

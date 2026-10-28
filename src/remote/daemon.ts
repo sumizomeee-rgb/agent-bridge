@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { stoppedExecutionFailure } from '../agents/interrupted-execution.js';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, renameSync } from 'node:fs';
 import { lstat, realpath, open, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve, isAbsolute, relative, dirname, extname, basename } from 'node:path';
@@ -20,6 +21,13 @@ import { observeActivity } from '../agents/activity.js';
 import { executionErrorEvidence } from '../delivery-errors.js';
 import { completedRetirementFailure } from '../agents/retirement.js';
 import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
+
+function blocksWorkerContinuation(job: RemoteJob): boolean {
+  return job.status === 'running' || job.status === 'uncertain' && !stoppedExecutionFailure({
+    processStopped: job.stopped, nativeResult: job.result, stopEvidence: job.stopEvidence,
+    executionError: job.executionError, cleanupError: job.cleanupError })
+    || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true;
+}
 
 const CHUNK = 192 * 1024;
 const MAX_BYTES = 24 * 1024 * 1024;
@@ -288,7 +296,7 @@ export class RemoteDaemon {
     const agent = this.agent(raw.agent); const engine = this.config.engines[agent]!;
     if (fingerprint(raw.agentCommand) !== fingerprint(engine.agentCommand)) throw new Error('登记的 CLI 命令与目标执行器配置不一致。');
     const cwd = await this.directory(raw.cwd); const workerId = identifier(raw.workerId, '子任务编号');
-    if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain' || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true))) throw new Error('同一子会话尚在执行、收尾或结果未知，拒绝并发续接。');
+    if (this.store.jobs().some(job => job.workerId === workerId && blocksWorkerContinuation(job))) throw new Error('同一子会话尚在执行、收尾或结果未知，拒绝并发续接。');
     const nativeId = raw.nativeId == null ? null : identifier(raw.nativeId, '原生会话编号');
     const userId = principal(raw.userId);
     const priorWorker = this.store.jobs().filter(job => job.workerId === workerId).map(job => this.store.request(job.dispatchId)).find(Boolean);
@@ -316,7 +324,7 @@ export class RemoteDaemon {
       ...(raw.input !== undefined ? { input: await this.input(raw.input) } : {}) };
     // Check again after filesystem awaits. The SQLite insert/active check is synchronous.
     const raced = this.store.job(id); if (raced) return this.store.create(request).job;
-    if (this.store.jobs().some(job => job.workerId === workerId && (job.status === 'running' || job.status === 'uncertain' || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true))) throw new Error('同一子会话仍在执行或收尾，拒绝并发续接。');
+    if (this.store.jobs().some(job => job.workerId === workerId && blocksWorkerContinuation(job))) throw new Error('同一子会话仍在执行或收尾，拒绝并发续接。');
     if (nativeId) this.store.bindSession(nativeId, workerId, agent, cwd, userId);
     const created = this.store.create(request); if (created.created) this.start(request);
     return created.job;

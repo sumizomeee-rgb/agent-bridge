@@ -138,7 +138,7 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
         `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
       if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
       if (item.archivedAt) lines.push(`归档：${clean(item.archiveReason ?? '已确认停止，保留异常历史', 80)}`);
-      if (item.blocked || workerReviewEvidence(item) || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`需核对：${workerReviewEvidence(item) ?? clean(item.statusReason ?? '任务已阻塞', 80)}`);
+      if (item.blocked || workerReviewEvidence(item) || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`${item.status === 'failed' && item.processStopped === true ? '失败原因' : '需核对'}：${workerReviewEvidence(item) ?? clean(item.statusReason ?? '任务已阻塞', 180)}`);
       return { kind: 'entry', text: lines.join('\n') };
     }) : [{ kind: 'text', text: view === 'history' ? `${label}没有历史助手。` : `${label}没有正在执行、排队或待核对的助手。` }], footer: view === 'history' ? '/workers 查看未结束助手 · /workers history details 查看历史详情。' : '/workers history 查看历史 · /workers details 查看完整 ID 与回执。' };
 }
