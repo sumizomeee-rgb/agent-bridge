@@ -93,7 +93,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       createControllerAdapters: (_config, _env, _execution, invoke) => {
         const adapters = {};
         for (const selectedAgent of ['codex', 'claude']) adapters[selectedAgent] = new NativeControllerAdapter(source.commands[selectedAgent], env, {
-          agent: selectedAgent, dataDir: config.dataDir, metadataAdapter: execution[selectedAgent], defaultModels: config.defaultModels,
+          agent: selectedAgent, dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace, metadataAdapter: execution[selectedAgent], defaultModels: config.defaultModels,
           invokeTool: (turn, name, args, id) => invokeTracked(invoke, turn, name, args, id) });
         native = adapters[agent]; return adapters;
       },

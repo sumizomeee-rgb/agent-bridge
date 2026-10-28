@@ -101,7 +101,7 @@ function setup() {
   const invokes: string[] = [], published: { text: string; key?: string }[] = [];
   let managementHold: Promise<unknown> | undefined;
   let metadataReads = 0, metadataUnavailable = false;
-  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, { HTTP_PROXY: 'http://127.0.0.1:7898' }, { agent: 'codex', dataDir: join(dir, 'data'), userHome,
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, { HTTP_PROXY: 'http://127.0.0.1:7898' }, { agent: 'codex', dataDir: join(dir, 'data'), userHome, contextWorkspace: dir,
     metadataAdapter: { run: async () => { throw new Error('metadata only'); }, interrupt: async () => {}, close: async () => {}, getModelInfo: async () => { metadataReads++; if (metadataUnavailable) throw new Error('独立探测不可用'); return { defaultModel: 'gpt-6.1-sol', models: [{ id: 'gpt-6.1-sol', displayName: 'Sol', supportedEfforts: ['medium', 'xhigh'] }] }; } },
     invokeTool: async (_turn, name) => { invokes.push(name); return managementHold ?? {}; },
     createTransport: (_command, args, _cwd, env) => { const t = new FakeTransport(); t.mode = mode; transports.push(t); launches.push({ args, env }); return t; },
@@ -234,7 +234,7 @@ test('workspace bootstrap can finish quietly and feeds evidence into the same na
     assert(!bridgePrompt.includes(turn.event.text));
     assert(!/Chinese|Haru|MyHaruSkills|SuchProject/.test(bridgePrompt));
     assert.match(bridgePrompt, /user-maintained workspace-context input/);
-    assert.match(bridgePrompt, /Until its event arrives/);
+    assert.match(bridgePrompt, /need no initialization worker/);
     s.transports[0]!.mode = 'public';
     const next = s.makeTurn(); next.conversation.nativeId = initialized.nativeId;
     const result = await s.adapter.run(next);
@@ -1023,5 +1023,20 @@ test('native preserves direct-recipient facts for ordinary owner group messages 
     const legacy = JSON.parse(legacyRuntime.split('\n')[0]!.split('] ')[1]!);
     assert.equal(legacy.currentMessage, undefined);
     assert.deepEqual(legacy.defaultDelivery, { area: 'group', channelId: 'shared-group' });
+  } finally { await s.cleanup(); }
+});
+
+
+test('Memory change refreshes the same Codex native controller without new chat, model change or initializer', async () => {
+  const s = setup();
+  try {
+    writeFileSync(join(s.dir, 'README.md'), '# Shared rules'); writeFileSync(join(s.dir, 'MEMORY.md'), 'ORIGINAL_OWNER_RULE');
+    const turn = s.makeTurn(); const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
+    writeFileSync(join(s.dir, 'MEMORY.md'), 'UPDATED_OWNER_RULE: Client/Lua and MyHaruSkills');
+    await s.adapter.run(turn);
+    assert.equal(s.transports.length, 2); assert.equal(s.transports[0]!.stopped, true);
+    const resumed = s.transports[1]!.written.find(message => message.method === 'thread/resume')!.params as JsonObject;
+    assert.equal(resumed.threadId, first.nativeId); assert.match(resumed.baseInstructions as string, /UPDATED_OWNER_RULE/);
+    assert.doesNotMatch(resumed.baseInstructions as string, /ORIGINAL_OWNER_RULE/);
   } finally { await s.cleanup(); }
 });

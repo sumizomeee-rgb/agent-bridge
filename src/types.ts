@@ -24,6 +24,8 @@ export interface Conversation {
   controllerMode?: boolean;
   contextSeed?: string | null;
   cwd: string;
+  /** Explicit /cwd selection survives shared-workspace relocation. */
+  cwdExplicit?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -37,6 +39,8 @@ export interface BridgeConfig {
   ownerUserId?: string;
   contextWorkspace?: string;
   workingCwd?: string;
+  /** Previous per-Bot default, used only to relocate inherited defaults on /new. */
+  legacyWorkspace?: string;
   groupMode?: boolean;
   /** 跨 Bot 后台互通开关；缺省保留旧部署行为，false 时仅允许公开协作。 */
   internalBotCommunicationEnabled?: boolean;

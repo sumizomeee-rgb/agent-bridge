@@ -116,9 +116,9 @@ export class BotRuntime {
     const invoke = (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string): Promise<unknown> =>
       hooks.invoke(turn, name, args, id, input => this.controller!.invoke(turn, name, input, id));
     const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke) ?? {
-      codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir,
+      codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
         internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
-      claude: new NativeControllerAdapter(config.commands.claude, { ...env, CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' }, { agent: 'claude', dataDir: config.dataDir,
+      claude: new NativeControllerAdapter(config.commands.claude, { ...env, CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' }, { agent: 'claude', dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
         internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.claude, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
     } : this.execution;
     this.controllerAdapters = adapters;

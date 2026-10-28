@@ -40,7 +40,7 @@ test('handoff reads only delivered public replies, supports Code Mode, and exclu
     assert.match(contents, /只接上目标，保留纠正/); assert.match(contents, /必须卸载后重装/);
     for (const secret of ['PRIVATE_AFTER', 'NOT_DELIVERED', 'FAILED_REPLY', 'PRIVATE_REASONING', 'DONE']) assert(!contents.includes(secret));
     const prompt = f.handoffs.prompt(f.target, 'dm');
-    assert.match(prompt, /只启动这一个初始化助手/); assert.match(prompt, /硬上限3000/); assert.match(prompt, /不自动继续旧任务/);
+    assert.match(prompt, /只读桥提供的旧会话材料/); assert.match(prompt, /硬上限3000/); assert.match(prompt, /不自动续做/);
   } finally { f.cleanup(); }
 });
 

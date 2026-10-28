@@ -37,7 +37,7 @@ function conversation(row: Row): Conversation {
     effort: row.effort == null ? null : String(row.effort),
     fastMode: row.fast_mode == null ? null : Number(row.fast_mode) === 1,
     actualEffort: row.actual_effort == null ? null : String(row.actual_effort),
-    cwd: String(row.cwd), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    cwd: String(row.cwd), cwdExplicit: Number(row.cwd_explicit ?? 0) === 1, createdAt: String(row.created_at), updatedAt: String(row.updated_at),
     controllerMode: Number(row.controller_mode ?? 0) === 1, contextSeed: row.context_seed == null ? null : String(row.context_seed),
   };
 }
@@ -139,6 +139,7 @@ export class SessionStore {
     if (!columns.has('actual_effort')) this.db.exec('ALTER TABLE conversations ADD COLUMN actual_effort TEXT');
     if (!columns.has('controller_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN controller_mode INTEGER NOT NULL DEFAULT 0');
     if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
+    if (!columns.has('cwd_explicit')) this.db.exec('ALTER TABLE conversations ADD COLUMN cwd_explicit INTEGER NOT NULL DEFAULT 0');
     const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
     if (!inboxColumns.has('group_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN group_json TEXT');
     if (!inboxColumns.has('source_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN source_json TEXT');
@@ -396,16 +397,16 @@ export class SessionStore {
     this.db.prepare("UPDATE inbox SET conversation_id=?,updated_at=? WHERE conversation_id=? AND state='queued'")
       .run(newId, new Date().toISOString(), oldId);
   }
-  createConversation(userId: string, agent: AgentName, cwd: string, options: { controllerMode?: boolean; contextSeed?: string } = {}): Conversation {
+  createConversation(userId: string, agent: AgentName, cwd: string, options: { controllerMode?: boolean; contextSeed?: string; cwdExplicit?: boolean } = {}): Conversation {
     const now = new Date().toISOString();
     const item: Conversation = {
       id: randomUUID(), userId, agent, nativeId: null, model: null, actualModel: null, actualEffort: null,
-      title: '新会话', cwd, createdAt: now, updatedAt: now, controllerMode: options.controllerMode === true, contextSeed: options.contextSeed ?? null,
+      title: '新会话', cwd, cwdExplicit: options.cwdExplicit === true, createdAt: now, updatedAt: now, controllerMode: options.controllerMode === true, contextSeed: options.contextSeed ?? null,
     };
     this.db.prepare(`INSERT INTO conversations
-      (id, user_id, agent, native_id, title, cwd, created_at, updated_at, controller_mode, context_seed)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      item.id, userId, agent, null, item.title, cwd, now, now, item.controllerMode ? 1 : 0, item.contextSeed ?? null,
+      (id, user_id, agent, native_id, title, cwd, created_at, updated_at, controller_mode, context_seed, cwd_explicit)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      item.id, userId, agent, null, item.title, cwd, now, now, item.controllerMode ? 1 : 0, item.contextSeed ?? null, item.cwdExplicit ? 1 : 0,
     );
     return item;
   }

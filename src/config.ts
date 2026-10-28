@@ -150,6 +150,7 @@ export function loadHostConfig(argv = process.argv.slice(2), createDirectories =
     const owner = profile.ownerPrincipalId == null ? undefined : principals.find(principal => principal.id === profile.ownerPrincipalId);
     if (profile.ownerPrincipalId != null && !owner?.accounts[botId]) throw new Error('Profile ownerPrincipalId 缺少对应账号映射。');
     return { ...config, botId, contextWorkspace: workspace, workingCwd: resolve(projectRoot, profile.workingCwd ?? String(raw.workingCwd ?? workspace)),
+      legacyWorkspace: resolve(workspaceRoot, key),
       ownerPrincipalId: owner?.id, ownerUserId: owner ? config.scopePrefix! + owner.accounts[botId] : undefined, groupMode: raw.groupMode === true };
   });
   const spaces: SpaceMapping[] = [];

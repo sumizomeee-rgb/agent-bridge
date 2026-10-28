@@ -59,7 +59,7 @@ export function groupCommands(): CommandDefinition[] {
   }));
 }
 export function parseNewArguments(argument: string): { agent?: 'codex' | 'claude'; continue: boolean } | null {
-  const parts = argument.toLowerCase().split(/\s+/).filter(Boolean);
+  const parts = argument.toLowerCase().split(/\s+/).filter(Boolean).map(value => value === 'c' ? 'continue' : value);
   if (new Set(parts).size !== parts.length || parts.some(value => !['continue', 'codex', 'claude'].includes(value))
     || parts.includes('codex') && parts.includes('claude')) return null;
   return { continue: parts.includes('continue'), ...(parts.includes('codex') ? { agent: 'codex' as const } : parts.includes('claude') ? { agent: 'claude' as const } : {}) };

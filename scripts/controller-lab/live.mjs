@@ -135,7 +135,7 @@ export async function runLive({ root, runDir, configPath, agent, evidence, save 
       instance++;
       runtime = new ControllerRuntime(config, { [agent]: worker, [other]: deny }, registry, { onCompletion: () => manager.completionAvailable(), pollIntervalMs: 100,
         onError: error => { receipt.runtimeErrors ??= []; receipt.runtimeErrors.push(String(error.message).slice(0, 200)); save(); } });
-      native = new NativeControllerAdapter(command, env, { agent, dataDir: config.dataDir, userHome, metadataAdapter: execution,
+      native = new NativeControllerAdapter(command, env, { agent, dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace, userHome, metadataAdapter: execution,
         invokeTool: async (turn, name, args, callId) => {
           receipt.tools.push({ name, at: new Date().toISOString() }); save();
           if (!['bridge_start_worker', 'bridge_list_workers'].includes(name)) throw new Error('Lab tool not authorized: ' + name);

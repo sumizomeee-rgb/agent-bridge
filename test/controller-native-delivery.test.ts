@@ -57,14 +57,17 @@ class DeliveryProtocol implements RpcTransport {
 function fixture(t: TestContext, agent: AgentName, management?: (name: string) => Promise<unknown>) {
   const root = mkdtempSync(join(tmpdir(), 'controller-native-delivery-')); mkdirSync(join(root, '.codex')); mkdirSync(join(root, '.claude')); writeFileSync(join(root, '.codex', 'config.toml'), 'model_provider="fixture"\n'); writeFileSync(join(root, '.claude', 'settings.json'), '{}');
   const protocol = new DeliveryProtocol(agent, !!management), invoked: string[] = [], sends: Array<{ target: string | undefined; finish: boolean | undefined; text: string }> = [];
-  const adapter = new NativeControllerAdapter({ command: 'offline-fixture', args: [] }, {}, { agent, dataDir: join(root, 'data'), userHome: root,
+  const launchArgs: string[][] = [];
+  const shared = join(root, 'shared'); mkdirSync(shared);
+  writeFileSync(join(shared, 'README.md'), '# Shared rules'); writeFileSync(join(shared, 'MEMORY.md'), '# Owner memory');
+  const adapter = new NativeControllerAdapter({ command: 'offline-fixture', args: [] }, {}, { agent, dataDir: join(root, 'data'), userHome: root, contextWorkspace: shared,
     invokeTool: async (_turn, name) => { invoked.push(name); if (management) return management(name); return { defaultTargetId: 'private', targets: [{ targetId: TARGET, audience: 'all group members' }] }; },
-    createTransport: (_command, args) => { if (agent === 'claude') protocol.mcpUrl = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url; return protocol; } });
+    createTransport: (_command, args) => { launchArgs.push(args); if (agent === 'claude') protocol.mcpUrl = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url; return protocol; } });
   const turn: AgentTurn = { conversation: { id: 'existing-controller', userId: 'owner', agent, nativeId: 'continued-native', title: '', cwd: root, createdAt: '', updatedAt: '' },
     source: { messageId: 'real-private-request', userId: 'owner', channelId: 'original-private-channel' }, text: '查询区域后只向测试群发一句，不在本私聊重复', imagePaths: [], signal: new AbortController().signal, onProgress() {},
     onPublicMessage: async (text, _paths, _id, target, finish) => { sends.push({ text, target, finish }); } };
   t.after(async () => { await adapter.close(); await protocol.http.close(); rmSync(root, { recursive: true, force: true }); });
-  return { adapter, protocol, turn, invoked, sends };
+  return { adapter, protocol, turn, invoked, sends, root, shared, launchArgs };
 }
 
 test('Claude confirmed final delivery survives a later native error result without another send', async t => {
@@ -270,3 +273,20 @@ for (const agent of ['codex', 'claude'] as const) {
     assert.equal(f.sends.length, 1); assert.match(f.sends[0]!.text, /派工失败/); assert.deepEqual(f.invoked, ['bridge_start_worker']);
   });
 }
+
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控直接获得共享 README 与 Memory 全文，不依赖初始化摘要或执行目录`, async t => {
+  const f = fixture(t, agent);
+  const readme = '# SHARED_README_FULL\nFollow the actual skill.\n';
+  const memory = '# Owner rules\n' + Array.from({ length: 90 }, (_, i) => `- RULE_${i}: keep this complete instruction.\n`).join('') + '- 工位优先 Client／Lua；流程遵循 MyHaruSkills\n';
+  writeFileSync(join(f.shared, 'README.md'), readme); writeFileSync(join(f.shared, 'MEMORY.md'), memory);
+  writeFileSync(join(f.root, 'MEMORY.md'), 'WRONG_CONVERSATION_DIRECTORY_MEMORY');
+  f.turn.event = { kind: 'workspace-context', toolName: 'bridge_workspace_context', text: 'Initializer summary omitted the critical rules.' };
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.started);
+  const instructions = agent === 'codex'
+    ? (f.protocol.written.find(message => message.method === 'thread/resume')!.params as JsonObject).baseInstructions as string
+    : f.launchArgs[0]![f.launchArgs[0]!.indexOf('--system-prompt') + 1]!;
+  assert.ok(instructions.includes(readme)); assert.ok(instructions.includes(memory));
+  assert.ok(!instructions.includes('WRONG_CONVERSATION_DIRECTORY_MEMORY'));
+  f.protocol.complete(); await running;
+});

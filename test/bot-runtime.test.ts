@@ -74,6 +74,7 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
     dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
     defaultAgent: 'codex', defaultModels: { codex: 'offline-model', claude: 'offline-model' }, controllerMode: options.controller !== false,
     proxyUrl: null, commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, maxImageBytes: 100 };
+  mkdirSync(config.workspace, { recursive: true }); writeFileSync(join(config.workspace, 'README.md'), '# Shared fixture'); writeFileSync(join(config.workspace, 'MEMORY.md'), '# Owner rules');
   const execution = { codex: new LocalAdapter(), claude: new LocalAdapter() }, controllers = { codex: new LocalAdapter(true), claude: new LocalAdapter(true) };
   const groups: IncomingDM[] = [], initialization: string[] = [], groupCompletions: TaskCompletionEvent[] = []; let ready = 0, reconnected = 0;
   let activeController: string | null = null;
@@ -131,7 +132,7 @@ test('真实BotRuntime离线初始化可走通执行助手→任务结果→主�
   assert.equal(f.bot.isReady(), true); assert.equal(f.ready, 1); assert.equal(f.transport.menus, 1);
   await f.transport.emit(f.message('100000000000000001', '/new'));
   await until(() => f.initialization.includes('ready'));
-  assert.equal(f.execution.codex.turns.length, 1); assert(f.controllers.codex.turns.some(turn => turn.event?.kind === 'workspace-context'));
+  assert.equal(f.execution.codex.turns.length, 0); assert(f.controllers.codex.turns.some(turn => turn.event?.kind === 'workspace-context'));
   assert(f.transport.sent.some(message => message.text.includes('离线测试回复')));
   await f.bot.start(); assert.equal(f.transport.started, 1); assert.equal(f.transport.menus, 1);
 });
