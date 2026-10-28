@@ -882,7 +882,9 @@ export class SessionManager {
           this.store.setModel(target.id, model);
           if (current!.agent === agent) this.store.setEffort(target.id, current!.effort ?? current!.actualEffort ?? null);
           this.handoffs.prepare(current!, this.store.getConversation(target.id)!, message.channelId,
-            this.store.handoffHistory(current!.id, message.userId), previousWorkers);
+            this.store.handoffHistory(current!.id, message.userId), previousWorkers, 'continue',
+            current!.cwd !== target.cwd && !current!.cwdExplicit && this.config.legacyWorkspace
+              ? { from: current!.cwd, to: this.config.workingCwd ?? this.config.workspace } : undefined);
         } else {
           if (current?.agent === agent && (current.model || current.modelPolicy === 'cli-default')) this.store.setModel(target.id, current.model ?? null);
           if (current?.agent === agent && current.effort) this.store.setEffort(target.id, current.effort);

@@ -117,8 +117,9 @@ export class SessionHandoffs {
       || channelId !== undefined && value.channelId !== channelId || value.source.userId !== owner.userId) throw new Error('交接材料与当前用户、入口或会话不匹配。');
     return value;
   }
-  prepare(source: Conversation, target: Conversation, channelId: string, messages: HandoffMessage[], workers: unknown[], mode: 'continue' | 'agent-switch' = 'continue'): void {
-    if (source.userId !== target.userId || source.cwd !== target.cwd || source.id === target.id) throw new Error('不能跨用户或工作区交接会话。');
+  prepare(source: Conversation, target: Conversation, channelId: string, messages: HandoffMessage[], workers: unknown[], mode: 'continue' | 'agent-switch' = 'continue', workspaceRelocation?: { from: string; to: string }): void {
+    const relocated = workspaceRelocation?.from === source.cwd && workspaceRelocation?.to === target.cwd;
+    if (source.userId !== target.userId || source.cwd !== target.cwd && !relocated || source.id === target.id) throw new Error('不能跨用户或工作区交接会话。');
     const createdAt = new Date().toISOString();
     const native = nativePublished(this.dataDir, source, createdAt);
     const previous = this.get(source);
