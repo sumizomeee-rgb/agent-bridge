@@ -141,6 +141,49 @@ test('已开始请求的失败保留未知结果，不把断线当成可自动�
   } finally { f.close(); }
 });
 
+test('Codex预设继承浏览器工具配置和插件，刷新工具时不跟随用户模型线路及认证', async () => {
+  const { parse } = await import('smol-toml');
+  const f = fixture();
+  try {
+    const source = join(f.user, '.codex'); mkdirSync(join(source, 'plugins'), { recursive: true });
+    const configuration = (command: string) => `model_provider = "user-selected"\nmodel = "other-model"\napi_key = "source-secret"\n[model_providers.user-selected]\nbase_url = "https://wrong.example"\n[mcp_servers.node_repl]\ncommand = "${command}"\n[mcp_servers.node_repl.env]\nCODEX_HOME = "source-browser-profile"\n[plugins."browser@openai-bundled"]\nenabled = true\n[features]\nbrowser = true\n`;
+    writeFileSync(join(source, 'config.toml'), configuration('browser-runtime-v1'));
+    writeFileSync(join(source, 'auth.json'), '{"OPENAI_API_KEY":"source-secret"}');
+    const binding = await f.binding(), first = await f.runtime.prepare(binding, 'worker-A', null, f.command, {}, 'hidden');
+    const home = first.env.CODEX_HOME!; const inherited = parse(readFileSync(join(home, 'config.toml'), 'utf8'));
+    assert.deepEqual(inherited.mcp_servers, parse(configuration('browser-runtime-v1')).mcp_servers);
+    assert.deepEqual(inherited.plugins, parse(configuration('browser-runtime-v1')).plugins);
+    assert.equal(inherited.model_provider, undefined); assert.equal(inherited.model_providers, undefined); assert.equal(inherited.api_key, undefined);
+    assert.equal(readdirSync(home).includes('auth.json'), false); assert.equal(readdirSync(home).includes('plugins'), true);
+    assert.equal(first.env.BRIDGE_PRESET_API_KEY, 'private-test-key');
+    assert(first.command.args.includes('model_providers.bridge_preset.base_url="https://gateway.example"')); await first.close();
+    writeFileSync(join(source, 'config.toml'), configuration('browser-runtime-v2'));
+    const resumed = await f.runtime.prepare(binding, 'worker-A', 'same-native', f.command, {}, 'hidden');
+    assert.equal((parse(readFileSync(join(home, 'config.toml'), 'utf8')).mcp_servers as Record<string, { command: string }>).node_repl!.command, 'browser-runtime-v2');
+    assert.equal(resumed.env.CODEX_HOME, home); assert.equal(resumed.env.BRIDGE_PRESET_API_KEY, 'private-test-key'); await resumed.close();
+  } finally { f.close(); }
+});
+
+test('预设返回的收尾回执不随原生对象漂移，续接先核实并释放旧句柄', async () => {
+  const f = fixture(); let permitExit = false, created = 0, closed = 0;
+  const raw = { nativeId: 'same-native', text: 'saved report', processStopped: false };
+  try {
+    const adapter = new PresetAgentAdapter(f.runtime, await f.binding(), f.command, {}, () => {
+      const index = ++created;
+      return { run: async () => index === 1 ? raw : { nativeId: 'same-native', text: 'continued', processStopped: true },
+        confirmStopped: async () => { raw.processStopped = true; return permitExit; },
+        interrupt: async () => { throw new Error('must not interrupt a completed native turn'); }, close: async () => { closed++; } };
+    });
+    const report = await adapter.run(turn(f.root, f.profile.model));
+    assert.equal(raw.processStopped, true); assert.equal(report.processStopped, false); assert.equal(closed, 0);
+    await assert.rejects(adapter.run(turn(f.root, f.profile.model, 'same-native')), /仍在执行/); assert.equal(created, 1);
+    permitExit = true;
+    const next = await adapter.run(turn(f.root, f.profile.model, 'same-native'));
+    assert.equal(next.text, 'continued'); assert.equal(created, 2); assert.equal(closed, 2);
+    assert.equal(report.processStopped, false); assert.equal(await adapter.confirmStopped('worker-A'), true); await adapter.close();
+  } finally { f.close(); }
+});
+
 test('透明CONNECT拒绝其他目的地，保留不透明字节并关闭受控SSH进程', async () => {
   let spawns = 0;
   const relay = await startPresetConnect({ kind: 'ssh-connect', sshConfig: join(tmpdir(), 'fixed-config'), alias: 'fixed-host' }, 'gateway.example:443', (command, args) => {

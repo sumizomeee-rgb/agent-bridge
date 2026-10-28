@@ -12,6 +12,7 @@ import { presetId, readPrivateJson } from './registry.js';
 import { readMaterials } from './materials.js';
 import { exposeCodexHistory, pinSessionLocation } from '../agents/worker-session.js';
 import { startPresetConnect } from './connect.js';
+import { inheritCodexCapabilities } from './capabilities.js';
 import type { LaunchProfile, PresetBinding } from './types.js';
 
 export function profileFingerprint(profile: LaunchProfile): string { return createHash('sha256').update(JSON.stringify(profile)).digest('hex'); }
@@ -122,6 +123,7 @@ export class PresetRuntime {
         for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) env[name] = relay.proxyUrl;
       }
       if (binding.agent === 'codex') {
+        inheritCodexCapabilities(home, location?.profileHome ?? join(this.userHome, '.codex'));
         env.CODEX_HOME = home; env.CODEX_SQLITE_HOME = home; env.BRIDGE_PRESET_API_KEY = key;
         if (location?.visibility === 'visible') { exposeCodexHistory(home, location); env.CODEX_SQLITE_HOME = location.sqliteHome; }
         const provider = 'bridge_preset';
@@ -172,17 +174,25 @@ export class PresetAgentAdapter implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed || turn.signal.aborted) throw abortError();
     if (turn.conversation.agent !== this.binding.agent || turn.conversation.model !== this.binding.model) throw new Error('预设助手的引擎或模型不匹配。');
-    const id = turn.conversation.id; if (this.active.has(id)) throw new Error('预设助手仍在执行。');
+    const id = turn.conversation.id;
+    if (this.unconfirmed.has(id)) await this.confirmStopped(id);
+    if (this.closed || turn.signal.aborted) throw abortError();
+    if (this.active.has(id)) throw new Error('预设助手仍在执行。');
     const state: { stopped: boolean; adapter?: AgentAdapter; prepared?: PreparedPreset } = { stopped: false }; this.active.set(id, state); this.stopped.delete(id); this.completed.delete(id);
     let prepared: PreparedPreset | undefined;
-    let nativeResult: AgentResult | undefined;
+    let nativeResult: AgentResult | undefined, observedResult: AgentResult | undefined;
     let success = false, stopOnlyReport = false, resultUncertain = false, executionError: string | undefined;
     try {
       prepared = await this.runtime.prepare(this.binding, id, turn.conversation.nativeId, this.command, this.env, this.visibility); state.prepared = prepared;
       if (this.closed || state.stopped || turn.signal.aborted) throw abortError();
       state.adapter = this.factory(prepared.command, prepared.env);
       let ready = false;
-      try { nativeResult = await state.adapter.run({ ...turn, onReady: () => { ready = true; turn.onReady?.(); } }); success = true; return nativeResult; }
+      try {
+        observedResult = await state.adapter.run({ ...turn, onReady: () => { ready = true; turn.onReady?.(); } });
+        // Native retirement updates its own result asynchronously. Keep the wrapper's receipt stable until it reaps the handle.
+        nativeResult = { ...observedResult, ...(observedResult.stopEvidence ? { stopEvidence: { ...observedResult.stopEvidence } } : {}) };
+        success = true; return nativeResult;
+      }
       catch (error) {
         nativeResult = completedResultFromError(error);
         executionError = executionErrorEvidence(error);
@@ -198,7 +208,9 @@ export class PresetAgentAdapter implements AgentAdapter {
       if (stopOnlyReport) { try { confirmed = await state.adapter?.confirmStopped?.(id) === true; } catch {} }
       if (!stopOnlyReport || confirmed) { try { await state.adapter?.close(); } catch (error) { cleanupError = error; } }
       if (!stopOnlyReport || confirmed) { try { await prepared?.close(); } catch (error) { cleanupError ??= error; } }
-      if (confirmed && cleanupError === undefined && !turn.signal.aborted && !state.stopped && !this.closed) { this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id); return nativeResult!; }
+      if (confirmed && cleanupError === undefined && !turn.signal.aborted && !state.stopped && !this.closed) {
+        if (nativeResult?.processStopped === false) { nativeResult.processStopped = true; if (observedResult?.stopEvidence) nativeResult.stopEvidence = { ...observedResult.stopEvidence }; }
+        this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id); return nativeResult!; }
       if (success && nativeResult && cleanupError !== undefined && !turn.signal.aborted && !state.stopped && !this.closed) {
         nativeResult.processStopped = false; nativeResult.cleanupError = executionErrorEvidence(cleanupError);
         this.unconfirmed.add(id); this.completed.add(id); return nativeResult;
@@ -218,7 +230,10 @@ export class PresetAgentAdapter implements AgentAdapter {
   async confirmStopped(id: string): Promise<boolean> {
     if (this.unconfirmed.has(id)) {
       try { const state = this.active.get(id); if (await state?.adapter?.confirmStopped?.(id) === true) {
-        await state?.adapter?.close(); await state?.prepared?.close(); this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id);
+        if (this.active.get(id) !== state) return false;
+        await state?.adapter?.close(); await state?.prepared?.close();
+        if (this.active.get(id) !== state) return false;
+        this.unconfirmed.delete(id); this.active.delete(id); this.stopped.add(id);
       } } catch {}
     }
     return this.stopped.has(id) && !this.active.has(id) && !this.unconfirmed.has(id);
