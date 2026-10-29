@@ -136,6 +136,30 @@ test('真实 BotRuntime 管理入口贯通历史与持久清单，new 保留但�
   assert.equal(f.execution.codex.turns.length, 0); assert.equal(f.execution.claude.turns.length, 0);
 });
 
+test('真实 BotRuntime 文件工具直接读取桥电脑，不派工且拒绝失效轮次', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  const path = join(f.config.workspace, 'quick.txt'); writeFileSync(path, '桥电脑现有资料');
+  const originalRun = f.controllers.codex.run.bind(f.controllers.codex); let savedTurn: AgentTurn | undefined, checked = false;
+  f.controllers.codex.run = async turn => {
+    if (!turn.event && turn.text.includes('快速核对')) {
+      savedTurn = turn;
+      const read = await f.invoke(turn, 'bridge_read_file', { path }) as { lines: Array<{ text: string }> };
+      assert.equal(read.lines[0]!.text, '桥电脑现有资料');
+      const list = await f.invoke(turn, 'bridge_list_directory', { path: f.config.workspace }) as { entries: Array<{ name: string }> };
+      assert(list.entries.some(item => item.name === 'quick.txt')); checked = true;
+    }
+    return originalRun(turn);
+  };
+  await f.transport.emit(f.message('100000000000000001', '快速核对'));
+  await until(() => checked && f.transport.sent.some(message => message.text.includes('离线测试回复')));
+  assert.equal(f.execution.codex.turns.length, 0); assert.equal(f.execution.claude.turns.length, 0);
+  const first = f.bot.manager.currentConversation(f.config.ownerUserId!)!.id;
+  await f.transport.emit(f.message('100000000000000002', '/new'));
+  await until(() => f.bot.manager.currentConversation(f.config.ownerUserId!)?.id !== first);
+  await assert.rejects(f.invoke(savedTurn!, 'bridge_read_file', { path }), /失效/);
+  assert.equal(readFileSync(path, 'utf8'), '桥电脑现有资料');
+});
+
 test('转发引用到达真实主控入口，历史斜杠不重建会话或重做初始化', async t => {
   const f = setup(t); await f.bot.verify(); await f.bot.start();
   await f.transport.emit(f.message('100000000000000001', '/new'));

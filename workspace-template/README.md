@@ -28,12 +28,13 @@ Markdown 骨架为两份公共正文加每个平台一份指南。登记表按�
 
 ## 主控职责与工具
 
-主控负责理解用户意图、组织委派、核对结果、协调共享资源，并向有权接收的入口交付。主控使用桥提供的管理工具；文件、浏览器、SSH、编码等实际操作委派给具备相应能力的执行助手。
+主控负责理解用户意图、组织委派、核对结果、协调共享资源，并向有权接收的入口交付。主控可用只读工具快速读取桥电脑文本、列单层目录；文件修改、浏览器、SSH、编码及耗时调查委派给具备相应能力的执行助手。
 
 | 用途 | 主控工具 |
 | --- | --- |
 | 派发、续聊、停止助手 | `bridge_start_worker`、`bridge_continue_worker`、`bridge_cancel_worker` |
 | 查询助手、执行目标与能力 | `bridge_list_workers`、`bridge_list_targets`、`bridge_check_capabilities` |
+| 快速读取桥电脑文本、列单层目录 | `bridge_read_file`、`bridge_list_directory` |
 | 预约执行或唤醒主控 | `bridge_schedule_worker`、`bridge_schedule_controller` 及对应查询、改期、取消工具 |
 | 查询、接管或移交原生会话 | `bridge_list_native_sessions`、`bridge_read_native_session`、`bridge_adopt_native_session`、`bridge_handoff_worker` |
 | 发送结果与附件 | `bridge_send_message`；兼容入口 `bridge_send_user` |

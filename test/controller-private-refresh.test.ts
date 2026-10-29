@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { NativeControllerAdapter } from '../src/controller/native.js';
 import { RestartService } from '../src/restart.js';
 import { SessionStore } from '../src/store.js';
+import { invokeControllerFileTool } from '../src/controller/files.js';
 import type { AgentName, AgentTurn, PrivateInputBatch } from '../src/types.js';
 import type { JsonObject, RpcTransport } from '../src/agents/process.js';
 
@@ -99,6 +100,29 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控实际协
   await f.protocol.call('bridge_send_user', { text: '已记住并核对原文。' }); f.protocol.complete();
   assert.equal((await running).controlledOutput, true);
   assert.deepEqual(f.invoked.map(item => item.name), [names[0], names[1], names[3], names[2]]);
+});
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控真实协议提供文件快读与单层目录工具，按需读取不触发执行重判`, async t => {
+  const f = fixture(t, agent), path = join(f.path, 'lookup.txt'); writeFileSync(path, '只在工具调用后返回的资料');
+  f.turn.conversation.nativeId = null;
+  f.manage = (turn, name, args) => invokeControllerFileTool(name, args, turn.signal);
+  let checks = 0; f.turn.onPrivateInputCheck = async () => { checks++; return { refreshRequired: false }; };
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+  const names = ['bridge_read_file', 'bridge_list_directory'];
+  if (agent === 'codex') {
+    const started = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
+    assert(names.every(name => (started.dynamicTools as JsonObject[]).some(tool => tool.name === name)));
+  } else {
+    const response = await fetch(f.protocol.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'tools/list' }) });
+    const body = await response.json() as { result: { tools: { name: string }[] } };
+    assert(names.every(name => body.result.tools.some(tool => tool.name === name)));
+  }
+  assert.doesNotMatch(JSON.stringify(f.protocol.written), /只在工具调用后返回的资料/);
+  const read = await f.protocol.call(names[0]!, { path }); assert.equal(read.ok, true); assert.match(JSON.stringify(read.value), /只在工具调用后返回的资料/);
+  const list = await f.protocol.call(names[1]!, { path: f.path }); assert.equal(list.ok, true); assert.match(JSON.stringify(list.value), /lookup.txt/);
+  assert.equal(checks, 0);
+  await f.protocol.call('bridge_send_user', { text: '已核对资料。' }); f.protocol.complete(); await running;
+  assert.equal(checks, 1); assert.deepEqual(f.invoked.map(item => item.name), names);
 });
 
 for (const agent of ['codex', 'claude'] as const) {

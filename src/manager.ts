@@ -14,6 +14,7 @@ import { completedResultFromError, isObject, stopEvidenceFromError } from './age
 import { MetadataProbeError } from './agents/metadata.js';
 import type { BridgeFeedback, FeedbackScope, FeedbackRead } from './controller-feedback.js';
 import { knowledgeToolNames, type KnowledgeScope } from './controller-knowledge.js';
+import { controllerFileToolNames, invokeControllerFileTool } from './controller/files.js';
 import type { ControllerSupplement, WorkerPolicyReport } from './controller/runtime-types.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
@@ -1054,6 +1055,16 @@ export class SessionManager {
     if (name === 'bridge_update_tasks' && (!callId || turn.event?.kind === 'workspace-context')) throw new Error('初始化介绍不修改任务清单；修改须有工具调用标识。');
     return this.store.knowledge.invoke(this.knowledgeScope(source.userId, source.channelId, turn.groupContext), name, args,
       `${turn.conversation.id}:${source.messageId}:${callId ?? ''}`);
+  }
+
+  async invokeFileTool(turn: AgentTurn, name: string, args: Record<string, unknown>): Promise<unknown> {
+    const source = turn.source;
+    const current = () => controllerFileToolNames.has(name) && source && !turn.preparing && !turn.signal.aborted && !this.closed
+      && source.userId === turn.conversation.userId && this.store.getActive(source.userId)?.id === turn.conversation.id;
+    if (!current()) throw new Error('本机文件查询轮次已失效。');
+    const result = await invokeControllerFileTool(name, args, turn.signal);
+    if (!current()) throw new Error('本机文件查询期间主控已停止或切换。');
+    return result;
   }
 
   private input(items: BridgeMessage[]) {
