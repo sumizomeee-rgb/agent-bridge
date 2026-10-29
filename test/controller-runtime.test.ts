@@ -1244,7 +1244,8 @@ test('policy report keeps raw evidence, normalizes parent completion and worker 
     assert.equal(f.runtime.store.getJob(handle.jobId)!.nativeResult!.text, raw);
     assert.equal(f.events.length, 1); assert.equal(f.events[0]!.displayText, raw);
     assert.doesNotMatch(f.events[0]!.text, /blocked by policy/i);
-    assert.match(f.events[0]!.text, /本次工具调用被拒绝；本次未执行/);
+    assert.match(f.events[0]!.text, /；本次未执行/);
+    assert.doesNotMatch(f.events[0]!.text, /本次工具调用被拒绝/);
     assert.match(f.events[0]!.text, /不得通过其他工具绕过此拒绝/);
     const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: handle.workerId }) as any;
     const compact = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as any;

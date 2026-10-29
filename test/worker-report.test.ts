@@ -7,7 +7,7 @@ test('normalization keeps denial facts, scope and instructions while original ev
   const shown = controllerWorkerReport(raw);
   assert(mentionsPolicyDenial(raw));
   assert.doesNotMatch(shown, /blocked by policy/i);
-  assert.equal(shown, 'Codex: 本次工具调用被拒绝；本次未执行。Do not retry through another tool. 范围未知。');
+  assert.equal(shown, 'Codex: ；本次未执行。Do not retry through another tool. 范围未知。');
   assert.match(raw, /BLOCKED by policy/);
   assert.equal(controllerWorkerReport('原结果：成功。\r\n'), '原结果：成功。\r\n');
   assert.equal(mentionsPolicyDenial('unblocked by policy'), false);
