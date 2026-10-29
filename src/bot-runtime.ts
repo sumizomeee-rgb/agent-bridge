@@ -18,6 +18,7 @@ import { closeResources } from './shutdown.js';
 import { BridgeLifecycle } from './lifecycle.js';
 import type { ControllerTargetCatalog } from './controller/runtime-types.js';
 import { mapPresentation } from './presentation.js';
+import { knowledgeToolNames } from './controller-knowledge.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from './types.js';
 import type { RestartOrigin } from './restart.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
@@ -115,7 +116,8 @@ export class BotRuntime {
       },
     }) : undefined;
     const invoke = (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string): Promise<unknown> =>
-      hooks.invoke(turn, name, args, id, input => this.controller!.invoke(turn, name, input, id));
+      hooks.invoke(turn, name, args, id, input => knowledgeToolNames.has(name)
+        ? Promise.resolve(this.manager.invokeKnowledge(turn, name, input, id)) : this.controller!.invoke(turn, name, input, id));
     const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke) ?? {
       codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
         internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),

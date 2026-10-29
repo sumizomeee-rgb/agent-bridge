@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NativeControllerAdapter } from '../src/controller/native.js';
 import { RestartService } from '../src/restart.js';
+import { SessionStore } from '../src/store.js';
 import type { AgentName, AgentTurn, PrivateInputBatch } from '../src/types.js';
 import type { JsonObject, RpcTransport } from '../src/agents/process.js';
 
@@ -39,8 +40,9 @@ class PrivateProtocol implements RpcTransport {
     this.emit({ type: 'assistant', session_id: 'same-private-native', message: { content: [{ type: 'tool_use', id: toolId, name: 'mcp__bridge_controller__' + name, input: args }] } });
     const response = await fetch(this.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(5000),
       body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) });
-    const body = await response.json() as { result?: { content: Array<{ text: string }> }; error?: unknown };
-    return { ok: response.status === 200, value: body.result ? JSON.parse(body.result.content[0]!.text) : { error: body.error } };
+    const body = await response.json() as { result?: { isError?: boolean; content: Array<{ text: string }> }; error?: unknown };
+    return { ok: response.status === 200 && !body.result?.isError && !body.error, value: body.result
+      ? body.result.isError ? { error: body.result.content[0]!.text } : JSON.parse(body.result.content[0]!.text) : { error: body.error } };
   }
   complete() {
     if (this.agent === 'codex') this.emit({ method: 'turn/completed', params: { threadId: 'same-private-native', turn: { id: 'private-turn-' + this.turns, status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'DONE' }] } } });
@@ -52,18 +54,52 @@ function fixture(t: TestContext, agent: AgentName) {
   const path = mkdtempSync(join(tmpdir(), 'controller-private-refresh-')); mkdirSync(join(path, '.codex')); mkdirSync(join(path, '.claude'));
   writeFileSync(join(path, '.codex', 'config.toml'), 'model_provider="fixture"\n'); writeFileSync(join(path, '.claude', 'settings.json'), '{}');
   const protocol = new PrivateProtocol(agent), invoked: Array<{ name: string; source: AgentTurn['source']; images: string[] }> = [], sends: Array<{ text: string; target: string | undefined; finish: boolean | undefined }> = [];
-  let manage: () => Promise<unknown> = async () => ({ workerId: 'private-worker', status: 'started' });
+  const beforeCleanup: Array<() => void> = [];
+  let manage: (turn: AgentTurn, name: string, args: JsonObject, id?: string) => Promise<unknown> = async () => ({ workerId: 'private-worker', status: 'started' });
   const adapter = new NativeControllerAdapter({ command: 'offline-fixture', args: [] }, {}, { agent, dataDir: join(path, 'data'), userHome: path,
-    invokeTool: async (turn, name) => { invoked.push({ name, source: turn.source, images: turn.imagePaths }); return manage(); },
+    invokeTool: async (turn, name, args, id) => { invoked.push({ name, source: turn.source, images: turn.imagePaths }); return manage(turn, name, args, id); },
     createTransport: (_command, args) => { if (agent === 'claude') protocol.mcpUrl = JSON.parse(args[args.indexOf('--mcp-config') + 1]!).mcpServers.bridge_controller.url; return protocol; } });
   const turn: AgentTurn = { conversation: { id: 'private-controller', userId: 'owner', agent, nativeId: 'same-private-native', title: '', cwd: path, createdAt: '', updatedAt: '' },
     source: { messageId: 'original-private-input', userId: 'owner', channelId: 'private-channel' }, text: '先看旧要求', imagePaths: [], signal: new AbortController().signal, onProgress() {},
     onPublicMessage: async (text, _paths, _id, target, finish) => { sends.push({ text, target, finish }); } };
   const batch = (version = 2): PrivateInputBatch => ({ version, messages: [{ id: 'new-private-input', userId: 'owner', channelId: 'private-channel', text: '主人新要求：改看新的点', imagePaths: [],
     source: { messageId: 'raw-new-message', userId: 'actual-platform-owner', channelId: 'actual-private-chat', authorType: 'user', time: '2026-10-18T12:00:00.000Z' } }] });
-  t.after(async () => { await adapter.close(); rmSync(path, { recursive: true, force: true }); });
-  return { adapter, protocol, turn, invoked, sends, batch, path, set manage(value: () => Promise<unknown>) { manage = value; } };
+  t.after(async () => { await adapter.close(); for (const close of beforeCleanup) close(); rmSync(path, { recursive: true, force: true }); });
+  return { adapter, protocol, turn, invoked, sends, batch, path, beforeCleanup: (close: () => void) => beforeCleanup.push(close), set manage(value: typeof manage) { manage = value; } };
 }
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控实际协议暴露并调用历史/清单工具，注入紧凑索引，修改先检查新输入`, async t => {
+  const f = fixture(t, agent), store = new SessionStore(join(f.path, 'knowledge'));
+  f.beforeCleanup(() => store.close());
+  const scope = { userId: 'owner', channelId: 'private-channel' };
+  const conversation = store.createConversation('owner', agent, f.path);
+  store.addMessage({ id: 'remember', userId: 'owner', channelId: scope.channelId, text: '先排除免打扰再取最近 N 个', imagePaths: [] }, conversation.id, 'completed');
+  f.manage = async (_turn, name, args, id) => store.knowledge.invoke(scope, name, args, id ?? 'none');
+  f.turn.conversation.nativeId = null;
+  f.turn.taskChecklist = store.knowledge.summary(scope);
+  let checks = 0; f.turn.onPrivateInputCheck = async () => { checks++; return { refreshRequired: false }; };
+  const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
+  const names = ['bridge_search_chat_history', 'bridge_read_chat_history', 'bridge_list_tasks', 'bridge_update_tasks'];
+  if (agent === 'codex') {
+    const started = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
+    assert(names.every(name => (started.dynamicTools as JsonObject[]).some(tool => tool.name === name)));
+  } else {
+    const response = await fetch(f.protocol.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'tools/list' }) });
+    const body = await response.json() as { result: { tools: { name: string }[] } };
+    assert(names.every(name => body.result.tools.some(tool => tool.name === name)));
+  }
+  assert.match(JSON.stringify(f.protocol.written), /Bridge task checklist/);
+  const found = await f.protocol.call(names[0]!, { query: '免打扰' });
+  assert.equal(found.ok, true); assert.match(JSON.stringify(found.value), /先排除免打扰/);
+  const read = await f.protocol.call(names[1]!, { messageId: 'input:remember' }); assert.equal(read.ok, true);
+  assert.equal(checks, 0);
+  const updated = await f.protocol.call(names[3]!, { changes: [{ id: 'current-goal', expectedVersion: 0, title: '交付筛选结果', requirements: '先排除免打扰', evidenceIds: ['input:remember'] }] });
+  assert.equal(updated.ok, true); assert.equal(checks, 1);
+  const listed = await f.protocol.call(names[2]!, { id: 'current-goal' }); assert.match(JSON.stringify(listed.value), /先排除免打扰/);
+  await f.protocol.call('bridge_send_user', { text: '已记住并核对原文。' }); f.protocol.complete();
+  assert.equal((await running).controlledOutput, true);
+  assert.deepEqual(f.invoked.map(item => item.name), [names[0], names[1], names[3], names[2]]);
+});
 
 for (const agent of ['codex', 'claude'] as const) {
   test(`${agent} 新私聊输入暂停整个旧并行批次，同一原生会话只续判一次且保持真实新授权及图片顺序`, { timeout: 15000 }, async t => {

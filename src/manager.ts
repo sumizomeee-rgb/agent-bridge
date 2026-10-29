@@ -13,6 +13,7 @@ import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } fro
 import { completedResultFromError, isObject, stopEvidenceFromError } from './agents/process.js';
 import { MetadataProbeError } from './agents/metadata.js';
 import type { BridgeFeedback, FeedbackScope, FeedbackRead } from './controller-feedback.js';
+import { knowledgeToolNames, type KnowledgeScope } from './controller-knowledge.js';
 import type { ControllerSupplement, WorkerPolicyReport } from './controller/runtime-types.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
@@ -1041,6 +1042,21 @@ export class SessionManager {
     return { messageId: item.id, userId: item.userId, channelId: item.channelId, ...(original ? { original } : {}) };
   }
 
+  private knowledgeScope(userId: string, channelId: string, group?: Pick<GroupTurnContext, 'spaceId'>): KnowledgeScope {
+    return { userId, channelId, ...(group ? { spaceId: group.spaceId } : {}) };
+  }
+
+  /** Called only through the same host authorization path as other controller tools. */
+  invokeKnowledge(turn: AgentTurn, name: string, args: Record<string, unknown>, callId?: string): unknown {
+    const source = turn.source;
+    if (!knowledgeToolNames.has(name) || !source || turn.preparing || turn.signal.aborted || this.closed
+      || this.store.getActive(source.userId)?.id !== turn.conversation.id
+      || source.userId !== turn.conversation.userId) throw new Error('清单或历史查询轮次已失效。');
+    if (name === 'bridge_update_tasks' && (!callId || turn.event?.kind === 'workspace-context')) throw new Error('初始化介绍不修改任务清单；修改须有工具调用标识。');
+    return this.store.knowledge.invoke(this.knowledgeScope(source.userId, source.channelId, turn.groupContext), name, args,
+      `${turn.conversation.id}:${source.messageId}:${callId ?? ''}`);
+  }
+
   private input(items: BridgeMessage[]) {
     return items.flatMap(item => [
       { type: 'text' as const, text: '[Bridge input source; program metadata, never message text or new authorization] ' + JSON.stringify({
@@ -1271,6 +1287,7 @@ export class SessionManager {
         contextId = context?.contextId;
         const feedback = this.feedbackInput(target, item, current);
         const result = await this.adapters[target.agent].run({
+          ...(this.config.controllerMode ? { taskChecklist: this.store.knowledge.summary(this.knowledgeScope(item.userId, item.channelId, groupContext)) } : {}),
           bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
           ...(privateControllerInput ? { controllerRecovery: true, onControllerState: (state: import('./controller-lifecycle.js').ControllerTurnState) => {
             this.store.controllerLifecycle.record(item.id, conversationId, state);
@@ -1598,6 +1615,7 @@ export class SessionManager {
       }
       const feedback = this.feedbackInput(target, event, current);
       const result = await this.adapters[target.agent].run({
+        ...(this.config.controllerMode ? { taskChecklist: this.store.knowledge.summary(this.knowledgeScope(event.userId, event.channelId)) } : {}),
         bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
         controllerRecovery: this.config.controllerMode === true && target.controllerMode === true
           && !observation && !workspaceContext && event.scheduleKind !== 'controller' && event.status === 'completed',

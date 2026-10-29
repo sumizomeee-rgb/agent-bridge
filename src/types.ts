@@ -155,6 +155,8 @@ export interface AgentTurn {
   onPublicDeliveryComplete?: () => Promise<void>;
   /** Automatically supplied bounded active-group evidence; never a fresh request. */
   chatScene?: string;
+  /** Compact current-chat unfinished index, evidence only; details via knowledge tools. */
+  taskChecklist?: string;
   /** 当前会话、聊天与主控代次内的程序错误回执；不构成新授权。 */
   bridgeFeedback?: FeedbackBatch;
   onReadBridgeFeedback?: (options: FeedbackRead) => FeedbackBatch;

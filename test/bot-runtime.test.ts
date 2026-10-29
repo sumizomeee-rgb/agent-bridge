@@ -86,9 +86,10 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
     onReady: () => { ready++; }, onReconnect: async () => { reconnected++; } };
   let transport!: LocalTransport;
   const healthReport = (workspace = config.workspace) => ({ version: 1 as const, workspace, checkedAt: '2026-10-17', stale: false, scope: 'static-prerequisites' as const, items: [], total: 0, omitted: 0 });
+  let controllerInvoke!: Parameters<NonNullable<BotRuntimeDependencies['createControllerAdapters']>>[3];
   const dependencies: BotRuntimeDependencies = {
     createTransport: (selected, receive, events) => transport = new LocalTransport(selected, receive, events),
-    createExecutionAdapters: () => execution, createControllerAdapters: () => controllers,
+    createExecutionAdapters: () => execution, createControllerAdapters: (_config, _env, _execution, invoke) => { controllerInvoke = invoke; return controllers; },
     createTargetCatalog: () => ({
       async listTargets() { return []; }, async resolveTarget(_workspace, id, agent, cwd) { return { id, agent, label: id, transport: 'local', cwd: cwd ?? config.workspace, agentCommand: config.commands[agent] }; },
       adapterFor: binding => execution[binding.agent], async handoff() { throw new Error('unused'); }, async computerOverview() { return []; }, async close() {},
@@ -100,8 +101,40 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
   const message = (id: string, text: string, group = false): IncomingDM => ({ id: prefix + id, userId: config.ownerUserId!, channelId: prefix + (group ? '456789012345678901' : rawChannel), text, attachments: [],
     ...(group ? { space: { kind: 'group', spaceId: '456789012345678901', mentionedUserIds: ['999999999999999999'] } } : {}) });
   return { root, config, bot, transport, execution, controllers, hooks, dependencies, groups, initialization, groupCompletions, message,
+    invoke: (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string) => controllerInvoke(turn, name, args, id),
     get ready() { return ready; }, get reconnected() { return reconnected; } };
 }
+
+test('真实 BotRuntime 管理入口贯通历史与持久清单，new 保留但不派工，旧轮次不能再修改', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  const originalRun = f.controllers.codex.run.bind(f.controllers.codex);
+  let savedTurn: AgentTurn | undefined, recalled = false;
+  f.controllers.codex.run = async turn => {
+    if (!turn.event && turn.text.includes('记住原目标')) {
+      savedTurn = turn;
+      await f.invoke(turn, 'bridge_update_tasks', { changes: [{ id: 'goal', expectedVersion: 0, title: '真实 Bot 路径', state: 'in_progress', nextStep: '核对后来纠正', evidenceIds: ['input:' + turn.source!.messageId] }] }, 'save');
+    }
+    if (!turn.event && turn.text.includes('新会话查旧目标')) {
+      assert.match(turn.taskChecklist!, /真实 Bot 路径/);
+      const history = await f.invoke(turn, 'bridge_search_chat_history', { query: '记住原目标' }) as { messages: unknown[] };
+      assert.equal(history.messages.length, 1);
+      const task = await f.invoke(turn, 'bridge_list_tasks', { id: 'goal' }) as { task: { state: string } };
+      assert.equal(task.task.state, 'in_progress'); recalled = true;
+    }
+    return originalRun(turn);
+  };
+  await f.transport.emit(f.message('100000000000000001', '记住原目标'));
+  await until(() => !!savedTurn && f.transport.sent.some(message => message.text.includes('离线测试回复')));
+  const first = f.bot.manager.currentConversation(f.config.ownerUserId!)!.id;
+  const initialized = f.initialization.length;
+  await f.transport.emit(f.message('100000000000000002', '/new'));
+  await until(() => f.bot.manager.currentConversation(f.config.ownerUserId!)?.id !== first && f.initialization.length > initialized);
+  assert.notEqual(f.bot.manager.currentConversation(f.config.ownerUserId!)!.id, first);
+  assert.throws(() => f.bot.manager.invokeKnowledge(savedTurn!, 'bridge_update_tasks', { changes: [{ id: 'goal', expectedVersion: 1, state: 'done' }] }, 'stale'), /失效/);
+  await f.transport.emit(f.message('100000000000000003', '新会话查旧目标'));
+  await until(() => recalled);
+  assert.equal(f.execution.codex.turns.length, 0); assert.equal(f.execution.claude.turns.length, 0);
+});
 
 test('转发引用到达真实主控入口，历史斜杠不重建会话或重做初始化', async t => {
   const f = setup(t); await f.bot.verify(); await f.bot.start();
