@@ -41,7 +41,7 @@ Markdown 骨架为两份公共正文加每个平台一份指南。登记表按�
 | 查询其他主控、发起协作 | `bridge_list_controllers`、`bridge_start_collaboration`、`bridge_send_bot` |
 | 安排安全重启 | `bridge_request_restart` |
 
-工具是否开放、准确参数、授权范围和当前调用结果，以桥实际提供的协议为准。用户可用 `/workers` 查看已派发助手，用 `/presetlist` 查询可派发预设及别名，用 `/restart` 安排安全重启；查询清单不代表目标当前在线或可用。
+工具是否开放、准确参数、授权范围和当前调用结果，以桥实际提供的协议为准。用户可用 `/workers` 查看已派发助手，用 `/tasks [all] [页码]` 只读查看当前私聊的主控任务清单，用 `/presetlist` 查询可派发预设及别名，用 `/restart` 安排安全重启；查询清单不代表目标当前在线或可用。
 
 ## 初始化与会话续接
 

@@ -942,6 +942,7 @@ export class SessionManager {
         catch { throw new Error('电脑清单检查失败，请稍后重试。'); }
         const view = computerOverview(items, args.includes('details')); await reply(presentationText(view), { presentation: view }); return;
       }
+      case 'tasks': { await this.replyTasks(message, argument, reply); return; }
       case 'workers': { await this.replyWorkers(message.userId, argument, reply); return; }
       case 'status': {
         const running = current && this.running.get(message.userId)?.conversationId === current.id;
@@ -974,6 +975,37 @@ export class SessionManager {
       }
       default: await reply('未知命令；/help 查看可用命令。');
     }
+  }
+
+  private async replyTasks(message: BridgeMessage, argument: string, reply: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
+    if (!this.config.controllerMode) { await reply('任务清单仅支持主控模式。'); return; }
+    const args = argument.toLowerCase().split(/\s+/).filter(Boolean), includeClosed = args[0] === 'all';
+    if (includeClosed) args.shift();
+    const page = args.length ? Number(args[0]) : 1;
+    if (args.length > 1 || args.length && !/^[1-9]\d{0,2}$/.test(args[0]!) || page > 100) {
+      await reply('用法：/tasks [all] [页码]；默认未结束任务，all 包含已结束，每页10项，页码1–100。'); return;
+    }
+    const scope = this.knowledgeScope(message.userId, message.channelId);
+    const read = (cursor?: string) => {
+      const result = this.store.knowledge.list(scope, { includeClosed, limit: 10, ...(cursor ? { cursor } : {}) });
+      if (!result.tasks) throw new Error('任务清单读取失败。');
+      return { tasks: result.tasks, hasMore: result.hasMore === true, nextCursor: result.nextCursor ?? null };
+    };
+    let result = read();
+    for (let n = 1; n < page; n++) {
+      if (!result.nextCursor) { await reply('该页没有任务；/tasks 查看未结束任务，/tasks all 查看全部。'); return; }
+      result = read(result.nextCursor);
+    }
+    const labels = { pending: '待办', in_progress: '进行中', blocked: '受阻', paused: '暂停', done: '已完成', cancelled: '已取消', superseded: '已替代' };
+    const prefix = '/tasks' + (includeClosed ? ' all' : '');
+    const view: BridgePresentation = { title: `主控任务清单 · ${includeClosed ? '全部' : '未结束'} · 第${page}页`, tone: 'info',
+      blocks: result.tasks.length ? result.tasks.map((task, index) => ({ kind: 'entry' as const,
+        text: `${(page - 1) * 10 + index + 1}. ${labels[task.state]} · ${task.title}\nID：${task.id}${task.nextStep ? `\n下一步：${task.nextStep}` : ''}` }))
+        : [{ kind: 'entry', text: includeClosed ? '当前私聊尚未登记任务。' : '当前私聊没有登记的未结束任务。' }],
+      footer: [`本 Bot、当前私聊的登记记录，跨 /new 保留；状态由主控维护，助手实时状态看 /workers。`,
+        ...(page > 1 ? [`上一页：${prefix} ${page - 1}`] : []), ...(result.hasMore ? [page < 100 ? `下一页：${prefix} ${page + 1}` : '已达100页显示上限。'] : []),
+        '/tasks 查看未结束 · /tasks all 包含已结束'].join('\n') };
+    await reply(presentationText(view), { presentation: view });
   }
 
   private markReplyDelivered(messageIds: string[]): void {

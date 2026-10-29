@@ -36,6 +36,9 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'string', name: 'args', description: 'agentworker [电脑ID] [follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]', min_length: 1, max_length: 400 },
   ] },
   { name: 'presetlist', help: '/presetlist：查看可派发预设的口语别名，一行一条', description: '可派发预设清单与别名速查' },
+  { name: 'tasks', contexts: ['dm'], help: '/tasks [all] [页码]：查看主控登记的任务清单；默认未结束，all 含已结束', description: '只读查看当前私聊的主控任务清单', options: [
+    { type: 'string', name: 'args', description: '留空查看未结束任务；all 包含已结束，可追加页码（每页10项）', min_length: 1, max_length: 30 },
+  ] },
   { name: 'workers', help: "/workers [history] [all] [details]：默认查看未结束助手；history 查看历史", description: '查看执行中的直属助手，或单独查询历史', options: [
     { type: 'string', name: 'scope', description: '留空查看当前对话；all 查看你的全部对话', choices: [
       { name: '当前对话', value: 'current' }, { name: '我的全部对话', value: 'all' },

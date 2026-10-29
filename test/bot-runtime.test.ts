@@ -130,6 +130,10 @@ test('真实 BotRuntime 管理入口贯通历史与持久清单，new 保留但�
   await f.transport.emit(f.message('100000000000000002', '/new'));
   await until(() => f.bot.manager.currentConversation(f.config.ownerUserId!)?.id !== first && f.initialization.length > initialized);
   assert.notEqual(f.bot.manager.currentConversation(f.config.ownerUserId!)!.id, first);
+  const turns = f.controllers.codex.turns.length;
+  await f.transport.emit(f.message('100000000000000004', '/tasks'));
+  await until(() => f.transport.sent.some(message => message.text.includes('主控任务清单') && message.text.includes('真实 Bot 路径')));
+  assert.equal(f.controllers.codex.turns.length, turns, '清单斜杠查询不能唤醒主控');
   assert.throws(() => f.bot.manager.invokeKnowledge(savedTurn!, 'bridge_update_tasks', { changes: [{ id: 'goal', expectedVersion: 1, state: 'done' }] }, 'stale'), /失效/);
   await f.transport.emit(f.message('100000000000000003', '新会话查旧目标'));
   await until(() => recalled);
