@@ -13,7 +13,7 @@ import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } fro
 import { completedResultFromError, isObject, stopEvidenceFromError } from './agents/process.js';
 import { MetadataProbeError } from './agents/metadata.js';
 import type { BridgeFeedback, FeedbackScope, FeedbackRead } from './controller-feedback.js';
-import type { ControllerSupplement } from './controller/runtime-types.js';
+import type { ControllerSupplement, WorkerPolicyReport } from './controller/runtime-types.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
@@ -1123,6 +1123,19 @@ export class SessionManager {
     if (!target?.controllerMode) { if (notifyUser && deliver) await deliver(); return; }
     const feedback = this.failureFeedback(target, message, 'messageFailed', error, { stage: 'input', deliveryState: 'not-attempted' }, notifyUser);
     if (notifyUser) await this.sendFeedbackNotice(feedback, deliver);
+  }
+  async workerPolicyReport(value: WorkerPolicyReport): Promise<void> {
+    if (this.closed) return;
+    const target = this.store.getConversation(value.origin.conversationId);
+    if (!target || target.userId !== value.origin.userId || !target.controllerMode) return;
+    const scope = this.feedbackScope(target, value.origin);
+    scope.nativeId = value.origin.nativeId;
+    const item = this.store.feedback.record({ ...scope, sourceId: 'worker-policy:' + value.jobId,
+      audience: 'user-only', code: 'workerPolicyReport', stage: 'worker-result',
+      reason: '助手报告包含 blocked by policy；不是桥对真实策略来源的判定。',
+      workerId: value.workerId, jobId: value.jobId, taskId: value.taskId, taskTitle: value.taskTitle,
+      resultKnown: true, workerResultKnown: true, processStopped: null, deliveryState: 'not-attempted' }, true);
+    void this.sendFeedbackNotice(item);
   }
   async workerInputFailed(value: ControllerSupplement): Promise<boolean> {
     if (this.closed) return false;

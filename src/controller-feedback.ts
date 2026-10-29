@@ -14,6 +14,8 @@ export interface BridgeFeedback extends FeedbackScope {
   createdAt: string;
   userState: 'none' | 'pending' | 'sending' | 'delivered' | 'uncertain';
   controllerState: 'pending' | 'delivered';
+  /** User-only notices are excluded even from explicit/includeDelivered controller reads. */
+  audience?: 'user-only';
 }
 export interface FeedbackRead { id?: string; includeDelivered?: boolean; limit?: number }
 export interface FeedbackBatch { records: BridgeFeedback[]; remaining: number }
@@ -48,6 +50,7 @@ export class ControllerFeedbackJournal {
   read(scope: FeedbackScope, options: FeedbackRead = {}): FeedbackBatch {
     const limit = Math.max(1, Math.min(20, Math.floor(options.limit ?? 8)));
     const filter = `conversation_id=? AND user_id=? AND channel_id=? AND group_key=? AND (native_id IS NULL OR native_id=?)`
+      + " AND coalesce(json_extract(payload_json,'$.audience'),'both')!='user-only'"
       + (options.includeDelivered ? '' : " AND controller_state='pending'") + (options.id ? ' AND id=?' : '');
     const values = [scope.conversationId, scope.userId, scope.channelId, this.groupKey(scope), scope.nativeId, ...(options.id ? [options.id] : [])];
     const rows = this.db.prepare(`SELECT * FROM controller_feedback WHERE ${filter} ORDER BY created_at,rowid LIMIT ?`).all(...values, limit);

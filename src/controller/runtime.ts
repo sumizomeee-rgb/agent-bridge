@@ -19,6 +19,7 @@ import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, Con
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
 import { workspaceDocuments } from './workspace-documents.js';
 import { workspaceOutputGuidance } from '../workspace-layout.js';
+import { controllerWorkerReport, mentionsPolicyDenial } from './worker-report.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = '按下面的任务及授权边界执行，向主控返回实际结果、必要证据、未完成项和阻塞。涉及截图或文件，说明真实绝对路径、所属电脑及用途。\n\n';
@@ -969,7 +970,8 @@ export class ControllerRuntime {
           const history = supplements.filter(value => !['pending', 'steering', 'uncertain'].includes(value.status));
           const receipt = (value: ControllerSupplement) => ({ ...this.supplementResult(value) as Record<string, unknown>,
             reason: value.reason ? listText(value.reason, 256) : null, reasonTruncated: (value.reason?.length ?? 0) > 256 });
-          const lastResultPreview = latest?.result == null ? null : preview(latest.result);
+          const lastResult = latest?.result == null ? null : controllerWorkerReport(latest.result);
+          const lastResultPreview = lastResult == null ? null : preview(lastResult);
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
             source: { kind: worker.origin.groupContext ? 'group' : 'private', channelId: worker.origin.channelId,
               ...(worker.origin.groupContext ? { spaceId: worker.origin.groupContext.spaceId } : {}) },
@@ -977,15 +979,15 @@ export class ControllerRuntime {
             effort: worker.effort, actualEffort: worker.actualEffort ?? null, effortConfiguration: worker.effortConfiguration ?? null, effortMetadata: worker.effortMetadata ?? null, nativeId: worker.nativeId, cwd: worker.cwd, running: jobs.some(job => job.status === 'running'),
             resultKnown: !!latest?.nativeResult, processStopped: latest?.processStopped, retiring: this.retirementPending(worker.id),
             queued: jobs.filter(job => job.status === 'queued').length, blocked: worker.blocked === true,
-            ...(jobs.some(job => job.interrupted) ? { recovery: { previousExecutionInterrupted: true, canContinue: !worker.blocked && !worker.archivedAt && worker.ownership !== 'user', instruction: latest?.interrupted ? latest.result : '旧轮次未重放；可以用 bridge_continue_worker 在原会话按最新指令续接，先核对已发生的操作。' } } : {}),
+            ...(jobs.some(job => job.interrupted) ? { recovery: { previousExecutionInterrupted: true, canContinue: !worker.blocked && !worker.archivedAt && worker.ownership !== 'user', instruction: latest?.interrupted ? controllerWorkerReport(latest.result ?? '') : '旧轮次未重放；可以用 bridge_continue_worker 在原会话按最新指令续接，先核对已发生的操作。' } } : {}),
             ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
             lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
             startedAt: currentJob?.startedAt ?? null,
             progress: details ? { ...progressSummary, lastActivity: progress?.lastActivity ?? null, lastTool: progress?.lastTool ?? null, activeTools: progress?.activeTools ?? [] } : progressSummary,
             hasResult: latest?.result != null, lastResultPreview,
-            lastResultPreviewTruncated: latest?.result != null && lastResultPreview !== latest.result, supplementCounts,
-            ...(details ? { lastResult: latest?.result == null ? null : listText(latest.result, 4096),
-              lastResultTruncated: (latest?.result?.length ?? 0) > 4096, activeSupplements: active.map(receipt),
+            lastResultPreviewTruncated: lastResult != null && lastResultPreview !== lastResult, supplementCounts,
+            ...(details ? { lastResult: lastResult == null ? null : listText(lastResult, 4096),
+              lastResultTruncated: (lastResult?.length ?? 0) > 4096, activeSupplements: active.map(receipt),
               supplements: history.slice(-20).map(receipt), supplementsTotal: supplements.length,
               supplementsTruncated: history.length > 20 } : {}) };
         }), schedules: details ? [] : this.store.schedules().filter(value => this.scheduleScope(value, origin) && value.status === 'pending')
@@ -1252,8 +1254,13 @@ export class ControllerRuntime {
     const terminal: TaskTerminalStatus = status === 'uncertain' || status === 'failed' ? 'failed' : status === 'cancelled' ? 'cancelled' : 'completed';
     const current = this.store.getWorker(worker.id)!;
     if (status === 'uncertain') { current.blocked = true; this.store.saveWorker(current); }
+    if (mentionsPolicyDenial(result)) {
+      try { await this.callbacks.onPolicyReport?.({ origin: job.origin, workerId: worker.id, jobId: job.id, taskId, taskTitle: worker.title }); }
+      catch (error) { this.error(error); }
+    }
+    const controllerResult = controllerWorkerReport(result);
     const changed = this.registry.acceptObservedResult(taskId, terminal,
-      `workerId: ${worker.id}\njobId: ${job.id}\n子 Agent: ${worker.agent}\n原生会话: ${current.nativeId ?? '尚未建立'}\n\n${result}`, result);
+      `workerId: ${worker.id}\njobId: ${job.id}\n子 Agent: ${worker.agent}\n原生会话: ${current.nativeId ?? '尚未建立'}\n\n${controllerResult}`, result);
     await this.count(job.origin.conversationId);
     if (changed) await this.notify(taskId);
   }

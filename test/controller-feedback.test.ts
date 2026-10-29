@@ -196,3 +196,26 @@ test('斜杠命令失败保留原回复入口，同时为现有主控记录错�
   assert.equal(f.store.feedback.read(f.scope()).records[0]!.userState, 'delivered');
   await f.send('review-command'); await until(() => f.store.feedback.read(f.scope()).records.length === 0);
 });
+
+
+test('user-only worker policy notice is deduplicated, survives restart and never enters controller feedback', async t => {
+  const f = fixture(t, final);
+  await f.send('setup'); await until(() => f.store.getMessage('setup')?.state === 'completed');
+  const scope = f.scope();
+  const report = { origin: { ...scope, nativeId: 'parent-native', agent: 'claude' as const, cwd: f.root, originMessageId: 'setup' },
+    workerId: 'worker-policy', jobId: 'job-policy', taskId: 'job-policy', taskTitle: '正常部署任务' };
+  await f.manager.workerPolicyReport(report);
+  await f.manager.workerPolicyReport(report);
+  const notice = () => f.store.feedback.record({ ...entry(scope, 'worker-policy:job-policy'), audience: 'user-only' }, true);
+  await until(() => notice().userState === 'delivered');
+  const item = notice();
+  assert.equal(item.userState, 'delivered'); assert.equal(item.audience, 'user-only');
+  assert.equal(f.sent.filter(text => text.includes('blocked by policy')).length, 1);
+  assert.equal(f.store.feedback.read(scope, { includeDelivered: true, id: item.id }).records.length, 0);
+  assert.equal(f.store.feedback.read(scope, { includeDelivered: true }).remaining, 0);
+  assert.equal(f.turns.length, 1);
+  await f.restart(); await f.manager.workerPolicyReport(report);
+  assert.equal(f.sent.filter(text => text.includes('blocked by policy')).length, 1);
+  await f.send('next'); await until(() => f.store.getMessage('next')?.state === 'completed');
+  assert.equal(f.turns.at(-1)!.bridgeFeedback!.records.length, 0);
+});

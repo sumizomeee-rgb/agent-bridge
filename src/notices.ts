@@ -3,6 +3,7 @@ import type { BridgePresentation } from './presentation.js';
 /** 程序通知统一短前缀；业务分支只选择语义，不拼接平台样式。 */
 export const BRIDGE_NOTICE_PREFIX = '【桥】';
 export const BRIDGE_NOTICE_COPY = {
+  workerPolicyReport: { title: '助手报告提及策略拒绝', tone: 'error', text: '助手报告包含 blocked by policy；原始报告已保存。本通知仅面向用户。' },
   workerInputFailed: { title: '补充未送达', tone: 'error', text: '未自动排队。' },
   workerInputUncertain: { title: '补充发送待核对', tone: 'error', text: '未自动重发。' },
   resultDeliveryFailed: { title: '汇报发送失败', tone: 'error', text: '结果已保存。' },

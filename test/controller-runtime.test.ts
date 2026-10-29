@@ -1229,3 +1229,28 @@ test('a completed report survives cleanup uncertainty; confirming a stop updates
     finally { persisted.close(); }
   } finally { await f.runtime.close(); f.registry.close(); }
 });
+
+
+test('policy report keeps raw evidence, normalizes parent completion and worker details without replay', async () => {
+  const f = fixture();
+  const reports: import('../src/controller/runtime-types.js').WorkerPolicyReport[] = [];
+  (f.callbacks as import('../src/controller/runtime-types.js').ControllerRuntimeCallbacks).onPolicyReport = value => { reports.push(value); };
+  const raw = 'blocked by policy；本次未执行。不得通过其他工具绕过此拒绝。';
+  try {
+    const handle = await launch(f.runtime, f.turn); await flush();
+    f.codex.finish(handle.workerId, raw); await flush(); await flush();
+    assert.equal(reports.length, 1); assert.equal(reports[0]!.jobId, handle.jobId);
+    assert.equal(f.runtime.store.getJob(handle.jobId)!.result, raw);
+    assert.equal(f.runtime.store.getJob(handle.jobId)!.nativeResult!.text, raw);
+    assert.equal(f.events.length, 1); assert.equal(f.events[0]!.displayText, raw);
+    assert.doesNotMatch(f.events[0]!.text, /blocked by policy/i);
+    assert.match(f.events[0]!.text, /本次工具调用被拒绝；本次未执行/);
+    assert.match(f.events[0]!.text, /不得通过其他工具绕过此拒绝/);
+    const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: handle.workerId }) as any;
+    const compact = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as any;
+    assert.doesNotMatch(JSON.stringify(details), /blocked by policy/i);
+    assert.doesNotMatch(JSON.stringify(compact), /blocked by policy/i);
+    assert.equal(details.workers[0].lastResultPreviewTruncated, false);
+    assert.equal(f.codex.turns.length, 1); assert.equal(f.claude.turns.length, 0);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});

@@ -103,6 +103,7 @@ export class BotRuntime {
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
       onCompletion: () => this.manager.completionAvailable(),
       onSupplementFailure: value => this.manager.workerInputFailed(value),
+      onPolicyReport: value => this.manager.workerPolicyReport(value),
       onCountChanged: id => this.manager.refreshTaskCounts(id),
       onWorkCountsChanged: counts => this.transport.setWorkCounts(counts),
       onError: error => this.log('WORKER ' + safeError(error, this.secrets)),

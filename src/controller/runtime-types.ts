@@ -72,12 +72,16 @@ export interface ControllerStallEvent {
   id: string; observationKey: string; taskId: string | null; origin: TaskOrigin; workerId: string; jobId: string; targetId: string;
   tool: AgentToolActivity; observedAt: string; waitingMs: number;
 }
+export interface WorkerPolicyReport {
+  origin: TaskOrigin; workerId: string; jobId: string; taskId: string; taskTitle: string;
+}
 export interface ControllerRuntimeCallbacks {
   targetCatalog?: ControllerTargetCatalog;
   onCheckCapabilities?: (workspace: string, args: { targetId?: string; agent?: AgentName; capabilityId?: string; refresh?: boolean }) => Promise<unknown>;
   onRequestRestart?: (origin: TaskOrigin) => Promise<unknown>;
   isDraining?: () => boolean;
   onCompletion?: (event: TaskCompletionEvent) => void | Promise<void>;
+  onPolicyReport?: (report: WorkerPolicyReport) => void | Promise<void>;
   onSupplementFailure?: (supplement: ControllerSupplement) => boolean | void | Promise<boolean | void>;
   onCountChanged?: (conversationId: string, count: number) => void | Promise<void>;
   onWorkCountsChanged?: (counts: WorkCounts) => void | Promise<void>;
