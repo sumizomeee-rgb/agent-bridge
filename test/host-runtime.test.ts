@@ -106,7 +106,7 @@ async function eventual(check: () => boolean, label: string): Promise<void> {
   for (let tick = 0; tick < 3000; tick++) { if (check()) return; await nextImmediate(); }
   assert.fail(`No progress: ${label}`);
 }
-function fixture(t: TestContext, options: { initialized?: string[]; unowned?: string[]; run?: TurnHandler; platform?: 'feishu' | 'discord'; internalBotCommunicationEnabled?: boolean } = {}) {
+function fixture(t: TestContext, options: { initialized?: string[]; unowned?: string[]; run?: TurnHandler; platform?: 'feishu' | 'discord'; internalBotCommunicationEnabled?: boolean; maxCalls?: number } = {}) {
   const path = mkdtempSync(join(tmpdir(), 'bridge-host-runtime-test-'));
   const platform = options.platform ?? 'feishu', ids = platform === 'feishu' ? [A, B] : [D1, D2], primary = ids[0]!;
   const ownerId = (index: number) => platform === 'feishu' ? `owner-${index}` : '333333333333333333';
@@ -156,7 +156,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
     const adapter: AgentAdapter = {
       async run(turn) {
         calls.push({ botId, turn });
-        if (calls.length > 80) throw new Error('test guard: automatic discussion failed to terminate');
+        if (calls.length > (options.maxCalls ?? 80)) throw new Error('test guard: automatic discussion failed to terminate');
         await handler(botId, turn);
         return { nativeId: turn.conversation.nativeId ?? `native-${botId}`, text: '', controlledOutput: true };
       }, async interrupt() {}, async close() {}, async confirmStopped() { return true; },
@@ -1474,15 +1474,30 @@ test('observer membership proof cannot cross a group stop or binding replacement
   assert.equal(f.host.store.readContext(G1, A).recent.length, 0);
 });
 
-test('private default scene sees active group observer evidence without granting its sender authority', async t => {
-  const f = fixture(t); await f.activate();
+test('87 private turns never inject stored group history or wake extra controllers; real owner group events still carry the observer scene', async t => {
+  const f = fixture(t, { maxCalls: 100 }); await f.activate();
   const source = f.message(A, 'observer-before-private', 'recent group discussion'); source.userId = `${A}|guest`;
   await f.host.receive(A, source); await f.drain();
-  let scene: any;
-  f.run(async (_id, turn) => { scene = JSON.parse(turn.chatScene!); await turn.onPublicMessage?.('seen'); });
-  await f.managers.get(A)!.handle({ id: 'private-observer-question', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|owner-dm`, text: '群里在聊什么', imagePaths: [] });
-  await f.drain(); assert.equal(scene.records[0].text, source.text); assert.equal(scene.records[0].canAuthorize, false);
-  assert.equal(scene.records[0].spaceId, G1); assert.equal(scene.audience, 'only this Bot owner in this private conversation');
+  assert.equal(f.calls.length, 0);
+  const privateTurns: AgentTurn[] = [];
+  let membershipChecks = 0;
+  f.groupChecks.set(A, async () => { membershipChecks++; return true; });
+  f.groupChecks.set(B, async () => { membershipChecks++; return true; });
+  f.run(async (_id, turn) => { privateTurns.push(turn); await turn.onPublicMessage?.('private received'); });
+  for (let n = 0; n < 87; n++) {
+    const id = n % 2 ? B : A, config = f.configs.find(value => value.botId === id)!;
+    await f.managers.get(id)!.handle({ id: 'private-without-group-' + n, userId: config.ownerUserId!, channelId: `${id}|owner-dm`, text: '继续当前私聊', imagePaths: [] });
+    await f.drain();
+  }
+  assert.equal(privateTurns.length, 87); assert.equal(f.calls.length, 87);
+  for (const turn of privateTurns) { assert.equal(turn.chatScene, undefined); assert.equal(turn.groupContext, undefined); }
+  assert.equal(membershipChecks, 0); assert.equal(f.host.store.listEvents().length, 0);
+  assert(f.host.store.readContext(G1, A).unread.some(record => record.text === source.text));
+  const groupScenes: any[] = [];
+  f.run(async (_id, turn) => { assert(turn.groupContext); groupScenes.push(JSON.parse(turn.chatScene!)); await turn.onSilent!(); });
+  await f.host.receive(A, f.message(A, 'owner-after-private', '看看本群刚才讨论', G1, [A])); await f.drain();
+  assert.equal(groupScenes.length, 2);
+  for (const scene of groupScenes) assert(scene.conversationEvidence.recent.some((record: any) => record.text === source.text));
 });
 
 test('history tool returns all authors as evidence with opaque pagination and no replay side effects', async t => {
@@ -1521,17 +1536,24 @@ test('history tool rejects changed binding and cross-Bot cursor reuse without pl
 });
 
 
-test('private default scene includes confirmed Bot group publications with separate sequence and unknown time evidence', async t => {
+test('private turns omit Bot group publications and can explicitly read authorized group history without creating group events', async t => {
   const f = fixture(t); await f.activate();
   f.run(async (id, turn) => { if (id === A && turn.groupContext && turn.source?.original?.authorType !== 'system') await turn.onPublicMessage?.('Teto group progress'); else await turn.onSilent?.(); });
   await f.host.receive(A, f.message(A, 'publish-before-private', 'report progress', G1, [A])); await f.drain();
-  let scene: any;
-  f.run(async (_id, turn) => { scene = JSON.parse(turn.chatScene!); await turn.onPublicMessage?.('private received'); });
+  const eventsBefore = f.host.store.listEvents().length;
+  let history: any;
+  f.conversationHistories.set(A, async (raw, options) => historyPage(raw, options, [{ id: 'published-progress', author: { id: A, type: 'bot' },
+    time: '2026-10-29T04:00:00Z', text: 'Teto group progress', mentions: [], attachments: [] }], false));
+  f.run(async (id, turn) => {
+    assert.equal(turn.chatScene, undefined); assert.equal(turn.groupContext, undefined);
+    const targets = await f.host.invoke(id, turn, 'bridge_delivery_targets', {}) as any;
+    history = await f.host.invoke(id, turn, 'bridge_read_group_history', { targetId: targets.targets.find((target: any) => target.spaceId === G1).targetId });
+    await turn.onPublicMessage!('private received');
+  });
   await f.managers.get(A)!.handle({ id: 'private-after-publication', userId: f.configs[0]!.ownerUserId!, channelId: `${A}|owner-dm`, text: '群里进展', imagePaths: [] });
   await f.drain();
-  assert.equal(scene.publicProgress[0].text, 'Teto group progress'); assert.equal(scene.publicProgress[0].authorBotId, A);
-  assert.equal(scene.publicProgress[0].canAuthorize, false); assert.equal(scene.publicProgress[0].sequenceNamespace, 'host_public_log');
-  assert.equal(scene.publicProgress[0].time, null); assert(scene.records.length + scene.publicProgress.length <= 40);
+  assert.equal(history.messages[0].text, 'Teto group progress'); assert.equal(history.evidenceOnly, true);
+  assert.equal(f.host.store.listEvents().length, eventsBefore);
 });
 
 

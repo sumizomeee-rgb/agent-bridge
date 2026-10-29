@@ -607,32 +607,17 @@ test('merged and steered inputs retain each real source instead of relabeling th
   f.codex.finish(0); await waitFor(() => f.sink.replies.some(item => item.text.startsWith('[Codex')));
 });
 
-test('private turns automatically receive active-group scene while keeping native continuity and original reply address', async t => {
+test('private turns omit group scene while keeping native continuity and original reply address', async t => {
   const f = fixture(t); await f.manager.close();
-  const seen: { source: NonNullable<AgentTurn['source']>; nativeId: string | null }[] = [];
-  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink, { mergeDelayMs: 0,
-    onConversationScene: async (conversation, source, signal) => { assert.equal(signal.aborted, false); seen.push({ source, nativeId: conversation.nativeId }); return JSON.stringify({ groups: [{ spaceId: 'g', recent: [{ author: 'non-owner', text: '讨论材料' }] }] }); },
-  });
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink, { mergeDelayMs: 0 });
   await f.manager.handle(message('scene-private-1', '那个群在聊什么'));
   await waitFor(() => f.sink.replies.length === 1);
   await f.manager.handle(message('scene-private-2', '继续'));
   await waitFor(() => f.sink.replies.length === 2);
-  assert.equal(seen.length, 2); assert.equal(seen[0]!.source.channelId, 'dm-u1');
-  assert.equal(seen[0]!.nativeId, null); assert.equal(seen[1]!.nativeId, f.codex.result(f.codex.calls[0]!).nativeId);
-  assert.match(f.codex.calls[0]!.chatScene!, /non-owner/); assert.match(f.codex.calls[1]!.chatScene!, /讨论材料/);
+  assert.equal(f.codex.calls.length, 2);
+  assert.equal(f.codex.calls[0]!.chatScene, undefined); assert.equal(f.codex.calls[1]!.chatScene, undefined);
+  assert.equal(f.codex.calls[0]!.source?.channelId, 'dm-u1');
+  assert.equal(f.codex.calls[1]!.conversation.nativeId, f.codex.result(f.codex.calls[0]!).nativeId);
   assert.equal(f.codex.calls[0]!.conversation.id, f.codex.calls[1]!.conversation.id);
   assert.ok(f.sink.replies.every(item => item.channelId === 'dm-u1'));
-});
-
-test('scene acquisition cannot dispatch a stale controller turn after shutdown', async t => {
-  const f = fixture(t); await f.manager.close();
-  let release!: (scene: string) => void, acquiring = false;
-  const scene = new Promise<string>(resolve => { release = resolve; });
-  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink, { mergeDelayMs: 0,
-    onConversationScene: async () => { acquiring = true; return scene; },
-  });
-  await f.manager.handle(message('scene-cancel', '了解当前群'));
-  await waitFor(() => acquiring);
-  const closing = f.manager.close(); release('{"groups":[]}'); await closing;
-  assert.equal(f.codex.calls.length, 0);
 });

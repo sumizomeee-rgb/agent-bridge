@@ -45,7 +45,6 @@ interface AgentSwitchJournal {
 }
 export type GroupTurnContext = NonNullable<AgentTurn['groupContext']>;
 export interface SessionManagerOptions {
-  onConversationScene?: (conversation: Conversation, source: NonNullable<AgentTurn['source']>, signal: AbortSignal) => Promise<string>;
   binding?: ControllerBinding; authorizeUser?: (userId: string) => boolean;
   onGroupTurnError?: (context: GroupTurnContext) => Promise<boolean>;
   onGroupTurnStart?: (context: GroupTurnContext) => Promise<string>;
@@ -1278,7 +1277,7 @@ export class SessionManager {
         if (privateControllerInput) this.store.startPrivateBatch(item.id);
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
         if (!current()) throw new Error('消息轮次已经停止');
-        const chatScene = groupContext?.scene ?? await this.options.onConversationScene?.(target, this.turnSource(item), controller.signal);
+        const chatScene = groupContext?.scene;
         if (!current()) throw new Error('消息轮次已经停止');
         const context = this.options.taskRegistry?.createContext({
           conversationId, userId: item.userId, channelId: item.channelId, originMessageId: item.id,

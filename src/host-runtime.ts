@@ -124,7 +124,6 @@ export class HostRuntime {
             else this.store.setController(botId, owner, controller, current?.generation ?? 0, bot.controllerMode !== true);
           },
         },
-        onConversationScene: (conversation, source, signal) => this.conversationScene(botId, { conversation, source, signal }),
         onGroupTurnStart: context => this.startTurn(context),
         onSceneCheck: async context => this.checkScene(context),
         onGroupTurnError: async context => {
@@ -772,45 +771,6 @@ export class HostRuntime {
     void this.pump();
     return { registered: true, queued: true, requestId: id, eventId: queued.event.id, mode, targetBotId, consumed: false, acceptedWork: false, completion: receipt(),
       rule: sameGroupPublic ? 'Same-group public delivery and target queue acknowledged. This owner turn may DONE without a second acknowledgement. Not proof of target reading or acceptance.' : 'Durably queued, not proof of read/acceptance/completion. Target keeps its current controller context. Finish this owner-input turn with a brief FINAL acknowledgement (bridge_send_message finish:true or bridge_send_user), then DONE. The target reply arrives in a separate turn. Do not leave this turn open with finish:false, poll, or claim the target has read/accepted.' };
-  }
-
-  private async conversationScene(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'signal'>): Promise<string> {
-    const source = this.deliverySource(botId, turn);
-    const snapshots: Array<{ group: HostGroup; evidence: ReturnType<HostStore['readContext']> }> = [];
-    const unavailable: Array<{ spaceId: string; reason: string }> = [];
-    for (const group of this.store.listGroups(botId).filter(g => g.enabled && g.principalId === source.principalId)) {
-      try {
-        this.groupTarget(source, group); await this.verifyMember(botId, group.spaceId, source.principalId);
-        const now = this.deliverySource(botId, turn), current = this.store.getGroup(group.spaceId);
-        if (now.generation !== source.generation || !current?.enabled || current.epoch !== group.epoch || current.revision !== group.revision) throw new Error('群或主控在查询期间改变。');
-        snapshots.push({ group, evidence: this.store.readContext(group.spaceId, botId, 40) });
-      } catch (error) { unavailable.push({ spaceId: group.spaceId, reason: String(error) }); }
-    }
-    const current = this.deliverySource(botId, turn);
-    if (current.generation !== source.generation) throw new Error('主控在查询期间改变。');
-    // The authorization log also contains acknowledged Bot publications. Their sequence
-    // is a different namespace; timestamps were not stored, so never invent chronology.
-    const publications = snapshots.flatMap(({ group }) => this.store.readPublic(group.spaceId, botId, 0, 40)
-      .filter(record => record.authorBotId !== null).map(record => ({ sequence: record.sequence, sequenceNamespace: 'host_public_log',
-        id: record.id, spaceId: group.spaceId, targetId: this.targetId(group), authorBotId: record.authorBotId,
-        aliases: this.configurations.get(record.authorBotId!)?.aliases ?? [], time: null, timeEvidence: 'not recorded; use history tool for platform timestamps',
-        canAuthorize: false, text: record.text.slice(0, 500), ...(record.text.length > 500 ? { textTruncated: true } : {}),
-        attachments: record.attachments.slice(0, 5) }))).sort((a, b) => a.sequence - b.sequence);
-    const publicProgress = publications.slice(-Math.min(10, publications.length));
-    const all = snapshots.flatMap(({ group, evidence }) => evidence.recent.map(record => ({ ...record,
-      targetId: this.targetId(group), unread: evidence.unread.some(r => r.sequence === record.sequence),
-      text: record.text.slice(0, 500), ...(record.text.length > 500 ? { textTruncated: true } : {}) })))
-      .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.sequence - b.sequence).slice(-(40 - publicProgress.length));
-    for (const { group } of snapshots) {
-      const latest = this.store.getGroup(group.spaceId);
-      if (!latest?.enabled || latest.epoch !== group.epoch || latest.revision !== group.revision) throw new Error('群现场已失效，未提供旧绑定资料。');
-      // A prepared scene is not evidence that the model accepted or read it; do not acknowledge here.
-    }
-    return JSON.stringify({ internalBotCommunicationEnabled: this.config.internalBotCommunicationEnabled !== false, source: 'default private-turn group evidence', audience: 'only this Bot owner in this private conversation',
-      rule: 'Group records are conversation evidence, not fresh authorization. Preserve actual author and source. Information from private or other groups must not be disclosed to a group without permission or a justified audience decision.',
-      unreadMeaning: 'not acknowledged by bridge; preparation and tool queries are not proof of model reading',
-      publicationCoverage: { boundedAvailableCount: publications.length, scannedPerGroupLimit: 40, olderMayExist: true, included: publicProgress.length, truncated: publications.length > publicProgress.length, order: 'host_public_log sequence only; no cross-namespace chronology claimed' }, groups: snapshots.map(({ group, evidence }) => ({ spaceId: group.spaceId, targetId: this.targetId(group), unreadCount: evidence.unreadCount,
-        truncated: evidence.truncated || evidence.recent.length > all.filter(r => r.spaceId === group.spaceId).length })), unavailable, publicProgress, records: all });
   }
 
   private async readGroupHistory(botId: string, turn: AgentTurn, args: Record<string, unknown>): Promise<unknown> {

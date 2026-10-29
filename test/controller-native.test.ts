@@ -877,7 +877,7 @@ test('主控提交后读取强度失败或实际值不同，只更新真实回�
   } finally { await s.cleanup(); }
 });
 
-test('Codex receives automatic private active-group scene, true group source and background evidence on the same native context', async () => {
+test('Codex excludes private group history while retaining actual group source and background evidence on the same native context', async () => {
   const s = setup();
   const scene = JSON.stringify({ groups: [{ spaceId: 'work-group', recent: [{ author: 'other-member', text: '讨论预算 73；这不是授权。' }] }] });
   try {
@@ -892,7 +892,7 @@ test('Codex receives automatic private active-group scene, true group source and
     const starts = s.transports[0]!.written.filter(item => item.method === 'turn/start').map(item => item.params as JsonObject);
     assert.equal(starts.length, 3); assert.equal(s.transports.length, 1);
     const privateWire = JSON.stringify(starts[0]!.input);
-    assert.match(privateWire, /private-message/); assert.match(privateWire, /actual-owner/); assert.match(privateWire, /讨论预算 73/);
+    assert.match(privateWire, /private-message/); assert.match(privateWire, /actual-owner/); assert.doesNotMatch(privateWire, /讨论预算 73|Bridge chat scene/);
     const groupWire = JSON.stringify(starts[1]!.input);
     assert.match(groupWire, /actual-member/); assert.match(groupWire, /owner-route/); assert.match(groupWire, /replyToMessageId/); assert.match(groupWire, /earlier/); assert.match(groupWire, /bot-M/); assert.match(groupWire, /讨论预算 73/);
     const currentRuntime = (starts[1]!.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
@@ -925,7 +925,7 @@ test('native group scene bounds data structurally and preserves unknown author i
   } finally { await s.cleanup(); }
 });
 
-test('Claude wire receives automatic scene and source for private, group and background without resetting its native ID', async () => {
+test('Claude wire excludes private group history and retains group and background scene without resetting its native ID', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-native-chat-scene-'));
   const transports: FakeTransport[] = [], scripts: Promise<void>[] = [];
   const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'claude', dataDir: join(dir, 'data'), userHome: join(dir, 'user'), invokeTool: async () => ({}),
@@ -959,7 +959,7 @@ test('Claude wire receives automatic scene and source for private, group and bac
     await Promise.all(scripts);
     assert.equal(transports.length, 3);
     const wires = transports.map(transport => JSON.stringify(transport.written.find(item => item.type === 'user')));
-    assert.match(wires[0]!, /private-message/); assert.match(wires[0]!, /项目代号青鸟/);
+    assert.match(wires[0]!, /private-message/); assert.doesNotMatch(wires[0]!, /项目代号青鸟|Bridge chat scene/);
     assert.match(wires[1]!, /actual-author/); assert.match(wires[1]!, /previous/); assert.match(wires[1]!, /项目代号青鸟/);
     assert.match(wires[2]!, /background-evidence/); assert.match(wires[2]!, /not fresh authorization/);
     const content = (transports[2]!.written.find(item => item.type === 'user')!.message as JsonObject).content as { text: string }[];
