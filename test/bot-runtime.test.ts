@@ -9,12 +9,14 @@ import { fileURLToPath } from 'node:url';
 import { projectRoot } from '../src/config.js';
 import { BotRuntime, type BotRuntimeDependencies, type BotRuntimeHooks, type BotTransport } from '../src/bot-runtime.js';
 import { SessionStore } from '../src/store.js';
-import type { TaskCompletionEvent } from '../src/tasks.js';
+import { TaskRegistry, type TaskCompletionEvent, type TaskContextFile } from '../src/tasks.js';
+import { MetadataProbeError } from '../src/agents/metadata.js';
 import type { PlatformTransport } from '../src/platform.js';
 import type { BridgeLifecycleEvent } from '../src/lifecycle.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from '../src/types.js';
 import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
 import { acquireInstanceLock } from '../src/instance-lock.js';
+import { createHash } from 'node:crypto';
 
 const rawUser = '234567890123456789', rawChannel = '345678901234567890';
 let serial = 0;
@@ -285,4 +287,161 @@ test('旧误登记群游标不会走DM历史或附件准备，也不成为启动
   f.bot.ingress.capture(legacy); await f.bot.verify(); await f.bot.start(); await f.bot.ingress.whenIdle();
   assert.equal(f.transport.histories.length, 0); assert.equal(f.transport.downloads.length, 0); assert.equal(f.controllers.codex.turns.length, 0);
   await f.bot.publishReadyLifecycle(); assert.equal(f.transport.lifecycle.find(event => event.phase === 'ready')!.recipient, undefined);
+});
+
+test('事务巡视真实入口沿用默认助手，三平台只读摘要回主控，可静默且new后保留', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  assert.equal(f.bot.housekeeper!.store.read(), null);
+  await f.transport.emit(f.message('100000000000000001', '建立当前主控'));
+  await until(() => !!f.bot.manager.currentConversation(f.config.ownerUserId!)?.nativeId && f.bot.manager.isIdle());
+  f.bot.controller!.store.setWorkerDefault('local', { kind: 'ordinary', agent: 'codex', model: 'offline-model', effort: null });
+  const transactionRoot = join(f.config.workspace, 'bridge-transaction-sync'); mkdirSync(join(transactionRoot, 'sources'), { recursive: true });
+  const entries = ['feishu', 'chatgpt', 'bilibili'].map(site => ({ site, manifest: `sources/${site}/data.json`, timezone: 'UTC' }));
+  writeFileSync(join(transactionRoot, 'index.json'), JSON.stringify({ schema: 'bridge-transaction-source-index', version: 1, sources: entries }));
+  let reads = 0, issuedFollowups = false;
+  const followupTurns: AgentTurn[] = [];
+  const followupHandles: Array<{ workerId: string; jobId: string }> = [];
+  const controllerRun = f.controllers.codex.run.bind(f.controllers.codex);
+  f.controllers.codex.run = async turn => {
+    if (turn.event?.text.includes('B站：仅观看记录') && !issuedFollowups) {
+      issuedFollowups = true;
+      followupHandles.push(await f.invoke(turn, 'bridge_start_worker', { title: '管家判断后的普通跟进', prompt: 'FOLLOWUP_NOW：仅执行已授权的后续核查' }, 'housekeeper-followup') as { workerId: string; jobId: string });
+      await f.invoke(turn, 'bridge_schedule_worker', { title: '管家预约的普通跟进', prompt: 'FOLLOWUP_SCHEDULED：核对新进展', afterSeconds: 60 }, 'housekeeper-followup-plan');
+      await f.invoke(turn, 'bridge_schedule_controller', { title: '管家预约复核', text: 'HOUSEKEEPER_REASSESS：复核任务进展', afterSeconds: 60 }, 'housekeeper-reassess-plan');
+    }
+    return controllerRun(turn);
+  };
+  f.execution.codex.run = async turn => {
+    assert.equal(turn.conversation.model, 'offline-model');
+    const nativeId = 'worker-' + turn.conversation.id; turn.onNativeId?.(nativeId);
+    if (turn.conversation.title === '事务同步摘要') {
+      reads++; assert.equal(turn.readOnly, true);
+      const input = JSON.parse(readFileSync(f.bot.housekeeper!.store.read()!.run!.inputPath, 'utf8'));
+      assert.deepEqual(input.sources.map((source: { site: string }) => source.site).sort(), ['bilibili', 'chatgpt', 'feishu']);
+      assert(input.sources.every((source: { records: unknown[] }) => source.records.length === 1));
+      return { nativeId, text: '飞书：范围明确。GPT：保留纠正。B站：仅观看记录。' };
+    }
+    followupTurns.push(turn); assert.notEqual(turn.readOnly, true, '主控后续执行助手不能继承只读摘要职责');
+    return { nativeId, text: turn.text.includes('FOLLOWUP_SCHEDULED') ? '预约跟进已核查' : '即时跟进已核查' };
+  };
+  const housekeeperCallbacks = (f.bot.housekeeper as unknown as { callbacks: { isPaused(): boolean } }).callbacks;
+  const originalIsPaused = housekeeperCallbacks.isPaused;
+  // Hold only this test's scheduler while publishing its three fixtures. A real timer may otherwise
+  // correctly scan the first completed platform before the remaining manifests have been written.
+  housekeeperCallbacks.isPaused = () => true;
+  t.after(() => { housekeeperCallbacks.isPaused = originalIsPaused; });
+  await f.transport.emit(f.message('100000000000000002', '/housekeeper on'));
+  await until(() => f.bot.housekeeper!.store.read()?.enabled === true);
+  const began = f.bot.housekeeper!.store.read()!;
+  // New publications arrive after the enable command; the same scan path handles every round.
+  for (const { site } of entries) {
+    const value = { schema: 'cookiesync-content-batch', version: 1, source: site, item_id: site + '-item', created_at: Date.now() / 1000,
+      records: [{ identity: site + '-1', scope: 'scope', revision: 'r1', operation: 'upsert', occurred_at: Date.now() / 1000,
+        text: site + ' real input', data: { role: 'user', record_kind: 'message', sender: { name: 'Owner' } } }] };
+    const body = JSON.stringify(value), sha256 = createHash('sha256').update(body).digest('hex'), folder = 'batch-' + sha256.slice(0, 12);
+    const dir = join(transactionRoot, 'sources', site, folder); mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, 'records.json'), body);
+    writeFileSync(join(transactionRoot, 'sources', site, 'data.json'), JSON.stringify({ schema: 'cookiesync-delivery-state', version: 2,
+      items: { item: { source: site, item_id: site + '-item', batches: [{ folder, sha256 }] } } }));
+  }
+  housekeeperCallbacks.isPaused = originalIsPaused;
+  await f.bot.housekeeper!.poll();
+  await until(() => f.controllers.codex.turns.some(turn => turn.event?.text.includes('B站：仅观看记录')) && f.bot.manager.isIdle()).catch(error => {
+    t.diagnostic(f.bot.housekeeper!.status());
+    t.diagnostic(JSON.stringify(f.bot.controller!.store.jobs().map(job => ({ status: job.status, error: job.executionError, purpose: job.origin.purpose }))));
+    throw error;
+  });
+  await f.bot.housekeeper!.poll();
+  const acknowledged = f.bot.housekeeper!.store.read()!; assert(acknowledged.cursor); assert(!acknowledged.run);
+  assert.equal(reads, 1); assert.equal(f.transport.sent.filter(message => message.text.includes('B站：仅观看记录')).length, 0, '主控静默不转发内部摘要');
+  await until(() => f.controllers.codex.turns.some(turn => turn.event?.text.includes('即时跟进已核查')) && f.bot.manager.isIdle());
+  assert.equal(followupHandles.length, 1);
+  const followup = f.bot.controller!.store.getWorker(followupHandles[0]!.workerId)!;
+  assert.equal(followup.origin.housekeeperAuthorization, true); assert.notEqual(followup.origin.purpose, 'housekeeper');
+  const plans = f.bot.controller!.store.schedules(); assert.equal(plans.length, 2);
+  for (const plan of plans) {
+    assert.equal(plan.origin.housekeeperAuthorization, true); assert.equal(plan.origin.purpose, 'schedule');
+    plan.dueAt = new Date(Date.now() - 1000).toISOString(); f.bot.controller!.store.saveSchedule(plan);
+  }
+  await f.bot.controller!.poll();
+  await until(() => f.controllers.codex.turns.some(turn => turn.event?.text.includes('预约跟进已核查'))
+    && f.controllers.codex.turns.some(turn => turn.event?.text.includes('HOUSEKEEPER_REASSESS')) && f.bot.manager.isIdle());
+  assert.equal(followupTurns.length, 2);
+  assert(f.controllers.codex.turns.filter(turn => turn.event?.text.includes('已核查') || turn.event?.text.includes('HOUSEKEEPER_REASSESS'))
+    .every(turn => turn.conversation.id === followup.origin.conversationId), '完成结果和预约仍回到当前主控');
+  const controllerTurns = f.controllers.codex.turns.length;
+  await f.transport.emit(f.message('100000000000000003', '/housekeeper status'));
+  assert.equal(f.controllers.codex.turns.length, controllerTurns, '查状态不启动模型');
+  const beforeNew = f.bot.manager.currentConversation(f.config.ownerUserId!)!.id;
+  await f.transport.emit(f.message('100000000000000004', '/new'));
+  await until(() => f.bot.manager.currentConversation(f.config.ownerUserId!)?.id !== beforeNew && !!f.bot.manager.currentConversation(f.config.ownerUserId!)?.nativeId && f.bot.manager.isIdle());
+  assert.equal(f.bot.housekeeper!.store.read()!.enabledAt, began.enabledAt);
+  assert.deepEqual(f.bot.housekeeper!.store.read()!.cursor, acknowledged.cursor);
+  await f.transport.emit(f.message('100000000000000005', '/housekeeper off'));
+  await until(() => f.bot.housekeeper!.store.read()!.enabled === false);
+  assert.equal(f.bot.housekeeper!.store.read()!.enabled, false);
+  await f.transport.emit(f.message('100000000000000006', '/housekeeper on'));
+  await until(() => f.bot.housekeeper!.store.read()!.enabled === true);
+  await f.transport.emit(f.message('100000000000000007', '/stop'));
+  await until(() => f.bot.housekeeper!.store.read()!.enabled === false && f.bot.manager.isIdle());
+  assert.equal(f.bot.housekeeper!.store.read()!.enabled, false, 'stop停止本Bot的主动巡视');
+});
+
+test('真实完成回调仅对已确认退出且未提交的元数据失败提供管家重试证明', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  const input = f.message('100000000000000001', '建立失败回执核对会话');
+  await f.transport.emit(input);
+  await until(() => !!f.bot.manager.currentConversation(f.config.ownerUserId!)?.nativeId && f.bot.manager.isIdle());
+  const conversation = f.bot.manager.currentConversation(f.config.ownerUserId!)!;
+  const initialRun = f.controllers.codex.run.bind(f.controllers.codex);
+  const cases = [
+    { name: '已退出的独立元数据前置检查', error: new MetadataProbeError(new Error('model list failed'), true), safe: true, submitted: false },
+    { name: '常规未知失败', error: new Error('unknown controller failure'), safe: false, submitted: false },
+    { name: '元数据进程退出未确认', error: new MetadataProbeError(new Error('probe exit unknown'), false), safe: false, submitted: false },
+    { name: '主控已经提交但最终结果未知', error: new Error('accepted controller turn failed'), safe: false, submitted: true },
+  ];
+  for (const item of cases) await t.test(item.name, async () => {
+    let calls = 0;
+    f.controllers.codex.run = async turn => {
+      if (!turn.event) return initialRun(turn);
+      calls++;
+      if (item.submitted) turn.onControllerState?.({ attempt: 1, phase: 'accepted', submission: 'accepted' });
+      throw item.error;
+    };
+    const created = f.bot.tasks.createContext({ conversationId: conversation.id, userId: conversation.userId,
+      channelId: input.channelId, originMessageId: input.id, agent: conversation.agent, nativeId: conversation.nativeId, cwd: conversation.cwd });
+    const capability = JSON.parse(readFileSync(created.contextPath, 'utf8')) as TaskContextFile;
+    const task = f.bot.tasks.register(capability, '失败分类：' + item.name);
+    f.bot.tasks.acceptObservedResult(task.taskId, 'completed', '已完成的真实任务登记回文');
+    f.bot.tasks.closeContext(created.contextId);
+    const event = f.bot.tasks.queuedEvents().find(value => value.taskId === task.taskId)!;
+    assert(event, '完成事件须经真实任务表登记');
+    f.bot.manager.completionAvailable();
+    await until(() => f.bot.tasks.eventState(event.id) === 'uncertain' && f.bot.manager.isIdle());
+    assert.equal(calls, 1, '失败回调不得自行重放主控输入');
+    const persisted = new TaskRegistry(f.config.dataDir);
+    let reason: { stage?: string; submitted?: boolean; processStopped?: boolean };
+    try {
+      assert.equal(persisted.eventState(event.id), 'uncertain');
+      assert.equal(persisted.eventReason(event.id), f.bot.tasks.eventReason(event.id));
+      reason = JSON.parse(persisted.eventReason(event.id)!);
+    } finally { persisted.close(); }
+    const receipt = f.bot.manager.housekeeperEventReceipt(event.id);
+    assert.equal(receipt.state, 'uncertain'); assert.equal(receipt.processed, false);
+    assert.equal(receipt.safeToRetry, item.safe ? true : undefined);
+    if (item.error instanceof MetadataProbeError) {
+      assert.equal(reason.stage, 'preparation'); assert.equal(reason.submitted, false);
+      assert.equal(reason.processStopped, item.error.processStopped);
+    } else {
+      assert.notEqual(reason.stage, 'preparation');
+      assert.notEqual(reason.submitted, false, '未知或已提交的失败不能被当作未提交证明');
+    }
+    if (item.safe) {
+      const known = new SessionStore(f.config.dataDir);
+      try { known.saveTurnResult(event.id, conversation.id, { nativeId: conversation.nativeId!, text: '另已保存的结果', controlledOutput: true }); }
+      finally { known.close(); }
+      const afterSavedResult = f.bot.manager.housekeeperEventReceipt(event.id);
+      assert.equal(afterSavedResult.processed, true); assert.equal(afterSavedResult.safeToRetry, undefined,
+        '即使前置失败原因仍在，已保存结果也禁止自动重试');
+    }
+  });
 });

@@ -45,6 +45,7 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
     }
   };
   collect('dist/src');
+  collect('harness');
   // Include the dependencies reachable from the executor, not platform credentials or user files.
   const packages = new Set<string>();
   const include = (name: string): void => {

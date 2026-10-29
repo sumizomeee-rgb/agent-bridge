@@ -91,7 +91,7 @@ test('fast 原生菜单与文本参数一致，非法值拒绝', () => {
 });
 
 test('native registry contains the supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'default', 'presetlist', 'workers', 'stop', 'restart', 'help']);
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'default', 'presetlist', 'housekeeper', 'tasks', 'workers', 'stop', 'restart', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);
@@ -515,4 +515,34 @@ test('预设别名速查仅注册一个私聊入口，旧presets及all菜单已�
   assert.deepEqual(slashText({ name: 'presetlist' }), { text: '/presetlist' });
   assert('error' in slashText({ name: 'presets' }));
   assert('error' in slashText({ name: 'presetlist', options: [{ name: 'all', type: 5, value: true }] }));
+});
+
+test('housekeeper menu and encoding expose only on/off/status in private chats', () => {
+  const menu = SLASH_COMMANDS.find(command => command.name === 'housekeeper')!;
+  assert(menu); assert.deepEqual(menu.contexts, [1]);
+  assert.equal(menu.options!.length, 1); assert.equal(menu.options![0]!.name, 'action');
+  assert.equal(menu.options![0]!.type, 3); assert.notEqual(menu.options![0]!.required, true);
+  assert.deepEqual(menu.options![0]!.choices!.map(choice => choice.value), ['on', 'off', 'status']);
+  assert.deepEqual(result('housekeeper'), { text: '/housekeeper status' });
+  for (const action of ['on', 'off', 'status']) {
+    assert.deepEqual(result('housekeeper', [option('action', action)]), { text: '/housekeeper ' + action });
+    assert('error' in slashText({ name: 'housekeeper', type: 1, options: [option('action', action)] }, 'group'));
+  }
+  assert('error' in result('housekeeper', [option('action', 'restart')]));
+  assert('error' in result('housekeeper', [option('action', true)]));
+  assert('error' in result('housekeeper', [option('action', 'on'), option('action', 'off')]));
+  assert.equal(GROUP_SLASH_COMMANDS.some(command => command.name === 'housekeeper'), false);
+  assert.equal(GROUP_SLASH_COMMANDS.some(command => command.name === 'tasks'), false);
+  assert.deepEqual(result('tasks'), { text: '/tasks' });
+  assert.deepEqual(result('tasks', [option('args', 'all 2')]), { text: '/tasks all 2' });
+});
+
+test('real housekeeper private slash interactions ACK and forward each supported action', async t => {
+  const f = await fixture(t);
+  f.dispatch({ data: { name: 'housekeeper', type: 1 } });
+  for (const action of ['on', 'off', 'status']) f.dispatch({ data: { name: 'housekeeper', type: 1, options: [option('action', action)] } });
+  await until(() => f.received.length === 4);
+  assert.deepEqual(f.received.map(message => message.text), ['/housekeeper status', '/housekeeper on', '/housekeeper off', '/housekeeper status']);
+  assert.equal(f.callbacks().length, 4); assert(f.callbacks().every(request => request.body.type === 5));
+  assert(f.received.every(message => message.channelId === '222' && message.userId === '111' && message.interaction));
 });

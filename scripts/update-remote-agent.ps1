@@ -18,7 +18,7 @@ try {
  $candidate=Join-Path $data ('releases\'+$Release)
  # Only an immutable, checked release directory receives extracted program files.
  $entries=@(& tar -tzf $archive|ForEach-Object {$_ -replace '^\./',''});if($LASTEXITCODE -ne 0){throw 'Cannot list release archive'}
- if($entries | Where-Object {$_ -and ($_ -match '(^[/\\]|^[A-Za-z]:|(^|[/\\])\.\.([/\\]|$))' -or $_ -notmatch '^(dist/|node_modules/|scripts/|package.json$|release.json$)')}){throw 'Unsafe archive entries'}
+ if($entries | Where-Object {$_ -and ($_ -match '(^[/\\]|^[A-Za-z]:|(^|[/\\])\.\.([/\\]|$))' -or $_ -notmatch '^(dist/|harness/|node_modules/|scripts/|package.json$|release.json$)')}){throw 'Unsafe archive entries'}
  New-Item -ItemType Directory -Force -Path $candidate|Out-Null
  & tar -xzf $archive -C $candidate;if($LASTEXITCODE -ne 0){throw 'Release extraction failed'}
  & $NodePath $helper verify $resolvedRoot $ExpectedHostname $Release|Out-Null;if($LASTEXITCODE -ne 0){throw 'Release verification failed'}

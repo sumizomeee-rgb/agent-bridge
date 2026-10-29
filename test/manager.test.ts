@@ -426,6 +426,39 @@ test('/stop 清空队列但保留会话和已及时保存的 nativeId', async t 
   assert.equal(f.codex.calls.length, 2);
 });
 
+test('/stop 遇事务摘要取消失败仍停止主控和其他助手，并保留巡视关闭状态与原错误', async t => {
+  const f = fixture(t, false); await f.manager.close(); f.config.controllerMode = true;
+  let housekeeperEnabled = true;
+  const stoppedConversations: string[] = [];
+  f.manager = new SessionManager(f.config, { codex: f.codex, claude: f.claude }, f.sink, {
+    mergeDelayMs: 0,
+    async onHousekeeper(_message, action) {
+      assert.equal(action, 'off');
+      assert.equal(f.codex.calls[0]!.signal.aborted, true, '主控取消应先于可能失败的摘要停机');
+      housekeeperEnabled = false;
+      throw Object.assign(new Error('摘要进程停止尚未确认'), { processStillRunning: true });
+    },
+    async onStop(conversationId) {
+      assert.equal(housekeeperEnabled, false);
+      assert.equal(f.codex.calls[0]!.signal.aborted, true);
+      stoppedConversations.push(conversationId);
+    },
+  });
+  await f.manager.handle(message('housekeeper-stop-running', '继续当前工作'));
+  await waitFor(() => f.codex.calls.length === 1);
+  const conversationId = f.codex.calls[0]!.conversation.id;
+  await f.manager.handle(message('housekeeper-stop-failed', '/stop'));
+  await waitFor(() => f.codex.interrupts.includes(conversationId));
+  assert.deepEqual(stoppedConversations, [conversationId]); assert.equal(housekeeperEnabled, false);
+  const inspect = new SessionStore(f.config.dataDir);
+  try {
+    assert.equal(inspect.getMessage('housekeeper-stop-failed')!.state, 'failed');
+    const feedback = inspect.feedback.read({ conversationId, userId: 'u1', channelId: 'dm-u1', nativeId: inspect.getActive('u1')!.nativeId }, { includeDelivered: true });
+    assert(feedback.records.some(item => item.sourceId === 'housekeeper-stop-failed' && item.reason.includes('摘要进程停止尚未确认')));
+  } finally { inspect.close(); }
+  f.codex.finish(0, '取消后的结果不应发布');
+});
+
 test('/cwd 新建会话，已有会话目录保持原值', async t => {
   const f = fixture(t);
   const other = join(f.root, 'other workspace');

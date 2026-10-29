@@ -69,6 +69,27 @@ try {
         }
     }
 
+    # README 的行为文案来自版本化提示词表；此生成器仍不依赖 Node 或第三方 TOML 库。
+    $renderedReadme = $null
+    if (![IO.File]::Exists((Join-Path $workspace 'README.md'))) {
+        $readmeTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'README.md'), [Text.Encoding]::UTF8)
+        $token = '{{harness.workspace.proactive_followup}}'
+        $catalogPath = Join-Path $PSScriptRoot 'harness\prompts.toml'
+        if (![IO.File]::Exists($catalogPath) -or ([IO.FileInfo]$catalogPath).Length -gt 524288) {
+            throw '缺少或超限的提示词配置：harness/prompts.toml'
+        }
+        $catalogText = [IO.File]::ReadAllText($catalogPath, [Text.Encoding]::UTF8)
+        $entry = [Regex]::Match($catalogText, '(?ms)^\[prompts\."workspace\.proactive_followup"\]\r?\n(?<entry>.*?)(?=^\[prompts\.|\z)')
+        $body = [Regex]::Match($entry.Groups['entry'].Value, "(?s)text = '''\r?\n(?<text>.*?)'''")
+        if (!$entry.Success -or !$body.Success -or [string]::IsNullOrWhiteSpace($body.Groups['text'].Value) -or !$readmeTemplate.Contains($token)) {
+            throw 'README 主动跟进提示词或模板占位符无效。'
+        }
+        $crlf = [string]::Concat([char]13, [char]10)
+        $newline = if ($readmeTemplate.Contains($crlf)) { $crlf } else { [string][char]10 }
+        $bodyText = $body.Groups['text'].Value -replace '\r?\n', $newline
+        $renderedReadme = $readmeTemplate.Replace($token, $bodyText)
+    }
+
     $privateRoot = Join-Path $workspace 'bridge-agent-presets\private'
     $protectPrivate = ![IO.Directory]::Exists($privateRoot)
     [void][IO.Directory]::CreateDirectory($workspace)
@@ -99,7 +120,13 @@ try {
         } else {
             # overwrite=false：即使有其他程序同时创建文件，也不会覆盖。
             [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
-            [IO.File]::Copy($source, $destination, $false)
+            if ($name -eq 'README.md') {
+                $bytes = [Text.UTF8Encoding]::new($false).GetBytes($renderedReadme)
+                $stream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+            } else {
+                [IO.File]::Copy($source, $destination, $false)
+            }
             Write-Host "生成：$name"
             $created++
         }

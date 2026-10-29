@@ -26,3 +26,22 @@ test('parity rejects stale source builds and edits during a run, including extra
   assert.throws(check.assertUnchanged, /Runtime changed/);
   await assert.rejects(verifyParity({ root, runDir: join(root, 'orphan'), compiler }), /Runtime differs/);
 });
+
+test('parity verifies runtime prompt assets against source and rejects prompt drift during a run', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'bridge-parity-prompts-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, 'source'), runtime = join(root, 'runtime');
+  const compiler = resolve(dirname(fileURLToPath(import.meta.url)), '../../node_modules/typescript/bin/tsc');
+  for (const folder of [join(source, 'src'), join(source, 'test'), join(source, 'harness'), join(runtime, 'harness')]) mkdirSync(folder, { recursive: true });
+  writeFileSync(join(source, 'src/main.ts'), 'export const value = 1;\n');
+  writeFileSync(join(source, 'tsconfig.json'), JSON.stringify({ compilerOptions: { rootDir: '.', outDir: join(runtime, 'dist'), types: [], skipLibCheck: true }, include: ['src/**/*.ts'] }));
+  for (const directory of [source, runtime]) writeFileSync(join(directory, 'harness/prompts.toml'), 'version = 1\n');
+  assert.equal(spawnSync(process.execPath, [compiler, '-p', join(source, 'tsconfig.json')], { windowsHide: true }).status, 0);
+  const check = await verifyParity({ root: runtime, sourceRoot: source, runDir: join(root, 'check'), compiler });
+  writeFileSync(join(runtime, 'harness/prompts.toml'), 'version = 2\n');
+  assert.throws(check.assertUnchanged, /Runtime changed/);
+  await assert.rejects(verifyParity({ root: runtime, sourceRoot: source, runDir: join(root, 'wrong-assets'), compiler }), /Runtime differs/);
+  writeFileSync(join(runtime, 'harness/prompts.toml'), 'version = 1\n');
+  writeFileSync(join(source, 'harness/prompts.toml'), 'version = 3\n');
+  assert.throws(check.assertUnchanged, /Source changed/);
+});

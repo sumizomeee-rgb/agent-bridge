@@ -18,7 +18,7 @@ test('只读Codex配置只继承模型路由，移除可写MCP、hooks和插件�
     assert.equal(filtered.sandbox_mode, 'read-only'); assert.equal(filtered.approval_policy, 'never');
     const features = filtered.features as Record<string, unknown>;
     assert.equal(features.hooks, false); assert.equal(features.plugins, false); assert.equal(features.multi_agent, false);
-    assert.equal(features.unified_exec, true); assert.equal(features.code_mode_host, false);
+    assert.equal(features.unified_exec, true); assert.equal(features.code_mode_host, true);
     assert.equal(readFileSync(join(runtime.env.CODEX_HOME!, 'auth.json'), 'utf8'), '{"fake":"credential"}');
     assert(existsSync(join(source, 'auth.json')));
   } finally { runtime.cleanup(); }

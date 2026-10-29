@@ -14,8 +14,10 @@ export interface TaskOrigin {
   /** Immutable original parent identities survive successive backend switches. */
   reboundFrom?: Array<{ conversationId: string; agent: AgentName; nativeId: string | null }>;
   /** Program-created internal workspace initialization, never a user/tool parameter. */
-  purpose?: 'workspace-context' | 'schedule' | 'host-event';
+  purpose?: 'workspace-context' | 'schedule' | 'host-event' | 'housekeeper';
   scheduleKind?: 'controller' | 'worker';
+  /** Minted only by the Bot's verified enable-command route; survives follow-up dispatch and scheduling. */
+  housekeeperAuthorization?: true;
 }
 /** Rebind only the parent identity. Audience, execution directory and frozen group evidence stay intact. */
 export function rebindTaskOrigin(origin: TaskOrigin, source: Conversation, target: Conversation): TaskOrigin {
@@ -429,6 +431,11 @@ export class TaskRegistry {
   }
   markUncertainNotified(id: string): void {
     for (const table of ['task_events', 'task_observations']) this.db.prepare(`UPDATE ${table} SET notice_sent=1,updated_at=? WHERE id=? AND state='uncertain'`).run(timestamp(), id);
+  }
+  /** Durable failure evidence is used only for proven pre-submission housekeeping retries. */
+  eventReason(id: string): string | null {
+    const row = this.db.prepare('SELECT reason FROM task_events WHERE id=?').get(id) ?? this.db.prepare('SELECT reason FROM task_observations WHERE id=?').get(id);
+    return row?.reason == null ? null : String(row.reason);
   }
   eventState(id: string): string | null {
     const row = this.db.prepare('SELECT state FROM task_events WHERE id=?').get(id) ?? this.db.prepare('SELECT state FROM task_observations WHERE id=?').get(id);

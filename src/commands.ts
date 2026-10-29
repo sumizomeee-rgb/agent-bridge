@@ -36,6 +36,9 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'string', name: 'args', description: 'agentworker [电脑ID] [follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]', min_length: 1, max_length: 400 },
   ] },
   { name: 'presetlist', help: '/presetlist：查看可派发预设的口语别名，一行一条', description: '可派发预设清单与别名速查' },
+  { name: 'housekeeper', contexts: ['dm'], help: '/housekeeper on|off|status：开启、关闭或查看事务巡视；默认关闭，每20分钟一次', description: '设置或查看当前 Bot 的事务巡视', options: [
+    { type: 'string', name: 'action', description: 'on 开启，off 关闭，status 查看；留空查看状态', choices: ['on', 'off', 'status'].map(value => ({ name: value, value })) },
+  ] },
   { name: 'tasks', contexts: ['dm'], help: '/tasks [all] [页码]：查看主控登记的任务清单；默认未结束，all 含已结束', description: '只读查看当前私聊的主控任务清单', options: [
     { type: 'string', name: 'args', description: '留空查看未结束任务；all 包含已结束，可追加页码（每页10项）', min_length: 1, max_length: 30 },
   ] },

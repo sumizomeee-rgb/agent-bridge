@@ -25,7 +25,8 @@ export function readOnlyRuntime(agent: 'codex' | 'claude', env: NodeJS.ProcessEn
       const configPath = join(source, 'config.toml');
       const config = parse(isolatedCodexConfig(existsSync(configPath) ? readFileSync(configPath, 'utf8') : ''));
       const features = isObject(config.features) ? Object.fromEntries(Object.entries(config.features).map(([key, value]) => [key, value === true])) : {};
-      config.features = { ...features, code_mode_host: false, shell_tool: true, unified_exec: true };
+      // Codex exposes shell reads through its local code-mode host; disabling it breaks Read-Only reads too.
+      config.features = { ...features, code_mode_host: true, shell_tool: true, unified_exec: true };
       config.sandbox_mode = 'read-only'; config.approval_policy = 'never';
       writeFileSync(join(root, 'config.toml'), stringify(config), { encoding: 'utf8', mode: 0o600 }); copy(join(source, 'auth.json'), 'auth.json');
       return { env: { ...env, CODEX_HOME: root, BRIDGE_TASK_CONTEXT: undefined }, args: ['-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"', '-c', 'mcp_servers={}', '-c', 'plugins={}', '-c', 'agents.enabled=false'], cleanup };

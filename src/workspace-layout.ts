@@ -1,3 +1,4 @@
+import { harnessText } from './harness.js';
 import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -28,5 +29,5 @@ export function workspaceFile(workspace: string, role: keyof typeof workspaceDir
 }
 
 export function workspaceOutputGuidance(workspace: string): string {
-  return `\n[桥共享工作区产物规则；不扩大任务授权]\n共享工作区：${workspace}。临时脚本、日志、截图、调查材料和待发送附件统一放 ${join(workspace, 'tmp', '<任务名>')}；不在工作区根新建 artifacts、deliveries、archive 或 .local，不为单次任务新增职能目录。正式工程源码仍回所属项目，工程自己的运行环境按其约定维护。保留在用及未交付材料；清理不按目录名或文件年龄直接判垃圾。\n\n`;
+  return harnessText('workspace.output_guidance', { workspace, temporary_directory: join(workspace, 'tmp', '<任务名>') });
 }

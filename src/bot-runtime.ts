@@ -23,6 +23,9 @@ import { controllerFileToolNames } from './controller/files.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from './types.js';
 import type { RestartOrigin } from './restart.js';
 import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
+import { HousekeeperService } from './housekeeper/service.js';
+import type { TaskCompletionEvent, TaskContextFile } from './tasks.js';
+import { randomUUID } from 'node:crypto';
 
 export interface BotRuntimeHooks {
   authorize(userId: string, text: string): boolean;
@@ -59,6 +62,7 @@ export class BotRuntime {
   readonly transport: BotTransport;
   readonly controller?: ControllerRuntime;
   readonly tasks: TaskRegistry;
+  readonly housekeeper?: HousekeeperService;
   readonly ingress: DurableIngress;
   private readonly targetCatalog: BotTargetCatalog;
   private readonly execution: Adapters;
@@ -103,7 +107,7 @@ export class BotRuntime {
       targetCatalog: this.targetCatalog,
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
-      onCompletion: () => this.manager.completionAvailable(),
+      onCompletion: event => this.backgroundCompletion(event),
       onSupplementFailure: value => this.manager.workerInputFailed(value),
       onPolicyReport: value => this.manager.workerPolicyReport(value),
       onCountChanged: id => this.manager.refreshTaskCounts(id),
@@ -141,6 +145,9 @@ export class BotRuntime {
       ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
       ...(this.controller ? {
         onWorkerDefaults: argument => this.controller!.workerDefaultCommand(argument),
+        onHousekeeper: (message, argument) => this.housekeeper!.command(message, argument),
+        isHousekeeperEvent: event => this.housekeeper?.validEvent(event) === true,
+        housekeeperEventText: event => this.housekeeper!.eventText(event),
         onStop: (id: string) => this.controller!.cancelConversation(id),
         onDetach: (id: string) => this.controller!.detachConversation(id),
         onInitializeWorkspace: (turn: AgentTurn) => this.controller!.initializeWorkspace(turn),
@@ -151,7 +158,34 @@ export class BotRuntime {
         onResumeSwitch: async source => { await this.controller!.resumeConversation(source.id); hooks.resumeGroup(); },
       } : {}),
     });
-    this.taskService = new TaskService(this.tasks, { onCompletion: () => this.manager.completionAvailable(),
+    this.housekeeper = this.controller ? new HousekeeperService(config, {
+      active: userId => this.manager.housekeeperActive(userId),
+      dispatch: (runId, state, prompt) => this.manager.housekeeperContext(state, turn => this.controller!.invoke(turn, 'bridge_start_worker',
+        { targetId: 'local', assistant: { kind: 'default' }, title: '事务同步摘要', prompt }, 'housekeeper:' + runId) as Promise<{ workerId: string; jobId: string }>).catch(error => {
+          const saved = state.run ? this.recoverHousekeeperRun(state.run.inputPath) : null;
+          if (saved) return saved; throw error;
+        }),
+      job: id => this.controller!.store.getJob(id),
+      recoverRun: run => this.recoverHousekeeperRun(run.inputPath),
+      eventForJob: id => this.tasks.queuedEvents().find(event => event.taskId === id) ?? null,
+      cancel: async id => { const value = this.housekeeper?.store.read(); if (value) await this.controller!.cancelHousekeeperWorker(id, value.userId); },
+      event: id => this.manager.housekeeperEventReceipt(id),
+      reroute: (run, state) => this.manager.housekeeperContext(state, async turn => {
+        const context = JSON.parse(readFileSync(turn.taskContextPath!, 'utf8')) as TaskContextFile;
+        const task = this.tasks.register(context, '事务同步摘要', randomUUID());
+        const summary = run.summary ?? (run.jobId ? this.controller!.store.getJob(run.jobId)?.result : null);
+        if (!summary) throw new Error('已保存的事务摘要缺失。');
+        this.tasks.acceptObservedResult(task.taskId, 'completed', summary);
+        const event = this.tasks.queuedEvents().find(event => event.taskId === task.taskId)!;
+        return { taskId: task.taskId, eventId: event.id, conversationId: turn.conversation.id };
+      }),
+      retireEvent: id => { if (this.tasks.claimEvent(id)) this.tasks.markDelivered(id); },
+      wake: () => this.manager.completionAvailable(),
+      notify: (state, text, key) => this.send(state.channelId, text, { deliveryKey: key }),
+      onError: error => this.log('HOUSEKEEPER ' + safeError(error, this.secrets)),
+      isPaused: () => !this.ready || this.closed || this.hooks.isDraining(),
+    }) : undefined;
+    this.taskService = new TaskService(this.tasks, { onCompletion: event => this.backgroundCompletion(event),
       onCountChanged: id => this.manager.refreshTaskCounts(id), onError: error => this.log('TASK ' + safeError(error, this.secrets)) });
     const control = (message: IncomingDM) => /^(?:\/(?:stop|new|cwd)(?:\s|$)|\/agent\s+\S|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
     this.ingress = new DurableIngress(config.dataDir, {
@@ -182,6 +216,16 @@ export class BotRuntime {
       const contact = this.ingress.lastAuthorizedContact();
       return contact && !hooks.isGroupChannel?.(contact.channelId) && hooks.authorize(contact.userId, '') ? contact : undefined;
     }, error => this.log('LIFECYCLE_NOTICE_FAILED ' + safeError(error, this.secrets)));
+  }
+  private recoverHousekeeperRun(inputPath: string): { workerId: string; jobId: string } | null {
+    const jobs = this.controller!.store.jobs().filter(job => job.origin.purpose === 'housekeeper' && job.prompt.includes(inputPath));
+    if (jobs.length > 1) throw new Error('同一事务批次有多个执行登记，未重复派工。');
+    const job = jobs[0]; return job ? { workerId: job.workerId, jobId: job.id } : null;
+  }
+  private backgroundCompletion(event: TaskCompletionEvent): void {
+    if (this.closed) return;
+    if (event.purpose === 'housekeeper') { this.housekeeper?.acceptCompletion(event); return; }
+    this.manager.completionAvailable();
   }
   log(message: string): void {
     appendFileSync(join(this.config.logsDir, 'bridge.log'), `${new Date().toISOString()} ${safeError(message, this.secrets)}\n`);
@@ -250,7 +294,7 @@ export class BotRuntime {
     this.lagTimer = setInterval(() => { const now = performance.now(), lag = now - lastTick - 1000; lastTick = now;
       if (lag >= 1000) this.log(`EVENT_LOOP_LAG ms=${Math.round(lag)}`); }, 1000);
     this.lagTimer.unref();
-    this.taskService.start(); this.ingress.start(); this.manager.completionAvailable();
+    this.taskService.start(); this.ingress.start(); this.manager.completionAvailable(); this.housekeeper?.start();
     if (this.config.features?.nativeCommands !== false) {
       try { await this.transport.syncSlashCommands(); this.log('SLASH_COMMANDS_SYNCED'); }
       catch (error) { this.log('SLASH_COMMANDS_FAILED ' + safeError(error, this.secrets)); }
@@ -271,15 +315,16 @@ export class BotRuntime {
     await this.transport.sendText(channel, redactText(text, this.secrets), options ? { ...options,
       ...(options.presentation ? { presentation: mapPresentation(options.presentation, s => redactText(s, this.secrets)) } : {}) } : undefined);
   }
-  beginDrain(): void { this.ingress.pause(); this.manager.beginDrain(); this.controller?.beginDrain(); }
-  isIdle(): boolean { return this.manager.isIdle() && (this.controller?.isIdle() ?? true) && this.transport.isIdle(); }
+  beginDrain(): void { this.housekeeper?.beginDrain(); this.ingress.pause(); this.manager.beginDrain(); this.controller?.beginDrain(); }
+  isIdle(): boolean { return this.manager.isIdle() && (this.housekeeper?.isIdle() ?? true) && (this.controller?.isIdle() ?? true) && this.transport.isIdle(); }
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closed = true; this.ready = false; clearInterval(this.lagTimer);
+    this.closed = true; this.ready = false; clearInterval(this.lagTimer); this.housekeeper?.beginDrain();
     this.closePromise = closeResources([
       { name: '通信平台', close: () => this.transport.close() }, { name: '收件', close: () => this.ingress.close() },
       { name: '任务回执', close: () => this.taskService.close() }, { name: '主控', close: () => this.manager.close() },
       { name: '执行任务', close: async () => { await this.controller?.close(); } },
+      { name: '管家巡视', close: async () => { await this.housekeeper?.close(); } },
       { name: '远程目录', close: () => this.targetCatalog.close() },
       ...(this.controller ? Object.entries(this.execution).map(([name, adapter]) => ({ name, close: () => adapter.close() })) : []),
       { name: '生命周期', close: () => this.lifecycle.close() },

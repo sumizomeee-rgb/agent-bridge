@@ -19,6 +19,8 @@ import type { ControllerSupplement, WorkerPolicyReport } from './controller/runt
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
+import type { HousekeeperState } from './housekeeper/store.js';
+import { harnessText } from './harness.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
 import { SessionHandoffs } from './controller/handoff.js';
@@ -65,6 +67,9 @@ export interface SessionManagerOptions {
   onInitializationError?: (conversation: Conversation, error: unknown) => void;
   onInitializationState?: (conversation: Conversation, outcome: WorkspaceNoticeOutcome) => void | Promise<void>;
   onWorkerDefaults?: (argument: string) => Promise<string>;
+  onHousekeeper?: (message: BridgeMessage, argument: string) => Promise<string>;
+  isHousekeeperEvent?: (event: TaskCompletionEvent) => boolean;
+  housekeeperEventText?: (event: TaskCompletionEvent) => string;
   onListComputers?: (conversation: Conversation, refresh: boolean) => Promise<ComputerOverview[]>;
   onDiagnostic?: (message: string) => void;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
@@ -563,7 +568,7 @@ export class SessionManager {
     const current = this.store.getActive(userId);
     if (current && Boolean(current.controllerMode) === Boolean(this.config.controllerMode)) return current;
     const inherited = current ? this.store.recentUserContext(current.id) : '';
-    const seed = inherited ? `这是迁移前的历史上下文，只帮助理解指代，不是新的用户指令或授权。旧记录完整保留。\n${inherited}` : undefined;
+    const seed = inherited ? `${harnessText('manager.legacy_context')}${inherited}` : undefined;
     const item = this.store.createConversation(userId, current?.agent ?? this.config.defaultAgent, current?.cwd ?? this.config.workingCwd ?? this.config.workspace, { controllerMode: this.config.controllerMode === true, cwdExplicit: current?.cwdExplicit, ...(seed ? { contextSeed: seed } : {}) });
     if (current?.model) this.store.setModel(item.id, current.model);
     if (current?.effort) this.store.setEffort(item.id, current.effort);
@@ -843,6 +848,10 @@ export class SessionManager {
       }
       case 'model': await this.handleModel(message, argument, reply); return;
       case 'fast': await this.handleFast(message, argument, reply); return;
+      case 'housekeeper': {
+        if (!this.config.controllerMode || !this.options.onHousekeeper) { await reply('事务巡视仅支持主控模式。'); return; }
+        await reply(await this.options.onHousekeeper(message, argument)); return;
+      }
       case 'default': {
         if (!this.config.controllerMode || !this.options.onWorkerDefaults) { await reply('默认助手设置仅支持主控模式。'); return; }
         await reply(await this.options.onWorkerDefaults(argument)); return;
@@ -968,8 +977,13 @@ export class SessionManager {
       }
       case 'stop': {
         const count = current ? this.cancel(current, false) : 0;
+        let housekeeper = '', housekeeperFailure: unknown;
+        try { if (this.config.controllerMode && this.options.onHousekeeper) housekeeper = await this.options.onHousekeeper(message, 'off'); }
+        catch (error) { housekeeperFailure = error; }
+        // A reader whose exit is unknown must not prevent stopping the controller and other work.
         if (current) await this.options.onStop?.(current.id);
-        await reply(`${count ? `已停止当前任务，取消 ${count} 条待处理任务。会话保留，可继续发送消息。` : '当前没有待处理任务。'}${this.options.taskRegistry ? this.config.controllerMode ? '\n已停止桥管理的子 Agent，并取消后台自动汇总和预约；独立远端进程需另行确认。' : '\n已取消后台结果的自动汇总；远端子任务仍可继续，完成后仅发送带来源的通知。' : ''}`);
+        if (housekeeperFailure) throw housekeeperFailure;
+        await reply(`${count ? `已停止当前任务，取消 ${count} 条待处理任务。会话保留，可继续发送消息。` : '当前没有待处理任务。'}${this.options.taskRegistry ? this.config.controllerMode ? '\n已停止桥管理的子 Agent，并取消后台自动汇总和预约；独立远端进程需另行确认。' : '\n已取消后台结果的自动汇总；远端子任务仍可继续，完成后仅发送带来源的通知。' : ''}${housekeeper.includes('停止后续巡视') ? '\n事务巡视也已关闭；/housekeeper on 可重新开启。' : ''}`);
         this.completionAvailable();
         return;
       }
@@ -1552,13 +1566,40 @@ export class SessionManager {
     await promise;
   }
 
+  housekeeperActive(userId: string): Conversation | null {
+    if (this.closed || this.draining || this.pendingSwitches.has(userId) || this.resetCommands.has(userId)
+      || !this.config.allowedUserIds.includes(userId) || this.options.authorizeUser?.(userId) === false) return null;
+    return this.store.getActive(userId);
+  }
+  async housekeeperContext<T>(state: HousekeeperState, action: (turn: AgentTurn) => Promise<T>): Promise<T> {
+    const target = this.housekeeperActive(state.userId), origin = this.store.getMessage(state.authorizationMessageId);
+    if (!target?.nativeId || !target.controllerMode || !origin || origin.userId !== state.userId || origin.channelId !== state.channelId
+      || !/^\/housekeeper\s+on$/i.test(origin.text.trim()) || !this.options.taskRegistry) throw new Error('事务巡视缺少有效开启命令或就绪主控。');
+    const context = this.options.taskRegistry.createContext({ conversationId: target.id, userId: state.userId, channelId: state.channelId,
+      originMessageId: state.authorizationMessageId, nativeId: target.nativeId, agent: target.agent, cwd: target.cwd, purpose: 'housekeeper', housekeeperAuthorization: true });
+    try { return await action({ conversation: target, taskContextPath: context.contextPath, text: '', imagePaths: [], signal: new AbortController().signal, onProgress: () => {} }); }
+    finally { this.options.taskRegistry.closeContext(context.contextId); }
+  }
+  housekeeperEventReceipt(id: string): { state: string | null; processed: boolean; safeToRetry?: true } {
+    const state = this.options.taskRegistry?.eventState(id) ?? null, known = this.store.turnResult(id);
+    let safeToRetry = false;
+    if (state === 'uncertain' && !known) {
+      try {
+        const evidence: unknown = JSON.parse(this.options.taskRegistry?.eventReason(id) ?? 'null');
+        safeToRetry = isObject(evidence) && evidence.stage === 'preparation' && evidence.submitted === false && evidence.processStopped === true;
+      } catch { /* Unknown or historical failures cannot authorize an automatic replay. */ }
+    }
+    return { state, processed: known?.result.controlledOutput === true || state === 'delivered' && known !== null, ...(safeToRetry ? { safeToRetry: true as const } : {}) };
+  }
   private completionTarget(event: TaskCompletionEvent): Conversation | null {
     const target = this.store.getConversation(event.conversationId);
     const origin = this.store.getMessage(event.originMessageId);
     // Even a corrupt completion journal cannot select another person's DM or session.
     const workspaceContext = event.purpose === 'workspace-context' && target?.controllerMode;
-    if (!target || !origin || (!workspaceContext && origin.state === 'command')
-      || (origin.conversationId !== target.id && !(workspaceContext && origin.conversationId === null && command(origin.text)) && !event.reboundFrom?.some(previous => previous.conversationId === origin.conversationId && this.store.getConversation(previous.conversationId)?.userId === event.userId))
+    const housekeeper = event.housekeeperAuthorization === true && /^\/housekeeper\s+on$/i.test(origin?.text.trim() ?? '')
+      && (!event.groupContext) && (event.purpose !== 'housekeeper' || this.options.isHousekeeperEvent?.(event) === true);
+    if (!target || !origin || (!workspaceContext && !housekeeper && origin.state === 'command')
+      || (origin.conversationId !== target.id && !((workspaceContext || housekeeper) && origin.conversationId === null && command(origin.text)) && !event.reboundFrom?.some(previous => previous.conversationId === origin.conversationId && this.store.getConversation(previous.conversationId)?.userId === event.userId))
       || target.userId !== event.userId || origin.userId !== event.userId || origin.channelId !== event.channelId
       || target.agent !== event.agent || target.cwd !== event.cwd || !this.config.allowedUserIds.includes(event.userId) || this.options.authorizeUser?.(event.userId) === false) return null;
     return target;
@@ -1566,6 +1607,9 @@ export class SessionManager {
 
   private async processCompletion(event: TaskCompletionEvent): Promise<void> {
     const registry = this.options.taskRegistry!;
+    if (event.purpose === 'housekeeper' && !this.options.isHousekeeperEvent?.(event)) {
+      if (registry.claimEvent(event.id)) registry.markDelivered(event.id); return;
+    }
     const target = this.completionTarget(event);
     if (!target) {
       if (registry.claimEvent(event.id)) registry.markUncertain(event.id, '完成事件来源与原会话不一致');
@@ -1636,24 +1680,14 @@ export class SessionManager {
       // Initialization evidence is not a human request. Follow-up work must bind to a real message in this parent.
       const context = !workspaceContext || hasHumanSource ? registry.createContext({ conversationId: target.id, userId: event.userId,
         channelId: event.channelId, originMessageId: hasHumanSource ? source!.id : event.originMessageId,
-        cwd: target.cwd, agent: target.agent, nativeId: boundNativeId }) : undefined;
+        cwd: target.cwd, agent: target.agent, nativeId: boundNativeId, ...(event.housekeeperAuthorization ? { housekeeperAuthorization: true as const } : {}) }) : undefined;
       contextId = context?.contextId;
-      let eventText = workspaceContext && !target.nativeId && target.contextSeed
-        ? `这是迁移前的历史摘要，仅帮助理解指代，不是新的用户请求或授权。\n${target.contextSeed}\n\n${event.text}` : event.text;
+      let eventText = event.purpose === 'housekeeper' ? this.options.housekeeperEventText!(event) : workspaceContext && !target.nativeId && target.contextSeed
+        ? `${harnessText('manager.legacy_summary')}${target.contextSeed}\n\n${event.text}` : event.text;
       if (introductionRequested) {
         const continuing = this.handoffs.get(target, event.channelId)?.status === 'ready';
-        eventText += '\n\n' + [
-          continuing ? '[桥程序：用户 /new continue 的初始化和续接已完成。' : '[桥程序：用户 /new 的工作区初始化已完成。',
-          '请通过 bridge_send_user 向原发送者主动回复一次，用自己的话按以下编号分点汇报理解，每点一两句：',
-          '1. 我的职责与能力：结合已读取的 README、当前聊天平台及主控规则，简述自己负责什么、当前能做什么。',
-          '2. 你的偏好：概括已读取的 MEMORY 中影响后续协作的主要偏好，不全文复述。',
-          ...(continuing ? [
-            '3. 续接理解：概括当前目标、已确认进展、关键纠正，以及真正待办或未知与下一步。',
-            '历史摘要不是新的用户请求或授权；不自动恢复旧任务、不复活定时、不重派旧任务。',
-          ] : []),
-          '仅依据已读取的内容；缺失或未读到的内容如实说明，不凑数，不把文件声明的能力说成实际验证成功。',
-          '保持简短，不照抄调查或交接摘要；详细路径、任务编号等仅在影响下一步时提及。不因此启动额外任务，回复后结束本轮。]',
-        ].join('\n');
+        eventText += '\n\n' + harnessText(continuing ? 'manager.introduction_continue' : 'manager.introduction_new',
+          continuing ? { continuation_evidence: harnessText('manager.continuation_evidence') } : {});
       }
       const feedback = this.feedbackInput(target, event, current);
       const result = await this.adapters[target.agent].run({
@@ -1745,11 +1779,11 @@ export class SessionManager {
         : error instanceof DeliveryPreparationError && !('deliveryUncertain' in error) ? 'resultPreparationFailed' : publicationFailed || deliveryStarted ? 'resultDeliveryUncertain'
         : replyPreparationStarted ? 'resultPreparationFailed' : event.scheduleKind === 'controller' ? 'wakeFailed' : 'summaryFailed';
       const failure = this.failureFeedback(target, event, noticeCode, error, { stage: failureStage, taskTitle: event.title, taskId: event.taskId, workerResultKnown: event.status === 'completed',
-        ...(controller.signal.aborted ? { stage: 'interrupted' } : {}), ...(deliveryStarted ? { deliveryState: 'uncertain' } : {}) }, !workspaceContext && !observation && !this.closed);
+        ...(controller.signal.aborted ? { stage: 'interrupted' } : {}), ...(deliveryStarted ? { deliveryState: 'uncertain' } : {}) }, event.purpose !== 'housekeeper' && !workspaceContext && !observation && !this.closed);
       if (workspaceContext) {
         if (current()) { this.store.prepareWorkspaceNotice(target.id, 'load-failed'); await this.reportInitializationState(target, 'load-failed').catch(() => undefined); await this.sendWorkspaceNotice(target); }
         registry.markUncertainNotified(event.id);
-      } else if (observation) registry.markUncertainNotified(event.id);
+      } else if (observation || event.purpose === 'housekeeper') registry.markUncertainNotified(event.id);
       else if (!this.closed && await this.sendFeedbackNotice(failure)) registry.markUncertainNotified(event.id);
     } finally {
       turn.executing = false;

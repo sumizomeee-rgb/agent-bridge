@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { parseTargetRegistry } from '../src/remote/catalog.js';
 import { parseCapabilityRegistry } from '../src/capabilities.js';
+import { renderHarnessReferences, harnessText } from '../src/harness.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
@@ -48,7 +49,9 @@ test('workspace initializer generates usable templates from another working dire
     const workspace = join(root, '上下文 空间', '新工作区[原样]');
     requireSuccess(run(workspace, root));
     assert.deepEqual(readdirSync(workspace).sort(), [...new Set([...templates.map(file => file.split('/')[0]!), 'tmp'])].sort());
-    for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), readFileSync(join(project, 'workspace-template', file)));
+    for (const file of templates) assert.deepEqual(readFileSync(join(workspace, file)), file === 'README.md'
+      ? Buffer.from(renderHarnessReferences(readFileSync(join(project, 'workspace-template', file), 'utf8')))
+      : readFileSync(join(project, 'workspace-template', file)));
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
     assert.deepEqual(parseCapabilityRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-capabilities/registry.json'), 'utf8'))), []);
     assert.deepEqual(readdirSync(join(workspace, 'tmp')), []);
@@ -99,6 +102,10 @@ test('workspace initializer relocates with its templates to a project path conta
     const relocated = join(root, '迁移项目 空格');
     mkdirSync(join(relocated, 'workspace-template'), { recursive: true });
     copyFileSync(script, join(relocated, 'init-workspace.ps1'));
+    mkdirSync(join(relocated, 'harness'));
+    const customFollowup = '迁移后的提示词表仍是生成 README 的唯一正文来源。';
+    writeFileSync(join(relocated, 'harness/prompts.toml'), readFileSync(join(project, 'harness/prompts.toml'), 'utf8')
+      .replace(harnessText('workspace.proactive_followup'), customFollowup));
     for (const file of templates) {
       const destination = join(relocated, 'workspace-template', file);
       mkdirSync(dirname(destination), { recursive: true });
@@ -108,6 +115,8 @@ test('workspace initializer relocates with its templates to a project path conta
     assert.ok(!existsSync(join(relocated, 'node_modules')));
     const workspace = join(root, '目标 工作区');
     requireSuccess(run(workspace, root, join(relocated, 'init-workspace.ps1')));
+    assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').includes(customFollowup));
+    assert.ok(!readFileSync(join(workspace, 'README.md'), 'utf8').includes('{{harness.'));
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
   } finally { cleanup(); }
 });
