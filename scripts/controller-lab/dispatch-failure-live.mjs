@@ -3,10 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 
-// Only the platform transport is a receipt sink. The Host, BotRuntime, native
-// controller, catalog, remote cwd check, journals and 30s scheduler are real.
+// The transport is an isolated sink. A test fault defers early acknowledgement
+// to reproduce an ignored error; Host, BotRuntime, the native controller,
+// catalog, remote cwd check, journals and the 30s scheduler remain real.
 const [rootArgument, configPath, runArgument, sourceRootArgument] = process.argv.slice(2);
 assert(rootArgument && configPath && runArgument, 'root configPath runDir required');
 const root = path.resolve(rootArgument), runDir = path.resolve(runArgument);
@@ -43,6 +45,29 @@ const channel = prefix + (source.platform === 'feishu' ? 'oc_lab_failure_' + pro
 assert(validChannelId(channel));
 const report = { status: 'running', model, effort, tools: [], deliveries: [], cases: [], logs: [] };
 const save = () => fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify(report, null, 2)); save();
+const journal = () => {
+  const db = new DatabaseSync(path.join(config.dataDir, 'bridge.sqlite'), { readOnly: true });
+  try { return db.prepare('SELECT value_json FROM dispatch_failures ORDER BY rowid').all().map(row => JSON.parse(row.value_json)); }
+  finally { db.close(); }
+};
+const nativeStarts = conversation => {
+  const nativeId = store.getConversation(conversation.id).nativeId;
+  const pending = [path.join(config.dataDir, 'controller-homes/codex', conversation.id, 'sessions')];
+  const files = []; let visited = 0;
+  while (pending.length) {
+    const directory = pending.pop(); assert(++visited <= 32, 'Bounded isolated session audit');
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      assert(!entry.isSymbolicLink(), 'No linked session logs');
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(file);
+      else if (entry.name.endsWith(nativeId + '.jsonl')) files.push(file);
+    }
+  }
+  assert.equal(files.length, 1, 'Exact isolated native session log required');
+  assert(fs.statSync(files[0]).size < 4 * 1024 * 1024, 'Bounded native session log');
+  return fs.readFileSync(files[0], 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+    .filter(row => row.type === 'event_msg' && row.payload?.type === 'task_started').map(row => row.timestamp);
+};
 const wait = async (condition, label, timeout = 240000) => {
   const end = Date.now() + timeout;
   while (!condition()) { assert(Date.now() < end, label); await delay(100); }
@@ -72,10 +97,14 @@ try {
         metadataAdapter: execution[agent], defaultModels: config.defaultModels,
         invokeTool: async (turn, name, args, id) => {
           assert(['bridge_start_worker', 'bridge_list_dispatch_failures', 'bridge_ack_dispatch_failure'].includes(name), 'Unrelated tool forbidden: ' + name);
-          const event = { name, at: new Date().toISOString(), status: 'running', callId: id }; report.tools.push(event); save();
+          const event = { name, at: new Date().toISOString(), status: 'running', callId: id, eventKind: turn.event?.kind ?? 'owner-input', eventTool: turn.event?.toolName }; report.tools.push(event); save();
           if (name === 'bridge_start_worker') {
             assert.equal(report.tools.filter(t => t.name === name).length, 1, 'No replay permitted');
             assert.equal(args.targetId, expected.targetId); assert.equal(args.cwd, expected.cwd);
+          }
+          if (name === 'bridge_ack_dispatch_failure' && (turn.event?.kind !== 'wake' || !journal().some(row => row.id === args.id && row.reminders >= 1))) {
+            event.status = 'injected-deferred'; event.finishedAt = new Date().toISOString(); save();
+            return { performed: false, testFaultInjected: true, message: 'Isolated fault injection keeps this failure pending until an actual bridge dispatch-failure wake. End this turn without retrying; do not schedule or poll.' };
           }
           try { const value = await invoke(turn, name, args, id); event.status = 'completed';
             if (name === 'bridge_ack_dispatch_failure') event.failureId = args.id;
@@ -101,11 +130,20 @@ try {
   assert.equal(store.getMessage(id).state, 'completed');
   assert(report.tools.some(t => t.name === 'bridge_start_worker' && t.status === 'failed' && /ENOENT/.test(t.error)));
   assert(report.deliveries.some(d => d.text.includes('隔离测试：本轮确认已发送')));
+  assert(journal().some(row => row.handledAt === null || row.reminders >= 1), 'Injected failure must stay pending until an actual reminder');
   report.cases.push('real remote cwd rejection and premature confirmation reproduced'); save();
   await wait(() => report.tools.some(t => t.name === 'bridge_ack_dispatch_failure' && t.status === 'completed') && bot.manager.isIdle(), 'Automatic review and explicit acknowledgement');
+  const handled = journal().find(row => row.handledAt !== null && row.reminders >= 1);
+  assert(handled, 'A real recorded reminder must precede explicit acknowledgement');
+  assert(report.tools.some(t => t.name === 'bridge_ack_dispatch_failure' && t.status === 'completed' && t.eventKind === 'wake'), 'Only the real wake may acknowledge this injected failure');
+  report.verifiedJournal = { id: handled.id, reminders: handled.reminders, handledAt: handled.handledAt, autoState: handled.autoState };
   report.cases.push('30s scheduler woke real controller without owner input; list and ack succeeded'); save();
   const management = report.tools.length; await delay(35000);
   assert.equal(report.tools.length, management, 'Acknowledged failure must stop waking');
+  const ack = report.tools.find(t => t.name === 'bridge_ack_dispatch_failure' && t.status === 'completed' && t.eventKind === 'wake');
+  const starts = nativeStarts(conversation); assert(starts.length >= 2, 'Native turn markers must be present');
+  assert.equal(starts.filter(timestamp => timestamp > ack.finishedAt).length, 0, 'No model turn may start after acknowledgement');
+  report.nativeTurnAudit = { totalStarts: starts.length, afterAcknowledgement: 0, checkedAt: new Date().toISOString() };
   assert.equal(bot.controller.store.workers().length, 0, 'Failed preparation must not create fake workers');
   report.cases.push('no wake after acknowledgement and no fake workers'); report.status = 'passed'; save();
 } catch (error) {
