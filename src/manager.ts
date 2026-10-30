@@ -18,7 +18,8 @@ import { controllerFileToolNames, invokeControllerFileTool } from './controller/
 import type { ControllerSupplement, WorkerPolicyReport } from './controller/runtime-types.js';
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
-import type { TaskCompletionEvent, TaskRegistry } from './tasks.js';
+import type { TaskCompletionEvent, TaskRegistry, TaskContextFile, TaskOrigin } from './tasks.js';
+import { dispatchFailureOperations, type DispatchFailureScope, type DispatchFailureRecord } from './dispatch-failures.js';
 import type { HousekeeperState } from './housekeeper/store.js';
 import { harnessText } from './harness.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
@@ -105,13 +106,110 @@ export class SessionManager {
   private readonly pendingSwitches = new Set<string>();
   private readonly revisions = new Map<string, number>();
   private readonly authorizedGroupEvents = new Map<string, { conversationId: string; contextKey: string }>();
+  private dispatchFailureTimer?: ReturnType<typeof setTimeout>;
+  private dispatchFailurePolling?: Promise<void>;
 
   constructor(
     private readonly config: BridgeConfig,
     private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly sink: ReplySink,
     private readonly options: SessionManagerOptions = {},
-  ) { this.store = new SessionStore(config.dataDir, options.binding); this.handoffs = new SessionHandoffs(config.dataDir); }
+  ) { this.store = new SessionStore(config.dataDir, options.binding); this.handoffs = new SessionHandoffs(config.dataDir); this.armDispatchFailures(); }
+
+  private dispatchFailureScope(target: Conversation, route: {userId:string;channelId:string;groupContext?:GroupTurnContext}): DispatchFailureScope {
+    const g=route.groupContext;
+    return {botId:this.config.botId??'',conversationId:target.id,userId:route.userId,channelId:route.channelId,nativeId:target.nativeId,
+      groupKey:g?JSON.stringify([g.botId,g.spaceId,g.rootId,g.generation,g.bindingEpoch,g.principalId]):''};
+  }
+  private assertDispatchFailureTurn(turn:AgentTurn):Conversation {
+    const target=this.store.getActive(turn.conversation.userId),running=this.running.get(turn.conversation.userId);
+    if(this.closed||turn.signal.aborted||!target||target.id!==turn.conversation.id||target.agent!==turn.conversation.agent
+      ||target.cwd!==turn.conversation.cwd||running?.controller.signal!==turn.signal||!this.config.allowedUserIds.includes(target.userId)
+      ||this.options.authorizeUser?.(target.userId)===false||!turn.source?.channelId||turn.source.userId!==target.userId)throw new Error('失败清单不属于当前有效主控轮次。');
+    return target;
+  }
+  recordDispatchFailure(turn:AgentTurn,name:string,args:Record<string,unknown>,callId:string|undefined,error:unknown):string|undefined {
+    if(!dispatchFailureOperations.has(name)||turn.signal.aborted||(error instanceof Error&&error.name==='AbortError'))return undefined;
+    let target:Conversation;try{target=this.assertDispatchFailureTurn(turn);}catch{return undefined;}
+    const source=turn.source!,input=this.store.getMessage(source.messageId),completion=this.options.taskRegistry?.completionById(source.messageId);
+    let originMessageId=input?.conversationId===target.id&&input.userId===source.userId&&input.channelId===source.channelId?input.id:undefined;
+    // The task capability can itself be the broken input that caused dispatch to fail. The
+    // manager's authenticated inbox/completion row is stronger evidence and remains readable.
+    if(!originMessageId&&completion?.conversationId===target.id&&completion.userId===source.userId&&completion.channelId===source.channelId)originMessageId=completion.originMessageId;
+    if(!originMessageId&&turn.taskContextPath&&this.options.taskRegistry){
+      try{const origin=this.options.taskRegistry.getContextOrigin(JSON.parse(readFileSync(turn.taskContextPath,'utf8')) as TaskContextFile,{allowClosed:true});
+        if(origin.conversationId===target.id&&origin.userId===source.userId&&origin.channelId===source.channelId)originMessageId=origin.originMessageId;
+      }catch{return undefined;}
+    }
+    if(!originMessageId)return undefined;
+    const origin:TaskOrigin={conversationId:target.id,userId:source.userId,channelId:source.channelId,originMessageId,nativeId:target.nativeId,
+      agent:target.agent,cwd:target.cwd,...(turn.groupContext?{groupContext:turn.groupContext}:{})};
+    const record=this.store.dispatchFailures.record(this.dispatchFailureScope(target,{...source,groupContext:turn.groupContext}),origin,source.messageId,callId,name,
+      typeof args.title==='string'?args.title:typeof args.workerId==='string'?args.workerId:name,errorEvidence(error,[this.config.token,this.config.appSecret??'']),Date.now(),
+      {...(typeof args.targetId==='string'?{targetId:args.targetId.slice(0,256)}:{}),...(typeof args.cwd==='string'?{cwd:args.cwd.slice(0,2048)}:{}),...(typeof args.workerId==='string'?{workerId:args.workerId.slice(0,256)}:{})});
+    this.armDispatchFailures();
+    return `${record.reason}\n派工失败记录 ID：${record.id}。该错误本身不能证明助手是否已建立或提交；请核对真实回执。处理后需调用 bridge_ack_dispatch_failure 按 ID 点掉；正常回复或 DONE 不会清除。`;
+  }
+  invokeDispatchFailureTool(turn:AgentTurn,name:string,args:Record<string,unknown>,_callId?:string):unknown {
+    const target=this.assertDispatchFailureTurn(turn),scope=this.dispatchFailureScope(target,{...turn.source!,groupContext:turn.groupContext});
+    if(name==='bridge_list_dispatch_failures'){
+      if(Object.keys(args).some(k=>!['includeHandled','limit'].includes(k))||args.includeHandled!==undefined&&typeof args.includeHandled!=='boolean'
+        ||args.limit!==undefined&&(!Number.isInteger(args.limit)||Number(args.limit)<1||Number(args.limit)>20))throw new Error('失败清单查询参数无效。');
+      return this.store.dispatchFailures.read(scope,args.includeHandled===true,args.limit===undefined?8:Number(args.limit));
+    }
+    if(name!=='bridge_ack_dispatch_failure'||Object.keys(args).some(k=>!['id','note'].includes(k))||typeof args.id!=='string'||!/^[a-f0-9]{64}$/.test(args.id)
+      ||args.note!==undefined&&(typeof args.note!=='string'||args.note.length>1000))throw new Error('用法：bridge_ack_dispatch_failure({id,note?})。');
+    const result=this.store.dispatchFailures.ack(scope,args.id,args.note as string|undefined,Date.now());this.armDispatchFailures();return result;
+  }
+  private armDispatchFailures():void {
+    if(this.dispatchFailureTimer||this.closed||this.draining||!this.config.controllerMode||!this.store.dispatchFailures.hasWork())return;
+    this.dispatchFailureTimer=setTimeout(()=>{this.dispatchFailureTimer=undefined;void this.pollDispatchFailures().catch(e=>this.options.onDiagnostic?.('DISPATCH_FAILURE_POLL '+String(e))).finally(()=>this.armDispatchFailures());},30000);
+    this.dispatchFailureTimer.unref();
+  }
+  /** Public deterministic test seam; production polls only while unresolved red dots exist. */
+  pollDispatchFailures(now=Date.now()):Promise<void> {
+    if(this.dispatchFailurePolling)return this.dispatchFailurePolling;
+    const work=this.pollDispatchFailuresOnce(now);this.dispatchFailurePolling=work;
+    void work.finally(()=>{if(this.dispatchFailurePolling===work)this.dispatchFailurePolling=undefined;}).catch(()=>undefined);return work;
+  }
+  private async pollDispatchFailuresOnce(now:number):Promise<void> {
+    if(this.closed||this.draining||this.recovering||!this.isIdle())return;
+    for(const records of this.store.dispatchFailures.pendingNotifications()){
+      const r=records[0]!,target=this.store.getActive(r.userId);if(target?.id!==r.conversationId||target.nativeId!==r.nativeId||!this.config.allowedUserIds.includes(r.userId)||this.options.authorizeUser?.(r.userId)===false)continue;
+      const channel=r.groupKey?this.knownDMChannels().filter(v=>v.userId===r.userId).at(-1)?.channelId:r.channelId;
+      if(!channel)continue;
+      this.store.dispatchFailures.notification(records,'sending');
+      try{await this.sink.sendText(channel,harnessText('manager.dispatch_failure_paused',{failure_titles:records.map(v=>`${v.title}（${v.id.slice(0,8)}）`).join('、')}),{deliveryKey:'dispatch-failure-paused:'+records.map(v=>v.id).join(':')});this.store.dispatchFailures.notification(records,'delivered');}
+      catch(error){this.store.dispatchFailures.notification(records,error instanceof DeliveryPreparationError||isObject(error)&&error.deliveryUncertain===false?'retry':'unknown');}
+    }
+    const registry=this.options.taskRegistry;if(!registry)return;
+    for(const records of this.store.dispatchFailures.due(now)){
+      const r=records[0]!,target=this.store.getActive(r.userId);
+      if(!target||target.id!==r.conversationId||target.nativeId!==r.nativeId||!this.config.allowedUserIds.includes(r.userId)||this.options.authorizeUser?.(r.userId)===false){this.store.dispatchFailures.deactivateScope(r);continue;}
+      if(this.running.has(r.userId)||this.userWorkers.has(r.userId)||this.store.nextQueued(target.id)||this.resetCommands.has(r.userId))continue;
+      const queued=records.find(v=>v.reviewTaskId);
+      if(queued){
+        const event=registry.completionForTask(queued.reviewTaskId!);
+        if(event&&['queued','processing'].includes(registry.eventState(event.id)??''))continue;
+        if(event&&registry.eventState(event.id)==='delivered'&&event.groupContext)continue;
+        this.store.dispatchFailures.releaseReview(queued.reviewTaskId!,now);continue;
+      }
+      const selected=records.slice(0,8),taskId=randomUUID();this.store.dispatchFailures.assign(selected,taskId);
+      try{registry.enqueueDispatchFailureReview({...r.origin,purpose:'dispatch-failure',scheduleKind:'controller',dispatchFailureReviewId:taskId},taskId,
+        harnessText('manager.dispatch_failure_review',{failure_list:JSON.stringify(selected.map(v=>({id:v.id,tool:v.tool,title:v.title,reason:v.reason})))}));}
+      catch(error){this.store.dispatchFailures.releaseReview(taskId,now);throw error;}
+    }
+    this.completionAvailable();
+  }
+  validDispatchFailureReview(taskId:string,groupContext?:GroupTurnContext):boolean {
+    const records=this.store.dispatchFailures.pendingReview(taskId),r=records[0]!,target=r?this.store.getActive(r.userId):null;
+    return !!r&&!!target&&target.id===r.conversationId&&target.nativeId===r.nativeId
+      &&JSON.stringify([r.botId,r.conversationId,r.userId,r.channelId,r.nativeId,r.groupKey])
+        ===JSON.stringify(Object.values(this.dispatchFailureScope(target,{userId:r.userId,channelId:r.channelId,groupContext})))
+      &&this.config.allowedUserIds.includes(r.userId)&&this.options.authorizeUser?.(r.userId)!==false;
+  }
+  invalidateDispatchFailureReview(taskId:string):void {this.store.dispatchFailures.deactivateReview(taskId);}
+  releaseDispatchFailureReview(taskId:string):void {this.store.dispatchFailures.releaseReview(taskId,Date.now());}
 
   revision(userId: string): number { return this.revisions.get(userId) ?? 0; }
 
@@ -290,7 +388,7 @@ export class SessionManager {
     }
     this.completionAvailable(); if (this.store.nextQueued(target.id)) this.wake(target.id);
   }  /** Pause new turns without aborting a CLI, supplement or reply already executing. */
-  beginDrain(): void { this.draining = true; }
+  beginDrain(): void { this.draining = true; clearTimeout(this.dispatchFailureTimer); this.dispatchFailureTimer=undefined; }
   isIdle(): boolean {
     return this.workers.size === 0 && this.userWorkers.size === 0 && this.running.size === 0
       && this.initializations.size === 0 && this.initializationRecoveries.size === 0 && this.noticeSends.size === 0 && this.interruptPromises.size === 0 && this.detachPromises.size === 0 && this.modelChanges.size === 0 && this.activeCommands === 0;
@@ -449,6 +547,7 @@ export class SessionManager {
     this.recovering = true;
     try {
       this.store.feedback.recoverNotices();
+      this.store.dispatchFailures.recoverNotifications();
       await this.recoverAgentSwitches();
       this.options.taskRegistry?.recoverContexts(this.authorizedUsers());
       const notices = new Set<string>();
@@ -578,6 +677,7 @@ export class SessionManager {
   }
 
   private cancel(conversation: Conversation, detach = true): number {
+    this.store.dispatchFailures.deactivate(conversation.id);
     for (const item of this.switches.values()) if (item.journal.source.id === conversation.id && item.journal.phase !== 'committing') item.controller.abort();
     this.noticeSends.get(conversation.id)?.controller.abort();
     this.store.cancelWorkspaceNotice(conversation.id);
@@ -1342,9 +1442,18 @@ export class SessionManager {
         });
         contextId = context?.contextId;
         const feedback = this.feedbackInput(target, item, current);
+        const dispatchReview=groupContext?.dispatchFailureReviewId;
+        if(dispatchReview&&!this.validDispatchFailureReview(dispatchReview,groupContext)){
+          this.invalidateDispatchFailureReview(dispatchReview);
+          groupOutcome='silent';this.store.setState(item.id,'cancelled','失败记录已处理或复核来源失效');
+          await this.options.onGroupSilent?.(groupContext!);continue;
+        }
+        const dispatchReviewText=dispatchReview?harnessText('manager.dispatch_failure_review',{failure_list:JSON.stringify(this.store.dispatchFailures.pendingReview(dispatchReview).map(r=>({id:r.id,tool:r.tool,title:r.title,reason:r.reason})))}):undefined;
+        if(dispatchReview)this.store.dispatchFailures.reminded(dispatchReview,Date.now());
         const result = await this.adapters[target.agent].run({
           ...(this.config.controllerMode ? { taskChecklist: this.store.knowledge.summary(this.knowledgeScope(item.userId, item.channelId, groupContext)) } : {}),
           bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
+          dispatchFailures: this.store.dispatchFailures.read(this.dispatchFailureScope(target,{...item,groupContext})),
           ...(privateControllerInput ? { controllerRecovery: true, onControllerState: (state: import('./controller-lifecycle.js').ControllerTurnState) => {
             this.store.controllerLifecycle.record(item.id, conversationId, state);
           } } : {}),
@@ -1366,10 +1475,10 @@ export class SessionManager {
             })) } };
           } } : {}),
           ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
-          ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: item.text } } : {}),
-          conversation: target, source: this.turnSource(item), text: `${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
+          ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: dispatchReviewText??item.text } } : {}),
+          conversation: target, source: this.turnSource(item), text: dispatchReviewText??`${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
           imagePaths: batch.flatMap(value => value.imagePaths), input: [
-            ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...this.input(batch),
+            ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...(dispatchReviewText?[{type:'text' as const,text:dispatchReviewText}]:this.input(batch)),
           ],
           onReady: () => { turn.ready = true; this.pumpSupplements(target, turn); },
           signal: controller.signal,
@@ -1607,6 +1716,12 @@ export class SessionManager {
 
   private async processCompletion(event: TaskCompletionEvent): Promise<void> {
     const registry = this.options.taskRegistry!;
+    if(event.purpose==='dispatch-failure'){
+      if(event.dispatchFailureReviewId!==event.taskId||!this.validDispatchFailureReview(event.taskId,event.groupContext)){
+        if(registry.claimEvent(event.id))registry.markDelivered(event.id);return;
+      }
+      event={...event,text:harnessText('manager.dispatch_failure_review',{failure_list:JSON.stringify(this.store.dispatchFailures.pendingReview(event.taskId).map(r=>({id:r.id,tool:r.tool,title:r.title,reason:r.reason})))})};
+    }
     if (event.purpose === 'housekeeper' && !this.options.isHousekeeperEvent?.(event)) {
       if (registry.claimEvent(event.id)) registry.markDelivered(event.id); return;
     }
@@ -1690,9 +1805,11 @@ export class SessionManager {
           continuing ? { continuation_evidence: harnessText('manager.continuation_evidence') } : {});
       }
       const feedback = this.feedbackInput(target, event, current);
+      if(event.purpose==='dispatch-failure')this.store.dispatchFailures.reminded(event.taskId,Date.now());
       const result = await this.adapters[target.agent].run({
         ...(this.config.controllerMode ? { taskChecklist: this.store.knowledge.summary(this.knowledgeScope(event.userId, event.channelId)) } : {}),
         bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
+        dispatchFailures: this.store.dispatchFailures.read(this.dispatchFailureScope(target,event)),
         controllerRecovery: this.config.controllerMode === true && target.controllerMode === true
           && !observation && !workspaceContext && event.scheduleKind !== 'controller' && event.status === 'completed',
         onControllerState: state => this.store.controllerLifecycle.record(event.id, target.id, state),
@@ -1796,11 +1913,13 @@ export class SessionManager {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
+    clearTimeout(this.dispatchFailureTimer);this.dispatchFailureTimer=undefined;
     this.closePromise = this.closeResources();
     return this.closePromise;
   }
 
   private async closeResources(): Promise<void> {
+    await this.dispatchFailurePolling;
     for (const item of this.switches.values()) item.controller.abort();
     for (const turn of this.running.values()) {
       turn.controller.abort();

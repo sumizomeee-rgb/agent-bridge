@@ -15,7 +15,7 @@ test('legacy controller protocol and complete tool schemas migrate without behav
   // Captured from the compiled pre-refactor runtime, independently of the new catalog.
   assert.equal(sha(controllerInstructions), 'a6dbf062e9fad6cca4715db1aef78c402f1da8e25a3c8166a438f8b4f7cb06dc');
   assert.equal(sha(controllerInstructionsForCommunication(false)), '33ed025e6db0aa731c77e406399005690575df9e497bf21e1237b2e7aee78b5f');
-  assert.equal(sha(JSON.stringify(controllerTools)), '0ab99de05ad6fc08a01620c08bfd3cf6440cb79d7ba6d87d203a9bd176195064');
+  assert.equal(sha(JSON.stringify(controllerTools.filter(tool => !['bridge_list_dispatch_failures', 'bridge_ack_dispatch_failure'].includes(tool.name)))), '0ab99de05ad6fc08a01620c08bfd3cf6440cb79d7ba6d87d203a9bd176195064');
   assert.equal(controllerInstructionsForCommunication(true), controllerInstructions);
 });
 

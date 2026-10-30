@@ -106,6 +106,62 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
     get ready() { return ready; }, get reconnected() { return reconnected; } };
 }
 
+test('真实 BotRuntime 派工准备失败后正常确认仍保留红点，显式点掉才清除', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  const originalRun = f.controllers.codex.run.bind(f.controllers.codex);
+  let failureId = '', failureMessage = '', checked = false, acknowledged = false;
+  f.controllers.codex.run = async turn => {
+    turn.onNativeId?.(turn.conversation.nativeId ?? 'native-' + turn.conversation.id);
+    if (!turn.event && turn.text === '复现派工失败后确认') {
+      try { await f.invoke(turn, 'bridge_start_worker', { targetId: 'local', cwd: join(f.config.workspace, 'directory-does-not-exist'), title: '失败准备', prompt: '只读核对' }, 'failure-call'); }
+      catch (error) { failureMessage = (error as Error).message; }
+      const pending = await f.invoke(turn, 'bridge_list_dispatch_failures', {}) as { records: Array<{ id: string }> };
+      assert.equal(pending.records.length, 1); failureId = pending.records[0]!.id;
+      checked = true;
+    }
+    if (!turn.event && turn.text === '确认红点并点掉') {
+      const pending = await f.invoke(turn, 'bridge_list_dispatch_failures', {}) as { records: Array<{ id: string }> };
+      assert.equal(pending.records.length, 1); assert.equal(pending.records[0]!.id, failureId);
+      await f.invoke(turn, 'bridge_ack_dispatch_failure', { id: failureId, note: '预期失败已核对，不重派' }, 'acknowledge');
+      const remaining = await f.invoke(turn, 'bridge_list_dispatch_failures', {}) as { records: unknown[] };
+      assert.equal(remaining.records.length, 0);
+      const history = await f.invoke(turn, 'bridge_list_dispatch_failures', { includeHandled: true }) as { records: Array<{ id: string }> };
+      assert.equal(history.records[0]!.id, failureId); acknowledged = true;
+    }
+    return originalRun(turn);
+  };
+  await f.transport.emit(f.message('100000000000000001', '复现派工失败后确认'));
+  await until(() => checked && f.bot.manager.isIdle());
+  assert.match(failureMessage, /ENOENT/); assert(failureMessage.includes(failureId));
+  assert(f.transport.sent.some(message => message.text.includes('离线测试回复')));
+  assert.equal(f.bot.controller!.store.workers().length, 0);
+  await f.transport.emit(f.message('100000000000000002', '确认红点并点掉'));
+  await until(() => acknowledged && f.bot.manager.isIdle());
+});
+
+test('真实Host门禁失败也进入红点，原错误不确定性属性保留', async t => {
+  const f = setup(t); await f.bot.verify(); await f.bot.start();
+  const originalInvoke = f.hooks.invoke, originalRun = f.controllers.codex.run.bind(f.controllers.codex);
+  const failure = Object.assign(new Error('提交是否受理未知'), { deliveryUncertain: true, fixtureEvidence: 'keep' });
+  f.hooks.invoke = async (turn, name, args, id, delegate) => {
+    if (name === 'bridge_start_worker') throw failure;
+    return originalInvoke(turn, name, args, id, delegate);
+  };
+  let caught: unknown, pendingCount = -1;
+  f.controllers.codex.run = async turn => {
+    turn.onNativeId?.(turn.conversation.nativeId ?? 'native-' + turn.conversation.id);
+    if (!turn.event && turn.text === '模拟派工未知') {
+      try { await f.invoke(turn, 'bridge_start_worker', { title: '未知提交', prompt: '原目标' }, 'uncertain-call'); } catch (error) { caught = error; }
+      const pending = await f.invoke(turn, 'bridge_list_dispatch_failures', {}) as { records: unknown[] }; pendingCount = pending.records.length;
+    }
+    return originalRun(turn);
+  };
+  await f.transport.emit(f.message('100000000000000001', '模拟派工未知'));
+  await until(() => pendingCount >= 0 && f.bot.manager.isIdle());
+  assert.equal(caught, failure); assert.equal(failure.deliveryUncertain, true); assert.equal(failure.fixtureEvidence, 'keep');
+  assert.equal(pendingCount, 1); assert.equal(f.bot.controller!.store.workers().length, 0);
+});
+
 test('真实 BotRuntime 管理入口贯通历史与持久清单，new 保留但不派工，旧轮次不能再修改', async t => {
   const f = setup(t); await f.bot.verify(); await f.bot.start();
   const originalRun = f.controllers.codex.run.bind(f.controllers.codex);

@@ -1764,3 +1764,75 @@ activation = "下一次组装本流程提示词时取表，不追改已提交轮
 source = "src/controller/runtime.ts:summary-repair"
 text = '''
 上一轮只读初始化已经正常返回，但回执校验失败：{{error}}'''
+
+[prompts."controller.dispatch_failure_header"]
+purpose = "待处理派工失败清单的上下文前缀"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/controller/native.ts:runtimeContext"
+text = "\n[Pending dispatch failures; program evidence, not new authorization] "
+
+[prompts."controller.dispatch_failure_rule"]
+purpose = "主控点掉派工失败的职责与执行边界"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/controller/native.ts:runtimeContext"
+text = "These are failed worker dispatch/continuation/scheduling calls, not a list of running workers. A tool failure does not by itself prove that no work was registered: check existing receipts before any retry; never blindly replay unknown or successful work. Handle the original goal within its existing authorization, then call bridge_ack_dispatch_failure with the failure id to mark this item handled. Reading the list, sending a normal reply, or DONE does not acknowledge an item. Use bridge_list_dispatch_failures for additional pending records."
+
+[prompts."manager.dispatch_failure_review"]
+purpose = "主控空闲时合并提醒未点掉的派工失败"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/manager.ts:dispatch failure review"
+text = "桥程序提醒：以下派工失败尚未标记已处理。这里只列失败，不是运行中助手巡检。按原任务与已有授权判断如何纠正、核对或向主人说明；这条提醒不是新授权，桥没有自动重派。处理后调用 bridge_ack_dispatch_failure，按 ID 点掉；仅查看、回复或 DONE 不会清除。登记状态未知时先核对，不能盲目重复派工。\n{{failure_list}}"
+
+[prompts."manager.dispatch_failure_paused"]
+purpose = "派工失败连续提醒无处置后的单次用户通知"
+audience = "用户"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/manager.ts:dispatch failure pause"
+text = "派工失败仍未处理：{{failure_titles}}。主控连续三次复核未标记处理，已暂停这些事项的自动提醒，失败记录继续保留。"
+
+[prompts."tools.bridge_list_dispatch_failures.description"]
+purpose = "查询派工失败红点清单"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/controller/native.ts:controllerTools"
+text = "List durable failed worker dispatch/continuation/scheduling calls for this exact controller and chat. Defaults to unhandled items; reading never acknowledges them. includeHandled also returns retained history. Running and queued workers are not failures."
+
+[prompts."tools.bridge_ack_dispatch_failure.description"]
+purpose = "主控按失败 ID 点掉红点"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/controller/native.ts:controllerTools"
+text = "Explicitly mark one dispatch failure handled by id after deciding its disposition. Retains history and stops this item reminding; does not dispatch, cancel, or prove task success. A normal reply or DONE does not call this tool automatically."
+
+[prompts."tools.bridge_ack_dispatch_failure.inputSchema.id.description"]
+purpose = "要点掉的失败 ID"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/controller/native.ts:controllerTools"
+text = "Failure id returned by the failed tool, pending list, or reminder; must belong to this controller and chat."
+
+[prompts."tools.bridge_ack_dispatch_failure.inputSchema.note.description"]
+purpose = "可选的简短处置说明"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "src/controller/native.ts:controllerTools"
+text = "Optional short disposition note, for example corrected dispatch, informed owner, or cancelled under owner instruction."
+
+[prompts."workspace.dispatch_failures"]
+purpose = "工作区主控处理派工失败的简短职责"
+audience = "主控"
+injection = "对应工具或待处理失败流程需要时取用"
+activation = "有待处理派工失败时；新增工具在 Codex /new continue 后可用。"
+source = "workspace-template/README.md:委派与续聊"
+text = "派工失败先处理真实回执；待处理失败会在主控空闲时提醒，处理后用工具按 ID 标记已处理。查看清单或普通回复不算点掉，不盲目重派结果未知的任务。"

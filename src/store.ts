@@ -8,6 +8,7 @@ import { parseCommand } from './commands.js';
 import { ControllerFeedbackJournal } from './controller-feedback.js';
 import { ControllerLifecycleJournal } from './controller-lifecycle.js';
 import { ControllerKnowledgeJournal } from './controller-knowledge.js';
+import { DispatchFailureJournal } from './dispatch-failures.js';
 
 export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'running' | 'completed' | 'cancelled' | 'interrupted' | 'failed';
 export interface InboxItem extends BridgeMessage {
@@ -64,6 +65,7 @@ export class SessionStore {
   readonly feedback: ControllerFeedbackJournal;
   readonly controllerLifecycle: ControllerLifecycleJournal;
   readonly knowledge: ControllerKnowledgeJournal;
+  readonly dispatchFailures: DispatchFailureJournal;
 
   constructor(dataDir: string, private readonly binding?: ControllerBinding) {
     mkdirSync(dataDir, { recursive: true });
@@ -152,6 +154,7 @@ export class SessionStore {
     this.feedback = new ControllerFeedbackJournal(this.db);
     this.controllerLifecycle = new ControllerLifecycleJournal(this.db);
     this.knowledge = new ControllerKnowledgeJournal(this.db);
+    this.dispatchFailures = new DispatchFailureJournal(this.db);
   }
 
   hasMessage(id: string): boolean {

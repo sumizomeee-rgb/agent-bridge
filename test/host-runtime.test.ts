@@ -1162,6 +1162,38 @@ test('one Bot retains durable intake order across two groups with different perm
   for (const id of [A, B]) assert.deepEqual(f.calls.filter(c => c.botId === id).map(call => call.turn.text), ['first from G1', 'second from G2']);
 });
 
+test('真实Host预算耗尽取消派工失败复核，红点停止提醒但不伪标已处理', { timeout: 10000 }, async t => {
+  const f = fixture(t); await f.activate(); let failureId = '';
+  f.run(async (botId, turn) => {
+    if (botId === A && turn.text === 'red-dot-budget-source') {
+      const manager = f.managers.get(A)!;
+      manager.recordDispatchFailure(turn, 'bridge_start_worker', { title: '预算取消待处理项', cwd: 'missing' }, 'budget-failure', new Error('ENOENT fixture'));
+      const pending = manager.invokeDispatchFailureTool(turn, 'bridge_list_dispatch_failures', {}) as { records: Array<{ id: string }> };
+      failureId = pending.records[0]!.id;
+    }
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'red-dot-budget-source', 'red-dot-budget-source', G1, [A])); await f.drain();
+  assert(failureId); const first = f.calls.find(call => call.botId === A)!;
+  const context = first.turn.groupContext!, hook = f.hooks.get(A)!.manager as SessionManagerOptions;
+  const common = { wakeAllowed: true, conversationId: first.turn.conversation.id, groupContext: context, text: 'timer budget evidence' };
+  for (let index = 0; index < 8; index++) {
+    await hook.onGroupCompletion!({ ...common, id: 'consume-budget-' + index, scheduleKind: 'controller' } as never); await f.drain();
+  }
+  assert.equal(f.host.store.getRoot(context.rootId)?.automaticUsed, 8);
+  const journal = f.sessions.get(A)!.dispatchFailures, taskId = 'failure-budget-review';
+  journal.assign([journal.get(failureId)!], taskId);
+  const before = f.calls.length;
+  assert.equal(await hook.onGroupCompletion!({ ...common, id: 'red-dot-at-budget', taskId, dispatchFailureReviewId: taskId,
+    purpose: 'dispatch-failure', scheduleKind: 'controller' } as never), 'queued');
+  await f.drain();
+  assert(f.host.store.listEvents(A).some(event => event.error === 'root-budget-exhausted'));
+  assert.equal(f.calls.length, before, 'Host取消的提醒不得运行主控');
+  const retained = journal.get(failureId)!;
+  assert.equal(retained.autoState, 'inactive'); assert.equal(retained.handledAt, null);
+  assert.equal(retained.reminders, 0); assert.equal(retained.reviewTaskId, undefined);
+});
+
 test('controller timer wakes share the original root budget while genuine worker completion remains deliverable', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate();
   await f.host.receive(A, f.message(A, 'scheduled-root', 'authorized root', G1, [A])); await f.drain();

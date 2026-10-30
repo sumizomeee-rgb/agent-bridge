@@ -45,6 +45,8 @@ const workerDispatchSelection = {
 export const controllerTools: { name: string; description: string; inputSchema: JsonObject }[] = [
   ...knowledgeTools,
   ...controllerFileTools,
+  { name: 'bridge_list_dispatch_failures', description: harnessText('tools.bridge_list_dispatch_failures.description'), inputSchema: object({ includeHandled: { type: 'boolean', default: false }, limit: { type: 'integer', minimum: 1, maximum: 20, default: 8 } }) },
+  { name: 'bridge_ack_dispatch_failure', description: harnessText('tools.bridge_ack_dispatch_failure.description'), inputSchema: { ...object({ id: string(harnessText('tools.bridge_ack_dispatch_failure.inputSchema.id.description')), note: string(harnessText('tools.bridge_ack_dispatch_failure.inputSchema.note.description')) }), required: ['id'] } },
   { name: 'bridge_read_feedback', description: harnessText('tools.bridge_read_feedback.description'), inputSchema: object({ id: string(harnessText('tools.bridge_read_feedback.inputSchema.id.description')), includeDelivered: { type: 'boolean', description: harnessText('tools.bridge_read_feedback.inputSchema.includeDelivered.description') }, limit: { type: 'integer', minimum: 1, maximum: 20, default: 8 } }) },
   { name: 'bridge_delivery_targets', description: harnessText('tools.bridge_delivery_targets.description'), inputSchema: object({}) },
   { name: 'bridge_send_message', description: harnessText('tools.bridge_send_message.description'), inputSchema: { ...object({ targetId: string(harnessText('tools.bridge_send_message.inputSchema.targetId.description')), text: string(harnessText('tools.bridge_send_message.inputSchema.text.description')), finish: { type: 'boolean', default: true, description: harnessText('tools.bridge_send_message.inputSchema.finish.description') }, attachmentPaths: outgoingAttachmentPaths }), required: ['targetId', 'text'] } },
@@ -457,7 +459,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (active.replyRecovery) {
       const finalReply = (name === 'bridge_send_user' || name === 'bridge_send_message') && args.finish !== false
         && (args.targetId == null || args.targetId === 'private');
-      if (!finalReply && !['bridge_read_feedback', 'bridge_list_workers', 'bridge_search_chat_history', 'bridge_read_chat_history', 'bridge_list_tasks', 'bridge_read_file', 'bridge_list_directory'].includes(name))
+      if (!finalReply && !['bridge_read_feedback', 'bridge_list_dispatch_failures', 'bridge_list_workers', 'bridge_search_chat_history', 'bridge_read_chat_history', 'bridge_list_tasks', 'bridge_read_file', 'bridge_list_directory'].includes(name))
         throw new Error('本次补救只允许核对已有结果并补发原私聊最终回复；禁止重派任务或产生其他副作用。');
     }
     if (name === 'bridge_claim_work' || name === 'bridge_finish_work') return { performed: false, legacyTool: true, message: 'Work ownership and completion are recorded automatically. Use bridge_start_worker, bridge_continue_worker, bridge_schedule_worker or bridge_list_workers directly; no separate claim/finish step is needed.' };
@@ -604,7 +606,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     // shared by Codex and Claude. Keep its whole remaining batch behind the barrier.
     const readonly = ['bridge_delivery_targets', 'bridge_read_group_history', 'bridge_list_controllers', 'bridge_group_context',
       'bridge_search_chat_history', 'bridge_read_chat_history', 'bridge_list_tasks',
-      'bridge_read_file', 'bridge_list_directory',
+      'bridge_read_file', 'bridge_list_directory', 'bridge_list_dispatch_failures',
       'bridge_list_schedules', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_check_capabilities', 'bridge_list_targets', 'bridge_list_workers'].includes(name);
     if (!readonly && active.turn.onPrivateInputCheck && active.privateFinalCallId && active.privateFinalCallId !== callId) return this.privateFinalPendingResult();
     if (!readonly && active.sceneCheckTail) await active.sceneCheckTail;
@@ -613,7 +615,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (active.sceneRefreshPending) return readonly ? undefined : this.scenePausedResult(active);
     if (active.sceneReassessmentStarted || (!active.turn.onSceneCheck && !active.turn.onPrivateInputCheck)) return undefined;
     const guarded = ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_send_user',
-      'bridge_send_message', 'bridge_send_private', 'bridge_update_tasks'].includes(name) || (name === 'bridge_start_collaboration' && args.mode === 'public');
+      'bridge_send_message', 'bridge_send_private', 'bridge_update_tasks', 'bridge_ack_dispatch_failure'].includes(name) || (name === 'bridge_start_collaboration' && args.mode === 'public');
     if (!guarded) return undefined;
     const previous = active.sceneCheckTail ?? Promise.resolve();
     let release!: () => void;
@@ -925,6 +927,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     const sceneBlock = scene == null && !turn.groupContext ? '' : harnessText('controller.chat_scene_header') + JSON.stringify(this.groupScene(scene));
     return '[Bridge chat input; program facts] ' + JSON.stringify(chat) + sceneBlock + '\n' + harnessText('controller.bot_identity_header') + JSON.stringify({ botId: this.options.identity?.botId ?? null, aliases: this.options.identity?.aliases ?? [], rule: 'Aliases are names used to address this Bot; they do not assign a profession, task, identity ownership, or permission. Authorize with real botId/principal/space IDs only.' }) + '\n' + bridgeClock() + harnessText('controller.runtime_facts_header') + JSON.stringify(info)
       + (turn.bridgeFeedback?.records.length ? harnessText('controller.feedback_header') + JSON.stringify({ ...turn.bridgeFeedback, rule: FEEDBACK_RULE, more: 'For more records use bridge_read_feedback if exposed; existing resumed toolkits can use bridge_list_workers with details=true for pending feedback.' }) : '')
+      + (turn.dispatchFailures?.records.length ? harnessText('controller.dispatch_failure_header') + JSON.stringify({ ...turn.dispatchFailures, rule: harnessText('controller.dispatch_failure_rule') }) : '')
       + (includeTaskChecklist && turn.taskChecklist ? harnessText('controller.task_checklist_header') + turn.taskChecklist : '')
       + '\nWorker model: omitted/default inherits this controller selection, then confirmed actual model; another backend uses its bridge worker default. The bridge resolves it before dispatch; never defer to a remote CLI default. Omitted continuation model keeps that worker selection; explicit default reapplies bridge policy. Effort inherits only within the same backend; explicit effort=default uses backend native default. Preserve user aliases and gateway mappings.';
   }

@@ -6,7 +6,7 @@ import { assertBotCommunicationAllowed } from './bot-communication.js';
 import { isActiveWorker } from './overview.js';
 import type { HostConfig } from './config.js';
 import type { HostSemanticMarker } from './host-migration.js';
-import { HostStore, type HostController, type HostEvent, type HostGroup, type RoutedDeliverySource, type RoutedDeliveryTarget } from './host-store.js';
+import { HostStore, HostStateError, type HostController, type HostEvent, type HostGroup, type RoutedDeliverySource, type RoutedDeliveryTarget } from './host-store.js';
 import { prepareIncomingMessage } from './forwarded.js';
 import { HostInbox, type HostInput } from './host-inbox.js';
 import { BotRuntime, type BotRuntimeHooks } from './bot-runtime.js';
@@ -1017,13 +1017,22 @@ export class HostRuntime {
   }
   private async completion(botId: string, event: TaskCompletionEvent): Promise<'queued' | 'retain'> {
     const old = event.groupContext; if (!old || !event.wakeAllowed) return 'retain';
+    const dispatchReview=event.purpose==='dispatch-failure'?event.dispatchFailureReviewId:undefined;
+    if(event.purpose==='dispatch-failure'&&(!dispatchReview||dispatchReview!==event.taskId||!this.bots.get(botId)?.manager.validDispatchFailureReview(dispatchReview,old)))return 'retain';
     const group = this.store.getGroup(old.spaceId), controller = this.store.getController(botId);
-    if (!group?.enabled || !controller || event.conversationId !== controller.conversationId || group.epoch !== old.bindingEpoch) return 'retain';
+    if (!group?.enabled || !controller || event.conversationId !== controller.conversationId || group.epoch !== old.bindingEpoch) {
+      if(dispatchReview)this.bots.get(botId)?.manager.invalidateDispatchFailureReview(dispatchReview);return 'retain';
+    }
     try {
       this.store.enqueueEvent({ id: key('task-result', event.id), rootId: old.rootId, botId, generation: controller.generation,
-        kind: event.scheduleKind === 'controller' ? 'wake' : 'assistant-result', payload: { text: event.text, eventKind: event.scheduleKind === 'controller' ? 'wake' : 'worker-result' }, causeEventId: old.eventId });
+        kind: event.scheduleKind === 'controller' ? 'wake' : 'assistant-result', payload: { text: event.text, eventKind: event.scheduleKind === 'controller' ? 'wake' : 'worker-result',...(dispatchReview?{dispatchFailureReviewId:dispatchReview}:{}) }, causeEventId: old.eventId });
       void this.pump(); return 'queued';
-    } catch { return 'retain'; }
+    } catch(error) {
+      if(dispatchReview){const manager=this.bots.get(botId)?.manager;
+        if(error instanceof HostStateError&&['stale','forbidden','not-found'].includes(error.code))manager?.invalidateDispatchFailureReview(dispatchReview);
+        else manager?.releaseDispatchFailureReview(dispatchReview);
+      }return 'retain';
+    }
   }
   private retireDisabledInternalCommunication(): void {
     if (this.config.internalBotCommunicationEnabled !== false) return;
@@ -1045,11 +1054,23 @@ export class HostRuntime {
       this.retireDisabledInternalCommunication();
       this.reconcileAutomaticTasks();
       for (const [botId, bot] of this.bots) {
-        for (const cancelled of this.store.listEvents(botId).filter(event => event.state === 'cancelled')) bot.manager.cancelHostEvent(cancelled.id, cancelled.error ?? 'host cancelled this group input');
+        for (const cancelled of this.store.listEvents(botId).filter(event => event.state === 'cancelled')) {
+          bot.manager.cancelHostEvent(cancelled.id, cancelled.error ?? 'host cancelled this group input');
+          const review=(cancelled.payload as {dispatchFailureReviewId?:string}).dispatchFailureReviewId;
+          if(review)bot.manager.invalidateDispatchFailureReview(review);
+        }
         if (!bot.isReady() || this.isPaused(botId) || this.failures.has(botId) || this.preparations.has(botId)) continue;
         // Reserve synchronously: an empty asynchronous preparation can otherwise swallow a later enqueue wakeup.
         const event = this.store.claimNextEvent(botId);
-        if (!event) { this.notifyBudgetExhaustion(botId); continue; }
+        if (!event) {
+          // claimNextEvent can cancel an exhausted wake synchronously. Reconcile that terminal
+          // receipt now rather than leaving its red-dot review waiting forever for manager.run.
+          for(const cancelled of this.store.listEvents(botId).filter(value=>value.state==='cancelled')){
+            const review=(cancelled.payload as {dispatchFailureReviewId?:string}).dispatchFailureReviewId;
+            if(review)bot.manager.invalidateDispatchFailureReview(review);
+          }
+          this.notifyBudgetExhaustion(botId); continue;
+        }
         const work = this.prepareBot(botId, bot, event).catch(error => { this.report('GROUP_PREPARATION_FAILED ' + String(error)); return false; }).then(progress => {
           this.preparations.delete(botId);
           if (progress && !this.closed) void this.pump();
@@ -1115,11 +1136,11 @@ export class HostRuntime {
   /** Slow attachment preparation for one Bot never holds another Bot's dispatch. */
   private async prepareBot(botId: string, bot: BotRuntime, event: HostEvent): Promise<boolean> {
     const root = this.store.getRoot(event.rootId)!, group = this.store.getGroup(root.spaceId)!;
-    const payload = event.payload as { text?: string; original?: IncomingDM; sourceBotId?: string; eventKind?: 'wake' | 'worker-result' };
+    const payload = event.payload as { text?: string; original?: IncomingDM; sourceBotId?: string; eventKind?: 'wake' | 'worker-result';dispatchFailureReviewId?:string };
     const channel = bot.config.scopePrefix! + this.rawSpace(botId, root.spaceId);
     const context: Context = { eventId: event.id, rootId: root.id, botId, spaceId: root.spaceId, generation: event.generation,
       bindingEpoch: root.epoch, originChannelId: channel, principalId: root.principalId, scene: '',
-      ...(event.kind === 'human' ? {} : { eventKind: payload.eventKind ?? 'group-event' }) };
+      ...(event.kind === 'human' ? {} : { eventKind: payload.eventKind ?? 'group-event' }),...(payload.dispatchFailureReviewId?{dispatchFailureReviewId:payload.dispatchFailureReviewId}:{}) };
     const message: BridgeMessage = { id: event.id, userId: bot.config.ownerUserId!, channelId: channel,
       text: payload.text ?? '群现场有新的已授权进展。', imagePaths: [], groupContext: context,
       source: payload.original ? { messageId: payload.original.id, userId: payload.original.userId, channelId: payload.original.channelId,

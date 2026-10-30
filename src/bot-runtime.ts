@@ -120,10 +120,26 @@ export class BotRuntime {
           `观察时间：${event.observedAt}；workerId：${event.workerId}；jobId：${event.jobId}；任务仍在执行，未自动重做。`)) this.manager.completionAvailable();
       },
     }) : undefined;
-    const invoke = (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string): Promise<unknown> =>
-      hooks.invoke(turn, name, args, id, input => knowledgeToolNames.has(name)
-        ? Promise.resolve(this.manager.invokeKnowledge(turn, name, input, id)) : controllerFileToolNames.has(name)
-          ? this.manager.invokeFileTool(turn, name, input) : this.controller!.invoke(turn, name, input, id));
+    const invoke = async (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string): Promise<unknown> => {
+      try {
+        return await hooks.invoke(turn, name, args, id, input => knowledgeToolNames.has(name)
+          ? Promise.resolve(this.manager.invokeKnowledge(turn, name, input, id)) : controllerFileToolNames.has(name)
+            ? this.manager.invokeFileTool(turn, name, input) : ['bridge_list_dispatch_failures', 'bridge_ack_dispatch_failure'].includes(name)
+              ? Promise.resolve(this.manager.invokeDispatchFailureTool(turn, name, input, id)) : this.controller!.invoke(turn, name, input, id));
+      } catch (error) {
+        if (['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker'].includes(name) && !turn.signal.aborted && !hooks.isDraining()) {
+          let message: string | undefined;
+          try { message = this.manager.recordDispatchFailure(turn, name, args, id, error); }
+          catch (recordError) { this.log('DISPATCH_FAILURE_JOURNAL ' + safeError(recordError, this.secrets)); }
+          if (message) {
+            // Preserve native uncertainty/exit properties and the original error type.
+            if (error instanceof Error) { try { error.message = message; } catch { /* The durable record still survives a frozen error. */ } }
+            else throw new Error(message, { cause: error });
+          }
+        }
+        throw error;
+      }
+    };
     const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke) ?? {
       codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
         internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),

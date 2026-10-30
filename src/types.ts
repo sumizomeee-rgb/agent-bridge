@@ -1,4 +1,5 @@
 import type { FeedbackBatch, FeedbackRead } from './controller-feedback.js';
+import type { DispatchFailureBatch } from './dispatch-failures.js';
 
 export type AgentName = 'codex' | 'claude';
 export type SessionVisibility = 'hidden' | 'visible';
@@ -159,9 +160,10 @@ export interface AgentTurn {
   taskChecklist?: string;
   /** 当前会话、聊天与主控代次内的程序错误回执；不构成新授权。 */
   bridgeFeedback?: FeedbackBatch;
+  dispatchFailures?: DispatchFailureBatch;
   onReadBridgeFeedback?: (options: FeedbackRead) => FeedbackBatch;
   /** Frozen per-event audience and host causal identity; never inferred from last contact. */
-  groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event' };
+  groupContext?: { eventId: string; rootId: string; botId: string; spaceId: string; generation: number; bindingEpoch: number; originChannelId: string; principalId: string; scene: string; eventKind?: 'worker-result' | 'wake' | 'group-event'; dispatchFailureReviewId?: string };
   onSilent?: () => Promise<void>;
   /** 程序现场检查；返回的增量只是原授权下的证据，不是新用户请求。 */
   onSceneCheck?: (input: ControllerActionCheck) => Promise<{ refreshRequired: boolean; scene?: string }>;

@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -14,7 +14,9 @@ export interface TaskOrigin {
   /** Immutable original parent identities survive successive backend switches. */
   reboundFrom?: Array<{ conversationId: string; agent: AgentName; nativeId: string | null }>;
   /** Program-created internal workspace initialization, never a user/tool parameter. */
-  purpose?: 'workspace-context' | 'schedule' | 'host-event' | 'housekeeper';
+  purpose?: 'workspace-context' | 'schedule' | 'host-event' | 'housekeeper' | 'dispatch-failure';
+  /** Minted by the persisted red-dot scheduler, never a user tool argument. */
+  dispatchFailureReviewId?: string;
   scheduleKind?: 'controller' | 'worker';
   /** Minted only by the Bot's verified enable-command route; survives follow-up dispatch and scheduling. */
   housekeeperAuthorization?: true;
@@ -274,6 +276,25 @@ export class TaskRegistry {
   /** An exit/result watcher is authenticated by the registered local path or SSH identity. */
   acceptObservedResult(taskId: string, status: TaskTerminalStatus, text: string, displayText = text): boolean {
     return this.finish(taskId, status, text, displayText);
+  }
+  /** Internal evidence wake: no execution worker, watcher or pending assistant is created. */
+  enqueueDispatchFailureReview(origin: TaskOrigin, taskId: string, text: string): TaskCompletionEvent {
+    if (origin.purpose !== 'dispatch-failure' || origin.dispatchFailureReviewId !== taskId) throw new Error('失败复核来源无效。');
+    const context = this.createContext(origin);
+    try {
+      this.register(JSON.parse(readFileSync(context.contextPath,'utf8')) as TaskContextFile, '待处理派工失败', taskId);
+      this.acceptObservedResult(taskId,'completed',text);
+      return this.completionForTask(taskId)!;
+    } finally { this.closeContext(context.contextId); }
+  }
+  completionForTask(taskId: string): TaskCompletionEvent | null {
+    const row = this.db.prepare('SELECT e.*,t.title,t.wake_allowed FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.task_id=? ORDER BY e.rowid DESC LIMIT 1').get(taskId);
+    return row ? this.event(row) : null;
+  }
+  completionById(id:string):TaskCompletionEvent|null {
+    const row=this.db.prepare('SELECT e.*,t.title,t.wake_allowed FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.id=?').get(id)
+      ??this.db.prepare("SELECT o.*,t.title,t.wake_allowed,'worker-progress' kind FROM task_observations o JOIN tasks t ON t.id=o.task_id WHERE o.id=?").get(id);
+    return row?this.event(row):null;
   }
   private finish(taskId: string, status: TaskTerminalStatus, text: string, displayText = text): boolean {
     this.db.exec('BEGIN IMMEDIATE');

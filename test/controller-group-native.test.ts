@@ -223,6 +223,8 @@ test('群公开响应限额把final和补充发送转为正常静默，DONE等�
     const running = f.adapter.run(f.turn).then(value => { finished = true; return value; });
     await until(() => f.protocol.turns === 1);
     f.protocol.tool(201, 'bridge_list_workers'); await until(() => f.invoked.length === 1);
+    // FINAL must use the completed management receipt; the supplement branch below still races pending management.
+    if (finish) { releaseManagement(); await until(() => !!reply(f.protocol, 201)); }
     f.protocol.emit({ id: 202, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'public-at-limit',
       tool: finish ? 'bridge_send_user' : 'bridge_send_message', arguments: JSON.stringify({ text: '群响应', ...(finish ? {} : { targetId: 'group-current', finish: false }) }) } });
     f.protocol.complete(); await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(finished, false);
