@@ -73,21 +73,26 @@ try {
     $renderedReadme = $null
     if (![IO.File]::Exists((Join-Path $workspace 'README.md'))) {
         $readmeTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'README.md'), [Text.Encoding]::UTF8)
-        $token = '{{harness.workspace.proactive_followup}}'
         $catalogPath = Join-Path $PSScriptRoot 'harness\prompts.toml'
         if (![IO.File]::Exists($catalogPath) -or ([IO.FileInfo]$catalogPath).Length -gt 524288) {
             throw '缺少或超限的提示词配置：harness/prompts.toml'
         }
         $catalogText = [IO.File]::ReadAllText($catalogPath, [Text.Encoding]::UTF8)
-        $entry = [Regex]::Match($catalogText, '(?ms)^\[prompts\."workspace\.proactive_followup"\]\r?\n(?<entry>.*?)(?=^\[prompts\.|\z)')
-        $body = [Regex]::Match($entry.Groups['entry'].Value, "(?s)text = '''\r?\n(?<text>.*?)'''")
-        if (!$entry.Success -or !$body.Success -or [string]::IsNullOrWhiteSpace($body.Groups['text'].Value) -or !$readmeTemplate.Contains($token)) {
-            throw 'README 主动跟进提示词或模板占位符无效。'
-        }
         $crlf = [string]::Concat([char]13, [char]10)
         $newline = if ($readmeTemplate.Contains($crlf)) { $crlf } else { [string][char]10 }
-        $bodyText = $body.Groups['text'].Value -replace '\r?\n', $newline
-        $renderedReadme = $readmeTemplate.Replace($token, $bodyText)
+        $renderedReadme = $readmeTemplate
+        $references = [Regex]::Matches($readmeTemplate, '\{\{harness\.(?<id>[A-Za-z][A-Za-z0-9_.-]*)\}\}')
+        foreach ($reference in $references) {
+            $promptId = $reference.Groups['id'].Value
+            $entryPattern = '(?ms)^\[prompts\."' + [Regex]::Escape($promptId) + '"\]\r?\n(?<entry>.*?)(?=^\[prompts\.|\z)'
+            $entry = [Regex]::Match($catalogText, $entryPattern)
+            $body = [Regex]::Match($entry.Groups['entry'].Value, "(?s)text = '''\r?\n(?<text>.*?)'''")
+            if (!$entry.Success -or !$body.Success -or [string]::IsNullOrWhiteSpace($body.Groups['text'].Value)) {
+                throw "README 提示词无效：$promptId"
+            }
+            $bodyText = $body.Groups['text'].Value -replace '\r?\n', $newline
+            $renderedReadme = $renderedReadme.Replace($reference.Value, $bodyText)
+        }
     }
 
     $privateRoot = Join-Path $workspace 'bridge-agent-presets\private'
