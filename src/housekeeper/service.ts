@@ -275,7 +275,7 @@ export class HousekeeperService {
   }
   private async submit(value: HousekeeperState, active: Conversation, snapshot: TransactionSnapshot): Promise<void> {
     const id = randomUUID(), dir = join(this.config.dataDir, 'housekeeper', id); mkdirSync(dir, { recursive: true });
-    const inputPath = join(dir, 'input.json'), temporary = inputPath + '.tmp';
+    const inputPath = join(dir, 'input.txt'), temporary = inputPath + '.tmp';
     writeFileSync(temporary, snapshot.text, { encoding: 'utf8', mode: 0o600 }); renameSync(temporary, inputPath);
     value.run = { id, epoch: value.epoch, phase: 'preparing', createdAt: this.time(), conversationId: active.id, snapshot, inputPath };
     this.store.save(value);

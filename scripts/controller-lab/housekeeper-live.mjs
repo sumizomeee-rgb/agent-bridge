@@ -40,7 +40,7 @@ export async function runHousekeeperLive(options) {
   assert(!existsSync(directory), 'Run directory must be new; existing lab evidence will not be overwritten');
   mkdirSync(directory, { recursive: true });
   const report = { version: 1, startedAt: stamp(), status: 'running', runtimeRoot, sourceRoot,
-    scope: '真实配置单轮验收；最多 12 条、12000 正文字，非全量语义验收。生产会话、任务、开关和消费进度不作修改。',
+    scope: '真实配置单轮验收；最多 12 个文本片段、12000 正文字，非全量语义验收。生产会话、任务、开关和消费进度不作修改。',
     isolatedPlatform: true, historicalWindow, limits: { maxRecords: 12, maxRecordsPerSource: 4, maxChars: 12000, maxRecordChars: 2800 },
     controller: { requestedModel: controllerModel, requestedEffort: controllerEffort },
     cases: [], scans: [], dispatches: [], workerRuns: [], controllerTurns: [], tools: [], deliveries: [], cleanup: [] };
@@ -74,7 +74,7 @@ export async function runHousekeeperLive(options) {
     const { harnessCatalogPath } = await load('harness.js');
     const context = source.contextWorkspace ?? source.workspace;
     const sourceDirectory = join(context, 'bridge-transaction-sync');
-    assert(existsSync(join(sourceDirectory, 'index.json')), 'Unified production transaction index missing');
+    assert(existsSync(sourceDirectory), 'Production readable transaction directory missing');
     const workspace = join(directory, 'workspace'); mkdirSync(workspace, { recursive: true });
     writeFileSync(join(workspace, 'README.md'), labRule + '\n');
     const applicationId = source.platform === 'feishu' ? 'cli_labhousekeeper' + process.pid : String(710000000000000000n + BigInt(process.pid));
@@ -90,7 +90,7 @@ export async function runHousekeeperLive(options) {
       token: '', appSecret: undefined, controllerMode: true, groupMode: false,
       defaultModels: { ...source.defaultModels, codex: controllerModel } };
     report.sourceBotId = source.botId; report.labBotId = config.botId; report.contextWorkspace = context;
-    report.sourceIndexHash = hash(readFileSync(join(sourceDirectory, 'index.json')));
+    report.sourceEntry = { directory: sourceDirectory, kind: 'readable-text', platformSchemaRequired: false };
     report.candidateHarnessHash = hash(readFileSync(harnessCatalogPath()));
     const originalSettings = [];
     const productionDb = new DatabaseSync(join(source.dataDir, 'controller.sqlite'), { readOnly: true });
@@ -128,7 +128,7 @@ export async function runHousekeeperLive(options) {
                 assert.equal(binding.id, 'local'); assert(!binding.preset, 'Saved ordinary default changed');
                 assert.equal(turn.conversation.model, 'gpt-6.1-sol'); assert.equal(turn.conversation.effort, 'xhigh');
                 assert(item.readOnly && item.newSession && item.noTaskCapability, 'Summary worker lost disposable read-only isolation');
-                assert(item.inlineSnapshotPresent, 'Real bounded JSON body was not sent directly to the summary adapter');
+                assert(item.inlineSnapshotPresent, 'Real bounded readable text was not sent directly to the summary adapter');
                 assert.equal(readFileSync(preparedRun.inputPath, 'utf8'), preparedRun.snapshot.text, 'Audit file differs from the inline body');
                 return target.run(turn);
               };
@@ -332,7 +332,7 @@ export async function runHousekeeperLive(options) {
     const lines = ['# 管家事务真实隔离验收', '', '结果：' + report.status, '', report.scope, '',
       '- 主控：gpt-6-luna xhigh；摘要助手：生产保存的笔记本 default，不覆盖选择。',
       '- 平台发送、会话、任务登记、开关和游标均隔离；真实生产事务目录只读扫描。',
-      '- 测试只调整隔离开关窗口为 ' + historicalWindow + '，三个平台最多各 4 条。', '',
+      '- 测试只调整隔离开关窗口为 ' + historicalWindow + '，三个平台最多各 4 个文本片段。', '',
       ...report.cases.map(item => '- ' + (item.status === 'passed' ? '通过' : '失败') + '：' + item.name + (item.error ? ' — ' + item.error : '')),
       '', ...(report.summary ? ['## 实际摘要助手回文', '', report.summary, ''] : []),
       ...(report.error ? ['错误：' + report.error, ''] : []), '结构化证据：report.json', ''];

@@ -46,14 +46,15 @@ test('source and built module locations resolve the same catalog, including relo
 });
 
 test('one summary-worker prompt serves every window and generated README uses the approved follow-up text', () => {
-  const inputText = JSON.stringify({ sources: [{ site: 'feishu', records: [{ text: '来源 {{unexpanded_instruction}}' }] }] });
-  const prompt = harnessText('housekeeper.summary_worker', { input_path: 'C:\\input.json', input_text: inputText });
+  const inputText = '飞书 / 会话正文\n陈某 09:12：来源 {{unexpanded_instruction}}';
+  const prompt = harnessText('housekeeper.summary_worker', { input_path: 'C:\\input.txt', input_text: inputText });
   assert.ok(prompt.includes(inputText), '完整有界正文直接进入模型输入，来源中的模板标记仍是原文');
   assert.match(prompt, /不调用工具读取文件，也不编写提取脚本/);
   assert.match(prompt, /审计文件位置：.*仅用于证据定位，无需打开/);
-  assert.throws(() => harnessText('housekeeper.summary_worker', { input_path: 'audit-only.json' }), /参数缺失/);
-  assert.match(prompt, /按输入清单的平台分别分节/);
-  assert.match(prompt, /程序已整理的有界正文包/);
+  assert.throws(() => harnessText('housekeeper.summary_worker', { input_path: 'audit-only.txt' }), /参数缺失/);
+  assert.match(prompt, /按正文标明的平台或来源分别分节/);
+  assert.match(prompt, /同步正文增量/);
+  assert.doesNotMatch(prompt, /JSON 正文/);
   assert.match(prompt, /首次和后续使用相同职责/);
   assert.match(prompt, /只总结，不执行事务、不派工、不联系用户、不维护主控任务清单/);
   assert.doesNotMatch(prompt, /首次.*7\s*天/);

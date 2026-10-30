@@ -1,203 +1,166 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, utimesSync, unlinkSync, renameSync, symlinkSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ownTemporaryDirectory } from './temp-directory.js';
-import { scanTransactionSources, type TransactionCursor } from '../src/housekeeper/sources.js';
+import { scanTransactionSources, type TransactionCursor, type TransactionSourceOptions } from '../src/housekeeper/sources.js';
 
-const start = '2026-10-29T00:00:00Z', end = '2026-10-30T00:00:00Z';
-const time = (value: string) => Date.parse(value) / 1000;
-const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-const json = (file: string, value: unknown) => writeFileSync(file, JSON.stringify(value), 'utf8');
-type Row = Record<string, unknown>;
-function record(id: string, text = id, extra: Row = {}): Row {
-  return { identity: id, scope: 'chat-1', revision: `revision-${id}`, operation: 'upsert', deleted: false,
-    occurred_at: time('2026-10-29T10:00:00Z'), text, data: { sender: { name: 'Owner' }, chat_name: 'Project', record_kind: 'message' }, ...extra };
-}
-function fixture() {
-  const root = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'housekeeper-sources-')), 'housekeeper-sources-');
-  mkdirSync(join(root, 'sources'));
-  const entries: Row[] = [], manifests = new Map<string, { schema: string; version: number; items: Record<string, any> }>();
-  const source = (site: string) => {
-    const dir = join(root, 'sources', site); mkdirSync(dir, { recursive: true });
-    const manifest = { schema: 'cookiesync-delivery-state', version: 2, items: { item: { source: site, item_id: `${site}-item`, batches: [], record_revisions: {} } } };
-    manifests.set(site, manifest); entries.push({ site, label: site, timezone: 'UTC', manifest: `sources/${site}/data.json` });
-    json(join(root,'index.json'), { schema: 'bridge-transaction-source-index', version: 1, timezone: 'UTC', sources: entries });
-    json(join(dir,'data.json'), manifest);
+const start='2026-10-29T00:00:00Z', end='2026-10-30T00:00:00Z';
+function fixture(){
+  const root=ownTemporaryDirectory(mkdtempSync(join(tmpdir(),'housekeeper-sources-')),'housekeeper-sources-');
+  const file=(path:string,text:string|Buffer,mtime='2026-10-29T12:00:00Z')=>{
+    const target=join(root,path);mkdirSync(dirname(target),{recursive:true});writeFileSync(target,text);utimesSync(target,new Date(mtime),new Date(mtime));return target;
   };
-  const batch = (site: string, published: string, records: Row[]) => {
-    const manifest = manifests.get(site)!;
-    const value = { schema: 'cookiesync-content-batch', version: 1, source: site, item_id: `${site}-item`, created_at: time(published), records };
-    const body = JSON.stringify(value), sha256 = hash(body);
-    const folder = published.slice(0,19).replace('T','_').replaceAll(':','-') + '-' + sha256.slice(0,16);
-    const dir = join(root,'sources',site,folder); mkdirSync(dir, { recursive: true });
-    const file = join(dir,'records.json'); writeFileSync(file,body,'utf8');
-    manifest.items.item.batches.push({ folder, sha256 }); json(join(root,'sources',site,'data.json'),manifest);
-    return { file, folder, sha256, manifest };
-  };
-  return { root, source, batch, entries, manifests };
+  const scan=(options:Partial<TransactionSourceOptions>={})=>scanTransactionSources(root,{enabledAt:start,cutoff:end,...options});
+  return{root,file,scan};
 }
+const rows=(scan:Awaited<ReturnType<typeof scanTransactionSources>>)=>scan.sources.flatMap(s=>s.records);
 
-test('three platforms are frozen fairly and consumption is a separate caller acknowledgement', async () => {
-  const f = fixture();
-  for (const site of ['feishu','chatgpt','bilibili']) {
-    f.source(site); f.batch(site,'2026-10-29T12:00:00Z',[record(`${site}-1`),record(`${site}-2`)]);
+test('readable files are platform-agnostic, recursively discovered, fairly paged and acknowledged separately',async()=>{
+  const f=fixture();
+  for(const site of ['chatgpt','feishu','bilibili']){f.file(site+'/a.md',site+' original text');f.file(site+'/nested/b.txt',site+' second text');}
+  const first=await f.scan({limits:{maxRecords:3}});assert.equal(first.recordCount,3);assert(first.hasMore);
+  assert.deepEqual(first.sources.map(s=>s.records.length),[1,1,1]);assert(first.text.includes('feishu original text'));
+  assert(first.text.includes('未读提示'));assert(!first.text.startsWith('{'));
+  assert.equal((await f.scan({limits:{maxRecords:3}})).text,first.text,'reader must not commit implicitly');
+  const second=await f.scan({cursor:first.nextCursor,limits:{maxRecords:3}});assert.equal(second.recordCount,3);assert(!second.hasMore);
+  const done=await f.scan({cursor:second.nextCursor});assert.equal(done.recordCount,0);assert(!done.hasMore);
+  assert(done.sources.every(s=>s.coverage.filesRead===0),'unchanged files must not be reopened or rehashed');
+});
+
+test('file publication mtime governs the on window; copied historical content and JSON metadata never become recent text',async()=>{
+  const f=fixture();f.file('any-platform/history.md','three months of old history','2026-08-01T00:00:00Z');
+  f.file('any-platform/new.txt','Original message time: 2026-08-01; newly published correction');
+  f.file('any-platform/future.log','future','2026-11-01T00:00:00Z');f.file('index.json','not even valid JSON');
+  f.file('.internal/secret.md','hidden payload');f.file('any-platform/.health-state.json','raw protocol');
+  f.file('any-platform/.hidden.txt','not published');f.file('any-platform/raw.bin','not text');
+  const first=await f.scan();assert.equal(first.recordCount,1);assert.equal(rows(first)[0]!.text,'Original message time: 2026-08-01; newly published correction');
+  assert.equal(first.sources[0]!.coverage.skippedBeforeWindow,1);assert(!first.text.includes('three months'));assert(!first.text.includes('raw protocol'));
+  // A migration can replace the bytes/ctime while preserving its original publication mtime.
+  f.file('any-platform/history.md','old history reformatted','2026-08-01T00:00:00Z');
+  assert.equal((await f.scan({cursor:first.nextCursor})).recordCount,0);
+  await assert.rejects(f.scan({enabledAt:'2026-10-29T01:00:00Z',cursor:first.nextCursor}),/开启窗口/);
+});
+
+test('whole-second publication precision retains the same-second enable overlap',async()=>{
+  const f=fixture();f.file('source/before.md','before','2026-10-28T23:59:59Z');f.file('source/overlap.md','overlap',start);
+  const scan=await f.scan({enabledAt:'2026-10-29T00:00:00.900Z'});assert.deepEqual(rows(scan).map(r=>r.text),['overlap']);
+});
+
+test('sub-millisecond filesystem mtime at the cutoff is included without including the next millisecond',async()=>{
+  const f=fixture(),same=f.file('source/same-ms.md','same millisecond'),future=f.file('source/next-ms.md','next millisecond');
+  const cutoff=Date.parse(end),sameSeconds=(cutoff+0.5)/1000,futureSeconds=(cutoff+1.5)/1000;
+  utimesSync(same,sameSeconds,sameSeconds);utimesSync(future,futureSeconds,futureSeconds);
+  assert(statSync(same).mtimeMs>cutoff&&statSync(same).mtimeMs<cutoff+1,'fixture must retain a fractional millisecond');
+  const scan=await f.scan();assert.deepEqual(rows(scan).map(r=>r.text),['same millisecond']);
+  const next=await f.scan({cursor:scan.nextCursor,cutoff:new Date(cutoff+1).toISOString()});
+  assert.deepEqual(rows(next).map(r=>r.text),['next millisecond']);
+});
+
+test('opaque text is delivered verbatim without interpreting sender, platform, markdown, or embedded JSON schemas',async()=>{
+  const f=fixture(),body='# 任意平台\n作者和会话由来源说明\n```json\n{"data":{"role":"tool"},"operation":"retract"}\n```\n正文 😀\n';
+  f.file('new-calendar-format/free-form.log',body);const scan=await f.scan();assert.equal(rows(scan)[0]!.text,body);
+  assert.equal(scan.sources[0]!.site,'new-calendar-format');assert.equal(rows(scan)[0]!.operation,'upsert');
+  assert(scan.text.includes(body));assert.equal(rows(scan)[0]!.source.file,'new-calendar-format/free-form.log');
+});
+
+test('append verifies the consumed prefix and returns only the new suffix',async()=>{
+  const f=fixture(),target=f.file('notes/events.log','已读原文😀\n'),first=await f.scan();
+  appendFileSync(target,'新增尾部😀\n');utimesSync(target,new Date(end),new Date(end));
+  const next=await f.scan({cursor:first.nextCursor});assert.equal(next.recordCount,1);assert.equal(rows(next)[0]!.change,'append');
+  assert.equal(rows(next)[0]!.text,'新增尾部😀\n');assert.equal(rows(next)[0]!.source.byteOffset,Buffer.byteLength('已读原文😀\n'));
+  assert.equal((await f.scan({cursor:next.nextCursor})).recordCount,0);
+});
+
+test('rewrite is detected even when size grows, and shorter replacements are delivered as explicit revisions',async()=>{
+  const f=fixture(),original='A'.repeat(9000)+'old tail',target=f.file('source/change.md',original),first=await f.scan();
+  // Changing the middle cannot be mistaken for an append merely because head/tail probes match.
+  const replacement='A'.repeat(4300)+'CHANGED'+'A'.repeat(4693)+'old tail plus appended';
+  writeFileSync(target,replacement);utimesSync(target,new Date(end),new Date(end));
+  const changed=await f.scan({cursor:first.nextCursor});assert.equal(rows(changed)[0]!.change,'rewrite');assert.equal(rows(changed).map(r=>r.text).join(''),replacement);
+  writeFileSync(target,'short revised');utimesSync(target,new Date(end),new Date(end));
+  const short=await f.scan({cursor:changed.nextCursor});assert.equal(rows(short)[0]!.change,'rewrite');assert.equal(rows(short)[0]!.text,'short revised');
+});
+
+test('long UTF-8 files continue at byte offsets without corrupting multibyte text or losing unseen tails',async()=>{
+  const f=fixture(),body='first😀'+'汉字与emoji😀'.repeat(1600)+'last😀';f.file('platform/large.txt',body);
+  let cursor:TransactionCursor|undefined,actual='',offset=0;
+  for(let n=0;n<100;n++){
+    const scan=await f.scan({cursor,limits:{maxRecords:1,maxRecordChars:512,maxChars:4000}});
+    for(const record of rows(scan)){assert.equal(record.source.byteOffset,offset);assert(!/[\uD800-\uDBFF]$/.test(record.text));actual+=record.text;offset+=Buffer.byteLength(record.text);}
+    cursor=scan.nextCursor;if(!scan.hasMore)break;
   }
-  const options = { enabledAt: start, cutoff: end, limits: { maxRecords: 3 } };
-  const first = await scanTransactionSources(f.root,options);
-  assert.equal(first.recordCount,3); assert(first.hasMore);
-  assert.deepEqual(first.sources.map(s=>s.records.length),[1,1,1]);
-  assert.deepEqual(first.sources.map(s=>s.status),['partial','partial','partial']);
-  assert.equal(first.text,JSON.stringify({version:first.version,trust:first.trust,window:first.window,sources:first.sources}));
-  assert.equal((await scanTransactionSources(f.root,options)).text,first.text,'no implicit acknowledgement');
-  const second = await scanTransactionSources(f.root,{...options,cursor:first.nextCursor});
-  assert.equal(second.recordCount,3); assert(!second.hasMore);
-  const done = await scanTransactionSources(f.root,{...options,cursor:second.nextCursor});
-  assert.equal(done.recordCount,0); assert(!done.hasMore);
-  assert.deepEqual(first.sources.map(s=>s.records[0]!.source.recordIndex),[1,1,1]);
+  assert.equal(actual,body);assert.equal(offset,Buffer.byteLength(body));assert.equal((await f.scan({cursor})).recordCount,0);
 });
 
-test('publication time controls the window while original event time remains evidence', async () => {
-  const f = fixture(); f.source('feishu');
-  f.batch('feishu','2026-10-27T20:00:00Z',[record('before','before')]);
-  f.batch('feishu','2026-10-29T12:00:00Z',[record('old-event','older event newly published',{occurred_at:time('2026-09-01T10:00:00Z')})]);
-  f.batch('feishu','2026-10-30T01:00:00Z',[record('future','future')]);
-  const first = await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.deepEqual(first.sources[0]!.records.map(r=>r.identity),['old-event']);
-  assert.equal(first.sources[0]!.records[0]!.occurredAt,'2026-09-01T10:00:00.000Z');
-  const next = await scanTransactionSources(f.root,{enabledAt:start,cutoff:'2026-10-30T02:00:00Z',cursor:first.nextCursor});
-  assert.deepEqual(next.sources[0]!.records.map(r=>r.identity),['future']);
-  await assert.rejects(scanTransactionSources(f.root,{enabledAt:'2026-10-29T01:00:00Z',cutoff:end,cursor:first.nextCursor}),/开启窗口/);
-});
-
-test('integer-second publications overlapping the millisecond enable boundary are retained',async()=>{
-  const f=fixture();f.source('feishu');
-  f.batch('feishu','2026-10-28T23:59:59Z',[record('earlier-second')]);
-  f.batch('feishu','2026-10-29T00:00:00Z',[record('same-second')]);
-  const scan=await scanTransactionSources(f.root,{enabledAt:'2026-10-29T00:00:00.900Z',cutoff:end});
-  assert.deepEqual(scan.sources[0]!.records.map(r=>r.identity),['same-second']);
-});
-
-test('newest business revision wins over earlier batches and later retracts survive deduplication', async () => {
-  const f = fixture(); f.source('feishu');
-  f.batch('feishu','2026-10-29T01:00:00Z',[record('same','old',{revision:'r1'})]);
-  f.batch('feishu','2026-10-29T02:00:00Z',[record('same','new',{revision:'r2'})]);
-  const first = await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.deepEqual(first.sources[0]!.records.map(r=>r.text),['new']);
-  assert.equal(first.sources[0]!.coverage.duplicateRecords,1);
-  f.batch('feishu','2026-10-29T03:00:00Z',[record('same','',{revision:'r3',deleted:true,operation:'retract'})]);
-  const second = await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,cursor:first.nextCursor});
-  assert.equal(second.recordCount,1); assert.equal(second.sources[0]!.records[0]!.operation,'retract');
-  assert.equal(second.sources[0]!.records[0]!.text,'[该来源记录已撤回或删除]');
-  const manifest = f.manifests.get('feishu')!; manifest.items.item.last_success = time(end);
-  json(join(f.root,'sources/feishu/data.json'),manifest);
-  assert.equal((await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,cursor:second.nextCursor})).recordCount,0);
-});
-
-test('long records continue at exact text offsets without splitting surrogate pairs or dropping the tail', async () => {
-  const f=fixture();f.source('feishu');
-  const body='first😀'+'很长的正文'.repeat(600)+'last😀';f.batch('feishu','2026-10-29T01:00:00Z',[record('long',body)]);
-  let cursor: TransactionCursor | undefined, accumulated='';
-  for(let i=0;i<30;i++){
-    const part=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,cursor,limits:{maxRecords:1,maxRecordChars:512,maxChars:8000}});
-    if(!part.recordCount){assert.equal(accumulated,body);break;}
-    const r=part.sources[0]!.records[0]!;assert.equal(r.fragment?.offset??0,accumulated.length);
-    assert(!/[\uD800-\uDBFF]$/.test(r.text));accumulated+=r.text;cursor=part.nextCursor;
-    if(!part.hasMore){assert.equal(accumulated,body);break;}
+test('changed-prefix verification itself is bounded and can continue across technical acknowledgements',async()=>{
+  const f=fixture(),target=f.file('source/log.txt','prefix '.repeat(5000)),first=await f.scan();
+  appendFileSync(target,'only this appended');utimesSync(target,new Date(end),new Date(end));
+  let cursor=first.nextCursor,body='',technical=0;
+  for(let n=0;n<30;n++){
+    const scan=await f.scan({cursor,limits:{maxTotalBytes:8192}});cursor=scan.nextCursor;
+    if(!scan.recordCount&&scan.hasMore)technical++;
+    body+=rows(scan).map(r=>r.text).join('');if(!scan.hasMore)break;
   }
-  assert.equal(accumulated,body);
+  assert(technical>0);assert.equal(body,'only this appended');
 });
 
-test('GPT internal and empty events are counted separately from visible conversations', async () => {
-  const f=fixture();f.source('chatgpt');
-  f.batch('chatgpt','2026-10-29T01:00:00Z',[
-    record('tool','tool result',{data:{role:'tool',record_kind:'tool_event',content_type:'text'}}),
-    record('thought','thinking',{data:{role:'assistant',record_kind:'assistant_event',content_type:'thoughts'}}),
-    record('empty','',{data:{role:'assistant',record_kind:'message'}}),
-    record('question','real question',{data:{role:'user',record_kind:'message',conversation_title:'Topic'}}),
-    record('answer','model claims finished',{data:{role:'assistant',record_kind:'message',channel:'final'}}),
-  ]);
-  const scan=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(scan.recordCount,2);assert.equal(scan.sources[0]!.coverage.filteredRecords,3);
-  assert.equal(scan.sources[0]!.coverage.unreadRecords,0);
-  assert.deepEqual(scan.sources[0]!.records.map(r=>r.role),['user','assistant']);
-  assert(!scan.text.includes('tool result'));assert(!scan.text.includes('thinking'));
+test('deletion and rename of consumed files produce explicit withdrawals; an unconsumed historical file does not',async()=>{
+  const f=fixture();f.file('source/consumed.md','known fact');const historical=f.file('source/history.txt','old','2026-08-01T00:00:00Z');
+  const first=await f.scan();renameSync(join(f.root,'source/consumed.md'),join(f.root,'source/renamed.md'));unlinkSync(historical);
+  const next=await f.scan({cursor:first.nextCursor});assert.equal(next.recordCount,2);
+  const removed=rows(next).find(r=>r.change==='delete'&&r.source.file==='source/consumed.md');assert(removed);
+  assert.match(removed.text,/仅确认文件消失，不代表其中历史内容均被撤回/);
+  assert(rows(next).some(r=>r.change==='new'&&r.source.file==='source/renamed.md'));
+  assert.equal((await f.scan({cursor:next.nextCursor})).recordCount,0);
 });
 
-test('Bilibili preserves viewing metadata without leaking raw source content into the body pack',async()=>{
-  const f=fixture();f.source('bilibili');
-  f.batch('bilibili','2026-10-29T01:00:00Z',[record('watch','Video title',{data:{author:'Uploader',bvid:'BV1example',duration:264,progress:6,video_content_fetched:false,source_content:{token:'not source text'}}})]);
-  const scan=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(scan.sources[0]!.records[0]!.metadata?.progress,6);
-  assert.equal(scan.sources[0]!.records[0]!.metadata?.author,'Uploader');
-  assert(!scan.text.includes('not source text'));
+test('file and record limits retain pending work and rotate fairly between sources',async()=>{
+  const f=fixture();for(const source of ['alpha','beta','gamma'])for(let n=0;n<3;n++)f.file(source+'/'+n+'.md',source+n);
+  let cursor:TransactionCursor|undefined;const seen:string[]=[];
+  for(let n=0;n<12;n++){
+    const scan=await f.scan({cursor,limits:{maxFiles:1,maxRecords:1}});seen.push(...rows(scan).map(r=>r.text));cursor=scan.nextCursor;if(!scan.hasMore)break;
+  }
+  assert.deepEqual(seen.slice(0,3),['alpha0','beta0','gamma0']);assert.equal(new Set(seen).size,9);
 });
 
-test('corrupt and missing sources remain explicit errors while healthy platforms continue',async()=>{
-  const f=fixture();f.source('feishu');f.source('chatgpt');f.source('bilibili');
-  f.batch('feishu','2026-10-29T01:00:00Z',[record('good')]);
-  const bad=f.batch('chatgpt','2026-10-29T01:00:00Z',[record('bad')]);writeFileSync(bad.file,'{}');
-  f.entries[2]!.manifest='sources/bilibili/missing.json';json(join(f.root,'index.json'),{timezone:'UTC',sources:f.entries});
-  const scan=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(scan.recordCount,1);assert.equal(scan.sources.find(s=>s.site==='chatgpt')!.status,'error');
-  assert.match(scan.sources.find(s=>s.site==='chatgpt')!.error!,/SHA256/);
-  assert(scan.sources.some(s=>s.site==='bilibili'&&s.status==='error'));
-  assert.deepEqual(scan.nextCursor.sources.chatgpt,{batches:{},revisions:{}});
-  assert.equal(scan.sources.find(s=>s.site==='feishu')!.status,'ok');
+test('invalid text and oversized files remain source errors while other platforms continue',async()=>{
+  const f=fixture();f.file('good/a.md','safe content');f.file('bad/b.txt',Buffer.from([0xff,0xff,0x80]));f.file('large/c.log','x'.repeat(5000));
+  const scan=await f.scan({limits:{maxFileBytes:4096}});assert.equal(scan.sources.find(s=>s.id==='bad')!.status,'error');
+  assert.equal(scan.sources.find(s=>s.id==='large')!.status,'error');assert.equal(rows(scan)[0]!.text,'safe content');
+  assert.equal(scan.nextCursor.files!['bad/b.txt'],undefined);assert.equal(scan.nextCursor.files!['large/c.log'],undefined);
 });
 
-test('source manifests reject traversal and linked paths and unknown platforms use the same envelope',async()=>{
-  const f=fixture();f.source('calendar');f.batch('calendar','2026-10-29T01:00:00Z',[record('meeting')]);
-  json(join(f.root,'index.json'),{timezone:'UTC',sources:[]});
-  assert.equal((await scanTransactionSources(f.root,{enabledAt:start,cutoff:end})).sources[0]!.site,'calendar');
-  json(join(f.root,'index.json'),{sources:[{site:'escape',manifest:'../outside.json'}]});
-  const escaped=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(escaped.sources.find(s=>s.site==='escape')!.status,'error');
-  const other=fixture();other.source('feishu');other.batch('feishu','2026-10-29T01:00:00Z',[record('outside')]);
-  symlinkSync(join(other.root,'sources/feishu'),join(f.root,'sources/linked'),process.platform==='win32'?'junction':'dir');
-  json(join(f.root,'index.json'),{sources:[{site:'feishu',manifest:'sources/linked/data.json'}]});
-  const linked=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(linked.sources.find(s=>s.id==='feishu')!.status,'error');
-  assert.match(linked.sources.find(s=>s.id==='feishu')!.error!,/链接/);
+test('links, hidden paths and path traversal in saved cursors are never followed',async()=>{
+  const f=fixture(),outside=fixture();outside.file('outside.md','private secret');f.file('safe/a.md','visible');
+  symlinkSync(outside.root,join(f.root,'linked'),process.platform==='win32'?'junction':'dir');
+  const scan=await f.scan();assert.equal(scan.recordCount,1);assert(!scan.text.includes('private secret'));
+  const malicious:TransactionCursor={version:2,enabledAt:start,sources:{},files:{'../escape.md':{version:'x',mtime:1,size:0,offset:0,blocks:[]}}};
+  await assert.rejects(f.scan({cursor:malicious}),/越界/);
+  await assert.rejects(scanTransactionSources(join(f.root,'linked'),{enabledAt:start,cutoff:end}),/链接/);
 });
 
-test('byte and file budgets resume instead of losing unread batches; input files remain byte-identical',async()=>{
-  const f=fixture();f.source('feishu');
-  const first=f.batch('feishu','2026-10-29T01:00:00Z',[record('older')]);
-  const latest=f.batch('feishu','2026-10-29T02:00:00Z',[record('newer')]);
-  const bytes=readFileSync(latest.file);
-  const one=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,limits:{maxFiles:3}});
-  assert.deepEqual(one.sources[0]!.records.map(r=>r.identity),['newer']);assert(one.hasMore);
-  const two=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,cursor:one.nextCursor,limits:{maxFiles:3}});
-  assert.deepEqual(two.sources[0]!.records.map(r=>r.identity),['older']);
-  assert.deepEqual(readFileSync(latest.file),bytes);assert(readFileSync(first.file).length>0);
-  await assert.rejects(scanTransactionSources(f.root,{enabledAt:start,cutoff:end,signal:AbortSignal.abort(new Error('cancelled'))}),/cancelled/);
-  await assert.rejects(scanTransactionSources(f.root,{enabledAt:start,cutoff:end,limits:{maxChars:100}}),/过小/);
+test('source discovery errors cannot falsely withdraw previously consumed files',async()=>{
+  const f=fixture();f.file('source/nested/doc.md','previously seen');f.file('healthy/a.md','healthy');const first=await f.scan();
+  const scan=await f.scan({cursor:first.nextCursor,limits:{maxDepth:1}});
+  assert.equal(scan.sources.find(s=>s.id==='source')!.status,'error');assert(!rows(scan).some(r=>r.change==='delete'));
+  assert.deepEqual(scan.nextCursor.files!['source/nested/doc.md'],first.nextCursor.files!['source/nested/doc.md']);
 });
 
-test('an empty or malformed entry cannot masquerade as a successful source scan',async()=>{
-  const f=fixture();json(join(f.root,'index.json'),{sources:[]});
-  await assert.rejects(scanTransactionSources(f.root,{enabledAt:start,cutoff:end}),/未登记/);
-  f.source('feishu');writeFileSync(join(f.root,'sources/feishu/data.json'),'not-json');
-  const scan=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(scan.sources[0]!.status,'error');assert.match(scan.sources[0]!.error!,/UTF-8 JSON/);
+test('legacy progress cannot be silently baselined, while an empty old cursor migrates without losing unread files',async()=>{
+  const f=fixture();f.file('platform/new.md','unread');
+  const old:TransactionCursor={version:1,enabledAt:start,sources:{platform:{batches:{old:{next:4}},revisions:{}}}};
+  const blocked=await f.scan({cursor:old});assert.equal(blocked.recordCount,0);assert.equal(blocked.sources[0]!.status,'error');
+  assert.match(blocked.text,/旧格式进度无法自动映射，未消费任何文本/);assert.deepEqual(blocked.nextCursor,old);
+  const empty:TransactionCursor={version:1,enabledAt:start,sources:{platform:{batches:{},revisions:{}}}};
+  const migrated=await f.scan({cursor:empty});assert.equal(migrated.nextCursor.version,2);assert.equal(migrated.recordCount,1);
 });
 
-test('producer health failures are explicit while valid content can be acknowledged without being replayed',async()=>{
-  const f=fixture();f.source('bilibili');f.batch('bilibili','2026-10-29T01:00:00Z',[record('watch')]);
-  const health='sources/bilibili/.cookiesync-source-health.json';f.entries[0]!.health=health;
-  json(join(f.root,'index.json'),{timezone:'UTC',sources:f.entries});
-  const state={schema:'cookiesync-source-health-v1',version:1,source:'bilibili',item_id:'bilibili-item',generation:1,
-    checked_at:time('2026-10-29T02:00:00Z'),observed_at:time('2026-10-29T02:00:00Z'),last_success:time('2026-10-29T01:00:00Z'),status:'failed',code:'login_required'};
-  json(join(f.root,health),state);
-  const first=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end});
-  assert.equal(first.sources[0]!.status,'error');assert.equal(first.recordCount,1);assert.match(first.sources[0]!.error!,/login_required/);
-  assert.equal(first.sources[0]!.health!.lastSuccess,'2026-10-29T01:00:00.000Z');
-  const next=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,cursor:first.nextCursor});
-  assert.equal(next.recordCount,0);assert.equal(next.sources[0]!.status,'error');
-  json(join(f.root,health),{...state,status:'ok',code:null,last_success:time('2026-10-29T03:00:00Z')});
-  const recovered=await scanTransactionSources(f.root,{enabledAt:start,cutoff:end,cursor:first.nextCursor});
-  assert.equal(recovered.recordCount,0);assert.equal(recovered.sources[0]!.status,'empty');assert.equal(recovered.sources[0]!.health!.code,null);
+test('missing root, global inventory overflow and cancellation are explicit; reading never modifies source bytes',async()=>{
+  const f=fixture(),target=f.file('source/a.md','untouched'),before=readFileSync(target);
+  await f.scan();assert.deepEqual(readFileSync(target),before);
+  await assert.rejects(scanTransactionSources(join(f.root,'missing'),{enabledAt:start,cutoff:end}),/ENOENT/);
+  await assert.rejects(f.scan({limits:{maxEntries:1}}),/目录项超过上限/);
+  await assert.rejects(f.scan({signal:AbortSignal.abort(new Error('cancelled'))}),/cancelled/);
 });

@@ -1040,3 +1040,63 @@ test('Memory change refreshes the same Codex native controller without new chat,
     assert.doesNotMatch(resumed.baseInstructions as string, /ORIGINAL_OWNER_RULE/);
   } finally { await s.cleanup(); }
 });
+
+test('task checklist cadence shares private/group/background rounds 1/4/7 and starts again for a new conversation', async () => {
+  const s = setup();
+  try {
+    const conversation = s.makeTurn().conversation;
+    for (let ordinal = 1; ordinal <= 7; ordinal++) {
+      const turn = { ...s.makeTurn(), conversation: { ...conversation }, taskChecklist: 'CHECKLIST_CADENCE_' + ordinal };
+      if ([2, 7].includes(ordinal)) turn.groupContext = { eventId: 'group-' + ordinal, rootId: 'r', botId: 'M', spaceId: 'g',
+        generation: 1, bindingEpoch: 1, originChannelId: 'g', principalId: 'owner', scene: '{}' };
+      if (ordinal === 3) turn.event = { kind: 'worker-result', text: 'saved worker evidence' };
+      if (ordinal === 4) turn.event = { kind: 'wake', text: 'scheduled controller evidence' };
+      if (ordinal === 5) turn.event = { kind: 'workspace-context', text: 'current workspace evidence' };
+      conversation.nativeId = (await s.adapter.run(turn)).nativeId;
+      if (ordinal === 1) await s.adapter.getModelInfo(s.dir, conversation);
+      if (ordinal === 4) await s.adapter.interrupt(conversation.id);
+    }
+    const starts = s.transports.flatMap(transport => transport.written.filter(message => message.method === 'turn/start'));
+    assert.equal(starts.length, 7);
+    assert.deepEqual(starts.map(message => JSON.stringify(message.params).includes('CHECKLIST_CADENCE_')), [true, false, false, true, false, false, true]);
+    assert.equal(s.transports.length, 2, 'transport recreation preserves the logical conversation counter');
+    const next = { ...s.makeTurn(), taskChecklist: 'NEW_CONVERSATION_CHECKLIST' };
+    next.conversation.id = 'conversation-after-new';
+    await s.adapter.run(next);
+    const newStart = s.transports.at(-1)!.written.find(message => message.method === 'turn/start')!;
+    assert.match(JSON.stringify(newStart.params), /NEW_CONVERSATION_CHECKLIST/);
+  } finally { await s.cleanup(); }
+});
+
+test('Claude task checklist cadence uses the same logical session boundary for all background entries', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-claude-checklist-cadence-'));
+  const transports: FakeTransport[] = [];
+  const adapter = new NativeControllerAdapter({ command: 'fake', args: [] }, {}, { agent: 'claude', dataDir: join(dir, 'data'), userHome: dir,
+    invokeTool: async () => ({}), createTransport: () => {
+      const transport = new FakeTransport(); transports.push(transport);
+      transport.write = message => {
+        transport.written.push(message);
+        if (message.type !== 'user') return;
+        transport.emit({ type: 'system', subtype: 'init', session_id: 'claude-checklist-native', tools: [] });
+        transport.emit({ type: 'result', subtype: 'success', session_id: 'claude-checklist-native', result: 'DONE' });
+      };
+      return transport;
+    } });
+  const conversation: AgentTurn['conversation'] = { id: 'claude-checklist-c', userId: 'owner', agent: 'claude', nativeId: null,
+    title: '', cwd: dir, createdAt: '', updatedAt: '' };
+  const kinds = ['workspace-context', 'group-event', 'worker-result', 'wake', 'workspace-context', 'worker-progress', 'worker-result'] as const;
+  try {
+    for (let index = 0; index < kinds.length; index++) {
+      const turn: AgentTurn = { conversation: { ...conversation }, text: '', imagePaths: [], signal: new AbortController().signal,
+        onProgress() {}, event: { kind: kinds[index]!, text: 'existing evidence' }, taskChecklist: 'CLAUDE_CADENCE_' + (index + 1) };
+      conversation.nativeId = (await adapter.run(turn)).nativeId;
+      if (index === 3) await adapter.interrupt(conversation.id);
+    }
+    const inputs = transports.flatMap(transport => transport.written.filter(message => message.type === 'user'));
+    assert.equal(inputs.length, 7);
+    assert.deepEqual(inputs.map(message => JSON.stringify(message).includes('CLAUDE_CADENCE_')), [true, false, false, true, false, false, true]);
+    await adapter.run({ conversation: { ...conversation, id: 'claude-after-new', nativeId: null }, text: '', imagePaths: [],
+      signal: new AbortController().signal, onProgress() {}, event: { kind: 'workspace-context', text: 'new conversation' }, taskChecklist: 'CLAUDE_NEW_FIRST_CHECKLIST' });
+    assert.match(JSON.stringify(transports.at(-1)!.written.find(message => message.type === 'user')), /CLAUDE_NEW_FIRST_CHECKLIST/);
+  } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
+});

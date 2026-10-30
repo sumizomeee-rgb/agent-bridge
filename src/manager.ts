@@ -811,7 +811,7 @@ export class SessionManager {
         const prepared = this.store.getConversation(target.id)!;
         let preparedNativeId: string | null = prepared.nativeId;
         const text = `[桥程序：Agent 切换准备，尚未提交当前主控]\n${contextSeed}\n只接收以上背景并结束。禁止发消息、使用工具、派工、取消或修改任何任务；真实用户后续输入将在切换提交后到达。`;
-        const result = await this.adapters[agent].run({ conversation: prepared, text, input: [{ type: 'text', text }], imagePaths: [], signal: controller.signal, preparing: true,
+        const result = await this.adapters[agent].run({ taskChecklist: this.store.knowledge.summary(this.knowledgeScope(message.userId, message.channelId)), conversation: prepared, text, input: [{ type: 'text', text }], imagePaths: [], signal: controller.signal, preparing: true,
           event: { kind: 'workspace-context', toolName: 'bridge_agent_switch_bootstrap', text }, onProgress: () => {},
           onPublicMessage: async () => { throw new Error('切换提交前不能公开回复。'); }, onSilent: async () => { throw new Error('切换准备不是群参与轮次。'); },
           onNativeId: nativeId => { if (!nativeId || preparedNativeId && preparedNativeId !== nativeId) throw new Error('切换准备返回了不同原生主控会话。'); preparedNativeId = nativeId; this.store.saveNativeId(target.id, nativeId); },

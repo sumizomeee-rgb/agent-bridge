@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import { ownTemporaryDirectory } from './temp-directory.js';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -16,7 +16,6 @@ import type { BridgeLifecycleEvent } from '../src/lifecycle.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from '../src/types.js';
 import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
 import { acquireInstanceLock } from '../src/instance-lock.js';
-import { createHash } from 'node:crypto';
 
 const rawUser = '234567890123456789', rawChannel = '345678901234567890';
 let serial = 0;
@@ -295,9 +294,8 @@ test('事务巡视真实入口沿用默认助手，三平台只读摘要回主�
   await f.transport.emit(f.message('100000000000000001', '建立当前主控'));
   await until(() => !!f.bot.manager.currentConversation(f.config.ownerUserId!)?.nativeId && f.bot.manager.isIdle());
   f.bot.controller!.store.setWorkerDefault('local', { kind: 'ordinary', agent: 'codex', model: 'offline-model', effort: null });
-  const transactionRoot = join(f.config.workspace, 'bridge-transaction-sync'); mkdirSync(join(transactionRoot, 'sources'), { recursive: true });
-  const entries = ['feishu', 'chatgpt', 'bilibili'].map(site => ({ site, manifest: `sources/${site}/data.json`, timezone: 'UTC' }));
-  writeFileSync(join(transactionRoot, 'index.json'), JSON.stringify({ schema: 'bridge-transaction-source-index', version: 1, sources: entries }));
+  const transactionRoot = join(f.config.workspace, 'bridge-transaction-sync'); mkdirSync(transactionRoot, { recursive: true });
+  const entries = ['feishu', 'chatgpt', 'bilibili'];
   let reads = 0, issuedFollowups = false;
   const followupTurns: AgentTurn[] = [];
   const followupHandles: Array<{ workerId: string; jobId: string }> = [];
@@ -316,9 +314,9 @@ test('事务巡视真实入口沿用默认助手，三平台只读摘要回主�
     const nativeId = 'worker-' + turn.conversation.id; turn.onNativeId?.(nativeId);
     if (turn.conversation.title === '事务同步摘要') {
       reads++; assert.equal(turn.readOnly, true);
-      const input = JSON.parse(readFileSync(f.bot.housekeeper!.store.read()!.run!.inputPath, 'utf8'));
-      assert.deepEqual(input.sources.map((source: { site: string }) => source.site).sort(), ['bilibili', 'chatgpt', 'feishu']);
-      assert(input.sources.every((source: { records: unknown[] }) => source.records.length === 1));
+      const input = readFileSync(f.bot.housekeeper!.store.read()!.run!.inputPath, 'utf8');
+      for (const site of entries) assert(input.includes(site + ' real input'), `Missing ${site} fixture in: ${input}`);
+      assert(turn.text.includes(input), '冻结的三平台正文直接送到默认助手');
       return { nativeId, text: '飞书：范围明确。GPT：保留纠正。B站：仅观看记录。' };
     }
     followupTurns.push(turn); assert.notEqual(turn.readOnly, true, '主控后续执行助手不能继承只读摘要职责');
@@ -327,21 +325,18 @@ test('事务巡视真实入口沿用默认助手，三平台只读摘要回主�
   const housekeeperCallbacks = (f.bot.housekeeper as unknown as { callbacks: { isPaused(): boolean } }).callbacks;
   const originalIsPaused = housekeeperCallbacks.isPaused;
   // Hold only this test's scheduler while publishing its three fixtures. A real timer may otherwise
-  // correctly scan the first completed platform before the remaining manifests have been written.
+  // correctly scan the first completed platform before the remaining readable files have been written.
   housekeeperCallbacks.isPaused = () => true;
   t.after(() => { housekeeperCallbacks.isPaused = originalIsPaused; });
   await f.transport.emit(f.message('100000000000000002', '/housekeeper on'));
   await until(() => f.bot.housekeeper!.store.read()?.enabled === true);
   const began = f.bot.housekeeper!.store.read()!;
   // New publications arrive after the enable command; the same scan path handles every round.
-  for (const { site } of entries) {
-    const value = { schema: 'cookiesync-content-batch', version: 1, source: site, item_id: site + '-item', created_at: Date.now() / 1000,
-      records: [{ identity: site + '-1', scope: 'scope', revision: 'r1', operation: 'upsert', occurred_at: Date.now() / 1000,
-        text: site + ' real input', data: { role: 'user', record_kind: 'message', sender: { name: 'Owner' } } }] };
-    const body = JSON.stringify(value), sha256 = createHash('sha256').update(body).digest('hex'), folder = 'batch-' + sha256.slice(0, 12);
-    const dir = join(transactionRoot, 'sources', site, folder); mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, 'records.json'), body);
-    writeFileSync(join(transactionRoot, 'sources', site, 'data.json'), JSON.stringify({ schema: 'cookiesync-delivery-state', version: 2,
-      items: { item: { source: site, item_id: site + '-item', batches: [{ folder, sha256 }] } } }));
+  for (const site of entries) {
+    const dir = join(transactionRoot, site); mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'conversation.md');
+    writeFileSync(file, `${site} / 会话正文\nOwner 09:12：${site} real input\n`);
+    utimesSync(file, new Date(began.enabledAt), new Date(began.enabledAt));
   }
   housekeeperCallbacks.isPaused = originalIsPaused;
   await f.bot.housekeeper!.poll();

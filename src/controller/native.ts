@@ -189,6 +189,7 @@ interface ControllerProcessProof {
 }
 export class NativeControllerAdapter implements AgentAdapter {
   private readonly sessions = new Map<string, ControllerSession>();
+  private readonly checklistTurnCounts = new Map<string, number>();
   private readonly metadataConnections = new WeakMap<MetadataProbeError, ControllerSession>();
   private readonly closingSessions = new Map<string, ControllerSession>();
   private readonly transportProofs = new WeakMap<RpcTransport, ControllerProcessProof>();
@@ -906,7 +907,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     const content = bound(parsed, 0);
     return { status: 'provided', content, truncated, coverage: harnessText('controller.group_scene_coverage') };
   }
-  private runtimeContext(turn: AgentTurn, session: ControllerSession): string {
+  private runtimeContext(turn: AgentTurn, session: ControllerSession, includeTaskChecklist = false): string {
     const info = { agent: turn.conversation.agent, selectedModel: turn.conversation.model ?? null,
       observedModel: session.model ?? turn.conversation.actualModel ?? null,
       selectedEffort: selectedEffort(turn), observedEffort: session.effort ?? turn.conversation.actualEffort ?? null,
@@ -924,7 +925,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     const sceneBlock = scene == null && !turn.groupContext ? '' : harnessText('controller.chat_scene_header') + JSON.stringify(this.groupScene(scene));
     return '[Bridge chat input; program facts] ' + JSON.stringify(chat) + sceneBlock + '\n' + harnessText('controller.bot_identity_header') + JSON.stringify({ botId: this.options.identity?.botId ?? null, aliases: this.options.identity?.aliases ?? [], rule: 'Aliases are names used to address this Bot; they do not assign a profession, task, identity ownership, or permission. Authorize with real botId/principal/space IDs only.' }) + '\n' + bridgeClock() + harnessText('controller.runtime_facts_header') + JSON.stringify(info)
       + (turn.bridgeFeedback?.records.length ? harnessText('controller.feedback_header') + JSON.stringify({ ...turn.bridgeFeedback, rule: FEEDBACK_RULE, more: 'For more records use bridge_read_feedback if exposed; existing resumed toolkits can use bridge_list_workers with details=true for pending feedback.' }) : '')
-      + (turn.taskChecklist ? harnessText('controller.task_checklist_header') + turn.taskChecklist : '')
+      + (includeTaskChecklist && turn.taskChecklist ? harnessText('controller.task_checklist_header') + turn.taskChecklist : '')
       + '\nWorker model: omitted/default inherits this controller selection, then confirmed actual model; another backend uses its bridge worker default. The bridge resolves it before dispatch; never defer to a remote CLI default. Omitted continuation model keeps that worker selection; explicit default reapplies bridge policy. Effort inherits only within the same backend; explicit effort=default uses backend native default. Preserve user aliases and gateway mappings.';
   }
 
@@ -933,6 +934,10 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (turn.signal.aborted) throw abortError();
     // A parallel call is a caller error, not permission to retire another active decision.
     if (this.sessions.get(turn.conversation.id)?.active) throw new Error('主控消息必须按顺序执行。');
+    // One logical model turn, shared by private/group/background entry points and native retries.
+    const ordinal = (this.checklistTurnCounts.get(turn.conversation.id) ?? 0) + 1;
+    if ((ordinal - 1) % 3 !== 0) turn = { ...turn, taskChecklist: undefined };
+    let counted = false;
     const report = turn.event?.kind === 'worker-result';
     const recover = turn.controllerRecovery === true && (!turn.event || report) && !turn.groupContext && !turn.preparing;
     let reportRecovery = false;
@@ -941,11 +946,15 @@ export class NativeControllerAdapter implements AgentAdapter {
     for (let attempt = 1; ; attempt++) {
       let submission: ControllerSubmission = 'not-submitted';
       const state = (phase: ControllerTurnState['phase'], value = submission, error?: unknown) => {
-        submission = value; turn.onControllerState?.({ attempt, phase, submission, ...(error === undefined ? {} : { diagnostic: executionErrorEvidence(error) }) });
+        submission = value;
+        turn.onControllerState?.({ attempt, phase, submission, ...(error === undefined ? {} : { diagnostic: executionErrorEvidence(error) }) });
+        if (!counted && value !== 'not-submitted') {
+          this.checklistTurnCounts.set(turn.conversation.id, ordinal); counted = true;
+        }
       };
       state('preparing');
       try {
-        const result = await this.runAttempt({ ...turn, conversation: { ...turn.conversation, nativeId },
+        const result = await this.runAttempt({ ...turn, taskChecklist: counted ? undefined : turn.taskChecklist, conversation: { ...turn.conversation, nativeId },
           onNativeId: id => { nativeId = id; turn.onNativeId?.(id); },
           onControllerState: update => state(update.phase, update.submission),
         }, value => state(value === 'unknown' ? 'submitting' : 'accepted', value), reportRecovery);
@@ -1032,7 +1041,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         const input = (turn.input ?? [{ type: 'text' as const, text: turn.text }, ...turn.imagePaths.map(path => ({ type: 'localImage' as const, path }))]).map(value => value.type === 'text' ? { ...value, text_elements: [] } : value);
         const manifest = imageManifest(turn);
         if (!turn.event && manifest) input.push({ type: 'text', text: manifest, text_elements: [] });
-        const clock = this.runtimeContext(turn, session);
+        const clock = this.runtimeContext(turn, session, true);
         if (!turn.event) input.push({ type: 'text', text: clock, text_elements: [] });
         const params: JsonObject = { threadId: session.nativeId, environments: [], input: turn.event ? [] : input, ...(effort ? { effort } : {}),
           ...(turn.conversation.fastMode != null ? { serviceTierForTurn: turn.conversation.fastMode ? 'fast' : 'default' } : {}) };
@@ -1056,7 +1065,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         const content = await this.claudeInput(values);
         const manifest = imageManifest(turn);
         if (!turn.event && manifest) content.push({ type: 'text', text: manifest });
-        content.push({ type: 'text', text: this.runtimeContext(turn, session) });
+        content.push({ type: 'text', text: this.runtimeContext(turn, session, true) });
         submitted('unknown'); // A successful pipe write alone is not model acceptance.
         session.transport.write({ type: 'user', session_id: session.nativeId ?? '', parent_tool_use_id: null, message: { role: 'user', content } });
       }
@@ -1119,7 +1128,7 @@ export class NativeControllerAdapter implements AgentAdapter {
   }
   async interrupt(conversationId: string): Promise<void> { const session = this.sessions.get(conversationId) ?? this.closingSessions.get(conversationId); if (session) { session.active?.completed.reject(abortError()); await this.stopSession(conversationId, session); } }
   async close(): Promise<void> {
-    this.closed = true;
+    this.closed = true; this.checklistTurnCounts.clear();
     const sessions = new Map([...this.sessions, ...this.closingSessions]);
     const results = await Promise.allSettled([...sessions].map(([key, session]) => { session.active?.completed.reject(abortError()); return this.stopSession(key, session); }));
     const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);

@@ -460,3 +460,61 @@ test('Claude explicit failed report resumes same history with saved evidence onl
   assert.match(JSON.stringify(s.transports[1]!.written), /Saved worker result/);
   assert.equal(s.states.filter(state => state.phase === 'reply-recovery').length, 1);
 });
+
+test('task checklist cadence ignores failed preparation, internal retries, metadata and tool calls', async t => {
+  const s = fixture(t, (transport, index) => {
+    transport.intercept = message => {
+      if (index > 1 || message.method !== 'initialize') return false;
+      transport.emit({ id: message.id, error: { code: -1, message: 'temporary initialization failure' } }); return true;
+    };
+  });
+  const starts = () => s.transports.flatMap(transport => transport.written.filter(message => message.method === 'turn/start'));
+  await assert.rejects(s.adapter.run({ ...s.turn, controllerRecovery: false, taskChecklist: 'FAILED_PREPARATION_CHECKLIST' }));
+  assert.equal(starts().length, 0);
+  for (let ordinal = 1; ordinal <= 7; ordinal++) {
+    const count = starts().length;
+    const running = s.adapter.run({ ...s.turn, event: { kind: 'worker-result', text: 'saved evidence' }, taskChecklist: 'RETRY_CADENCE_' + ordinal });
+    await until(() => starts().length === count + 1);
+    if (ordinal === 2) {
+      s.transports.at(-1)!.tool('bridge_list_workers', {}, 901);
+      await until(() => s.transports.at(-1)!.written.some(message => message.id === 901 && !message.method));
+    }
+    if (ordinal === 4) {
+      s.transports.at(-1)!.complete('failed');
+      await until(() => starts().length === count + 2);
+    }
+    await reply(s.transports.at(-1)!); await running;
+    if (ordinal === 1) await s.adapter.getModelInfo(s.root, s.turn.conversation);
+  }
+  assert.equal(starts().length, 8, 'one logical report turn had an internal native recovery');
+  assert.deepEqual(starts().map(message => JSON.stringify(message.params).includes('RETRY_CADENCE_')), [true, false, false, true, false, false, false, true]);
+  assert.equal(starts().some(message => JSON.stringify(message.params).includes('FAILED_PREPARATION_CHECKLIST')), false);
+});
+
+test('task checklist cadence does not repeat the first snapshot in a private supplement reassessment', async t => {
+  const s = fixture(t); let update = true;
+  s.turn.onPrivateInputCheck = async () => {
+    if (!update) return { refreshRequired: false };
+    update = false;
+    return { refreshRequired: true, input: { version: 1, messages: [
+      { id: 'supplement', userId: 'owner', channelId: 'dm', text: 'verified user supplement', imagePaths: [] },
+    ] } };
+  };
+  const running = s.adapter.run({ ...s.turn, taskChecklist: 'SUPPLEMENT_CHECKLIST_1' });
+  await until(() => s.transports[0]?.turns === 1);
+  const transport = s.transports[0]!;
+  transport.tool('bridge_start_worker', { title: 'stale work', prompt: 'must not execute' }, 701);
+  await until(() => transport.written.some(message => message.id === 701 && !message.method));
+  transport.complete(); await until(() => transport.turns === 2);
+  await reply(transport); await running;
+  for (let ordinal = 2; ordinal <= 4; ordinal++) {
+    const before = transport.turns;
+    const next = s.adapter.run({ ...s.turn, event: { kind: 'worker-result', text: 'saved result' }, taskChecklist: 'SUPPLEMENT_CHECKLIST_' + ordinal });
+    await until(() => transport.turns === before + 1); await reply(transport); await next;
+  }
+  const starts = transport.written.filter(message => message.method === 'turn/start');
+  assert.equal(starts.length, 5);
+  assert.deepEqual(starts.map(message => JSON.stringify(message.params).includes('SUPPLEMENT_CHECKLIST_')), [true, false, false, false, true]);
+  assert.match(JSON.stringify(starts[1]!.params), /verified user supplement/);
+  assert.deepEqual(s.management, [], 'the paused stale dispatch never ran');
+});

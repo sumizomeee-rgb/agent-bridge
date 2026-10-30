@@ -60,7 +60,7 @@ D:\Agent Workspace/
 │  ├─ registry.json           实际登记，默认空表
 │  └─ example.json            填写示例，不自动启用
 ├─ bridge-chat-platforms/            lark.md、discord.md，执行助手按当前平台和任务读取
-├─ bridge-transaction-sync/          跨平台事务同步内容和统一来源索引
+├─ bridge-transaction-sync/          跨平台事务同步的可读正文
 └─ tmp/                       按任务收纳临时材料与待交付附件
 ```
 
@@ -93,7 +93,7 @@ D:\Agent Workspace/
 
 执行助手的固定电脑、供应商与模型预设见 [派发预设](docs/presets.md)。上下文工作区统一维护预设清单及 `bridge-agent-presets/private/` 下的启动配置和凭据；桥复用已登记电脑与执行器，启动后自动准备相应文件，不要求用户逐台维护预设。个人清单和凭据不入 Git，主控通过现有目标查询接口按需发现预设。生成器只创建空结构，不包含真实凭据；已有工作区补缺时也不覆盖现有配置。
 
-事务巡视按 Bot 默认关闭：私聊 `/housekeeper on|off|status` 开启、关闭或查看；开启立即检查，此后每 20 分钟读取 `bridge-transaction-sync/` 的开启后增量，无新增不派模型。每轮新建当前默认助手，直接注入程序整理的有界 JSON 正文供其按平台、事项总结；审计文件仍保留，助手无需调用工具读文件。摘要只交主控判断跟进、提醒或静默；来源失败、缺失及未读范围如实呈现。开关和消费进度跨 `/new`、重启保留，失败不前移未确认进度；`/stop` 同时关闭巡视，继续需重新开启。本轮不自动清理同步内容。
+事务巡视按 Bot 默认关闭：私聊 `/housekeeper on|off|status` 开启、关闭或查看；开启立即检查，此后每 20 分钟读取 `bridge-transaction-sync/` 的开启后增量，无新增不派模型。各平台正文格式由同步来源决定，桥仅增量读取普通 UTF-8 文本（`.md`、`.txt`、`.log`），不解析平台协议或 JSON。每轮新建当前默认助手，直接注入有界文本增量供其按平台、事项总结；审计文件仍保留，助手无需调用工具读文件。摘要只交主控判断跟进、提醒或静默；来源失败、缺失及未读范围如实呈现。开关和消费进度跨 `/new`、重启保留，失败不前移未确认进度；`/stop` 同时关闭巡视，继续需重新开启。本轮不自动清理同步内容。
 
 `harness/prompts.toml` 集中维护内置提示词，每项标明用途、受众、注入时机、生效条件、来源及正文；工作区 README 的通用行为句也从这里生成。动态取词在下次取用时读取，模块启动常量需重启，已有 Codex 工具声明还需 `/new c` 重建；具体以条目 `activation` 为准。工程和执行器部署必须携带 `harness/`，不能只复制 `dist/`。目录与编辑规则见 [harness/README.md](harness/README.md)。
 
@@ -103,4 +103,4 @@ D:\Agent Workspace/
 node scripts/controller-lab/housekeeper-live.mjs --runtime-root <候选工程绝对目录> --source-root <生产工程绝对目录> --config <生产配置绝对路径>
 ```
 
-该脚本使用真实 Bot／Host／主控、保存的默认助手及事务读取路径，平台发送落在隔离 sink；测试主控为 `gpt-6-luna xhigh`，摘要助手沿用当前笔记本默认 `gpt-6.1-sol xhigh`。仅扫描三个平台的 12 条／12000 字有界历史样本，验证回传确认、关闭和重建持久化；它不代表全量语义验收，也不修改生产开关或会话。结果保存为独立目录的 `report.json`、`result.md`。
+该脚本使用真实 Bot／Host／主控、保存的默认助手及事务读取路径，平台发送落在隔离 sink；测试主控为 `gpt-6-luna xhigh`，摘要助手沿用当前笔记本默认 `gpt-6.1-sol xhigh`。仅扫描三个平台的至多 12 个文本片段／12000 字有界历史样本，验证回传确认、关闭和重建持久化；它不代表全量语义验收，也不修改生产开关或会话。结果保存为独立目录的 `report.json`、`result.md`。
