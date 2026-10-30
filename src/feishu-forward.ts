@@ -4,13 +4,14 @@ import type { DiscordAttachment } from './types.js';
 type Json = Record<string, any>;
 const record = (value: unknown): value is Json => !!value && typeof value === 'object' && !Array.isArray(value);
 const messageId = (value: unknown): value is string => typeof value === 'string' && /^om_[a-zA-Z0-9_-]+$/.test(value);
-function body(item: Json, depth: number, notes: string[]): ForwardedItem {
+function body(item: Json, depth: number, notes: string[], resourceMessageId: string): ForwardedItem {
   const type = item.msg_type ?? item.message_type;
   let content: Json = {}, text = '';
   try { const raw = type === 'merge_forward' || item.deleted ? {} : JSON.parse(String(item.body?.content ?? item.content ?? '{}')); if (record(raw)) content = raw; else throw new Error(); }
   catch { notes.push('部分转发消息正文格式无效。'); }
   const attachments: DiscordAttachment[] = [];
-  const image = (key: unknown) => { if (typeof key === 'string' && key) attachments.push({ id: key, filename: 'image', url: '', size: 0, content_type: 'image/unknown', resourceKey: key, messageId: item.message_id }); };
+  // 转发资源归属收到的外层转发消息；子消息 ID 仅用于保留原文定位。
+  const image = (key: unknown) => { if (typeof key === 'string' && key) attachments.push({ id: key, filename: 'image', url: '', size: 0, content_type: 'image/unknown', resourceKey: key, messageId: resourceMessageId }); };
   if (item.deleted) text = '[消息已撤回或删除]';
   else if (type === 'text') text = typeof content.text === 'string' ? content.text : '';
   else if (type === 'image') image(content.image_key);
@@ -35,7 +36,7 @@ function body(item: Json, depth: number, notes: string[]): ForwardedItem {
     collect(content); text = parts.join('\n') || '[转发卡片：接口未提供可读正文]';
     notes.push('转发卡片仅为接口可见的文字投影，不保证包含原卡全部内容。');
   } else if (type === 'merge_forward') text = '[嵌套合并转发]';
-  else if (typeof content.file_key === 'string') attachments.push({ id: content.file_key, filename: String(content.file_name ?? type ?? 'file'), url: '', size: 0, content_type: 'application/octet-stream', resourceKey: content.file_key, messageId: item.message_id });
+  else if (typeof content.file_key === 'string') attachments.push({ id: content.file_key, filename: String(content.file_name ?? type ?? 'file'), url: '', size: 0, content_type: 'application/octet-stream', resourceKey: content.file_key, messageId: resourceMessageId });
   else { text = `[${String(type ?? 'unknown').slice(0, 64)}：当前未提取正文]`; notes.push('部分转发消息类型尚未支持，未补写内容。'); }
   const sender = record(item.sender) ? item.sender : {};
   const timestamp = Number(item.create_time);
@@ -66,7 +67,7 @@ export async function readFeishuForwarded(id: string, fetchItems: (id: string, s
     for (const item of children) {
       if (seen.has(item.message_id)) continue; seen.add(item.message_id);
       if (result.messages.length >= FORWARD_LIMITS.messages) { result.notes.push('转发消息超过 100 条上限。'); break; }
-      result.messages.push(body(item, depth, result.notes));
+      result.messages.push(body(item, depth, result.notes, id));
       if ((item.msg_type ?? item.message_type) === 'merge_forward' && item.deleted !== true) await expand(item.message_id, depth + 1,
         items.some(child => child.upper_message_id === item.message_id) ? items : undefined);
     }

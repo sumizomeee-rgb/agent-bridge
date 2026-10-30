@@ -34,7 +34,8 @@ test('飞书实时转发先持久收件，随后按关联补取原文与图片�
   const transport = new FeishuTransport(selected, async message => { received.push(message); }, { fetch: (async (url: any) => {
     const path = new URL(String(url)).pathname; paths.push(path);
     if (path.includes('/auth/')) return response({ code: 0, tenant_access_token: 'secret' });
-    if (path.endsWith('/resources/img_one')) return new Response(png);
+    if (path.endsWith('/resources/img_one')) return path.includes('/om_forward/resources/')
+      ? new Response(png) : new Response(JSON.stringify({code:234003,msg:'File not in msg.'}),{status:400});
     assert.equal(path, '/open-apis/im/v1/messages/om_forward');
     return response({ code: 0, data: { items: [
       { message_id: 'om_forward', msg_type: 'merge_forward', body: { content: 'Merged and Forwarded Message' } },
@@ -52,9 +53,41 @@ test('飞书实时转发先持久收件，随后按关联补取原文与图片�
     const prepared=await prepareIncomingMessage(transport,saved);
     assert(prepared.text.includes('/new\\n这是原文')); assert(!prepared.text.includes('不可混入的消息'));
     assert.equal(parseCommand(prepared.text),null); assert.equal(prepared.imagePaths.length,1); assert.deepEqual(readFileSync(prepared.imagePaths[0]!),png);
-    assert(paths.some(path=>path.includes('/om_second/resources/'))); assert(!paths.some(path=>path.includes('/chats/')));
+    assert(paths.some(path=>path.includes('/om_forward/resources/'))); assert(!paths.some(path=>path.includes('/om_second/resources/'))); assert(!paths.some(path=>path.includes('/chats/')));
     assert(prepared.text.includes('原作者')); assert(prepared.text.includes('170000000000')===false);
   } finally { await journal.close(); await transport.close(); }
+});
+
+test('飞书富文本与嵌套转发图片沿外层转发下载，保留原消息定位',async()=>{
+  const directory=root(),selected=config(directory),resources:string[]=[];
+  const transport=new FeishuTransport(selected,async()=>{}, {fetch:(async(url:any)=>{
+    const path=new URL(String(url)).pathname;
+    if(path.includes('/auth/'))return response({code:0,tenant_access_token:'secret'});
+    if(path.includes('/resources/')){
+      resources.push(path);
+      assert(path.startsWith('/open-apis/im/v1/messages/om_forward/resources/'));
+      return new Response(png);
+    }
+    assert.equal(path,'/open-apis/im/v1/messages/om_forward');
+    return response({code:0,data:{items:[
+      child('om_post','om_forward','post',{zh_cn:{title:'版本',content:[[{tag:'text',text:'版本截图'},{tag:'img',image_key:'img_post'}]]}}),
+      child('om_nested','om_forward','merge_forward',{}),
+      child('om_inner','om_nested','image',{image_key:'img_nested'}),
+    ]}});
+  })as any});
+  try{
+    const message:IncomingDM={id:'feishu:cli_test|1700000000000|om_forward',userId:'feishu:cli_test|ou_owner',channelId:'feishu:cli_test|oc_chat',text:'',attachments:[],
+      forwarded:{status:'pending',messageId:'om_forward',messages:[],notes:[]}};
+    const content=(await transport.readForwardedContent(message))!;
+    assert.deepEqual(content.messages.map(item=>[item.id,item.depth]),[['om_post',0],['om_nested',0],['om_inner',1]]);
+    assert.deepEqual(content.messages.flatMap(item=>item.attachments).map(file=>file.messageId),['om_forward','om_forward']);
+    const prepared=await prepareIncomingMessage(transport,{...message,forwarded:content});
+    assert.equal(prepared.imagePaths.length,2);
+    for(const path of prepared.imagePaths)assert.deepEqual(readFileSync(path),png);
+    assert.equal(resources.length,2);
+    assert(prepared.text.includes('om_inner'));assert(prepared.text.includes('版本截图'));
+    assert(prepared.text.includes('提供 2 张'));
+  }finally{await transport.close();}
 });
 
 test('飞书同一转发由历史补读得到相同引用；读取失败时主控收到明确缺失而非空输入', async () => {
