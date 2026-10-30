@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { lstat, open, opendir, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { retentionDays } from './retention.js';
 
 export interface TransactionSourceLimits {
   maxSources: number; maxRecords: number; maxRecordsPerSource: number; maxChars: number; maxRecordChars: number;
@@ -185,6 +186,7 @@ export async function scanTransactionSources(root: string, options: TransactionS
   if (bounds.maxChars < 4000 || bounds.maxRecordChars < 128 || bounds.maxTotalBytes < blockBytes) throw new Error('事务正文或字节上限过小。');
   const start = date(options.enabledAt), cutoff = options.cutoff ?? new Date().toISOString(), end = date(cutoff);
   if (end < start) throw new Error('事务截止时间早于开启时间。');
+  const retainedFrom = end - retentionDays * 86400000;
   let next = loadCursor(options.cursor, options.enabledAt, bounds);
   if (next.version === 1 && legacyHasProgress(next)) {
     const source = emptySource('migration'); source.status = 'error'; source.error = '旧格式进度无法自动映射，未消费任何文本；请核对原未读内容后重新开启事务巡视。';
@@ -205,6 +207,8 @@ export async function scanTransactionSources(root: string, options: TransactionS
   for (const file of [...files.discovered.values()].sort((a,b) => a.mtime - b.mtime || a.path.localeCompare(b.path))) {
     const source = files.source(sourceId(file.path)), old = positions[file.path];
     source.coverage.rawRecords++;
+    // Expired public text is outside retention, including any not-yet-recycled files.
+    if (file.mtime < retainedFrom) { delete positions[file.path]; source.coverage.skippedBeforeWindow++; continue; }
     // Filesystem mtimes may carry sub-millisecond precision; the scan cutoff is an ISO millisecond.
     if (Math.floor(file.mtime) > end) continue;
     // Producer migrations preserve the original publication mtime; ctime/copy time is never publication.
@@ -216,7 +220,8 @@ export async function scanTransactionSources(root: string, options: TransactionS
     queues.get(source.id)!.push(file.path);
   }
   for (const [path, position] of Object.entries(positions)) if (!files.discovered.has(path) && !files.incomplete.has(sourceId(path))) {
-    if (position.ignored || position.offset === 0) delete positions[path]; else queues.get(sourceId(path))!.push(path);
+    // Retention expiry is not a source retraction; prune its cursor without waking a model.
+    if (position.ignored || position.offset === 0 || position.mtime < retainedFrom) delete positions[path]; else queues.get(sourceId(path))!.push(path);
   }
   let first = Math.max(0, groups.findIndex(s => s.id === next.nextSource)), count = 0, used = 0, more = false;
   const segments: string[] = [], pending = new Set<string>(), blocked = new Set<string>();

@@ -29,6 +29,27 @@ test('readable files are platform-agnostic, recursively discovered, fairly paged
   assert(done.sources.every(s=>s.coverage.filesRead===0),'unchanged files must not be reopened or rehashed');
 });
 
+
+test('retention keeps the exact ten-day boundary and expired cleanup never becomes a withdrawal',async()=>{
+  const f=fixture(),enabledAt='2026-10-01T00:00:00Z';
+  f.file('source/expired.md','expired body','2026-10-19T23:59:59Z');
+  const boundary=f.file('source/boundary.md','retained at the boundary','2026-10-20T00:00:00Z');
+  const first=await f.scan({enabledAt});assert.deepEqual(rows(first).map(r=>r.text),['retained at the boundary']);
+  assert(!first.nextCursor.files!['source/expired.md']);
+  unlinkSync(boundary);
+  const next=await f.scan({enabledAt,cutoff:'2026-10-31T00:00:00Z',cursor:first.nextCursor});
+  assert.equal(next.recordCount,0);assert(!next.hasMore);assert(!next.nextCursor.files!['source/boundary.md']);
+});
+
+test('retention expires unread fragments without replaying them or inventing retractions',async()=>{
+  const f=fixture(),enabledAt='2026-10-01T00:00:00Z';
+  f.file('source/long.md','retained fragment '.repeat(1000),'2026-10-20T12:00:00Z');
+  const first=await f.scan({enabledAt,limits:{maxRecords:1,maxRecordChars:128}});
+  assert.equal(first.recordCount,1);assert(first.hasMore);
+  const next=await f.scan({enabledAt,cutoff:'2026-10-31T12:00:00Z',cursor:first.nextCursor});
+  assert.equal(next.recordCount,0);assert(!next.hasMore);assert(!next.nextCursor.files!['source/long.md']);
+});
+
 test('file publication mtime governs the on window; copied historical content and JSON metadata never become recent text',async()=>{
   const f=fixture();f.file('any-platform/history.md','three months of old history','2026-08-01T00:00:00Z');
   f.file('any-platform/new.txt','Original message time: 2026-08-01; newly published correction');

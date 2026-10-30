@@ -12,6 +12,7 @@ import { RemoteDeploymentService } from './remote/deployment.js';
 import { parseTargetRegistry } from './remote/catalog.js';
 import { setRemoteDeploymentHook } from './remote/client.js';
 import { readFileSync } from 'node:fs';
+import { TransactionRetentionService } from './housekeeper/retention.js';
 
 if (process.argv.includes('--help')) {
   console.log('启动宿主：start.ps1；配置检查：start.ps1 -Check；首次升级：host-migration-cli --config 配置路径（默认dry-run）。启动集合在version:3 startupProfiles配置，私聊/help，群/group start。');
@@ -34,6 +35,7 @@ let host: HostRuntime;
 let closing: Promise<void> | undefined;
 let poll: ReturnType<typeof setInterval> | undefined;
 let deployments: RemoteDeploymentService | undefined;
+let transactionRetention: TransactionRetentionService | undefined;
 const pidFile = join(config.rootDataDir, 'bridge.pid.json'), stopFile = join(config.rootDataDir, 'stop.request');
 const drainStopFile = join(config.rootDataDir, 'drain-stop.request');
 async function shutdown(planned = false): Promise<void> {
@@ -41,6 +43,7 @@ async function shutdown(planned = false): Promise<void> {
   closing = (async () => {
     if (poll) clearInterval(poll);
     setRemoteDeploymentHook(undefined);
+    await transactionRetention?.close().catch(error => log('TRANSACTION_RETENTION_STOP_FAILED ' + safeError(error, secrets)));
     await deployments?.close();
     if (!planned) restart?.cancel();
     log(planned ? 'RESTART_STOPPING' : 'STOPPING');
@@ -101,6 +104,8 @@ try {
   await host.recover(); restart.ready();
   await Promise.all([...host.bots].filter(([id]) => !host.failures.has(id)).map(([, bot]) => bot.publishReadyLifecycle()));
   log(`HOST_READY bots=${config.configs.length - host.failures.size}/${config.configs.length}`);
+  transactionRetention = new TransactionRetentionService(config.configs.map(c => join(c.contextWorkspace ?? c.workspace, 'bridge-transaction-sync')), log);
+  transactionRetention.start();
   const drainStop = new DrainStop({ beginDrain: () => { host.beginDrain(); log('MAINTENANCE_DRAINING'); },
     isIdle: () => host.isIdle(), shutdown: () => shutdown() });
   poll = setInterval(() => {
