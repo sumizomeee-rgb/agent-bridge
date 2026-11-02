@@ -383,7 +383,8 @@ export class ControllerRuntime {
     return worker;
   }
   private scheduleScope(value: ControllerSchedule, origin: TaskOrigin): boolean {
-    return value.origin.conversationId === origin.conversationId && value.origin.userId === origin.userId && value.origin.channelId === origin.channelId && pathKey(value.origin.cwd) === pathKey(origin.cwd);
+    return value.origin.userId === origin.userId && value.origin.channelId === origin.channelId
+      && (!!this.callbacks.currentScheduleConversation || value.origin.conversationId === origin.conversationId && pathKey(value.origin.cwd) === pathKey(origin.cwd));
   }
   private dueAt(args: Record<string, unknown>): string {
     if ((args.afterSeconds === undefined) === (args.dueAt === undefined)) throw new Error('必须且只能指定 afterSeconds 或带时区的 dueAt');
@@ -925,7 +926,7 @@ export class ControllerRuntime {
       if (args.includeFinished !== undefined && typeof args.includeFinished !== 'boolean') throw new Error('includeFinished 必须是布尔值');
       const id = args.scheduleId === undefined ? undefined : text(args.scheduleId, 'scheduleId', 256);
       const value = id ? this.store.getSchedule(id) : null;
-      if (id && (!value || !this.scheduleScope(value, origin))) throw new Error('计划不属于当前用户、父会话、聊天入口和工作区');
+      if (id && (!value || !this.scheduleScope(value, origin))) throw new Error('计划不属于当前 Bot、用户或聊天入口');
       const limit = args.limit ?? 20, offset = args.offset ?? 0;
       if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 100 || !Number.isSafeInteger(offset) || Number(offset) < 0) throw new Error('计划分页参数无效');
       let result: unknown;
@@ -1410,10 +1411,12 @@ export class ControllerRuntime {
     this.store.setJob(latest.id, latest.status, { processStopped: true });
     // Stop proof never clears a result-reconciliation lock or replays queued work.
   }
-  private detachJobs(conversationId: string): ControllerWorker[] {
+  private detachJobs(conversationId: string, preservePending = false): ControllerWorker[] {
     const workers = this.store.workers(conversationId);
-    // All reset effects are durable before the first await, including a due-but-unclaimed plan.
-    for (const plan of this.store.schedules()) if (plan.origin.conversationId === conversationId && ['pending', 'dispatching'].includes(plan.status)) {
+    // Pause the old controller before awaiting reset. Pending Bot alarms are adopted only after the new controller is ready.
+    if (preservePending) this.store.pauseConversation(conversationId);
+    for (const plan of this.store.schedules()) if ((plan.origin.conversationId === conversationId || !preservePending && this.callbacks.currentScheduleConversation?.(plan.origin.userId)?.id === conversationId)
+      && ['pending', 'dispatching'].includes(plan.status) && !(preservePending && plan.status === 'pending')) {
       plan.status = 'cancelled'; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
       if (plan.taskId) this.registry.disableTaskWake(plan.taskId);
     }
@@ -1433,9 +1436,9 @@ export class ControllerRuntime {
         { name: 'AgentProcessStopError', processStillRunning: true });
     }
   }
-  /** Reset cancels every plan and stops scheduled workers; ordinary engineering jobs retain their original result route. */
+  /** Reset preserves pending Bot alarms. Already-started execution keeps the existing cancellation boundary. */
   async detachConversation(conversationId: string): Promise<void> {
-    const workers = this.detachJobs(conversationId);
+    const workers = this.detachJobs(conversationId, !!this.callbacks.currentScheduleConversation);
     await this.terminateWorkers(workers.filter(worker => worker.origin.purpose === 'schedule'), '新会话或切换会话已取消定时任务');
   }
   /** A Bot's persisted housekeeping capability can cancel its reader after /new. */
@@ -1518,6 +1521,19 @@ export class ControllerRuntime {
     await this.observeStalls();
     for (const candidate of this.store.schedules()) {
       const plan = this.store.getSchedule(candidate.id)!;
+      if (plan.status === 'pending' && this.callbacks.currentScheduleConversation) {
+        const target = this.callbacks.currentScheduleConversation(plan.origin.userId);
+        if (!target?.nativeId || target.userId !== plan.origin.userId || this.callbacks.canSendScheduledMessage?.() === false) continue;
+        if (target.id !== plan.origin.conversationId) {
+          const previous = plan.origin;
+          plan.origin = { ...previous, conversationId: target.id, nativeId: target.nativeId, agent: target.agent, cwd: target.cwd,
+            reboundFrom: [...(previous.reboundFrom ?? []), { conversationId: previous.conversationId, agent: previous.agent, nativeId: previous.nativeId }] };
+          if (plan.message) plan.message.source.conversationId = target.id;
+          if (plan.worker) plan.worker.origin = { ...plan.origin };
+          if (plan.job) plan.job.origin = { ...plan.origin };
+          plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
+        }
+      }
       if (!this.config.allowedUserIds.includes(plan.origin.userId) || this.store.isConversationPaused(plan.origin.conversationId)
         || !['pending', 'dispatching'].includes(plan.status) || Date.parse(plan.dueAt) > this.now()) continue;
       if (this.closed || this.stopping || this.isDraining()) return;

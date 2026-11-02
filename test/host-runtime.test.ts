@@ -2029,7 +2029,8 @@ test('scheduled delivery uses real host authorization, transport and history wit
       now: () => now, pollIntervalMs: 3600000, prepareScheduledMessage: hooks.prepareScheduledMessage,
       sendScheduledMessage: hooks.sendScheduledMessage, scheduledMessageDelivered: hooks.scheduledMessageDelivered,
       canSendScheduledMessage: hooks.canSendScheduledMessage,
-      onCompletion: async () => { assert.fail('Direct messages must not wake a controller'); },
+      currentScheduleConversation: user => f.managers.get(primary)!.currentConversation(user),
+      onCompletion: async event => { assert.equal(event.scheduleKind,'controller'); await hooks.manager!.onGroupCompletion!(event); },
     });
     const receipts: Array<{scheduleId: string}> = [];
     const dm = primary + '|' + (platform === 'feishu' ? 'oc_scheduled_private' : '777777777777777777');
@@ -2043,21 +2044,31 @@ test('scheduled delivery uses real host authorization, transport and history wit
       const receipt = await f.host.invoke(primary, scheduledTurn, 'bridge_schedule_message', {afterSeconds:30,targetId,text:body}, 'schedule-'+receipts.length,
         args => runtime.invoke(scheduledTurn,'bridge_schedule_message',args,'schedule-'+receipts.length));
       receipts.push(receipt as {scheduleId:string});
+      if (turn.groupContext) await runtime.invoke(scheduledTurn,'bridge_schedule_controller',{afterSeconds:60,text:'scheduled group follow-up'});
       await turn.onPublicMessage?.('已登记');
     });
     try {
       await f.managers.get(primary)!.handle({id:primary+'|private-plan',userId:c.ownerUserId!,channelId:dm,text:'plan private',imagePaths:[]}); await f.drain();
       await f.host.receive(primary,f.message(primary,'scheduled-from-group','plan group',G1,[primary])); await f.drain();
       assert.equal(receipts.length,2);
+      await runtime.detachConversation(f.managers.get(primary)!.currentConversation(c.ownerUserId!)!.id);
+      f.run(async(_botId,turn)=>{if(turn.groupContext)await turn.onSilent?.();else await turn.onPublicMessage?.('new controller ready');});
+      await f.managers.get(primary)!.handle({id:primary+'|reset-with-plans',userId:c.ownerUserId!,channelId:dm,text:'/new',imagePaths:[]});
+      const next=f.managers.get(primary)!.currentConversation(c.ownerUserId!)!;
+      // This fixture has no workspace initializer: finish its native/ready boundary explicitly.
+      f.sessions.get(primary)!.saveNativeId(next.id,'native-after-new');f.sessions.get(primary)!.cancelWorkspaceNotice(next.id);
+      await hooks.manager!.onInitializationState!({...next,nativeId:'native-after-new'},'ready');await f.drain();
       const turns=f.calls.length, delivered=f.replies.length; now+=31000; await runtime.poll();
       assert.equal(f.calls.length,turns,'no extra LLM call');
-      assert.equal(f.replies.length,delivered+2);assert(f.replies.slice(delivered).every(reply=>reply.text===body));
+      assert.equal(f.replies.length,delivered+2,JSON.stringify(runtime.store.schedules().map(plan=>({status:plan.status,error:plan.error}))));assert(f.replies.slice(delivered).every(reply=>reply.text===body));
       assert.equal(f.replies[delivered]!.channel,dm);
       assert.equal(f.host.store.listRoutedDeliveries().filter(value=>value.source.scheduleId).length,2);
       for(const receipt of receipts){assert.equal(runtime.store.getSchedule(receipt.scheduleId)?.status,'completed');assert.equal(hooks.scheduledMessageDelivered!(receipt.scheduleId),true);}
       await runtime.poll(); assert.equal(f.replies.length,delivered+2);
       const history:any=f.sessions.get(primary)!.knowledge.search({userId:c.ownerUserId!,channelId:dm},{query:'原样提醒'});
       assert(history.messages.some((message:any)=>message.speaker==='controller' && message.text===body));
+      now+=30000;await runtime.poll();await f.drain();assert.equal(f.calls.length,turns+1,'Bot-owned group alarm wakes the new controller exactly once');
+      await runtime.poll();await f.drain();assert.equal(f.calls.length,turns+1);
     } finally {await runtime.close();registry.close();}
   });
 });

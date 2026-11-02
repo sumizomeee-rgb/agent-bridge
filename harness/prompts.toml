@@ -652,7 +652,7 @@ source = "src/controller/tools/catalog.ts"
 text = '''
 Freeze and schedule a complete execution task. At due time the agent starts directly; its result wakes the controller. Sleeping plans have no worker process.
 
-冻结已决定的执行参数；待触发计划没有助手进程。到期需要桥运行，逾期计划在启动后处理。重启和 Agent 连续切换保留；/new、/cwd 取消旧会话计划并停止其定时助手。'''
+冻结已决定的执行参数；待触发计划没有助手进程。到期需要桥运行，逾期计划在启动后处理。待触发计划跟随 Bot，重启、/new、/new c、/cwd 和 Agent 切换保留；新主控就绪后处理。执行参数和接收目标保持登记时的选择，/stop 或取消工具可取消。'''
 
 [prompts."tools.bridge_schedule_worker.inputSchema.workId.description"]
 purpose = "工具 bridge_schedule_worker 的 inputSchema.workId 说明"
@@ -716,7 +716,7 @@ activation = "桥启动载入工具登记；新会话可发现"
 source = "src/controller/tools/catalog.ts"
 text = '''
 Schedule an already decided message for direct bridge delivery. No model or worker runs when due. Freeze an authorized targetId from bridge_delivery_targets and the exact text; no generated response or model header is added.
-Uses the existing schedule query/cancel/reschedule tools and time bounds. Bridge restart and continuous Agent switch preserve pending plans; /new and /cwd cancel them. Startup/maintenance defers unattempted sends. Failed/uncertain sends remain visible in schedule status, never automatically resend an unknown delivery or wake the controller. No attachments. Delivery can be delayed while the bridge is offline or unavailable.'''
+Uses the existing schedule query/cancel/reschedule tools and time bounds. Pending plans belong to the Bot and survive restart, /new, /new c, /cwd and Agent switch. After the current controller is ready, send to the original frozen destination; /stop or explicit cancellation cancels pending plans. Startup/maintenance defers unattempted sends. Failed/uncertain sends remain visible in schedule status, never automatically resend an unknown delivery or wake the controller. No attachments. Delivery can be delayed while the bridge is offline or unavailable.'''
 
 [prompts."tools.bridge_schedule_message.summary"]
 purpose = "定时直发短目录"
@@ -778,7 +778,7 @@ injection = "工具目录与参数描述"
 activation = "工具定义在模块启动时构建；Codex 已有原生会话的动态工具目录需 /new c 刷新。"
 source = "src/controller/tools/catalog.ts"
 text = '''
-List this conversation’s plans; pending/running by default. Select scheduleId for details or includeFinished for history.'''
+List this Bot/owner/chat’s plans across /new; pending/running by default. Select scheduleId for details or includeFinished for history.'''
 
 [prompts."tools.bridge_list_schedules.inputSchema.scheduleId.description"]
 purpose = "工具 bridge_list_schedules 的 inputSchema.scheduleId 说明"

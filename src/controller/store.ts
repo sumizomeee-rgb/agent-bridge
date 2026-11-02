@@ -225,7 +225,7 @@ export class ControllerStore {
     return this.db.prepare('SELECT * FROM controller_schedules ORDER BY due_at,rowid').all().map(schedule);
   }
   saveSchedule(value: ControllerSchedule): void {
-    this.db.prepare('UPDATE controller_schedules SET status=?,due_at=?,task_id=?,value_json=? WHERE id=?')
-      .run(value.status, value.dueAt, value.taskId, JSON.stringify(value), value.id);
+    this.db.prepare('UPDATE controller_schedules SET parent_id=?,status=?,due_at=?,task_id=?,value_json=? WHERE id=?')
+      .run(value.origin.conversationId, value.status, value.dueAt, value.taskId, JSON.stringify(value), value.id);
   }
 }

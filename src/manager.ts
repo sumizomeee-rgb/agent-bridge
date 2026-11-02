@@ -272,7 +272,8 @@ export class SessionManager {
 
   /** A confirmed program delivery belongs in history without creating a model input. */
   recordScheduledMessage(plan: import('./controller/runtime-types.js').ControllerSchedule, channelId: string): void {
-    const conversation = this.store.getConversation(plan.origin.conversationId);
+    // Program sends retain the original authenticated chat evidence across /new.
+    const conversation = this.store.getConversation(plan.origin.reboundFrom?.[0]?.conversationId ?? plan.origin.conversationId);
     if (!conversation?.nativeId) return;
     const id = 'scheduled-message:' + plan.id;
     this.store.claimPublicMessage(id, conversation.id, conversation.nativeId, channelId,

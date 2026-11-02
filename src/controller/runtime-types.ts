@@ -85,6 +85,8 @@ export interface ControllerRuntimeCallbacks {
   sendScheduledMessage?: (plan: ControllerSchedule) => Promise<void>;
   scheduledMessageDelivered?: (id: string) => boolean;
   canSendScheduledMessage?: () => boolean;
+  /** Bot-owned alarms follow the current controller; null defers during reset/initialization. */
+  currentScheduleConversation?: (userId: string) => import('../types.js').Conversation | null;
   onRequestRestart?: (origin: TaskOrigin) => Promise<unknown>;
   isDraining?: () => boolean;
   onCompletion?: (event: TaskCompletionEvent) => void | Promise<void>;

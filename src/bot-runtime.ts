@@ -112,6 +112,7 @@ export class BotRuntime {
       prepareScheduledMessage: hooks.prepareScheduledMessage,
       sendScheduledMessage: hooks.sendScheduledMessage,
       scheduledMessageDelivered: hooks.scheduledMessageDelivered,
+      currentScheduleConversation: userId => this.manager?.currentConversation(userId) ?? null,
       canSendScheduledMessage: () => this.ready && !this.closed && hooks.canSendScheduledMessage?.() !== false,
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),

@@ -889,7 +889,7 @@ export class HostRuntime {
       if (bot.controller?.store.getSchedule(plan.id)?.status !== 'dispatching' || controller?.conversationId !== plan.origin.conversationId
         || message.source.conversationId !== plan.origin.conversationId || message.source.botId !== botId || message.target.botId !== botId
         || message.source.userId !== plan.origin.userId || message.source.principalId !== registered.ownerPrincipalId
-        || !this.authorize(botId, plan.origin.userId, '') || !this.continuousGeneration(botId, message.source.generation)) throw new DeliveryPreparationError('原会话、接收人或投递权限已改变；未改投其他入口');
+        || !this.authorize(botId, plan.origin.userId, '')) throw new DeliveryPreparationError('原会话、接收人或投递权限已改变；未改投其他入口');
       return { bot, controller };
     };
     try {
@@ -1102,7 +1102,16 @@ export class HostRuntime {
       if(dispatchReview)this.bots.get(botId)?.manager.invalidateDispatchFailureReview(dispatchReview);return 'retain';
     }
     try {
-      this.store.enqueueEvent({ id: key('task-result', event.id), rootId: old.rootId, botId, generation: controller.generation,
+      let rootId = old.rootId;
+      const original = this.store.getRoot(rootId);
+      if (event.purpose === 'schedule' && event.reboundFrom?.length && original && original.generations[botId] !== controller.generation) {
+        // A persisted Bot alarm may cross /new; ordinary old group inputs still cannot wake a new controller.
+        rootId = this.store.acceptRoot({ id: key('scheduled-follow', botId, event.id), spaceId: old.spaceId,
+          principalId: original.principalId, sourceEventId: 'schedule:' + event.id, targetBotIds: [botId],
+          replyTo: { ...original.replyTo, collaborationBudgetKey: original.replyTo.collaborationBudgetKey ?? original.id },
+          automaticLimit: original.automaticLimit }).id;
+      }
+      this.store.enqueueEvent({ id: key('task-result', event.id), rootId, botId, generation: controller.generation,
         kind: event.scheduleKind === 'controller' ? 'wake' : 'assistant-result', payload: { text: event.text, eventKind: event.scheduleKind === 'controller' ? 'wake' : 'worker-result',...(dispatchReview?{dispatchFailureReviewId:dispatchReview}:{}) }, causeEventId: old.eventId });
       void this.pump(); return 'queued';
     } catch(error) {

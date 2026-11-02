@@ -102,3 +102,22 @@ test('bad time, raw payload limits and destination failures cannot create a plan
  f.callbacks.prepareScheduledMessage=async()=>{throw new DeliveryPreparationError('unknown destination');};
  await assert.rejects(handle(f));assert.equal(f.runtime.store.schedules().length,0);assert.equal(f.modelRuns,0);
 });
+
+test('Bot alarms survive new/new-c and restart, follow the ready controller, and explicit stop cancels them',async t=>{
+ const f=setup(t);let current={...f.turn.conversation};f.callbacks.currentScheduleConversation=()=>current;
+ const message=await handle(f),wake=await f.runtime.invoke(f.turn,'bridge_schedule_controller',{afterSeconds:30,text:'follow up'}) as {scheduleId:string};
+ await f.runtime.detachConversation(current.id);current={...current,id:'new',nativeId:'new-native'};
+ await f.runtime.poll();assert.equal(f.runtime.store.getSchedule(message.scheduleId)?.origin.conversationId,'new');
+ await f.runtime.detachConversation(current.id);current={...current,id:'new-c',nativeId:'new-c-native'};
+ let ready=false;f.callbacks.canSendScheduledMessage=()=>ready;
+ f.advance(31000);await f.runtime.poll();assert.equal(f.sent.length,0);assert.equal(f.wakes,0);
+ const runtime=await f.restart();await runtime.start();assert.equal(f.sent.length,0);
+ ready=true;await runtime.poll();assert.equal(f.sent.length,1);assert.equal(f.wakes,1);assert.equal(f.modelRuns,0);
+ const plan=runtime.store.getSchedule(wake.scheduleId)!;assert.equal(plan.origin.conversationId,'new-c');assert.equal(plan.origin.nativeId,'new-c-native');assert.equal(plan.origin.reboundFrom?.[0]?.conversationId,'parent');
+ assert.equal(f.sent[0]!.message?.source.conversationId,'new-c');assert.equal(f.sent[0]!.message?.target.channelId,'private-channel');
+ const context=f.registry.createContext({...plan.origin,originMessageId:'new-owner-input'}),turn={...f.turn,conversation:current,taskContextPath:context.contextPath};
+ const all=await runtime.invoke(turn,'bridge_list_schedules',{includeFinished:true}) as {schedules:unknown[]};assert.equal(all.schedules.length,2);
+ const pending=await runtime.invoke(turn,'bridge_schedule_message',args) as {scheduleId:string};
+ current={...current,id:'another-new',nativeId:'another-native'};
+ await runtime.cancelConversation(current.id);assert.equal(runtime.store.getSchedule(pending.scheduleId)?.status,'cancelled');
+});
