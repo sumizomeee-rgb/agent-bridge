@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } from './delivery-errors.js';
+import { DeliveryPreparationError, ScheduledMessageDeferredError, executionErrorEvidence as errorEvidence } from './delivery-errors.js';
 import { join } from 'node:path';
 import { collectOutgoingPaths } from './artifacts.js';
 import { assertBotCommunicationAllowed } from './bot-communication.js';
@@ -14,6 +14,7 @@ import { SessionStore } from './store.js';
 import { parseCommand, groupCommands } from './commands.js';
 import { compareMessageIds, validMessageId } from './routing.js';
 import type { AgentTurn, BridgeConfig, BridgeMessage, IncomingDM, ReplyOptions } from './types.js';
+import type { ControllerSchedule } from './controller/runtime-types.js';
 import type { TaskCompletionEvent } from './tasks.js';
 import { historyOptions, type ConversationHistoryOptions } from './group-history.js';
 import { GroupMentionResolutionError, groupMessagePayloadHash } from './group-mentions.js';
@@ -106,6 +107,23 @@ export class HostRuntime {
       onExecutionSettled: () => { if (!this.closed) { this.reconcileAutomaticTasks(); void this.pump(); } },
       allowDelivery: channel => this.allowDelivery(botId, channel), onReady: () => { void this.pump(); },
       invoke: (turn, name, args, callId, delegate) => this.invoke(botId, turn, name, args, callId, delegate),
+      prepareScheduledMessage: async (turn, targetId) => {
+        const { source, target } = await this.preparePublication(botId, turn, targetId);
+        return { source, target };
+      },
+      sendScheduledMessage: plan => this.sendScheduledMessage(botId, plan),
+      scheduledMessageDelivered: id => {
+        const receipt = this.store.getRoutedDelivery(key('scheduled-message', botId, id));
+        if (receipt?.state !== 'delivered') return false;
+        try {
+          this.store.appendRoutedPublic(receipt.id);
+          const plan = this.bots.get(botId)?.controller?.store.getSchedule(id);
+          if (plan) this.bots.get(botId)!.manager.recordScheduledMessage(plan, receipt.target.channelId);
+        } catch (error) { this.report('SCHEDULED_MESSAGE_HISTORY_FAILED ' + errorEvidence(error)); }
+        return true;
+      },
+      canSendScheduledMessage: () => !this.closed && !this.draining && !this.recovering && !this.isPaused(botId)
+        && this.store.getBot(botId)?.ready === true && this.bots.get(botId)?.isReady() === true,
       pauseGroup: () => { this.switchPaused.add(botId); },
       resumeGroup: () => { this.switchPaused.delete(botId); void this.pump(); },
       manager: {
@@ -633,6 +651,7 @@ export class HostRuntime {
     const source = turn.source, bot = this.bots.get(botId), registered = this.store.getBot(botId), controller = registered?.controller;
     if (!source || !bot || !controller || controller.conversationId !== turn.conversation.id || source.userId !== turn.conversation.userId
       || !registered.ownerPrincipalId || !this.authorize(botId, source.userId, '') || !source.channelId.startsWith(bot.config.scopePrefix!)) throw new Error('本轮缺少可信来源或当前 Bot 的投递权限。');
+    if ('scheduleId' in source) throw new Error('普通输入不能携带程序定时身份。');
     const context = turn.groupContext;
     if (context) {
       this.assertContext(context);
@@ -857,10 +876,46 @@ export class HostRuntime {
       throw Object.assign(new Error('本 Bot 在该群的连续非主人公开回复已达上限，本回合正常静默。'), { groupReplyPaused: true });
     }
   }
-  private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
-    text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>, observe = true): Promise<void> {
-    const allowDrainingFinal = !turn.groupContext && turn.finish === true && (!targetId || targetId === 'private' || targetId === turn.source?.channelId)
-      && this.bots.get(botId)?.manager.controllerActivity(turn.conversation.id).running === true;
+  private async sendScheduledMessage(botId: string, plan: ControllerSchedule): Promise<void> {
+    const id = key('scheduled-message', botId, plan.id), prior = this.store.getRoutedDelivery(id);
+    if (prior?.state === 'delivered') { this.store.appendRoutedPublic(id); return; }
+    if (prior && prior.state !== 'registered') throw new Error('定时消息已有未知或拒绝回执，未重复发送');
+    const message = plan.message;
+    if (!message) throw new DeliveryPreparationError('定时消息缺少已核实的投递目标');
+    const assertCurrent = () => {
+      const bot = this.bots.get(botId), registered = this.store.getBot(botId), controller = registered?.controller;
+      if (this.closed || this.draining || this.recovering || !bot?.isReady() || !registered?.ready || this.isPaused(botId)) throw new ScheduledMessageDeferredError('桥正在启动或维护，定时消息后移');
+      this.refreshConfiguredPermissions();
+      if (bot.controller?.store.getSchedule(plan.id)?.status !== 'dispatching' || controller?.conversationId !== plan.origin.conversationId
+        || message.source.conversationId !== plan.origin.conversationId || message.source.botId !== botId || message.target.botId !== botId
+        || message.source.userId !== plan.origin.userId || message.source.principalId !== registered.ownerPrincipalId
+        || !this.authorize(botId, plan.origin.userId, '') || !this.continuousGeneration(botId, message.source.generation)) throw new DeliveryPreparationError('原会话、接收人或投递权限已改变；未改投其他入口');
+      return { bot, controller };
+    };
+    try {
+      assertCurrent();
+      if (message.source.spaceId) await this.verifyMember(botId, message.source.spaceId, message.source.principalId);
+      if (message.target.spaceId && message.target.spaceId !== message.source.spaceId) await this.verifyMember(botId, message.target.spaceId, message.source.principalId);
+      const { controller } = assertCurrent();
+      const source = { ...message.source, generation: controller.generation, scheduleId: plan.id, messageId: 'schedule:' + plan.id };
+      this.store.registerRoutedDelivery({ id, source, target: message.target, payload: { text: plan.text, paths: [] } });
+      if (!this.store.beginRoutedDelivery(id)) throw new DeliveryPreparationError('定时消息投递校验未通过；未发送');
+    } catch (error) {
+      if (error instanceof ScheduledMessageDeferredError || error instanceof DeliveryPreparationError) throw error;
+      throw new DeliveryPreparationError(error instanceof Error ? error.message : '定时投递权限未通过', { cause: error });
+    }
+    try {
+      await this.bots.get(botId)!.send(message.target.channelId, plan.text, { deliveryKey: 'scheduled-message:' + plan.id });
+      this.store.finishRoutedDelivery(id, 'delivered', 'scheduled platform send acknowledged');
+      this.store.appendRoutedPublic(id);
+      this.bots.get(botId)!.manager.recordScheduledMessage(plan, message.target.channelId);
+    } catch (error) {
+      if (this.store.getRoutedDelivery(id)?.state === 'sending') this.store.finishRoutedDelivery(id, 'uncertain', errorEvidence(error));
+      throw error;
+    }
+  }
+  private async preparePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'>,
+    targetId: string | undefined, allowDrainingFinal = false) {
     const source = this.deliverySource(botId, turn, allowDrainingFinal);
     const collaboration = source.rootId ? this.store.getRoot(source.rootId)?.replyTo : undefined;
     // Compatibility for the exact verified original private address, never arbitrary channels.
@@ -893,6 +948,13 @@ export class HostRuntime {
     if (source.spaceId) await this.verifyMember(botId, source.spaceId, source.principalId);
     if (target.spaceId && target.spaceId !== source.spaceId) await this.verifyMember(botId, target.spaceId, source.principalId);
     this.deliverySource(botId, turn, allowDrainingFinal);
+    return { source, target, collaboration };
+  }
+  private async routePublication(botId: string, turn: Pick<AgentTurn, 'conversation' | 'source' | 'groupContext' | 'signal'> & { finish?: boolean },
+    text: string, paths: string[], targetId: string | undefined, messageKey: string | undefined, deliver: (channelId?: string) => Promise<void>, observe = true): Promise<void> {
+    const allowDrainingFinal = !turn.groupContext && turn.finish === true && (!targetId || targetId === 'private' || targetId === turn.source?.channelId)
+      && this.bots.get(botId)?.manager.controllerActivity(turn.conversation.id).running === true;
+    const { source, target, collaboration } = await this.preparePublication(botId, turn, targetId, allowDrainingFinal);
     return this.serializePublication(source.eventId && target.spaceId ? key(source.eventId, target.id) : null, async () => {
     const id = key('routed-delivery', botId, source.conversationId, source.messageId, messageKey ?? key(text, ...paths));
     const prior = this.store.getRoutedDelivery(id);

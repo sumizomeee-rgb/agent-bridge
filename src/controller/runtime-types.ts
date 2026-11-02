@@ -1,8 +1,9 @@
-import type { AgentAdapter, AgentName, AgentResult, AgentExecutionProgress, AgentToolActivity, EffortConfiguration, EffortMetadata } from '../types.js';
+import type { AgentAdapter, AgentName, AgentResult, AgentTurn, AgentExecutionProgress, AgentToolActivity, EffortConfiguration, EffortMetadata } from '../types.js';
 import type { TaskCompletionEvent, TaskOrigin } from '../tasks.js';
 import type { ExecutionTargetBinding, RemoteHandoff, TargetSummary } from '../remote/types.js';
 import type { NativeSessionAdoptArgs, NativeSessionAdoption, NativeSessionPage, NativeSessionRead, NativeSessionReadOptions, NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts } from '../overview.js';
+import type { RoutedDeliverySource, RoutedDeliveryTarget } from '../host-store.js';
 import type { AgentStopEvidence } from '../agents/process.js';
 
 export type ControllerJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'uncertain';
@@ -50,11 +51,13 @@ export interface ControllerSupplement {
 }
 export interface ControllerSchedule {
   id: string; origin: TaskOrigin; dueAt: string; title: string; text: string;
-  kind: 'controller' | 'worker';
+  kind: 'controller' | 'worker' | 'message';
   status: 'pending' | 'dispatching' | 'running' | 'triggered' | 'completed' | 'failed' | 'cancelled' | 'uncertain';
   taskId: string | null; createdAt: string; updatedAt: string;
   /** Frozen execution selection, prepared at registration; no controller turn is needed when due. */
   worker?: ControllerWorker; job?: ControllerJob; error?: string;
+  /** Frozen, program-verified destination and original authorization. Never model-provided routing data. */
+  message?: { source: RoutedDeliverySource; target: RoutedDeliveryTarget };
 }
 export interface ControllerTargetCatalog {
   listPresets?(workspace: string, filter?: import('../presets/types.js').PresetFilter): Promise<import('../presets/types.js').DispatchPreset[]>;
@@ -78,6 +81,10 @@ export interface WorkerPolicyReport {
 export interface ControllerRuntimeCallbacks {
   targetCatalog?: ControllerTargetCatalog;
   onCheckCapabilities?: (workspace: string, args: { targetId?: string; agent?: AgentName; capabilityId?: string; refresh?: boolean }) => Promise<unknown>;
+  prepareScheduledMessage?: (turn: AgentTurn, targetId: string) => Promise<NonNullable<ControllerSchedule['message']>>;
+  sendScheduledMessage?: (plan: ControllerSchedule) => Promise<void>;
+  scheduledMessageDelivered?: (id: string) => boolean;
+  canSendScheduledMessage?: () => boolean;
   onRequestRestart?: (origin: TaskOrigin) => Promise<unknown>;
   isDraining?: () => boolean;
   onCompletion?: (event: TaskCompletionEvent) => void | Promise<void>;

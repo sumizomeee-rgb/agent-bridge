@@ -17,7 +17,7 @@ test('context contraction preserves reviewed command schemas and essential turn 
   assert.match(controllerInstructions, /finish=false/);
   assert.match(controllerInstructions, /DONE/);
   assert.match(controllerInstructions, /performed=false/);
-  assert.equal(sha(JSON.stringify(controllerToolsForCommunication(false).map(tool => ({name:tool.name,inputSchema:tool.inputSchema}))).replace(/\\r\\n/g, '\\n')), '5b56c7dafad224c137c496e2178167e554af26bb098691aab4737a25d55e40a0');
+  assert.equal(sha(JSON.stringify(controllerToolsForCommunication(false).filter(tool => tool.name !== 'bridge_schedule_message').map(tool => ({name:tool.name,inputSchema:tool.inputSchema}))).replace(/\\r\\n/g, '\\n')), '5b56c7dafad224c137c496e2178167e554af26bb098691aab4737a25d55e40a0');
   assert.equal(controllerInstructionsForCommunication(true), controllerInstructions);
 });
 

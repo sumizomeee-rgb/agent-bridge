@@ -43,7 +43,7 @@ try {
     const assembled=workspaceDocuments(context,{agent,internalBotCommunicationEnabled:host.internalBotCommunicationEnabled});assert.deepEqual(assembled.errors,[]);
     const definitions=codexDynamicTools(host.internalBotCommunicationEnabled);
     evidence.sourceWorkspaceHashes[agent]={readme:sha(readFileSync(join(root,'workspace-template/README.md'))),memory:sha(readFileSync(join(context,'MEMORY.md'))),baseCharacters:assembled.text.length,entryCharacters:JSON.stringify(definitions).length,fixedCharacters:assembled.text.length+JSON.stringify(definitions).length};save();
-    await runConfigured({root,runDir,configPath,agent,evidence,save,sourceConfigRoot:productionRoot,contextWorkspace:context,exerciseNew:true,targets:values.targets.split(','),controllerModel:agent==='codex'?'gpt-6-luna':'haiku',controllerEffort:'xhigh'});
+    await runConfigured({root,runDir,configPath,agent,evidence,save,sourceConfigRoot:productionRoot,contextWorkspace:context,exerciseNew:true,exerciseMessages:true,targets:values.targets.split(','),controllerModel:agent==='codex'?'gpt-6-luna':'haiku',controllerEffort:'xhigh'});
   }
   for(const [file,hash]of originals)assert.equal(sha(readFileSync(file)),hash,'Production context changed during testing');
   parity.assertUnchanged();evidence.parity.unchangedAtEnd=true;

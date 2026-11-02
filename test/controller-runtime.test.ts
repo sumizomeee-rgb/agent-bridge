@@ -54,7 +54,7 @@ class FakeAdapter implements AgentAdapter {
 }
 function fixture() {
   const dir = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-controller-test-')), 'bridge-controller-test-');
-  writeFileSync(join(dir, 'README.md'), '# Runtime fixture rules'); writeFileSync(join(dir, 'MEMORY.md'), '# Required owner preferences');
+  writeFileSync(join(dir, 'README.md'), '# Runtime fixture rules\n{{include:bridge/controller-protocol}}\n{{include:bridge/agent-instructions}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}'); writeFileSync(join(dir, 'MEMORY.md'), '# Required owner preferences');
   const registry = new TaskRegistry(dir);
   const codex = new FakeAdapter(); const claude = new FakeAdapter();
   const config: BridgeConfig = { token: 'test', allowedUserIds: ['user-A'], defaultAgent: 'codex', workspace: dir,

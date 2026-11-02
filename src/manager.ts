@@ -270,6 +270,15 @@ export class SessionManager {
     finally { timing('delivery'); }
   }
 
+  /** A confirmed program delivery belongs in history without creating a model input. */
+  recordScheduledMessage(plan: import('./controller/runtime-types.js').ControllerSchedule, channelId: string): void {
+    const conversation = this.store.getConversation(plan.origin.conversationId);
+    if (!conversation?.nativeId) return;
+    const id = 'scheduled-message:' + plan.id;
+    this.store.claimPublicMessage(id, conversation.id, conversation.nativeId, channelId,
+      createHash('sha256').update(plan.text).digest('hex'), plan.text);
+    this.store.finishPublicMessage(id, 'delivered');
+  }
   currentConversation(userId: string): Conversation | null { return this.store.getActive(userId); }
   conversationById(id: string): Conversation | null { return this.store.getConversation(id); }
   private authorizedUsers(): string[] { return this.config.allowedUserIds.filter(user => this.options.authorizeUser?.(user) !== false); }

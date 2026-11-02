@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 /** The production catalog, deployment service and SSH adapter are never replaced here. */
-export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort = 'xhigh', sourceConfigRoot, contextWorkspace, exerciseNew = false }) {
+export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort = 'xhigh', sourceConfigRoot, contextWorkspace, exerciseNew = false, exerciseMessages = false }) {
   const load = file => import(pathToFileURL(join(root, 'dist/src', file)));
   const { loadHostConfig, agentEnvironment } = sourceConfigRoot
     ? await import(pathToFileURL(join(sourceConfigRoot, 'dist/src/config.js'))) : await load('config.js');
@@ -102,6 +102,10 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
           agent: selectedAgent, dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace, metadataAdapter: execution[selectedAgent], defaultModels: config.defaultModels,
           internalBotCommunicationEnabled: sourceHost.internalBotCommunicationEnabled,
           invokeTool: (turn, name, args, id) => invokeTracked(invoke, turn, name, args, id) });
+        for (const adapter of Object.values(adapters)) {
+          const run = adapter.run.bind(adapter);
+          adapter.run = async turn => { receipt.controllerRuns = (receipt.controllerRuns ?? 0) + 1; save(); return run(turn); };
+        }
         native = adapters[agent]; return adapters;
       },
     });
@@ -123,7 +127,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
     async function invokeTracked(invoke, turn, name, args, id) {
         const event = { name, callId: id, at: new Date().toISOString(), targetId: args.targetId, status: 'running' };
         receipt.tools.push(event); save();
-        assert(['bridge_list_targets', 'bridge_list_workers', 'bridge_start_worker', 'bridge_delivery_targets'].includes(name), 'Lab forbids unrelated management');
+        assert(['bridge_list_targets', 'bridge_list_workers', 'bridge_start_worker', 'bridge_delivery_targets', 'bridge_schedule_message', 'bridge_list_schedules'].includes(name), 'Lab forbids unrelated management');
         if (name === 'bridge_start_worker') {
           assert.equal(args.targetId, receipt.expected.targetId, 'Unexpected test computer');
           assert.equal(args.prompt, receipt.expected.prompt, 'Worker task changed');
@@ -182,6 +186,23 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       assert.equal(receipt.tools.slice(start).filter(t => t.name === 'bridge_list_targets').length, 1);
     });
     if (discovery.status !== 'passed') return;
+    if (exerciseMessages) {
+      const scheduled = await check('fixed scheduled message sends directly without another model invocation', async () => {
+        const marker = 'LAB_DIRECT_MESSAGE_' + agent.toUpperCase() + '_' + process.pid;
+        const runs = receipt.controllerRuns ?? 0, workers = runtime.store.workers().length;
+        await send('direct-message', '用户授权的隔离测试：仅调用一次 bridge_schedule_message，targetId=private，afterSeconds=2，text 必须逐字为 ' + JSON.stringify(marker)
+          + '。取得回执后简短回复已登记，不自行重发该正文，不预约主控或派工。');
+        const plan = runtime.store.schedules().find(value => value.kind === 'message' && value.text === marker);
+        assert(plan, 'No durable direct-message schedule');
+        await wait(() => runtime.store.getSchedule(plan.id).status === 'completed' && receipt.deliveries.some(value => value.text === marker), 'direct scheduled delivery');
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        assert.equal(receipt.deliveries.filter(value => value.text === marker).length, 1);
+        assert.equal(receipt.controllerRuns, runs + 1, 'Due delivery unexpectedly invoked the controller');
+        assert.equal(runtime.store.workers().length, workers, 'Due delivery unexpectedly created a worker');
+        receipt.directMessage = { scheduleId: plan.id, status: runtime.store.getSchedule(plan.id).status, exactTextDelivered: true, copies: 1, registrationModelTurns: 1, dueModelTurns: 0 }; save();
+      });
+      if (scheduled.status !== 'passed') return;
+    }
     let number = 0;
     for (const target of selected) {
       const choice = runtime.store.workerDefault(target.id);

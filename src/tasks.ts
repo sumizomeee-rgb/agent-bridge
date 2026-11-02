@@ -17,7 +17,7 @@ export interface TaskOrigin {
   purpose?: 'workspace-context' | 'schedule' | 'host-event' | 'housekeeper' | 'dispatch-failure';
   /** Minted by the persisted red-dot scheduler, never a user tool argument. */
   dispatchFailureReviewId?: string;
-  scheduleKind?: 'controller' | 'worker';
+  scheduleKind?: 'controller' | 'worker' | 'message';
   /** Minted only by the Bot's verified enable-command route; survives follow-up dispatch and scheduling. */
   housekeeperAuthorization?: true;
 }

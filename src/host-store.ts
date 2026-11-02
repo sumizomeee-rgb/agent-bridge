@@ -78,6 +78,8 @@ export interface RoutedDeliverySource {
   botId: string; principalId: string; conversationId: string; generation: number;
   messageId: string; userId: string; channelId: string;
   eventId?: string; rootId?: string; spaceId?: string; bindingEpoch?: number;
+  /** Program-minted scheduled delivery; original authorization survives the completed input. */
+  scheduleId?: string;
 }
 export interface RoutedDeliveryTarget {
   id: string; kind: 'private' | 'group'; botId: string; principalId: string; channelId: string;
@@ -1062,6 +1064,7 @@ export class HostStore {
   getRoutedDelivery(id: string): RoutedDelivery | null { const row = this.one('SELECT * FROM host_routed_outbox WHERE id=?', id); return row ? this.routedDelivery(row) : null; }
   listRoutedDeliveries(): RoutedDelivery[] { return this.rows('SELECT * FROM host_routed_outbox ORDER BY rowid').map(row => this.routedDelivery(row)); }
   private assertRoutedDelivery(source: RoutedDeliverySource, target: RoutedDeliveryTarget): void {
+    if (source.scheduleId !== undefined && !/^[a-f0-9-]{36}$/i.test(source.scheduleId)) throw new HostStateError('forbidden', '定时投递编号无效');
     this.assertMapped(source.botId, source.principalId);
     const bot = this.assertCurrent(source.botId, source.generation);
     if (bot.ownerPrincipalId !== source.principalId || bot.controller?.conversationId !== source.conversationId
@@ -1071,8 +1074,11 @@ export class HostStore {
     if (this.one('SELECT 1 FROM host_control_locks WHERE bot_id=?', source.botId)) throw new HostStateError('blocked', '控制操作已冻结，不能开始新发送');
     if (source.eventId) {
       const event = this.mustEvent(source.eventId), root = this.mustRoot(event.rootId);
-      if (event.botId !== source.botId || event.generation !== source.generation || root.id !== source.rootId || root.spaceId !== source.spaceId
-        || root.epoch !== source.bindingEpoch || root.principalId !== source.principalId || !this.canProduceEffects(event.id)) throw new HostStateError('stale', '原群输入已结束、停用或失权');
+      if (event.botId !== source.botId || root.id !== source.rootId || root.spaceId !== source.spaceId
+        || root.epoch !== source.bindingEpoch || root.principalId !== source.principalId) throw new HostStateError('stale', '原群输入身份不匹配');
+      if (source.scheduleId) {
+        this.assertMember(source.spaceId!, source.botId, source.principalId, source.bindingEpoch);
+      } else if (event.generation !== source.generation || !this.canProduceEffects(event.id)) throw new HostStateError('stale', '原群输入已结束、停用或失权');
     } else if (source.rootId || source.spaceId || source.bindingEpoch != null) throw new HostStateError('forbidden', '私聊来源不能伪装成群事件');
     if (target.kind === 'group') {
       const binding = this.assertMember(target.spaceId!, source.botId, source.principalId, target.epoch);

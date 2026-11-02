@@ -8,6 +8,8 @@ import { DeliveryPreparationError } from '../src/delivery-errors.js';
 import { HostRuntime } from '../src/host-runtime.js';
 import { HostStore } from '../src/host-store.js';
 import { ControllerStore } from '../src/controller/store.js';
+import { ControllerRuntime } from '../src/controller/runtime.js';
+import { TaskRegistry } from '../src/tasks.js';
 import type { ControllerWorker, ControllerJobStatus } from '../src/controller/runtime-types.js';
 import { SessionManager, type SessionManagerOptions } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
@@ -2015,4 +2017,77 @@ for (const platform of ['feishu', 'discord'] as const) test(`${platform} only th
   assert.equal(f.replies.find(reply => reply.text.includes('verified private result'))!.channel, dm);
   assert.equal(f.replies.some(reply => reply.text.includes('must not send')), false);
   const sent = f.host.store.listRoutedDeliveries(); assert.equal(sent.length, 2); assert.ok(sent.every(item => item.target.id === 'private'));
+});
+
+test('scheduled delivery uses real host authorization, transport and history without another model turn on both platforms', async t => {
+  for (const platform of ['feishu', 'discord'] as const) await t.test(platform, async t => {
+    const f = fixture(t, { platform }); await f.activate();
+    const primary = f.ids[0]!, c = f.configs[0]!, hooks = f.hooks.get(primary)!;
+    const registry = new TaskRegistry(c.dataDir); let now = Date.now();
+    const unused: AgentAdapter = { run: async () => { throw Error('No execution agent permitted'); }, interrupt: async () => {}, close: async () => {} };
+    const runtime = new ControllerRuntime(c, { codex: unused, claude: unused }, registry, {
+      now: () => now, pollIntervalMs: 3600000, prepareScheduledMessage: hooks.prepareScheduledMessage,
+      sendScheduledMessage: hooks.sendScheduledMessage, scheduledMessageDelivered: hooks.scheduledMessageDelivered,
+      canSendScheduledMessage: hooks.canSendScheduledMessage,
+      onCompletion: async () => { assert.fail('Direct messages must not wake a controller'); },
+    });
+    const receipts: Array<{scheduleId: string}> = [];
+    const dm = primary + '|' + (platform === 'feishu' ? 'oc_scheduled_private' : '777777777777777777');
+    const body = '  原样提醒\n保留空格  ';
+    f.run(async (botId, turn) => {
+      if (botId !== primary || turn.event) { await turn.onSilent?.(); return; }
+      const created = registry.createContext({conversationId:turn.conversation.id,userId:turn.conversation.userId,agent:turn.conversation.agent,nativeId:turn.conversation.nativeId,cwd:turn.conversation.cwd,channelId:turn.source!.channelId,originMessageId:turn.source!.messageId});
+      const scheduledTurn = {...turn,taskContextPath:created.contextPath};
+      const targets: any = await f.host.invoke(primary, turn, 'bridge_delivery_targets', {});
+      const targetId = turn.groupContext ? targets.defaultTargetId : 'private';
+      const receipt = await f.host.invoke(primary, scheduledTurn, 'bridge_schedule_message', {afterSeconds:30,targetId,text:body}, 'schedule-'+receipts.length,
+        args => runtime.invoke(scheduledTurn,'bridge_schedule_message',args,'schedule-'+receipts.length));
+      receipts.push(receipt as {scheduleId:string});
+      await turn.onPublicMessage?.('已登记');
+    });
+    try {
+      await f.managers.get(primary)!.handle({id:primary+'|private-plan',userId:c.ownerUserId!,channelId:dm,text:'plan private',imagePaths:[]}); await f.drain();
+      await f.host.receive(primary,f.message(primary,'scheduled-from-group','plan group',G1,[primary])); await f.drain();
+      assert.equal(receipts.length,2);
+      const turns=f.calls.length, delivered=f.replies.length; now+=31000; await runtime.poll();
+      assert.equal(f.calls.length,turns,'no extra LLM call');
+      assert.equal(f.replies.length,delivered+2);assert(f.replies.slice(delivered).every(reply=>reply.text===body));
+      assert.equal(f.replies[delivered]!.channel,dm);
+      assert.equal(f.host.store.listRoutedDeliveries().filter(value=>value.source.scheduleId).length,2);
+      for(const receipt of receipts){assert.equal(runtime.store.getSchedule(receipt.scheduleId)?.status,'completed');assert.equal(hooks.scheduledMessageDelivered!(receipt.scheduleId),true);}
+      await runtime.poll(); assert.equal(f.replies.length,delivered+2);
+      const history:any=f.sessions.get(primary)!.knowledge.search({userId:c.ownerUserId!,channelId:dm},{query:'原样提醒'});
+      assert(history.messages.some((message:any)=>message.speaker==='controller' && message.text===body));
+    } finally {await runtime.close();registry.close();}
+  });
+});
+
+test('scheduled messages reject stale destinations and retain uncertain transport receipts without replay',async t=>{
+  const f=fixture(t);await f.activate();
+  const c=f.configs[0]!,hooks=f.hooks.get(A)!,registry=new TaskRegistry(c.dataDir);let now=Date.now();
+  const unused:AgentAdapter={run:async()=>{throw Error('no model');},interrupt:async()=>{},close:async()=>{}};
+  const runtime=new ControllerRuntime(c,{codex:unused,claude:unused},registry,{now:()=>now,pollIntervalMs:3600000,prepareScheduledMessage:hooks.prepareScheduledMessage,sendScheduledMessage:hooks.sendScheduledMessage,canSendScheduledMessage:hooks.canSendScheduledMessage});
+  let receipt!: {scheduleId:string};let held!:AgentTurn;
+  f.run(async(botId,turn)=>{
+    if(botId!==A||turn.event){await turn.onSilent?.();return;}
+    held=turn;
+    const created=registry.createContext({conversationId:turn.conversation.id,userId:turn.conversation.userId,agent:turn.conversation.agent,nativeId:turn.conversation.nativeId,cwd:turn.conversation.cwd,channelId:turn.source!.channelId,originMessageId:turn.source!.messageId});
+    const delegated={...turn,taskContextPath:created.contextPath};
+    const targets:any=await f.host.invoke(A,turn,'bridge_delivery_targets',{});
+    await assert.rejects(hooks.prepareScheduledMessage!(turn,'oc_arbitrary_channel'),/目标/);
+    receipt=await runtime.invoke(delegated,'bridge_schedule_message',{afterSeconds:30,targetId:targets.targets.find((x:any)=>x.kind==='group').targetId,text:'fixed'}) as {scheduleId:string};
+    await turn.onPublicMessage?.('已登记');
+  });
+  try {
+    await f.managers.get(A)!.handle({id:A+'|stale-schedule',userId:c.ownerUserId!,channelId:A+'|oc_scheduled_owner',text:'schedule',imagePaths:[]});await f.drain();
+    f.host.store.stopGroup(G1,P);
+    await f.host.receive(A,f.message(A,'scheduled-target-refresh','/group start',G1,[A]));const before=f.replies.length,turns=f.calls.length;now+=31000;await runtime.poll();
+    assert.equal(f.replies.length,before);assert.equal(f.calls.length,turns);assert.equal(runtime.store.getSchedule(receipt.scheduleId)?.status,'failed');
+    const plan=runtime.store.getSchedule(receipt.scheduleId)!;
+    plan.status='dispatching';plan.message=await hooks.prepareScheduledMessage!(held,'private');runtime.store.saveSchedule(plan);
+    f.host.bots.get(A)!.send=async()=>{throw Error('ACK lost after transport attempt');};
+    await assert.rejects(hooks.sendScheduledMessage!(plan),/ACK lost/);
+    assert.equal(f.host.store.listRoutedDeliveries().find(value=>value.source.scheduleId===plan.id)?.state,'uncertain');
+    await assert.rejects(hooks.sendScheduledMessage!(plan),/未知|拒绝/);assert.equal(f.calls.length,turns);
+  } finally {await runtime.close();registry.close();}
 });

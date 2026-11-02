@@ -708,6 +708,40 @@ source = "src/controller/tools/catalog.ts"
 text = '''
 Relevant current attachments, retained until the scheduled execution'''
 
+[prompts."tools.bridge_schedule_message.description"]
+purpose = "定时直发固定文字，不调用模型"
+audience = "主控"
+injection = "工具完整说明，按需展开"
+activation = "桥启动载入工具登记；新会话可发现"
+source = "src/controller/tools/catalog.ts"
+text = '''
+Schedule an already decided message for direct bridge delivery. No model or worker runs when due. Freeze an authorized targetId from bridge_delivery_targets and the exact text; no generated response or model header is added.
+Uses the existing schedule query/cancel/reschedule tools and time bounds. Bridge restart and continuous Agent switch preserve pending plans; /new and /cwd cancel them. Startup/maintenance defers unattempted sends. Failed/uncertain sends remain visible in schedule status, never automatically resend an unknown delivery or wake the controller. No attachments. Delivery can be delayed while the bridge is offline or unavailable.'''
+
+[prompts."tools.bridge_schedule_message.summary"]
+purpose = "定时直发短目录"
+audience = "主控"
+injection = "README 工具短目录"
+activation = "固定上下文装配时载入"
+source = "src/controller/tools/catalog.ts"
+text = '''到点由桥原样发消息，不调用模型'''
+
+[prompts."tools.bridge_schedule_message.targetId"]
+purpose = "冻结已授权投递目标"
+audience = "主控"
+injection = "工具参数说明"
+activation = "按需查询"
+source = "src/controller/tools/catalog.ts"
+text = '''Exact authorized target from bridge_delivery_targets; private sends to this Bot owner. Never pass a raw channel or arbitrary account.'''
+
+[prompts."tools.bridge_schedule_message.text"]
+purpose = "固定发送正文"
+audience = "主控"
+injection = "工具参数说明"
+activation = "按需查询"
+source = "src/controller/tools/catalog.ts"
+text = '''The complete final message, preserved verbatim including whitespace. Not instructions for a future model. Up to 16000 characters.'''
+
 [prompts."tools.bridge_schedule_controller.description"]
 purpose = "工具 bridge_schedule_controller 的 description 说明"
 audience = "主控"
@@ -715,7 +749,7 @@ injection = "工具目录与参数描述"
 activation = "工具定义在模块启动时构建；Codex 已有原生会话的动态工具目录需 /new c 刷新。"
 source = "src/controller/tools/catalog.ts"
 text = '''
-Schedule controller reassessment or a reminder. Save the goal, needed context, next decision and ending condition.
+Schedule controller reassessment or generation when due; this invokes the LLM. For an already fixed message use bridge_schedule_message. Save the goal, needed context, next decision and ending condition.
 
 保存必要背景、下次判断和结束条件；使用桥时钟与明确时区，登记成功才承诺。到期及生命周期规则同桥当前预约实现。'''
 

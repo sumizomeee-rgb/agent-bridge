@@ -16,7 +16,7 @@ import { TargetCatalogService } from './remote/catalog.js';
 import { CapabilityHealthService } from './capabilities.js';
 import { closeResources } from './shutdown.js';
 import { BridgeLifecycle } from './lifecycle.js';
-import type { ControllerTargetCatalog } from './controller/runtime-types.js';
+import type { ControllerSchedule, ControllerTargetCatalog } from './controller/runtime-types.js';
 import { mapPresentation } from './presentation.js';
 import { knowledgeToolNames } from './controller-knowledge.js';
 import { controllerFileToolNames } from './controller/files.js';
@@ -32,6 +32,10 @@ export interface BotRuntimeHooks {
   receiveGroup(message: IncomingDM): Promise<void>;
   manager: Pick<SessionManagerOptions, 'binding' | 'onGroupTurnStart' | 'onSceneCheck' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'> & { binding: NonNullable<SessionManagerOptions['binding']> };
   invoke(turn: AgentTurn, name: string, input: Record<string, unknown>, callId: string | undefined, delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown>;
+  prepareScheduledMessage?: (turn: AgentTurn, targetId: string) => Promise<NonNullable<ControllerSchedule['message']>>;
+  sendScheduledMessage?: (plan: ControllerSchedule) => Promise<void>;
+  scheduledMessageDelivered?: (id: string) => boolean;
+  canSendScheduledMessage?: () => boolean;
   pauseGroup(): void;
   resumeGroup(): void;
   requestRestart(origin: RestartOrigin): Promise<unknown>;
@@ -105,6 +109,10 @@ export class BotRuntime {
     });
     this.controller = config.controllerMode ? new ControllerRuntime(config, this.execution, this.tasks, {
       targetCatalog: this.targetCatalog,
+      prepareScheduledMessage: hooks.prepareScheduledMessage,
+      sendScheduledMessage: hooks.sendScheduledMessage,
+      scheduledMessageDelivered: hooks.scheduledMessageDelivered,
+      canSendScheduledMessage: () => this.ready && !this.closed && hooks.canSendScheduledMessage?.() !== false,
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
       onCompletion: event => this.backgroundCompletion(event),

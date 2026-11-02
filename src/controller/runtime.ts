@@ -13,7 +13,7 @@ import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
 import { completedResultFromError, stopEvidenceFromError, isObject } from '../agents/process.js';
-import { executionErrorEvidence } from '../delivery-errors.js';
+import { DeliveryPreparationError, ScheduledMessageDeferredError, executionErrorEvidence } from '../delivery-errors.js';
 import { completedRetirementFailure } from '../agents/retirement.js';
 import { sessionVisibility } from '../agents/worker-session.js';
 import { stoppedExecutionFailure as hasStoppedExecutionFailure } from '../agents/interrupted-execution.js';
@@ -28,7 +28,7 @@ import type { ExecutionTargetBinding } from '../remote/types.js';
 const workerInstruction = harnessText('worker.execution');
 const workspaceWorkerInstruction = harnessText('worker.context_readonly');
 const workspacePrompt = harnessText('worker.continuation_history');
-const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_list_schedules', 'bridge_cancel_schedule', 'bridge_update_schedule', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_adopt_native_session']);
+const tools = new Set(['bridge_start_worker', 'bridge_continue_worker', 'bridge_cancel_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_schedule_message', 'bridge_list_schedules', 'bridge_cancel_schedule', 'bridge_update_schedule', 'bridge_list_workers', 'bridge_list_targets', 'bridge_handoff_worker', 'bridge_request_restart', 'bridge_check_capabilities', 'bridge_list_native_sessions', 'bridge_read_native_session', 'bridge_adopt_native_session']);
 function pathKey(value: string): string { const result = resolve(value); return process.platform === 'win32' ? result.toLowerCase() : result; }
 function text(value: unknown, label: string, limit: number): string {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value, 'utf8') > limit || value.includes('\0')) throw new Error(`${label}为空或超过限制`);
@@ -90,6 +90,7 @@ export class ControllerRuntime {
   private readonly unconfirmedStops = new Set<string>();
   private readonly recoveredLocalStops = new Set<string>();
   private readonly feedbackPublications = new Map<string, Promise<void>>();
+  private readonly messageDeliveries = new Set<Promise<void>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private polling: Promise<void> | undefined;
   private started = false;
@@ -101,7 +102,7 @@ export class ControllerRuntime {
   private lastWorkCounts: string | undefined;
   private isDraining(): boolean { return this.draining || this.callbacks.isDraining?.() === true; }
   beginDrain(): void { this.draining = true; }
-  isIdle(): boolean { return this.active.size === 0 && this.preparations.size === 0 && this.dispatches.size === 0 && [...this.unconfirmedStops].every(id => this.recoveredLocalStops.has(id)) && !this.polling && !this.starting; }
+  isIdle(): boolean { return this.messageDeliveries.size === 0 && this.active.size === 0 && this.preparations.size === 0 && this.dispatches.size === 0 && [...this.unconfirmedStops].every(id => this.recoveredLocalStops.has(id)) && !this.polling && !this.starting; }
 
   constructor(private readonly config: BridgeConfig, private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
@@ -404,6 +405,7 @@ export class ControllerRuntime {
       createdAt: value.createdAt, updatedAt: value.updatedAt, error: value.error ?? null,
       ...(value.worker ? { workerId: value.worker.id, jobId: value.job!.id, agent: value.worker.agent, model: value.worker.model,
         effort: value.worker.effort, targetId: value.worker.target?.id ?? 'local', cwd: value.worker.cwd, executionStatus: job?.status ?? 'not-started' } : {}),
+      ...(value.message ? { targetId: value.message.target.id, delivery: 'direct', invokesModel: false } : {}),
       textPreview: listText(value.text, details ? 4096 : 256), textPreviewTruncated: value.text.length > (details ? 4096 : 256) };
   }
   private images(turn: AgentTurn, value: unknown, worker?: ControllerWorker): string[] {
@@ -425,7 +427,13 @@ export class ControllerRuntime {
     try { await recovery; } finally { this.starting = undefined; }
   }
   private async recoverStartup(): Promise<void> {
-    for (const value of this.store.schedules()) if (value.taskId) this.registry.migrateScheduleTask(value.taskId, value.kind);
+    for (const value of this.store.schedules()) {
+      if (value.kind === 'message' && value.status === 'dispatching') {
+        value.status = this.callbacks.scheduledMessageDelivered?.(value.id) ? 'completed' : 'uncertain';
+        if (value.status === 'uncertain') value.error = '桥在发送期间重启，送达未确认；未自动重发。';
+        value.updatedAt = this.timestamp(); this.store.saveSchedule(value);
+      } else if (value.taskId && value.kind !== 'message') this.registry.migrateScheduleTask(value.taskId, value.kind);
+    }
     for (const worker of this.store.workers().filter(value => value.adoption?.status === 'pending' && this.config.allowedUserIds.includes(value.origin.userId))) {
       try { await this.completeAdoption(worker.id); } catch (error) { this.error(error); }
     }
@@ -644,7 +652,7 @@ export class ControllerRuntime {
   private async dispatch(turn: AgentTurn, name: string, input: unknown, callId?: string, workspaceInitialization = false): Promise<unknown> {
     if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
     if (!tools.has(name)) throw new Error('未知桥调度工具');
-    if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_update_schedule', 'bridge_adopt_native_session'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
+    if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_schedule_message', 'bridge_update_schedule', 'bridge_adopt_native_session'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
     const contextOrigin = this.origin(turn);
     await this.start();
     this.origin(turn);
@@ -897,6 +905,20 @@ export class ControllerRuntime {
       await this.workCountsChanged();
       return result;
     }
+    if (name === 'bridge_schedule_message') {
+      const args = object(input, ['afterSeconds', 'dueAt', 'title', 'text', 'targetId']);
+      const dueAt = this.dueAt(args), targetId = text(args.targetId, '接收目标', 512);
+      // Keep the original message, including intentional whitespace; never use the instruction-trimming helper.
+      if (typeof args.text !== 'string' || !args.text.trim() || args.text.length > 16000 || args.text.includes('\0')) throw new Error('发送正文须为 1–16000 字的有效文字');
+      if (!this.callbacks.prepareScheduledMessage || !this.callbacks.sendScheduledMessage) throw new Error('桥未配置定时直接发送服务');
+      const title = args.title === undefined ? '定时消息' : text(args.title, '计划名称', 1024);
+      const message = await this.callbacks.prepareScheduledMessage(turn, targetId);
+      this.origin(turn); turn.signal.throwIfAborted();
+      if (this.closed || this.stopping || this.isDraining() || this.store.isConversationPaused(origin.conversationId)) throw new Error('准备期间会话已停止或正在切换，未登记消息');
+      const value: ControllerSchedule = { id: randomUUID(), kind: 'message', origin: { ...origin, purpose: 'schedule', scheduleKind: 'message' },
+        title, text: args.text, dueAt, status: 'pending', taskId: null, message, createdAt: this.timestamp(), updatedAt: this.timestamp() };
+      return this.store.transaction(() => { this.store.addSchedule(value); const receipt = this.scheduleView(value, true); if (key) this.store.saveCall(key, fingerprint, receipt); return receipt; });
+    }
     if (['bridge_list_schedules', 'bridge_cancel_schedule', 'bridge_update_schedule'].includes(name)) {
       const args = object(input, name === 'bridge_list_schedules' ? ['scheduleId', 'includeFinished', 'limit', 'offset']
         : name === 'bridge_cancel_schedule' ? ['scheduleId'] : ['scheduleId', 'afterSeconds', 'dueAt']);
@@ -910,7 +932,7 @@ export class ControllerRuntime {
       this.store.transaction(() => {
         if (name === 'bridge_list_schedules') {
           const all = this.store.schedules().filter(value => this.scheduleScope(value, origin)
-            && (args.includeFinished || ['pending', 'dispatching', 'running'].includes(value.status)));
+            && (args.includeFinished || ['pending', 'dispatching', 'running'].includes(value.status) || value.kind === 'message' && ['uncertain', 'failed'].includes(value.status)));
           result = { schedules: value ? [this.scheduleView(value, true)] : all.slice(Number(offset), Number(offset) + Number(limit)).map(value => this.scheduleView(value)),
             total: value ? 1 : all.length, nextOffset: !value && all.length > Number(offset) + Number(limit) ? Number(offset) + Number(limit) : null };
         }
@@ -918,7 +940,7 @@ export class ControllerRuntime {
           if (!value) throw new Error('必须指定 scheduleId');
           if (name === 'bridge_cancel_schedule' && value.status === 'cancelled') result = this.scheduleView(value);
           else {
-            if (value.status !== 'pending') throw new Error(`计划已${value.status}，不能取消或改期；运行中的助手请使用 bridge_cancel_worker`);
+            if (value.status !== 'pending') throw new Error(value.kind === 'message' ? `定时消息已${value.status}，不能取消或改期；请先核对回执，不重复发送` : `计划已${value.status}，不能取消或改期；运行中的助手请使用 bridge_cancel_worker`);
             if (name === 'bridge_cancel_schedule') value.status = 'cancelled'; else value.dueAt = this.dueAt(args);
             value.updatedAt = this.timestamp(); this.store.saveSchedule(value); result = this.scheduleView(value);
           }
@@ -1475,6 +1497,20 @@ export class ControllerRuntime {
       }
     }
   }
+  private async sendMessage(plan: ControllerSchedule): Promise<void> {
+    let status: ControllerSchedule['status'] = 'completed', error: string | undefined;
+    try { if (!this.callbacks.sendScheduledMessage) throw new DeliveryPreparationError('定时消息发送通道未配置'); await this.callbacks.sendScheduledMessage(plan); }
+    catch (failure) {
+      status = this.callbacks.scheduledMessageDelivered?.(plan.id) === true ? 'completed'
+        : failure instanceof ScheduledMessageDeferredError ? 'pending' : failure instanceof DeliveryPreparationError ? 'failed' : 'uncertain';
+      if (status !== 'pending') { error = executionErrorEvidence(failure); this.error(failure); }
+    }
+    const current = this.store.getSchedule(plan.id)!;
+    if (current.status === 'cancelled' && status !== 'completed') return;
+    current.status = status; current.updatedAt = this.timestamp();
+    if (error) current.error = error; else delete current.error;
+    this.store.saveSchedule(current);
+  }
   async poll(): Promise<void> {
     if (this.closed || this.stopping) return;
     await this.confirmUncertainStops();
@@ -1484,6 +1520,15 @@ export class ControllerRuntime {
       const plan = this.store.getSchedule(candidate.id)!;
       if (!this.config.allowedUserIds.includes(plan.origin.userId) || this.store.isConversationPaused(plan.origin.conversationId)
         || !['pending', 'dispatching'].includes(plan.status) || Date.parse(plan.dueAt) > this.now()) continue;
+      if (this.closed || this.stopping || this.isDraining()) return;
+      if (plan.kind === 'message') {
+        if (plan.status !== 'pending' || this.callbacks.canSendScheduledMessage?.() === false) continue;
+        // Claim synchronously before the first await. Concurrent polls cannot send the same plan twice.
+        plan.status = 'dispatching'; plan.updatedAt = this.timestamp(); this.store.saveSchedule(plan);
+        const sending = this.sendMessage(plan); this.messageDeliveries.add(sending);
+        try { await sending; } finally { this.messageDeliveries.delete(sending); }
+        continue;
+      }
       if (plan.kind === 'worker') {
         // Worker creation and enqueue share the same durable transaction as the due claim.
         // A crash before kick is resumed from the queue, never by creating a second worker.
@@ -1524,6 +1569,7 @@ export class ControllerRuntime {
       for (const result of results) if (result.status === 'rejected') errors.push(result.reason);
     }));
     await this.polling;
+    await Promise.allSettled([...this.messageDeliveries]);
     await Promise.allSettled([...this.feedbackPublications.values()]);
     this.closed = true; this.store.close();
     if (errors.length) throw new AggregateError(errors, '部分执行子 Agent 的进程停止尚未确认');

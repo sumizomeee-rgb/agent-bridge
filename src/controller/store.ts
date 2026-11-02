@@ -93,6 +93,7 @@ export class ControllerStore {
       }
       for (const value of this.schedules()) if (value.origin.conversationId === source.id) {
         value.origin = rebindTaskOrigin(value.origin, source, target);
+        if (value.message) value.message.source.conversationId = target.id;
         if (value.worker) value.worker.origin = rebindTaskOrigin(value.worker.origin, source, target);
         if (value.job) value.job.origin = rebindTaskOrigin(value.job.origin, source, target);
         this.db.prepare('UPDATE controller_schedules SET parent_id=?,value_json=? WHERE id=?').run(target.id, JSON.stringify(value), value.id);

@@ -252,3 +252,14 @@ for (const agent of ['codex', 'claude'] as const) {
     assert.deepEqual(f.invoked.map(value => value.name), ['bridge_list_workers', 'bridge_start_worker']); assert.deepEqual(f.sends.map(value => value.text), ['保留原助手，按新要求回复']);
   });
 }
+
+for (const agent of ['codex','claude'] as const) test(`${agent} 新定时消息在主人追加纠正后不得按旧输入登记`,async t=>{
+  const f=fixture(t,agent);let checks=0;
+  f.turn.onPrivateInputCheck=async()=>{checks++;return{refreshRequired:true,input:f.batch()};};
+  const running=f.adapter.run(f.turn);await until(()=>f.protocol.turns===1);
+  const result=await f.protocol.call('bridge_schedule_message',{targetId:'private',afterSeconds:600,text:'旧消息不能发'});
+  assert.equal(result.ok,true);assert.equal(result.value.performed,false);assert.equal(result.value.privateInputChanged,true);assert.equal(f.invoked.length,0);
+  f.protocol.complete();await until(()=>f.protocol.turns===2);
+  await f.protocol.call('bridge_send_user',{text:'已按新要求处理，旧消息未登记'});f.protocol.complete();await running;
+  assert.equal(checks,1);assert.equal(f.invoked.length,0);assert.equal(f.sends.length,1);
+});

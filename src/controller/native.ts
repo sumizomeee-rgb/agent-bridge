@@ -559,7 +559,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     if (!readonly && active.turn.onPrivateInputCheck && active.sealed) this.rejectSealed(active);
     if (active.sceneRefreshPending) return readonly ? undefined : this.scenePausedResult(active);
     if (active.sceneReassessmentStarted || (!active.turn.onSceneCheck && !active.turn.onPrivateInputCheck)) return undefined;
-    const guarded = ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_send_user',
+    const guarded = ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_schedule_message', 'bridge_send_user',
       'bridge_send_message', 'bridge_send_private', 'bridge_update_tasks', 'bridge_ack_dispatch_failure'].includes(name) || (name === 'bridge_start_collaboration' && args.mode === 'public');
     if (!guarded) return undefined;
     const previous = active.sceneCheckTail ?? Promise.resolve();
