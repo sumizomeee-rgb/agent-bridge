@@ -59,6 +59,18 @@ function fixture(t: TestContext, auto = true) {
   return { f, send, inspect };
 }
 
+test('/model 序号使用已展示清单，变化和跨会话时拒绝，名称写法保留', async t => {
+  const { f, send, inspect } = fixture(t);
+  await send('/model 1'); assert.match(f.replies.at(-1)!.text, /未查看/);
+  await send('/models'); assert.match(f.replies.at(-1)!.text, /1\. gpt-6.1-sol/);
+  await send('/model 1'); assert.equal(inspect(s => s.getActive('owner')!.model), 'gpt-6.1-sol');
+  f.codex.metadata = async () => ({ ...catalog, models: [...catalog.models].reverse() });
+  await send('/model 1'); assert.match(f.replies.at(-1)!.text, /已变化/);
+  assert.equal(inspect(s => s.getActive('owner')!.model), 'gpt-6.1-sol');
+  await send('/model gpt-5.6-sol'); assert.equal(inspect(s => s.getActive('owner')!.model), 'gpt-5.6-sol');
+  assert.equal(f.codex.calls.length, 0);
+});
+
 test('/fast 仅当前 Codex 主控，持久化但不传播到新会话或其他用户', async t => {
   const { f, send, inspect } = fixture(t);
   await send('/fast on'); assert.match(f.replies.at(-1)!.text, /仅适用于/);

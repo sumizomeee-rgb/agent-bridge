@@ -184,7 +184,7 @@ export class BotRuntime {
       job: id => this.controller!.store.getJob(id),
       recoverRun: run => this.recoverHousekeeperRun(run.inputPath),
       eventForJob: id => this.tasks.queuedEvents().find(event => event.taskId === id) ?? null,
-      cancel: async id => { const value = this.housekeeper?.store.read(); if (value) await this.controller!.cancelHousekeeperWorker(id, value.userId); },
+      cancel: async (id, reason) => { const value = this.housekeeper?.store.read(); if (value) await this.controller!.cancelHousekeeperWorker(id, value.userId, reason); },
       event: id => this.manager.housekeeperEventReceipt(id),
       reroute: (run, state) => this.manager.housekeeperContext(state, async turn => {
         const context = JSON.parse(readFileSync(turn.taskContextPath!, 'utf8')) as TaskContextFile;
@@ -302,6 +302,11 @@ export class BotRuntime {
     if (this.closed) throw new Error('Bot 启动期间已关闭。');
     await this.manager.recover();
     await this.controller?.start();
+    try {
+      const cleanup = this.controller?.pruneWorkerCaches();
+      if (cleanup?.files) this.log(`WORKER_PLUGIN_CACHE_PRUNED files=${cleanup.files} bytes=${cleanup.bytes} workers=${cleanup.workers}`);
+      for (const error of cleanup?.errors ?? []) this.log('WORKER_PLUGIN_CACHE_CLEANUP_FAILED ' + error);
+    } catch (error) { this.log('WORKER_PLUGIN_CACHE_CLEANUP_FAILED ' + safeError(error, this.secrets)); }
     this.seedDMChannels();
     await this.ingress.recover((channel, options) => this.readDMHistory(channel, options));
     if (this.closed) throw new Error('Bot 恢复期间已关闭。');

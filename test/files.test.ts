@@ -153,7 +153,7 @@ test('file size/configuration limits are checked before reading and count includ
   const huge = join(f.workspace, 'huge.zip'); const handle = await open(huge, 'w');
   try { await handle.truncate(20 * 1024 * 1024 + 1); } finally { await handle.close(); }
   await assert.rejects(collectOutgoingAttachments(fileMarker(huge), f.workspace, 100), /单个文件最多 20971520/);
-  for (const limit of [0, -1, 1.5, NaN, 24 * 1024 * 1024 + 1]) {
+  for (const limit of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
     await assert.rejects(collectOutgoingAttachments(fileMarker(pdf), f.workspace, 100, limit), /文件大小上限/);
   }
   const image = join(f.workspace, 'image.png'); await writeFile(image, PNG);

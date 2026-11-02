@@ -91,7 +91,7 @@ test('fast 原生菜单与文本参数一致，非法值拒绝', () => {
 });
 
 test('native registry contains the supported DM-only commands, never resume/startup', () => {
-  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'default', 'presetlist', 'housekeeper', 'tasks', 'workers', 'stop', 'restart', 'help']);
+  assert.deepEqual(SLASH_COMMANDS.map(command => command.name), ['new', 'agent', 'chats', 'cwd', 'model', 'effort', 'fast', 'models', 'status', 'computers', 'default', 'presetlist', 'housekeeper', 'prompt', 'tasks', 'workers', 'stop', 'restart', 'help']);
   assert(SLASH_COMMANDS.every(command => command.type === 1 && command.contexts.length === 1 && command.contexts[0] === 1));
   assert(SLASH_COMMANDS.every(command => command.description.length <= 100));
   assert.equal(SLASH_COMMANDS.find(command => command.name === 'model')!.options![0]!.choices, undefined);

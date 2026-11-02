@@ -66,6 +66,26 @@ function prepareContinuation(f: ReturnType<typeof fixture>): void {
   new SessionHandoffs(f.config.dataDir).prepare({ ...f.turn.conversation, id: 'previous-parent', nativeId: null }, f.turn.conversation, 'local-sink', [], []);
 }
 
+test('编号默认选择绑定本Bot本电脑最近清单，含普通模型和预设；变更后不静默重映射', async () => {
+  const f = fixture(); try {
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker home 1'), /未查看/);
+    const list = await f.runtime.workerDefaultCommand('agentworker home');
+    assert.match(list, /1\. 预设 家用 Luna/); assert.match(list, /普通 codex · gpt-6-luna/);
+    await f.runtime.workerDefaultCommand('agentworker home 1 xhigh');
+    assert.deepEqual(f.runtime.store.workerDefault('home'), { kind: 'preset', presetId: 'home-luna', effort: 'xhigh' });
+    const line = list.split('\n').find(line => line.includes('普通 codex · gpt-6-luna'))!;
+    await f.runtime.workerDefaultCommand(`agentworker home ${line.split('.')[0]} low`);
+    assert.deepEqual(f.runtime.store.workerDefault('home'), { kind: 'ordinary', agent: 'codex', model: 'gpt-6-luna', effort: 'low' });
+    f.disablePreset();
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker home 1'), /已变化/);
+    assert.equal(f.runtime.store.workerDefault('home')!.kind, 'ordinary');
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker local 1'), /未查看/);
+    await f.runtime.workerDefaultCommand('agentworker local');
+    await f.runtime.workerDefaultCommand('agentworker local 1');
+    assert.deepEqual(f.runtime.store.workerDefault('local'), { kind: 'follow' });
+  } finally { await f.close(); }
+});
+
 test('初始桥电脑动态跟随；远端省略或 default 均拒绝且不留下 worker/job', async () => {
   const f = fixture(); try {
     const first = await f.launch(); assert.equal(f.runtime.store.getWorker(first.workerId)!.model, 'gpt-6.1-sol');

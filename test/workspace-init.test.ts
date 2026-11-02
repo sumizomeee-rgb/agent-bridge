@@ -11,7 +11,7 @@ import { renderHarnessReferences, harnessText } from '../src/harness.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const script = join(project, 'init-workspace.ps1');
-const templates = ['MEMORY.md', 'README.md', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms/lark.md', 'bridge-chat-platforms/discord.md'];
+const templates = ['MEMORY.md', 'README.md', 'bridge-prompts.json', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms/lark.md', 'bridge-chat-platforms/discord.md'];
 const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const windowsOnly = { skip: process.platform !== 'win32' };
 

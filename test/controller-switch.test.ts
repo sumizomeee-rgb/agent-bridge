@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import { ownTemporaryDirectory } from './temp-directory.js';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ControllerRuntime } from '../src/controller/runtime.js';
@@ -163,11 +163,16 @@ test('工作区初始化和执行目标登记读contextWorkspace，工程执行c
     }, pollIntervalMs: 60_000,
   });
   t.after(() => runtime.close());
-  const initialized = await runtime.initializeWorkspace(f.turn) as { workerId: string }; await flush();
-  assert.equal(f.codex.turns[0]!.conversation.cwd, f.contextWorkspace);
-  f.codex.finish(initialized.workerId, '工作区规则'); await flush(); await flush();
+  writeFileSync(join(f.contextWorkspace, 'README.md'), '# Shared rules');
+  writeFileSync(join(f.contextWorkspace, 'MEMORY.md'), '# Owner memory');
+  const initialized = await runtime.initializeWorkspace(f.turn) as { kind: string; taskId: string; status: string }; await flush();
+  assert.equal(initialized.kind, 'workspace-documents'); assert.equal(initialized.status, 'completed');
+  assert.equal(f.codex.turns.length, 0); assert.equal(f.claude.turns.length, 0, '普通初始化直接载入文档，不派初始化助手');
+  const event = f.registry.queuedEvents().find(value => value.taskId === initialized.taskId)!;
+  assert(event.text.includes(join(f.contextWorkspace, 'README.md'))); assert(event.text.includes(join(f.contextWorkspace, 'MEMORY.md')));
+  await runtime.invoke(f.turn, 'bridge_list_targets', {});
   const engineering = await launch(runtime, f.turn); await flush();
-  assert.equal(f.codex.turns[1]!.conversation.cwd, f.source.cwd); assert(lookups.every(path => path === f.contextWorkspace));
+  assert.equal(f.codex.turns[0]!.conversation.cwd, f.source.cwd); assert(lookups.length > 0 && lookups.every(path => path === f.contextWorkspace));
   f.codex.finish(engineering.workerId); await flush(); await flush();
 });
 

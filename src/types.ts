@@ -64,7 +64,7 @@ export interface BridgeConfig {
   maxImageBytes: number;
   /** Short coordinating turns with independently running execution agents. */
   controllerMode?: boolean;
-  /** Outgoing ordinary files; defaults to 20 MiB, at most 24 MiB. */
+  /** Outgoing ordinary files; resolved from platform defaults and API limits. */
   maxFileBytes?: number;
   /** Bridge worker defaults when parent model inheritance does not apply; independent of a remote CLI's default. */
   defaultModels?: Partial<Record<AgentName, string>>;
@@ -250,6 +250,8 @@ export interface GroupSpaceInfo { spaceId: string; name?: string; ownerId?: stri
 export interface GroupMember { id: string; idType: 'open_id' | 'user_id' | 'union_id' | 'discord'; isBot?: boolean }
 export interface GroupMembersPage { members: GroupMember[]; hasMore: boolean; pageToken?: string; verification: 'verified' | 'unknown'; reason?: string; scope?: 'humans' | 'channel' }
 export interface ChatInputSource {
+  /** Set only by the authorized workspace shortcut expansion; saved slash text remains literal input. */
+  shortcutId?: string;
   messageId: string; userId: string; channelId: string;
   space?: GroupMessageSpace;
   authorType?: 'user' | 'bot' | 'system' | 'unknown';

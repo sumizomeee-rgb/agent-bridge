@@ -38,13 +38,17 @@ export function workerChoiceText(choice: WorkerChoice | null): string {
   if (choice.kind === 'follow') return '跟随当前主控的后端、模型和强度';
   return (choice.kind === 'preset' ? `预设 ${choice.presetId}` : `${choice.agent} · ${choice.model}`) + ` · ${choice.effort ?? 'CLI 默认强度'}`;
 }
-export const workerDefaultUsage = '/default agentworker [电脑ID]：查看默认与候选；/default agentworker <电脑ID> follow|clear；/default agentworker <电脑ID> preset <预设ID> [强度]；/default agentworker <电脑ID> codex|claude <模型> [强度]。follow 仅用于 local。';
-export function parseWorkerDefaultCommand(argument: string): { targetId?: string; choice?: WorkerChoice | null } {
+export const workerDefaultUsage = '/default agentworker [电脑ID]：查看默认与编号候选；/default agentworker <电脑ID> <序号> [强度]：按最近清单设置；/default agentworker <电脑ID> follow|clear；/default agentworker <电脑ID> preset <预设ID> [强度]；/default agentworker <电脑ID> codex|claude <模型> [强度]。follow 仅用于 local。';
+export function parseWorkerDefaultCommand(argument: string): { targetId?: string; choice?: WorkerChoice | null; index?: number; effort?: string | null } {
   const [scope, target, mode, ...rest] = argument.trim().split(/\s+/);
   if (scope !== 'agentworker') throw new Error(workerDefaultUsage);
   if (!target) return {};
   const targetId = workerTargetId(target);
   if (!mode) return { targetId };
+  if (/^[1-9]\d{0,5}$/.test(mode) && rest.length <= 1) {
+    if (rest[0] && rest[0] !== 'default' && !isEffortLevel(rest[0])) throw new Error('助手强度无效。');
+    return { targetId, index: Number(mode), ...(rest.length ? { effort: rest[0] === 'default' ? null : rest[0] } : {}) };
+  }
   if (mode === 'clear' && !rest.length) return { targetId, choice: null };
   if (mode === 'follow' && !rest.length) {
     if (targetId !== 'local') throw new Error('跟随主控仅用于桥电脑 local；请为远端选择该电脑的普通助手或预设。');

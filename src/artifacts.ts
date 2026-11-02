@@ -7,7 +7,6 @@ import { DeliveryPreparationError } from './delivery-errors.js';
 
 const MAX_IMAGES = 10;
 const DEFAULT_FILE_BYTES = 20 * 1024 * 1024;
-const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
 
@@ -209,8 +208,8 @@ function fileType(path: string): string {
 async function collect(finalText: string, _rootDirectory: string | string[], maxImageBytes: number,
   signal?: AbortSignal, maxFileBytes?: number, declarations?: ImageMarker[]): Promise<CollectedAttachments> {
   if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes <= 0) throw failed('图片大小上限配置无效。');
-  if (maxFileBytes !== undefined && (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0 || maxFileBytes > MAX_FILE_BYTES)) {
-    throw failed('文件大小上限必须是 1–25165824 的整数。');
+  if (maxFileBytes !== undefined && (!Number.isSafeInteger(maxFileBytes) || maxFileBytes <= 0)) {
+    throw failed('文件大小上限必须是正安全整数。');
   }
   signal?.throwIfAborted();
   const declared = (declarations ?? markers(finalText, maxFileBytes !== undefined)).map(marker => ({ marker,

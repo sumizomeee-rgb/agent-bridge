@@ -86,7 +86,7 @@ test('独立配置覆盖继承环境，凭据只在子进程环境，快照不�
       assert.ok(!JSON.stringify(prepared.command).includes('private-test-key'));
       const path = join(prepared.env.CODEX_HOME!, 'preset-binding.json');
       assert.ok(!readFileSync(path, 'utf8').includes('private-test-key'));
-      assert.deepEqual(readdirSync(prepared.env.CODEX_HOME!).sort(), ['preset-binding.json']);
+      assert.deepEqual(readdirSync(prepared.env.CODEX_HOME!).sort(), ['config.toml', 'preset-binding.json']);
       assert.deepEqual(readdirSync(f.user), []);
     } finally { await prepared.close(); }
   } finally { f.close(); }
@@ -153,7 +153,10 @@ test('Codex预设继承浏览器工具配置和插件，刷新工具时不跟随
     const home = first.env.CODEX_HOME!; const inherited = parse(readFileSync(join(home, 'config.toml'), 'utf8'));
     assert.deepEqual(inherited.mcp_servers, parse(configuration('browser-runtime-v1')).mcp_servers);
     assert.deepEqual(inherited.plugins, parse(configuration('browser-runtime-v1')).plugins);
-    assert.equal(inherited.model_provider, undefined); assert.equal(inherited.model_providers, undefined); assert.equal(inherited.api_key, undefined);
+    assert.equal(inherited.model_provider, 'bridge_preset');
+    assert.equal((inherited.model_providers as Record<string, any>).bridge_preset.base_url, 'https://gateway.example');
+    assert.equal(inherited.api_key, undefined); assert(!JSON.stringify(inherited).includes('source-secret'));
+    assert(!JSON.stringify(inherited).includes('private-test-key'));
     assert.equal(readdirSync(home).includes('auth.json'), false); assert.equal(readdirSync(home).includes('plugins'), true);
     assert.equal(first.env.BRIDGE_PRESET_API_KEY, 'private-test-key');
     assert(first.command.args.includes('model_providers.bridge_preset.base_url="https://gateway.example"')); await first.close();

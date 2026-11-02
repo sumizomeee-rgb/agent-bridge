@@ -1,3 +1,5 @@
+import { NumberedChoices } from '../numbered-choices.js';
+import { pruneWorkerPluginCatalogCaches } from './cache-retention.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
@@ -95,6 +97,7 @@ export class ControllerRuntime {
   private closed = false;
   private stopping = false;
   private draining = false;
+  private readonly numberedWorkers = new NumberedChoices<{ choice: WorkerChoice; label: string }>();
   private lastWorkCounts: string | undefined;
   private isDraining(): boolean { return this.draining || this.callbacks.isDraining?.() === true; }
   beginDrain(): void { this.draining = true; }
@@ -124,6 +127,9 @@ export class ControllerRuntime {
       && !this.active.has(workerId) && !this.unconfirmedStops.has(workerId)
       && !this.store.jobs(workerId).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
       && !this.store.supplements().some(value => value.workerId === workerId && ['pending', 'steering', 'uncertain'].includes(value.status));
+  }
+  pruneWorkerCaches() {
+    return pruneWorkerPluginCatalogCaches(this.config.dataDir, this.store.workers(), this.store.jobs(), id => this.isWorkerStopped(id), this.now());
   }
   async rebindConversation(source: Conversation, target: Conversation): Promise<void> {
     rebindTaskOrigin({ conversationId: source.id, userId: source.userId, agent: source.agent, nativeId: source.nativeId,
@@ -512,6 +518,12 @@ export class ControllerRuntime {
     if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或重启，暂不能修改默认助手。');
     const command = parseWorkerDefaultCommand(argument);
     let view = await this.workerChoices({ targetId: command.targetId });
+    if (command.index !== undefined) {
+      const candidates = await this.numberedWorkerCandidates(view.computers[0]!);
+      const chosen = this.numberedWorkers.select(command.targetId!, command.index, candidates).choice;
+      if (chosen.kind === 'follow' && command.effort !== undefined) throw new Error('跟随主控不单独指定强度。');
+      command.choice = chosen.kind === 'follow' ? chosen : { ...chosen, ...(command.effort !== undefined ? { effort: command.effort } : {}) };
+    }
     if ('choice' in command) {
       const target = view.computers[0]!;
       const choice = command.choice!;
@@ -520,12 +532,41 @@ export class ControllerRuntime {
       this.store.setWorkerDefault(command.targetId!, choice);
       view = await this.workerChoices({ targetId: command.targetId });
     }
+    if (command.targetId && !('choice' in command)) {
+      const computer = view.computers[0]!;
+      const candidates = await this.numberedWorkerCandidates(computer);
+      const result = [`${computer.label} [${computer.targetId}] · 默认：${workerChoiceText(computer.defaultAssistant)}`,
+        ...candidates.map((item, i) => `${i + 1}. ${item.label}`),
+        `/default agentworker ${computer.targetId} 序号 [强度] 设置；编号绑定本次清单，变化或重启后须重新查看。`,
+        '普通模型来自该电脑CLI目录；目录读取失败的引擎不编入序号，可继续使用原来的名称写法。'];
+      this.numberedWorkers.remember(command.targetId, candidates);
+      return result.join('\n');
+    }
     const lines = view.computers.map(computer => [
       `${computer.label} [${computer.targetId}] · 默认：${workerChoiceText(computer.defaultAssistant)}`,
       `普通助手：${computer.assistants.filter(item => item.kind === 'ordinary').map(item => item.agent).join('、') || '无'}（明确选择模型与强度）`,
       ...computer.assistants.filter(item => item.kind === 'preset').map(item => `预设：${item.label} [${item.presetId}] · ${item.agent} · ${item.model}`),
     ].join('\n'));
     return [('choice' in command ? '默认助手已保存，仅影响此后新建派工。' : '各电脑默认助手与登记候选'), ...lines, workerDefaultUsage].join('\n\n');
+  }
+  private async numberedWorkerCandidates(computer: Awaited<ReturnType<ControllerRuntime['workerChoices']>>['computers'][number]) {
+    const workspace = this.config.contextWorkspace ?? this.config.workspace;
+    const candidates: Array<{ choice: WorkerChoice; label: string }> = [];
+    if (computer.targetId === 'local') candidates.push({ choice: { kind: 'follow' }, label: '跟随当前主控' });
+    for (const item of computer.assistants) if (item.kind === 'preset') {
+      candidates.push({ choice: { kind: 'preset', presetId: item.presetId, effort: null },
+        label: `预设 ${item.label ?? item.presetId} · ${item.agent} · ${item.model} [${item.presetId}]` });
+    }
+    const ordinary = await Promise.all(computer.assistants.filter(item => item.kind === 'ordinary').map(async item => {
+      try {
+        const binding = await this.callbacks.targetCatalog?.resolveTarget(workspace, computer.targetId, item.agent);
+        const adapter = binding ? this.callbacks.targetCatalog!.adapterFor(binding) : this.adapters[item.agent];
+        const info = await adapter.getModelInfo?.(binding?.cwd ?? workspace);
+        const ids = [...new Set((info?.models ?? []).map(model => model.id).filter(isModelId))];
+        return ids.map(model => ({ choice: { kind: 'ordinary' as const, agent: item.agent, model, effort: null }, label: `普通 ${item.agent} · ${model}` }));
+      } catch { return []; }
+    }));
+    return [...candidates, ...ordinary.flat()];
   }
   private normalizeWorkerArgs(input: Record<string, unknown>): Record<string, unknown> {
     const { assistant, ...args } = input;
@@ -1376,15 +1417,15 @@ export class ControllerRuntime {
     await this.terminateWorkers(workers.filter(worker => worker.origin.purpose === 'schedule'), '新会话或切换会话已取消定时任务');
   }
   /** A Bot's persisted housekeeping capability can cancel its reader after /new. */
-  async cancelHousekeeperWorker(workerId: string, userId: string): Promise<void> {
+  async cancelHousekeeperWorker(workerId: string, userId: string, reason = '用户关闭事务巡视'): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (!worker || worker.origin.purpose !== 'housekeeper' || worker.origin.userId !== userId) throw new Error('事务摘要助手归属不匹配。');
     this.assertBridgeOwnership(worker);
-    const reason = '用户关闭事务巡视'; this.requestCancellation(worker.id, reason);
+    this.requestCancellation(worker.id, reason);
     const stopped = await this.stopWorker(worker.id, reason);
     if (stopped) this.store.archiveStoppedWorker(worker.id, reason);
     await this.workCountsChanged();
-    if (!stopped) throw Object.assign(new Error('事务摘要助手停止尚未确认，已关闭后续巡视。'), { name: 'AgentProcessStopError', processStillRunning: true });
+    if (!stopped) throw Object.assign(new Error('事务摘要助手停止尚未确认，保留原执行登记，未重复启动。'), { name: 'AgentProcessStopError', processStillRunning: true });
   }
   /** /stop also terminates ordinary bridge-owned engineering workers. */
   async cancelConversation(conversationId: string): Promise<void> {

@@ -56,6 +56,16 @@ async function fixture() {
   return { transport, adapter, run, supplement, controller, turn };
 }
 
+test('预设配置回执不匹配时拒绝创建会话和提交请求，不回退openai', async () => {
+  const transport = new Transport();
+  const adapter = new CodexAdapter({ command: 'unused', args: [] }, { BRIDGE_PRESET_PROVIDER: 'bridge_preset' }, () => transport);
+  try {
+    await assert.rejects(adapter.run({ conversation: { id: 'preset-mismatch', userId: 'owner', agent: 'codex', nativeId: null,
+      title: '', cwd: process.cwd(), createdAt: '', updatedAt: '' }, text: 'test', imagePaths: [], signal: new AbortController().signal, onProgress() {} }), /预设供应商配置不一致/);
+    assert(!transport.writes.some(item => item.method === 'thread/start' || item.method === 'turn/start'));
+  } finally { await adapter.close(); }
+});
+
 test('Codex steer 使用经核验的官方字段和有序输入，复用同一活动 transport', async () => {
   const f = await fixture();
   try {

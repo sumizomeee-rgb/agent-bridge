@@ -67,9 +67,13 @@ D:\Agent Workspace/
 工作区 Markdown 骨架为 2 + 平台数：README 保存桥通用规则与 harness，MEMORY 保存用户偏好、本地工作约定和环境入口，每个平台另有一份指南。根目录不放临时产物，生成器预建根目录 `tmp/`；收工规则见工作区 README。机器导航和个人工作习惯放在工作区；技能由各电脑的 CLI 加载。桥提供执行能力，不复制个人指南、技能或认证到项目模板。
 
 
+快捷提示词保存在共享工作区 `bridge-prompts.json`，格式为 `{"1":{"name":"名称","text":"正文"}}`。`/prompt` 查看完整清单，`/prompt 1` 把对应正文作为用户消息发送给当前主控；忙碌时沿用普通消息机制。多个 Bot 共用工作区即共用提示词，修改即时生效，跨 `/new` 与重启保留，编号不自动重排；文件不作为每轮上下文注入。
+
+`/models` 或 `/model list` 显示编号，`/model 1` 按最近显示的模型清单切换。`/default agentworker local` 显示该电脑的跟随主控、预设和普通模型编号，`/default agentworker local 1 [强度]` 设置默认助手；其他电脑同理。普通目录从对应电脑读取，目录读取失败时不猜模型。编号只绑定最近清单，目录变化或桥重启后须重新查看；原模型名、Agent 和预设 ID 写法保留。
+
 ### 工作区职责与生成原理
 
-工作区根目录保留 `README.md`、`MEMORY.md` 和按职责命名的目录。README 保存跨电脑、跨机器人通用的主控规则与初始化约定；MEMORY 分为“用户偏好”“本地工作约定”“环境与入口”，保存本地可变上下文；`bridge-chat-platforms/` 提供按当前平台选择的操作指南。`bridge-remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`bridge-capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。`bridge-agent-presets/registry.json` 保存预设及目标引用，`bridge-agent-presets/private/` 保存启动配置和凭据，由桥按目标自动准备远端运行资料。清单由程序按需读取，不作为初始化全文注入；示例不会自动启用，非秘密登记表不含凭据，私有凭据也不注入主控正文。
+工作区根目录保留 `README.md`、`MEMORY.md`、`bridge-prompts.json` 和按职责命名的目录。README 保存跨电脑、跨机器人通用的主控规则与初始化约定；MEMORY 分为“用户偏好”“本地工作约定”“环境与入口”，保存本地可变上下文；`bridge-chat-platforms/` 提供按当前平台选择的操作指南。`bridge-remote-agents/` 保存远程电脑、SSH 配置路径与 CLI 导航；`bridge-capabilities/` 保存能力入口与有范围的历史验收，实时健康检查仍由桥负责。`bridge-agent-presets/registry.json` 保存预设及目标引用，`bridge-agent-presets/private/` 保存启动配置和凭据，由桥按目标自动准备远端运行资料。清单由程序按需读取，不作为初始化全文注入；示例不会自动启用，非秘密登记表不含凭据，私有凭据也不注入主控正文。
 
 `workspace-template/` 是随代码维护的公共骨架，`init-workspace.ps1 -Path <绝对目录>` 按固定清单复制缺失文件并预建职能目录和根目录 `tmp/`。生成前先检查目录／文件碰撞；已有用户文件保持原字节，不覆盖、不自动同步模板，也不扫描任意新增目录。桥运行时不生成工作区；直接完整载入 README 和 MEMORY，平台文档及其他资料留给执行助手按需读取。更新已有工作区时保留用户手动修改，仅同步通用 README，不覆盖本地 MEMORY 或私有登记；下一轮刷新规则时保留原生会话。共享目录迁移后 `/new` 不再继承旧 Bot 默认目录；通过 `/cwd` 明确选择的工程目录继续保留。
 

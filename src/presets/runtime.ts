@@ -12,7 +12,7 @@ import { presetId, readPrivateJson } from './registry.js';
 import { readMaterials } from './materials.js';
 import { exposeCodexHistory, pinSessionLocation } from '../agents/worker-session.js';
 import { startPresetConnect } from './connect.js';
-import { inheritCodexCapabilities } from './capabilities.js';
+import { inheritCodexCapabilities, writeCodexPresetRouting } from './capabilities.js';
 import type { LaunchProfile, PresetBinding } from './types.js';
 
 export function profileFingerprint(profile: LaunchProfile): string { return createHash('sha256').update(JSON.stringify(profile)).digest('hex'); }
@@ -110,7 +110,7 @@ export class PresetRuntime {
     const key = binding.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey;
     if (typeof key !== 'string' || !key || /[\r\n\0]/.test(key)) throw new Error('目标机预设认证材料无效。');
     const env: NodeJS.ProcessEnv = { ...process.env, ...baseEnv };
-    const cleared = new Set(['CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_API_KEY', 'CLAUDE_CONFIG_DIR', 'BRIDGE_PRESET_API_KEY', 'NO_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
+    const cleared = new Set(['CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_API_KEY', 'CLAUDE_CONFIG_DIR', 'BRIDGE_PRESET_API_KEY', 'BRIDGE_PRESET_PROVIDER', 'NO_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
     for (const name of Object.keys(env)) {
       const key = name.toUpperCase();
       if (/^(ANTHROPIC_|CLAUDE_CODE_|OPENAI_)/.test(key) || cleared.has(key)) env[name] = undefined;
@@ -126,7 +126,9 @@ export class PresetRuntime {
         inheritCodexCapabilities(home, location?.profileHome ?? join(this.userHome, '.codex'));
         env.CODEX_HOME = home; env.CODEX_SQLITE_HOME = home; env.BRIDGE_PRESET_API_KEY = key;
         if (location?.visibility === 'visible') { exposeCodexHistory(home, location); env.CODEX_SQLITE_HOME = location.sqliteHome; }
+        writeCodexPresetRouting(home, binding.model, profile.baseUrl);
         const provider = 'bridge_preset';
+        env.BRIDGE_PRESET_PROVIDER = provider;
         const values: Record<string, unknown> = { model_provider: provider, model: binding.model,
           [`model_providers.${provider}.name`]: 'Explicit bridge preset', [`model_providers.${provider}.base_url`]: profile.baseUrl,
           [`model_providers.${provider}.env_key`]: 'BRIDGE_PRESET_API_KEY', [`model_providers.${provider}.requires_openai_auth`]: false,

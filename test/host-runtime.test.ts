@@ -1602,6 +1602,56 @@ test('owner ordinary input broadcasts and preserves raw mention evidence without
 });
 
 
+for (const platform of ['feishu', 'discord'] as const) test(`${platform} cross-controller private history preserves defaults and reads across new without waking the target`, async t => {
+  const f = fixture(t, { platform, internalBotCommunicationEnabled: false }), [primary, target] = f.ids as [string, string];
+  const dm = (id: string, n: number, text: string) => ({ id: platform === 'feishu' ? `${id}|179218000${String(n).padStart(4, '0')}|om_history_${n}` : `${id}|${1792180000000000000n + BigInt(n)}`,
+    userId: f.configs.find(c => c.botId === id)!.ownerUserId!, channelId: `${id}|${platform === 'feishu' ? 'oc_history_dm' : '777777777777777777'}`, text, imagePaths: [] });
+  await f.managers.get(target)!.handle(dm(target, 1, '旧会话：视频交付需要跟进')); await f.drain();
+  await f.managers.get(target)!.handle(dm(target, 2, '/new')); await f.drain();
+  await f.managers.get(target)!.handle(dm(target, 3, '新会话纠正：视频已交付，待用户反馈')); await f.drain();
+  const before = f.calls.filter(c => c.botId === target).length;
+  f.run(async (id, turn) => {
+    assert.equal(id, primary);
+    const delegate = async (input: Record<string, unknown>) => f.managers.get(primary)!.invokeKnowledge(turn, 'bridge_search_chat_history', input);
+    const own: any = await f.host.invoke(primary, turn, 'bridge_search_chat_history', {}, undefined, delegate);
+    assert.equal(own.messages.some((m: any) => m.text.includes('旧会话')), false);
+    const explicitSelf: any = await f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: primary }, undefined, delegate);
+    assert.deepEqual(explicitSelf, own);
+    const page: any = await f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: target, query: '视频', limit: 1 });
+    assert.equal(page.targetBotId, target); assert.equal(page.hasMore, true); assert.match(page.messages[0].text, /新会话纠正/);
+    const next: any = await f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: target, query: '视频', limit: 1, cursor: page.nextCursor });
+    assert.match(next.messages[0].text, /旧会话/); assert.notEqual(next.messages[0].conversationId, page.messages[0].conversationId);
+    const read: any = await f.host.invoke(primary, turn, 'bridge_read_chat_history', { targetBotId: target, messageId: next.messages[0].messageId });
+    assert.ok(read.messages.some((m: any) => m.text.includes('新会话纠正')));
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_search_chat_history', { cursor: page.nextCursor, query: '视频' }, undefined, delegate), /游标/);
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: target, channelId: 'forged' }), /参数/);
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: 'unknown' }), /目标须/);
+    const config = f.configs.find(c => c.botId === target)!, originalPlatform = config.platform;
+    config.platform = platform === 'feishu' ? 'discord' : 'feishu';
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: target }), /目标须/); config.platform = originalPlatform;
+    const allowed = [...config.allowedUserIds]; config.allowedUserIds.length = 0;
+    await assert.rejects(f.host.invoke(primary, turn, 'bridge_search_chat_history', { targetBotId: target }), /目标须/); config.allowedUserIds.push(...allowed);
+    await turn.onPublicMessage!('已根据另一主控的历史接续跟进');
+  });
+  await f.managers.get(primary)!.handle(dm(primary, 4, '看看另一主控最近聊的，你来跟进')); await f.drain();
+  assert.equal(f.calls.filter(c => c.botId === target).length, before);
+  assert.equal(f.host.store.listEvents().length, 0);
+});
+
+test('cross-controller history rejects group/private leaks and unknown owner routes', async t => {
+  const f = fixture(t); await f.activate();
+  f.run(async (id, turn) => {
+    await assert.rejects(f.host.invoke(id, turn, 'bridge_search_chat_history', { targetBotId: id === A ? B : A }), /负责人私聊/);
+    await turn.onSilent?.();
+  });
+  await f.host.receive(A, f.message(A, 'history-group', '查询另一主控的私聊')); await f.drain();
+  f.run(async (id, turn) => {
+    await assert.rejects(f.host.invoke(id, turn, 'bridge_search_chat_history', { targetBotId: B }), /尚无.*私聊记录/);
+    await turn.onPublicMessage!('目标尚无私聊记录');
+  });
+  await f.managers.get(A)!.handle({ id: `${A}|1792180000998|om_history_no_route`, userId: f.configs[0]!.ownerUserId!, channelId: `${A}|oc_history_dm`, text: '查询', imagePaths: [] }); await f.drain();
+});
+
 test('controller roster is queried on demand with activity, aliases and snapshot limits, without waking any Bot', async t => {
   const f = fixture(t); await f.activate(); f.configs[1]!.aliases = ['Miku'];
   let roster: any;

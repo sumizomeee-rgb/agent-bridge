@@ -14,7 +14,7 @@ export interface HousekeeperCallbacks {
   job(jobId: string): ControllerJob | null;
   recoverRun?(run: HousekeeperRun): { workerId: string; jobId: string } | null;
   eventForJob?(jobId: string): TaskCompletionEvent | null;
-  cancel(workerId: string): Promise<void>;
+  cancel(workerId: string, reason?: string): Promise<void>;
   event(id: string): { state: string | null; processed: boolean; safeToRetry?: true };
   reroute(run: HousekeeperRun, state: HousekeeperState): Promise<{ taskId: string; eventId: string; conversationId: string }>;
   retireEvent(id: string): void;
@@ -216,6 +216,16 @@ export class HousekeeperService {
       if (run.phase === 'worker' && run.jobId) {
         const job = this.callbacks.job(run.jobId);
         if (!job) { await this.failure(value, '事务摘要执行记录缺失；消费进度未前移。', true, 'worker'); return; }
+        if (['queued', 'running'].includes(job.status) && this.now() - Date.parse(run.createdAt) >= 5 * 60000) {
+          const reason = '事务摘要超过5分钟未完成，已请求停止；消费进度未前移。';
+          try { await this.callbacks.cancel(run.workerId ?? job.workerId, reason); }
+          catch (error) {
+            await this.failure(value, reason + ' 停止待确认：' + String(error), true, 'worker'); return;
+          }
+          if (this.same(value)?.run?.id === run.id)
+            await this.failure(value, reason, !this.stopped(this.callbacks.job(run.jobId)), 'worker');
+          return;
+        }
         if (job.status === 'uncertain') { await this.failure(value, '事务摘要助手退出尚未确认；保留原执行登记，未重复启动。', true, 'worker'); return; }
         if (job.status === 'completed' && job.result) {
           const event = this.callbacks.eventForJob?.(run.jobId);

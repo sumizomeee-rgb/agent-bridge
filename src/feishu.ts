@@ -1,3 +1,4 @@
+import { FILE_LIMITS } from './attachment-limits.js';
 import { feishuPresentationCards, type BridgePresentation } from './presentation.js';
 import { BRIDGE_LIFECYCLE_COPY, type BridgeLifecycleEvent } from './lifecycle.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -432,7 +433,7 @@ export class FeishuTransport {
     const images = options?.images ?? [], files = options?.files ?? [];
     if (images.length + files.length > 10 || [...images, ...files].reduce((sum, file) => sum + file.data.length, 0) > 100 * 1024 * 1024) throw new Error('回传附件超过每轮限额。');
     for (const item of [...images, ...files]) {
-      const max = images.includes(item as any) ? Math.min(this.config.maxImageBytes, 10 * 1024 * 1024) : this.config.maxFileBytes ?? 20 * 1024 * 1024;
+      const max = images.includes(item as any) ? Math.min(this.config.maxImageBytes, 10 * 1024 * 1024) : Math.min(this.config.maxFileBytes ?? FILE_LIMITS.feishu.defaultBytes, FILE_LIMITS.feishu.maxBytes);
       if (!item.data.length || item.data.length > max) throw new Error('回传附件为空或超过限额；未重新运行 Agent。');
     }
     let view = options?.presentation;

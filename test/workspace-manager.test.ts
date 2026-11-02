@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
-import { TaskRegistry } from '../src/tasks.js';
+import { TaskRegistry, type TaskContextFile } from '../src/tasks.js';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig, ReplyOptions } from '../src/types.js';
 
 async function until(check: () => boolean) {
@@ -53,14 +53,15 @@ function fixture(t: TestContext) {
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } }, maxImageBytes: 1024 };
   const registry = new TaskRegistry(config.dataDir), children = new Children(), controller = new Controller(), inspect = new SessionStore(config.dataDir);
   const replies: Array<{ text: string; channel: string }> = [], errors: unknown[] = [], states: string[] = [];
-  let paused = false, now = Date.now(), failIntro = false;
+  let paused = false, now = Date.now(), failIntro = false, failInitialization = false;
+  let initializationWait: Promise<void> | undefined;
   let manager: SessionManager, runtime: ControllerRuntime;
   const makeRuntime = () => new ControllerRuntime(config, { codex: children, claude: children }, registry, {
     onCompletion: () => { if (!paused) manager.completionAvailable(); }, onError: error => { errors.push(error); }, now: () => now, pollIntervalMs: 60000 });
   const makeManager = () => new SessionManager(config, { codex: controller, claude: controller }, {
     sendText: async (channel, text, _options?: ReplyOptions) => { if (failIntro && text.includes('工作区介绍已送达')) throw new Error('delivery unknown'); replies.push({ channel, text }); },
   }, { mergeDelayMs: 0, taskRegistry: registry,
-    onInitializeWorkspace: turn => runtime.initializeWorkspace(turn), onInitializationError: (_c, error) => { errors.push(error); },
+    onInitializeWorkspace: async turn => { await initializationWait; if (failInitialization) throw new Error('initialization dispatch failed'); return runtime.initializeWorkspace(turn); }, onInitializationError: (_c, error) => { errors.push(error); },
     onInitializationState: (_c, state) => { states.push(state); },
     onDetach: id => runtime.detachConversation(id), onStop: id => runtime.cancelConversation(id) });
   runtime = makeRuntime(); manager = makeManager();
@@ -70,6 +71,7 @@ function fixture(t: TestContext) {
     pause(value = true) { paused = value; if (!value) manager.completionAvailable(); }, failIntro() { failIntro = true; },
     async ready() { await until(() => manager.isIdle() && states.includes('ready')); },
     advance(ms: number) { now += ms; },
+    beforeInitialization(wait: Promise<void>) { initializationWait = wait; }, failInitialization() { failInitialization = true; },
     async restart() { await manager.close(); await runtime.close(); runtime = makeRuntime(); manager = makeManager(); await manager.recover(); await runtime.start(); },
   };
   t.after(async () => { await manager.close(); await runtime.close(); inspect.close(); registry.close(); rmSync(root, { recursive: true, force: true }); });
@@ -186,4 +188,133 @@ test('新旧目录重启后保留 cwdExplicit，不因配置迁移覆盖用户�
   const f = fixture(t), legacy = join(f.root, 'legacy'); mkdirSync(legacy); f.config.legacyWorkspace = legacy;
   await f.send('cwd', '/cwd ' + legacy); await f.ready(); await f.restart(); await f.send('new', '/new'); await until(() => f.manager.isIdle());
   assert.equal(f.inspect.getActive('owner')!.cwd, legacy); assert.equal(f.inspect.getActive('owner')!.cwdExplicit, true);
+});
+
+
+for (const agent of ['codex', 'claude'] as const) test(`${agent} /new c 期间的普通消息等待历史与介绍，保持同一新父及输入顺序`, async t => {
+  const f = fixture(t); f.config.defaultAgent = agent;
+  await f.send('old', '旧目标：只调查，禁止修改配置'); await f.ready();
+  await f.send('new', '/new c'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('owner')!;
+  await f.send('during-1', '继续旧目标'); await f.send('during-2', '顺便核对来源');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.controller.turns.filter(turn => turn.conversation.id === parent.id).length, 0);
+  assert.equal(f.inspect.getMessage('during-1')!.state, 'queued'); assert.equal(f.inspect.getMessage('during-2')!.state, 'queued');
+  f.children.finish(0);
+  await until(() => f.inspect.getMessage('during-2')!.state === 'completed' && f.manager.isIdle());
+  const turns = f.controller.turns.filter(turn => turn.conversation.id === parent.id);
+  assert.equal(turns[0]!.event?.introductionRequested, true); assert.equal(turns[0]!.taskContextPath, undefined, '介绍不借用尚未处理的用户消息授权');
+  assert.deepEqual(turns.filter(turn => !turn.event).map(turn => turn.text), ['继续旧目标', '顺便核对来源']);
+  assert.ok(turns.filter(turn => !turn.event).every(turn => turn.conversation.nativeId === f.inspect.getActive('owner')!.nativeId)); assert.equal(f.children.turns.length, 1);
+  assert.equal(f.replies.findIndex(reply => reply.text.includes('工作区介绍已送达')) < f.replies.findIndex(reply => reply.text.includes('收到：继续旧目标')), true);
+});
+
+test('普通 /new 在初始化事件尚未生成时也先排队，再介绍再处理消息', async t => {
+  const f = fixture(t), g = gate(); f.beforeInitialization(g.promise);
+  try {
+    await f.send('new', '/new'); await f.send('during', '现在的问题');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.inspect.getMessage('during')!.state, 'queued'); assert.equal(f.controller.turns.length, 0);
+    g.release(); await until(() => f.inspect.getMessage('during')!.state === 'completed' && f.manager.isIdle());
+    assert.equal(f.controller.turns[0]!.event?.introductionRequested, true); assert.equal(f.children.turns.length, 0);
+    assert.equal(f.replies.findIndex(reply => reply.text.includes('工作区介绍已送达')) < f.replies.findIndex(reply => reply.text.includes('收到：现在的问题')), true);
+  } finally { g.release(); }
+});
+
+test('初始化派发失败报告现有失败回执后释放已排队消息，不等待不存在的介绍', async t => {
+  const f = fixture(t), g = gate(); f.beforeInitialization(g.promise); f.failInitialization();
+  try {
+    await f.send('new', '/new'); await f.send('during', '派发失败后继续');
+    assert.equal(f.inspect.getMessage('during')!.state, 'queued');
+    g.release(); await until(() => f.inspect.getMessage('during')!.state === 'completed' && f.manager.isIdle());
+    assert.equal(f.inspect.workspaceNotice(f.inspect.getActive('owner')!.id)!.outcome, 'request-failed');
+    assert(f.replies.some(reply => reply.text.includes('工作区初始化请求未确认完成')));
+    assert.equal(f.children.turns.length, 0);
+  } finally { g.release(); }
+});
+
+test('介绍轮抛错后记录失败并处理普通消息，不永久堵住队列', async t => {
+  const f = fixture(t), g = gate();
+  f.controller.hook = async turn => { if (turn.event?.introductionRequested) { await g.promise; throw new Error('introduction model failed'); } };
+  try {
+    await f.send('new', '/new'); await until(() => f.controller.turns.some(turn => turn.event?.introductionRequested));
+    await f.send('during', '介绍失败后继续'); assert.equal(f.inspect.getMessage('during')!.state, 'queued');
+    g.release(); await until(() => f.inspect.getMessage('during')!.state === 'completed' && f.manager.isIdle());
+    const notice = f.inspect.workspaceNotice(f.inspect.getActive('owner')!.id)!;
+    assert.equal(notice.outcome, 'load-failed'); assert.equal(notice.state, 'delivered');
+  } finally { g.release(); }
+});
+
+test('介绍投递未知仍释放后续消息，重启不重发介绍或重放用户请求', async t => {
+  const f = fixture(t), g = gate(); f.failIntro();
+  f.controller.hook = async turn => { if (turn.event?.introductionRequested) await g.promise; };
+  try {
+    await f.send('new', '/new'); await until(() => f.controller.turns.some(turn => turn.event?.introductionRequested));
+    await f.send('during', '介绍投递未知后继续'); g.release();
+    await until(() => f.inspect.getMessage('during')!.state === 'completed' && f.manager.isIdle());
+    const parent = f.inspect.getActive('owner')!;
+    assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'uncertain');
+    const count = f.controller.turns.length; await f.restart(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.controller.turns.length, count); assert.equal(f.inspect.getMessage('during')!.state, 'completed');
+  } finally { g.release(); }
+});
+
+for (const control of ['/stop', '/new']) test(`${control} 可中断 /new c 等待，不执行旧排队消息`, async t => {
+  const f = fixture(t); await f.send('old', '旧目标'); await f.ready();
+  await f.send('new', '/new c'); await until(() => f.children.turns.length === 1);
+  const previous = f.inspect.getActive('owner')!;
+  await f.send('cancel-me', '不要执行的旧排队消息'); assert.equal(f.inspect.getMessage('cancel-me')!.state, 'queued');
+  await f.send('control', control);
+  await until(() => f.inspect.getMessage('cancel-me')!.state === 'cancelled' && f.manager.isIdle());
+  assert.equal(f.controller.turns.some(turn => !turn.event && turn.text === '不要执行的旧排队消息'), false);
+  assert.equal(f.inspect.workspaceNotice(previous.id)!.state, 'cancelled');
+  await f.send('after-control', '控制命令后继续');
+  await until(() => f.inspect.getMessage('after-control')!.state === 'completed' && f.manager.isIdle());
+});
+
+test('/new c 回执已入库但介绍未执行时重启，仍先介绍再处理原排队消息且不重复摘要', async t => {
+  const f = fixture(t); await f.send('old', '旧目标：只调查'); await f.ready(); f.pause();
+  await f.send('new', '/new c'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('owner')!;
+  await f.send('during-restart', '重启后续接旧目标'); assert.equal(f.inspect.getMessage('during-restart')!.state, 'queued');
+  f.children.finish(0);
+  await until(() => f.registry.queuedEvents().some(event => event.purpose === 'workspace-context' && event.conversationId === parent.id));
+  await f.restart();
+  await until(() => f.inspect.getMessage('during-restart')!.state === 'completed' && f.manager.isIdle());
+  const turns = f.controller.turns.filter(turn => turn.conversation.id === parent.id);
+  assert.equal(turns[0]!.event?.introductionRequested, true); assert.equal(f.children.turns.length, 1);
+  assert.equal(f.runtime.store.jobs().find(job => job.origin.conversationId === parent.id)!.origin.originMessageId, 'new');
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'delivered');
+});
+
+
+test('/new c 历史摘要及唯一回执修复均失败后，报告读取失败并放行已排队消息', async t => {
+  const f = fixture(t); await f.send('old', '旧目标'); await f.ready();
+  await f.send('new', '/new c'); await until(() => f.children.turns.length === 1);
+  await f.send('during-failure', '历史读取失败后继续');
+  f.children.finish(0, 'invalid summary'); await until(() => f.children.turns.length === 2);
+  assert.equal(f.inspect.getMessage('during-failure')!.state, 'queued');
+  f.children.finish(1, 'invalid repaired summary');
+  await until(() => f.inspect.getMessage('during-failure')!.state === 'completed' && f.manager.isIdle());
+  assert.equal(f.inspect.workspaceNotice(f.inspect.getActive('owner')!.id)!.outcome, 'read-failed');
+  assert(f.replies.some(reply => reply.text.includes('工作区初始化未完成')));
+});
+
+test('其他来源的工作区回执不能提前解除 /new c 的介绍等待', async t => {
+  const f = fixture(t); await f.send('old', '旧目标'); await f.ready();
+  await f.send('new', '/new c'); await until(() => f.children.turns.length === 1);
+  const parent = f.inspect.getActive('owner')!;
+  await f.send('during-other-source', '仍须等待原历史摘要');
+  const context = f.registry.createContext({ conversationId: parent.id, userId: 'owner', channelId: 'other-channel', originMessageId: 'other-origin',
+    agent: parent.agent, nativeId: null, cwd: parent.cwd, purpose: 'workspace-context' });
+  const task = f.registry.register(JSON.parse(readFileSync(context.contextPath, 'utf8')) as TaskContextFile, '其他入口回执', '00000000-0000-4000-8000-000000000001');
+  f.registry.acceptObservedResult(task.taskId, 'completed', '其他来源不能冒充本次初始化'); f.registry.closeContext(context.contextId);
+  f.manager.completionAvailable(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.inspect.getMessage('during-other-source')!.state, 'queued');
+  assert.equal(f.controller.turns.filter(turn => turn.conversation.id === parent.id).length, 0);
+  const other = f.registry.queuedEvents().find(event => event.taskId === task.taskId)!;
+  assert(f.registry.claimEvent(other.id)); f.registry.markDelivered(other.id);
+  f.children.finish(0);
+  await until(() => f.inspect.getMessage('during-other-source')!.state === 'completed' && f.manager.isIdle());
+  assert.equal(f.inspect.workspaceNotice(parent.id)!.state, 'delivered');
 });

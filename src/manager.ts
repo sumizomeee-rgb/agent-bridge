@@ -1,3 +1,5 @@
+import { NumberedChoiceError, NumberedChoices } from './numbered-choices.js';
+import { promptShortcut, readPromptShortcuts } from './prompt-shortcuts.js';
 import { effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
@@ -87,6 +89,7 @@ export class SessionManager {
   private readonly interruptPromises = new Set<Promise<void>>();
   private readonly detachPromises = new Map<string, Promise<void>>();
   private readonly resetCommands = new Map<string, number>();
+  private readonly modelChoices = new NumberedChoices<string>();
   private readonly modelChanges = new Set<string>();
   private readonly initializationAttempts = new Set<string>();
   private readonly initializationRecoveries = new Set<Promise<void>>();
@@ -462,7 +465,19 @@ export class SessionManager {
   }  async handle(message: BridgeMessage, commandReply?: (text: string, options?: ReplyOptions) => Promise<void>): Promise<void> {
     if (this.closed) throw new Error('桥已关闭');
     if (!this.config.allowedUserIds.includes(message.userId) || this.options.authorizeUser?.(message.userId) === false || this.hasMessage(message.id)) return;
-    const parsed = message.groupContext?.eventKind ? null : command(message.text);
+    let parsed = message.groupContext?.eventKind ? null : command(message.text);
+    let shortcutName: string | undefined;
+    if (this.config.controllerMode && !message.groupContext && parsed?.name === 'prompt' && /^[1-9]\d{0,5}$/.test(parsed.argument)) {
+      try {
+        const shortcut = promptShortcut(this.config.contextWorkspace ?? this.config.workspace, parsed.argument);
+        message = { ...message, text: shortcut.text, source: {
+          ...(message.source ?? { messageId: message.id, userId: message.userId, channelId: message.channelId, authorType: 'user' as const }),
+          shortcutId: shortcut.id,
+        } };
+        shortcutName = shortcut.name;
+        parsed = null; // Treat the saved text literally, even if it begins with a slash.
+      } catch { /* Normal command handling reports invalid/missing workspace data. */ }
+    }
     if (parsed || message.groupContext) this.privateInputBarrier(message.userId, 'input:' + message.id);
     if (this.pendingSwitches.has(message.userId) && parsed?.name !== 'status' && parsed?.name !== 'help') throw new Error('上次 Agent 切换提交尚待核对；请先恢复操作日志。');
     if (parsed) {
@@ -522,6 +537,11 @@ export class SessionManager {
     const active = message.groupContext?.eventKind ? this.store.getActive(message.userId) : this.ensureActive(message.userId);
     if (!active) throw new Error('内部事件不能自动创建主控。');
     if (!this.store.addMessage(message, active.id, 'queued')) return;
+    if (shortcutName) {
+      const notice = `已使用快捷提示词：${shortcutName}`;
+      void Promise.resolve().then(() => (commandReply ?? ((text: string) => this.sink.sendText(message.channelId, text)))(notice))
+        .catch(() => undefined); // Receipt failures never discard or replay durable input.
+    }
     this.authorizeGroupEvent(message, active.id);
     this.store.nameConversation(active.id, message.text);
     this.setLatestMessage(message, active.id);
@@ -607,6 +627,12 @@ export class SessionManager {
   }
 
   private initializationSource(target: Conversation): BridgeMessage | null {
+    // Queued user inputs must not replace the /new source during restart recovery.
+    const notice = this.store.workspaceNotice(target.id);
+    if (notice && notice.state !== 'cancelled') {
+      const source = this.store.getMessage(notice.sourceMessageId);
+      return source?.userId === target.userId && source.channelId === notice.channelId && command(source.text)?.name === 'new' ? source : null;
+    }
     const latest = this.store.latestMessage(target.id);
     if (latest) return latest;
     const route = this.store.knownChannels().filter(item => item.userId === target.userId).at(-1);
@@ -658,6 +684,7 @@ export class SessionManager {
     }).finally(() => {
       if (this.initializations.get(target.id)?.promise === promise) this.initializations.delete(target.id);
       this.refreshTaskCounts(target.id);
+      if (this.store.nextQueued(target.id)) this.wake(target.id);
       this.completionAvailable();
     });
     this.initializations.set(target.id, { controller, promise });
@@ -756,8 +783,9 @@ export class SessionManager {
       const info = await this.modelInfo(target);
       if (this.closed) return;
       if (argument === 'list' || list) {
-        const entries = info.models.map(model => `${model.id}${model.displayName !== model.id ? ` · ${model.displayName}` : ''}${model.isDefault ? '（目录推荐）' : ''}`);
-        await reply(`${target.agent} 模型选项：\n${entries.length ? entries.join('\n') : 'CLI 尚未返回目录'}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/model 模型名 切换；自定义网关模型可用 /model custom 模型名。${target.agent === 'claude' ? '\n别名及自定义模型的提供方可用性以下次调用为准。' : ''}`);
+        this.modelChoices.remember(target.id, info.models.map(model => model.id));
+        const entries = info.models.map((model, index) => `${index + 1}. ${model.id}${model.displayName !== model.id ? ` · ${model.displayName}` : ''}${model.isDefault ? '（目录推荐）' : ''}`);
+        await reply(`${target.agent} 模型选项：\n${entries.length ? entries.join('\n') : 'CLI 尚未返回目录'}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/model 序号 或 模型名 切换；自定义网关模型可用 /model custom 模型名。${target.agent === 'claude' ? '\n别名及自定义模型的提供方可用性以下次调用为准。' : ''}`);
       } else {
         await reply(`${target.agent}\n${this.modelStatus(target)}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/model list 查看选项；/model 模型名 切换当前会话。`);
       }
@@ -770,7 +798,13 @@ export class SessionManager {
       return;
     }
     const custom = argument.startsWith('custom ');
-    const requested = custom ? argument.slice(7).trim() : argument;
+    let requested = custom ? argument.slice(7).trim() : argument;
+    if (!custom && /^\d+$/.test(requested)) {
+      try {
+        const info = await this.modelInfo(target);
+        requested = this.modelChoices.select(target.id, Number(requested), info.models.map(model => model.id));
+      } catch (error) { await reply(`${error instanceof Error ? error.message : String(error)} /model list 查看选项。`); return; }
+    }
     if (!isModelId(requested)) { await reply('模型 ID 需要是至多 200 字符的单个名称；/model list 查看选项。'); return; }
     this.modelChanges.add(target.id);
     try {
@@ -946,6 +980,21 @@ export class SessionManager {
         const view: BridgePresentation = { title: '命令与用法', tone: 'info', purpose: 'help', blocks: [{ kind: 'entry', text: commandHelp(this.config.controllerMode) }], footer: '平台和 bot 在启动前选择，不通过聊天命令切换。' };
         await reply(presentationText(view), { presentation: view }); return;
       }
+      case 'prompt': {
+        if (!this.config.controllerMode) { await reply('快捷提示词仅支持主控模式。'); return; }
+        try {
+          if (argument) {
+            if (!/^[1-9]\d{0,5}$/.test(argument)) { await reply('用法：/prompt 查看清单；/prompt 编号 发送。'); return; }
+            promptShortcut(this.config.contextWorkspace ?? this.config.workspace, argument);
+            await reply('快捷提示词未发送，请重试。'); return;
+          }
+          const items = readPromptShortcuts(this.config.contextWorkspace ?? this.config.workspace);
+          await reply(items.length ? items.map(item => `${item.id}. ${item.name}\n${item.text}`).join('\n\n')
+            + '\n\n/prompt 编号 发送；内容来自共享工作区 bridge-prompts.json。'
+            : '尚未配置快捷提示词；请在共享工作区 bridge-prompts.json 填写编号、name 和 text。');
+        } catch (error) { await reply(`快捷提示词未发送：${error instanceof Error ? error.message : String(error)}`); }
+        return;
+      }
       case 'model': await this.handleModel(message, argument, reply); return;
       case 'fast': await this.handleFast(message, argument, reply); return;
       case 'housekeeper': {
@@ -954,7 +1003,12 @@ export class SessionManager {
       }
       case 'default': {
         if (!this.config.controllerMode || !this.options.onWorkerDefaults) { await reply('默认助手设置仅支持主控模式。'); return; }
-        await reply(await this.options.onWorkerDefaults(argument)); return;
+        try { await reply(await this.options.onWorkerDefaults(argument)); }
+        catch (error) {
+          if (!(error instanceof NumberedChoiceError)) throw error;
+          await reply(error.message + '\n/default agentworker 电脑ID 查看编号清单。');
+        }
+        return;
       }
       case 'effort': await this.handleEffort(message, argument, reply); return;
       case 'models': await this.handleModel(message, '', reply, true); return;
@@ -1203,6 +1257,15 @@ export class SessionManager {
       `${turn.conversation.id}:${source.messageId}:${callId ?? ''}`);
   }
 
+  /** Read-only target selected and authorized by HostRuntime; never borrows its native turn. */
+  queryChatHistory(scope: KnowledgeScope, name: string, args: Record<string, unknown>): unknown {
+    if (this.closed || scope.spaceId !== undefined || !this.config.allowedUserIds.includes(scope.userId)
+      || !this.knownDMChannels().some(route => route.userId === scope.userId && route.channelId === scope.channelId)) throw new Error('目标主控没有该负责人的可用私聊记录。');
+    if (name === 'bridge_search_chat_history') return this.store.knowledge.search(scope, args);
+    if (name === 'bridge_read_chat_history') return this.store.knowledge.read(scope, args);
+    throw new Error('跨主控仅支持只读聊天历史查询。');
+  }
+
   async invokeFileTool(turn: AgentTurn, name: string, args: Record<string, unknown>): Promise<unknown> {
     const source = turn.source;
     const current = () => controllerFileToolNames.has(name) && source && !turn.preparing && !turn.signal.aborted && !this.closed
@@ -1225,23 +1288,38 @@ export class SessionManager {
     ]);
   }
 
+  /** A pending explicit /new introduction precedes ordinary inputs and other results. */
+  private waitingForWorkspaceIntroduction(target: Conversation): boolean {
+    if (!this.config.controllerMode || !target.controllerMode || !this.options.onInitializeWorkspace || !this.options.taskRegistry) return false;
+    const notice = this.store.workspaceNotice(target.id);
+    return notice?.state === 'waiting' && notice.outcome === null;
+  }
+  private workspaceInitializationEvent(conversationId: string): TaskCompletionEvent | null {
+    const notice = this.store.workspaceNotice(conversationId);
+    return this.options.taskRegistry?.queuedEvents().find(event => event.conversationId === conversationId && event.purpose === 'workspace-context'
+      && (!notice || notice.state !== 'waiting' || notice.outcome !== null || event.userId === notice.userId
+        && event.channelId === notice.channelId && event.originMessageId === notice.sourceMessageId)) ?? null;
+  }
+
   private wake(conversationId: string): void {
     const conversation = this.store.getConversation(conversationId);
     if (conversation && this.resetCommands.has(conversation.userId)
       && !(this.store.getActive(conversation.userId)?.id === conversationId
-        && this.options.taskRegistry?.getNextEvent(conversationId)?.purpose === 'workspace-context')) return;
+        && this.workspaceInitializationEvent(conversationId))) return;
     if (this.closed || this.draining || this.recovering || this.workers.has(conversationId) || this.modelChanges.has(conversationId)) return;
     const target = this.store.getConversation(conversationId);
     if (!target || (this.config.scopePrefix && !target.userId.startsWith(this.config.scopePrefix)) || this.options.authorizeUser?.(target.userId) === false || this.userWorkers.has(target.userId)) return;
+    const introductionPending = this.waitingForWorkspaceIntroduction(target);
+    if (introductionPending && !this.workspaceInitializationEvent(conversationId)) return;
     const head = this.store.nextQueued(conversationId);
-    if (head && !this.canProcessQueued(head)) return;
+    if (head && !this.canProcessQueued(head) && !introductionPending) return;
     const worker = Promise.resolve().then(() => this.processQueue(conversationId)).finally(() => {
       this.workers.delete(conversationId);
       if (this.userWorkers.get(target.userId) === worker) this.userWorkers.delete(target.userId);
       if (this.closed) return;
       const active = this.store.getActive(target.userId);
       // A switched conversation waits until the previous adapter really exits.
-      // Human messages always take priority over completion events.
+      // Human messages take priority once the explicit /new introduction has settled.
       if (active && this.store.nextQueued(active.id)) this.wake(active.id);
       this.completionAvailable();
     });
@@ -1383,9 +1461,14 @@ export class SessionManager {
     if (!this.config.controllerMode && this.options.mergeDelayMs !== 0) await new Promise<void>(resolve => setTimeout(resolve, this.options.mergeDelayMs ?? 1000));
     while (!this.closed && !this.draining && !this.modelChanges.has(conversationId)) {
       const owner = this.store.getConversation(conversationId);
+      if (owner && this.waitingForWorkspaceIntroduction(owner)) {
+        const initialization = this.workspaceInitializationEvent(conversationId);
+        if (!initialization) return; // Wake again on completion; do not spin over saved user inputs.
+        await this.processCompletion(initialization); continue;
+      }
       if (owner && this.resetCommands.has(owner.userId)) {
-        const initialization = this.options.taskRegistry?.getNextEvent(conversationId);
-        if (this.store.getActive(owner.userId)?.id !== conversationId || initialization?.purpose !== 'workspace-context') return;
+        const initialization = this.workspaceInitializationEvent(conversationId);
+        if (this.store.getActive(owner.userId)?.id !== conversationId || !initialization) return;
         // Initialization can settle while ACK delivery waits; its own publication already awaits that ACK.
         await this.processCompletion(initialization); continue;
       }
@@ -1790,7 +1873,7 @@ export class SessionManager {
     let deliveryStarted = false;
     try {
       const source = workspaceContext ? this.store.latestMessage(target.id) : null;
-      const hasHumanSource = source?.conversationId === target.id && source.userId === event.userId
+      const hasHumanSource = !introductionRequested && source?.conversationId === target.id && source.userId === event.userId
         && source.channelId === event.channelId && source.state !== 'command' && !command(source.text);
       // Initialization evidence is not a human request. Follow-up work must bind to a real message in this parent.
       const context = !workspaceContext || hasHumanSource ? registry.createContext({ conversationId: target.id, userId: event.userId,

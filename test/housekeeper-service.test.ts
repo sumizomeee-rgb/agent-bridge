@@ -63,6 +63,23 @@ function fixture() {
     async reopen(){await service.close();service=new HousekeeperService(config,callbacks);},async close(){await service.close();}};
 }
 
+test('事务摘要超时停止自身，保留消费进度，20分钟后可重新派发',async t=>{
+  const f=fixture();t.after(()=>f.close());await f.service.command(f.message(),'on');await f.service.poll();
+  const enabled=f.service.store.read()!.enabledAt;
+  f.advance(5*60000-1);await f.service.poll();assert.equal(f.cancelled.length,0);
+  f.advance(1);await f.service.poll();assert.deepEqual(f.cancelled,['worker-1']);
+  const failed=f.service.store.read()!;assert.equal(failed.cursor,undefined);assert.equal(failed.run,undefined);
+  assert.equal(failed.enabledAt,enabled);assert.equal(failed.enabled,true);assert.match(failed.lastError!,/超过5分钟/);
+  f.advance(20*60000);await f.service.poll();assert.equal(f.dispatches.length,2);assert.equal(f.current.nativeId,'native-1');
+});
+
+test('超时停止未确认时不重叠启动摘要，重启恢复仍遵守停止证据',async t=>{
+  const f=fixture();t.after(()=>f.close());f.callbacks.cancel=async()=>{throw new Error('exit unknown');};
+  await f.service.command(f.message(),'on');await f.service.poll();f.advance(5*60000);
+  await f.reopen();await f.service.poll();assert.equal(f.service.store.read()!.run!.phase,'uncertain');
+  f.advance(40*60000);await f.service.poll();assert.equal(f.dispatches.length,1);assert.equal(f.service.store.read()!.cursor,undefined);
+});
+
 test('housekeeper defaults off, requires the owner and opens an immediate fixed twenty-minute interval',async t=>{
   const f=fixture();t.after(()=>f.close());f.setScan(o=>snapshot(o,0));
   await f.service.poll();assert.equal(f.scans.length,0);assert.match(f.service.status(),/关闭.*默认/);

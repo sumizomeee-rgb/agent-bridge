@@ -183,7 +183,7 @@ export class SessionStore {
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   private ordinaryPrivateInput(value: Pick<BridgeMessage, 'groupContext' | 'source' | 'text'>): boolean {
-    return !value.groupContext && !value.source?.space && !parseCommand(value.text)
+    return !value.groupContext && !value.source?.space && (!!value.source?.shortcutId || !parseCommand(value.text))
       && (value.source?.authorType === undefined || value.source.authorType === 'user');
   }
   private validPrivateRoot(row: Row | undefined): row is Row {

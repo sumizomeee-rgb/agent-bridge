@@ -16,7 +16,7 @@ export const COMMANDS: CommandDefinition[] = [
   { name: 'cwd', help: "/cwd 路径：在指定目录新建会话", description: '在指定工作目录新建会话', options: [
     { type: 'string', name: 'path', description: '工作目录路径', required: true, min_length: 1, max_length: 1000 },
   ] },
-  { name: 'model', help: "/model [模型名|list|default]：查询、列出或切换模型，保留上下文；/model custom 模型名：网关自定义模型", description: '查看或切换模型，保留当前上下文', options: [
+  { name: 'model', help: "/model [序号|模型名|list|default]：查询、列出或切换模型，保留上下文；/model custom 模型名：网关自定义模型", description: '查看或切换模型，保留当前上下文', options: [
     { type: 'string', name: 'name', description: '模型名；Claude 可填 haiku/sonnet/opus；list 列出，default 默认；留空查询', min_length: 1, max_length: 200 },
     { type: 'boolean', name: 'custom', description: '网关自定义模型：跳过官方目录验证' },
   ] },
@@ -32,12 +32,15 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'boolean', name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
     { type: 'boolean', name: 'details', description: '展开完整检查信息；默认简要展示' },
   ] },
-  { name: 'default', help: '/default agentworker [电脑ID] [follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]：查看或设置各电脑默认助手', description: '查看或设置当前 Bot 各电脑的默认助手', options: [
-    { type: 'string', name: 'args', description: 'agentworker [电脑ID] [follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]', min_length: 1, max_length: 400 },
+  { name: 'default', help: '/default agentworker [电脑ID] [序号|follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]：查看或设置各电脑默认助手', description: '查看或设置当前 Bot 各电脑的默认助手', options: [
+    { type: 'string', name: 'args', description: 'agentworker [电脑ID] [序号|follow|clear|preset 预设ID|codex 模型|claude 模型] [强度]', min_length: 1, max_length: 400 },
   ] },
   { name: 'presetlist', help: '/presetlist：查看可派发预设的口语别名，一行一条', description: '可派发预设清单与别名速查' },
   { name: 'housekeeper', contexts: ['dm'], help: '/housekeeper on|off|status：开启、关闭或查看事务巡视；默认关闭，每20分钟一次', description: '设置或查看当前 Bot 的事务巡视', options: [
     { type: 'string', name: 'action', description: 'on 开启，off 关闭，status 查看；留空查看状态', choices: ['on', 'off', 'status'].map(value => ({ name: value, value })) },
+  ] },
+  { name: 'prompt', contexts: ['dm'], help: '/prompt [编号]：查看共享快捷提示词，或发送给当前主控', description: '查看或发送工作区快捷提示词', options: [
+    { type: 'string', name: 'number', description: '留空查看清单；填固定编号发送对应内容', min_length: 1, max_length: 6 },
   ] },
   { name: 'tasks', contexts: ['dm'], help: '/tasks [all] [页码]：查看主控登记的任务清单；默认未结束，all 含已结束', description: '只读查看当前私聊的主控任务清单', options: [
     { type: 'string', name: 'args', description: '留空查看未结束任务；all 包含已结束，可追加页码（每页10项）', min_length: 1, max_length: 30 },

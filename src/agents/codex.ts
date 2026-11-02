@@ -209,6 +209,9 @@ export class CodexAdapter implements AgentAdapter {
         throw new Error('Codex 当前供应商配置无效，本轮任务尚未提交。');
       }
       const modelProvider = typeof configuredProvider === 'string' ? configuredProvider : 'openai';
+      if (this.env.BRIDGE_PRESET_PROVIDER && configuredProvider !== this.env.BRIDGE_PRESET_PROVIDER) {
+        throw new Error('预设供应商配置不一致，本轮任务尚未提交，未回退普通供应商。');
+      }
       if (!effort && isEffortLevel(configured.config.model_reasoning_effort)) reportEffort({ configuration: { value: configured.config.model_reasoning_effort, source: 'session-settings' } });
       // Resume full server-side context, without copying its image/tool history back into stdio.
       const resumeId = nativeId;

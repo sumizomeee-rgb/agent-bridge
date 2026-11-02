@@ -1,3 +1,4 @@
+import { configuredFileLimit } from './attachment-limits.js';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,10 +52,16 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
       }
     }
   }
-  const maxFileBytes = raw.maxFileBytes ?? 20 * 1024 * 1024;
-  if (!Number.isSafeInteger(maxFileBytes) || (maxFileBytes as number) <= 0 || (maxFileBytes as number) > 24 * 1024 * 1024) {
-    throw new Error('maxFileBytes 必须是 1–25165824 的整数（单个回传文件大小上限）。');
+  const platformLimits = raw.maxFileBytesByPlatform;
+  if (platformLimits != null && (typeof platformLimits !== 'object' || Array.isArray(platformLimits))) {
+    throw new Error('maxFileBytesByPlatform 必须按平台配置。');
   }
+  for (const [platform, value] of Object.entries(platformLimits ?? {})) {
+    if (platform !== 'discord' && platform !== 'feishu') throw new Error('maxFileBytesByPlatform 含未知平台。');
+    configuredFileLimit(platform, value);
+  }
+  const maxFileBytes = configuredFileLimit(profile.platform,
+    (platformLimits as Record<string, unknown> | undefined)?.[profile.platform] ?? raw.maxFileBytes);
   if (raw.controllerMode != null && typeof raw.controllerMode !== 'boolean') throw new Error('controllerMode 必须是布尔值');
   if (raw.internalBotCommunicationEnabled !== undefined && typeof raw.internalBotCommunicationEnabled !== 'boolean') throw new Error('internalBotCommunicationEnabled 必须是布尔值');
   const dataDir = localPath(raw.dataDir, '.local/data');

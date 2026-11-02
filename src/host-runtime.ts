@@ -722,6 +722,22 @@ export class HostRuntime {
       rule: 'Host snapshot, not proof of model gateway availability or acceptance. Busy controllers queue collaboration; start revalidates ownership, readiness and membership.' };
   }
 
+  private queryOtherChatHistory(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>): unknown {
+    const source = this.deliverySource(botId, turn), targetId = bounded(args.targetBotId, 'targetBotId', 200);
+    if (source.spaceId) throw new Error('其他主控的私聊历史只能在负责人私聊中查询。');
+    const target = this.bots.get(targetId), stored = this.store.getBot(targetId);
+    if (!target || !stored || target.config.platform !== this.configurations.get(botId)!.platform
+      || stored.ownerPrincipalId !== source.principalId || !this.principalAllowed(targetId, source.principalId))
+      throw new Error('目标须为同平台、同一负责人名下的已登记主控。');
+    const userId = target.config.scopePrefix! + this.ownerAccount(targetId, source.principalId)!;
+    const route = target.manager.knownDMChannels().filter(value => value.userId === userId
+      && !this.hooks(target.config).isGroupChannel?.(value.channelId)).at(-1);
+    if (!route) throw new Error('目标主控尚无该负责人的已保存私聊记录。');
+    const { targetBotId: _target, ...input } = args;
+    const result = target.manager.queryChatHistory({ userId, channelId: route.channelId, historyBotId: targetId }, name, input);
+    return { targetBotId: targetId, ...(result as Record<string, unknown>) };
+  }
+
   private async startCollaboration(botId: string, turn: AgentTurn, args: Record<string, unknown>, callId?: string): Promise<unknown> {
     const source = this.deliverySource(botId, turn);
     if (turn.event || (turn.groupContext ? this.store.getEvent(turn.groupContext.eventId)?.kind !== 'human'
@@ -1174,6 +1190,10 @@ export class HostRuntime {
     if (this.draining || this.closed) throw new Error('桥正在等待现有轮次结束，暂停新增管理调用。');
     assertBotCommunicationAllowed(this.config.internalBotCommunicationEnabled, name, args);
     if (!turn.groupContext) this.deliverySource(botId, turn);
+    if (['bridge_search_chat_history', 'bridge_read_chat_history'].includes(name) && args.targetBotId !== undefined) {
+      if (args.targetBotId !== botId) return this.queryOtherChatHistory(botId, turn, name, args);
+      const { targetBotId: _target, ...input } = args; args = input;
+    }
     if (name === 'bridge_list_controllers') return this.listControllers(botId, turn, args);
     if (name === 'bridge_start_collaboration') return this.startCollaboration(botId, turn, args, callId);
     if (name === 'bridge_delivery_targets') return this.deliveryTargets(botId, turn);

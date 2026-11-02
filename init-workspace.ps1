@@ -37,7 +37,7 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('MEMORY.md', 'README.md', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms\lark.md', 'bridge-chat-platforms\discord.md')
+    $files = @('MEMORY.md', 'README.md', 'bridge-prompts.json', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms\lark.md', 'bridge-chat-platforms\discord.md')
     # 不在旧登记仍位于根目录时生成空表，以免真实配置被静默忽略。
     foreach ($legacy in @('agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')) {
         if (Test-Path -LiteralPath (Join-Path $workspace $legacy)) {

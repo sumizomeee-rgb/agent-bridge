@@ -9,7 +9,7 @@
   "controllerMode": true,
   "workspaceRoot": ".local/workspaces",
   "dataDir": ".local/data",
-  "maxFileBytes": 20971520,
+  "maxFileBytesByPlatform": { "discord": 20971520, "feishu": 30000000 },
   "commands": {
     "codex": {
       "command": ".local/runtime/win-x64/node.exe",

@@ -6,7 +6,7 @@ import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, unlin
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve, join, dirname, basename } from 'node:path';
-import { createServer, type Server } from 'node:http';
+import type { Server } from 'node:http';
 import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
 import type { AgentAdapter, AgentCommand, AgentModelInfo, AgentName, AgentResult, AgentTurn, AgentInput, PrivateInputBatch, EffortConfiguration, EffortCapability, Conversation } from '../types.js';
 import { claudeEffortConfiguration } from '../agents/claude-effort.js';
@@ -14,82 +14,20 @@ import { MetadataProbeError } from '../agents/metadata.js';
 import { readCodexModelInfo } from '../agents/codex-models.js';
 import { DeliveryPreparationError, executionErrorEvidence } from '../delivery-errors.js';
 import { FEEDBACK_RULE } from '../controller-feedback.js';
-import { knowledgeTools } from './knowledge-tools.js';
-import { controllerFileTools } from './files.js';
+import { controllerTools, controllerToolsForCommunication } from './tools/catalog.js';
+export { controllerTools, controllerToolsForCommunication } from './tools/catalog.js';
+import { createClaudeMcpServer } from './agents/claude/mcp.js';
+import { codexDynamicTools } from './agents/codex/dynamic-tools.js';
 import type { ControllerSubmission, ControllerTurnState } from '../controller-lifecycle.js';
-import { assertBotCommunicationAllowed, internalBotCommunicationTools } from '../bot-communication.js';
+import { assertBotCommunicationAllowed } from '../bot-communication.js';
 import { abortError, deferred, isObject, JsonLineProcess, JsonRpcClient, JsonRpcTimeoutError, processStopFailure, safeError, type JsonObject, type RpcTransport } from '../agents/process.js';
 
-const object = (properties: JsonObject): JsonObject => ({ type: 'object', properties, additionalProperties: false });
-const string = (description: string): JsonObject => ({ type: 'string', description });
 function bridgeClock(): string {
   const now = new Date();
   return harnessText('controller.clock', { utc: now.toISOString(), local: now.toString(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
 }
-const scheduleTime = { afterSeconds: { type: 'number', minimum: 1, maximum: 2592000, description: harnessText('tools.shared.scheduleTime.afterSeconds.description') },
-  dueAt: string(harnessText('tools.shared.scheduleTime.dueAt.description')) };
-const outgoingAttachmentPaths = { type: 'array', items: { type: 'string' }, maxItems: 10, description: harnessText('tools.shared.outgoingAttachmentPaths.description') };
-const workerDispatchSelection = {
-  targetId: string(harnessText('tools.shared.workerDispatchSelection.targetId.description')),
-  assistant: { ...object({ kind: { type: 'string', enum: ['default', 'ordinary', 'preset'] },
-    agent: { type: 'string', enum: ['codex', 'claude'], description: harnessText('tools.shared.workerDispatchSelection.assistant.agent.description') },
-    model: string(harnessText('tools.shared.workerDispatchSelection.assistant.model.description')), presetId: string(harnessText('tools.shared.workerDispatchSelection.assistant.presetId.description')),
-    effort: string(harnessText('tools.shared.workerDispatchSelection.assistant.effort.description')),
-  }), required: ['kind'], description: harnessText('tools.shared.workerDispatchSelection.assistant.description') },
-  cwd: string(harnessText('tools.shared.workerDispatchSelection.cwd.description')),
-  effort: string(harnessText('tools.shared.workerDispatchSelection.effort.description')),
-  agent: { type: 'string', enum: ['codex', 'claude'], description: harnessText('tools.shared.workerDispatchSelection.agent.description') },
-  model: string(harnessText('tools.shared.workerDispatchSelection.model.description')),
-  presetId: string(harnessText('tools.shared.workerDispatchSelection.presetId.description')),
-};
-export const controllerTools: { name: string; description: string; inputSchema: JsonObject }[] = [
-  ...knowledgeTools,
-  ...controllerFileTools,
-  { name: 'bridge_list_dispatch_failures', description: harnessText('tools.bridge_list_dispatch_failures.description'), inputSchema: object({ includeHandled: { type: 'boolean', default: false }, limit: { type: 'integer', minimum: 1, maximum: 20, default: 8 } }) },
-  { name: 'bridge_ack_dispatch_failure', description: harnessText('tools.bridge_ack_dispatch_failure.description'), inputSchema: { ...object({ id: string(harnessText('tools.bridge_ack_dispatch_failure.inputSchema.id.description')), note: string(harnessText('tools.bridge_ack_dispatch_failure.inputSchema.note.description')) }), required: ['id'] } },
-  { name: 'bridge_read_feedback', description: harnessText('tools.bridge_read_feedback.description'), inputSchema: object({ id: string(harnessText('tools.bridge_read_feedback.inputSchema.id.description')), includeDelivered: { type: 'boolean', description: harnessText('tools.bridge_read_feedback.inputSchema.includeDelivered.description') }, limit: { type: 'integer', minimum: 1, maximum: 20, default: 8 } }) },
-  { name: 'bridge_delivery_targets', description: harnessText('tools.bridge_delivery_targets.description'), inputSchema: object({}) },
-  { name: 'bridge_send_message', description: harnessText('tools.bridge_send_message.description'), inputSchema: { ...object({ targetId: string(harnessText('tools.bridge_send_message.inputSchema.targetId.description')), text: string(harnessText('tools.bridge_send_message.inputSchema.text.description')), finish: { type: 'boolean', default: true, description: harnessText('tools.bridge_send_message.inputSchema.finish.description') }, attachmentPaths: outgoingAttachmentPaths }), required: ['targetId', 'text'] } },
-  { name: 'bridge_read_group_history', description: harnessText('tools.bridge_read_group_history.description'), inputSchema: object({ targetId: string(harnessText('tools.bridge_read_group_history.inputSchema.targetId.description')), startTime: string(harnessText('tools.bridge_read_group_history.inputSchema.startTime.description')), endTime: string(harnessText('tools.bridge_read_group_history.inputSchema.endTime.description')), limit: { type: 'integer', minimum: 1, maximum: 50, default: 30 }, cursor: string(harnessText('tools.bridge_read_group_history.inputSchema.cursor.description')) }) },
-  { name: 'bridge_list_controllers', description: harnessText('tools.bridge_list_controllers.description'), inputSchema: object({ botId: string(harnessText('tools.bridge_list_controllers.inputSchema.botId.description')), limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 }, offset: { type: 'integer', minimum: 0, default: 0 } }) },
-  { name: 'bridge_start_collaboration', description: harnessText('tools.bridge_start_collaboration.description'), inputSchema: { ...object({ targetId: string(harnessText('tools.bridge_start_collaboration.inputSchema.targetId.description')), targetBotId: string(harnessText('tools.bridge_start_collaboration.inputSchema.targetBotId.description')), mode: { type: 'string', enum: ['internal', 'public'] }, text: string(harnessText('tools.bridge_start_collaboration.inputSchema.text.description')) }), required: ['targetId', 'targetBotId', 'mode', 'text'] } },
-  { name: 'bridge_group_context', description: harnessText('tools.bridge_group_context.description'), inputSchema: object({}) },
-  { name: 'bridge_send_bot', description: harnessText('tools.bridge_send_bot.description'), inputSchema: { ...object({ targetBotId: string(harnessText('tools.bridge_send_bot.inputSchema.targetBotId.description')), text: string(harnessText('tools.bridge_send_bot.inputSchema.text.description')) }), required: ['targetBotId', 'text'] } },
-  { name: 'bridge_send_private', description: harnessText('tools.bridge_send_private.description'), inputSchema: { ...object({ principalId: string(harnessText('tools.bridge_send_private.inputSchema.principalId.description')), text: string(harnessText('tools.bridge_send_private.inputSchema.text.description')), finish: { type: 'boolean', default: true, description: harnessText('tools.bridge_send_private.inputSchema.finish.description') }, attachmentPaths: outgoingAttachmentPaths }), required: ['principalId', 'text'] } },
-  { name: 'bridge_propose_handoff', description: harnessText('tools.bridge_propose_handoff.description'), inputSchema: { ...object({ taskId: string(harnessText('tools.bridge_propose_handoff.inputSchema.taskId.description')), targetBotId: string(harnessText('tools.bridge_propose_handoff.inputSchema.targetBotId.description')), summary: string(harnessText('tools.bridge_propose_handoff.inputSchema.summary.description')) }), required: ['taskId', 'targetBotId', 'summary'] } },
-  { name: 'bridge_accept_handoff', description: harnessText('tools.bridge_accept_handoff.description'), inputSchema: { ...object({ handoffId: string(harnessText('tools.bridge_accept_handoff.inputSchema.handoffId.description')) }), required: ['handoffId'] } },
-  { name: 'bridge_silent', description: harnessText('tools.bridge_silent.description'), inputSchema: object({}) },
-
-  { name: 'bridge_start_worker', description: harnessText('tools.bridge_start_worker.description'), inputSchema: { ...object({ workId: string(harnessText('tools.bridge_start_worker.inputSchema.workId.description')), resources: { type: 'array', items: { type: 'string' }, description: harnessText('tools.bridge_start_worker.inputSchema.resources.description') }, title: string(harnessText('tools.bridge_start_worker.inputSchema.title.description')), prompt: string(harnessText('tools.bridge_start_worker.inputSchema.prompt.description')), sessionVisibility: { type: 'string', enum: ['hidden', 'visible'], description: harnessText('tools.bridge_start_worker.inputSchema.sessionVisibility.description') }, ...workerDispatchSelection, imagePaths: { type: 'array', items: { type: 'string' }, description: harnessText('tools.bridge_start_worker.inputSchema.imagePaths.description') } }), required: ['title', 'prompt'] } },
-  { name: 'bridge_continue_worker', description: harnessText('tools.bridge_continue_worker.description'), inputSchema: { ...object({ workId: string(harnessText('tools.bridge_continue_worker.inputSchema.workId.description')), workerId: string(harnessText('tools.bridge_continue_worker.inputSchema.workerId.description')), prompt: string(harnessText('tools.bridge_continue_worker.inputSchema.prompt.description')), model: string(harnessText('tools.bridge_continue_worker.inputSchema.model.description')), effort: string(harnessText('tools.bridge_continue_worker.inputSchema.effort.description')), delivery: { type: 'string', enum: ['current', 'next'], description: harnessText('tools.bridge_continue_worker.inputSchema.delivery.description') }, imagePaths: { type: 'array', items: { type: 'string' }, description: harnessText('tools.bridge_continue_worker.inputSchema.imagePaths.description') } }), required: ['workerId', 'prompt'] } },
-  { name: 'bridge_cancel_worker', description: harnessText('tools.bridge_cancel_worker.description'), inputSchema: { ...object({ workerId: string(harnessText('tools.bridge_cancel_worker.inputSchema.workerId.description')), reason: string(harnessText('tools.bridge_cancel_worker.inputSchema.reason.description')) }), required: ['workerId'] } },
-  { name: 'bridge_schedule_worker', description: harnessText('tools.bridge_schedule_worker.description'), inputSchema: { ...object({ ...scheduleTime, workId: string(harnessText('tools.bridge_schedule_worker.inputSchema.workId.description')), resources: { type: 'array', items: { type: 'string' }, description: harnessText('tools.bridge_schedule_worker.inputSchema.resources.description') }, title: string(harnessText('tools.bridge_schedule_worker.inputSchema.title.description')), prompt: string(harnessText('tools.bridge_schedule_worker.inputSchema.prompt.description')), sessionVisibility: { type: 'string', enum: ['hidden', 'visible'], description: harnessText('tools.bridge_schedule_worker.inputSchema.sessionVisibility.description') }, ...workerDispatchSelection, imagePaths: { type: 'array', items: { type: 'string' }, description: harnessText('tools.bridge_schedule_worker.inputSchema.imagePaths.description') } }), required: ['title', 'prompt'] } },
-  { name: 'bridge_schedule_controller', description: harnessText('tools.bridge_schedule_controller.description'), inputSchema: { ...object({ ...scheduleTime, title: string(harnessText('tools.bridge_schedule_controller.inputSchema.title.description')), text: string(harnessText('tools.bridge_schedule_controller.inputSchema.text.description')) }), required: ['text'] } },
-  { name: 'bridge_list_schedules', description: harnessText('tools.bridge_list_schedules.description'), inputSchema: object({ scheduleId: string(harnessText('tools.bridge_list_schedules.inputSchema.scheduleId.description')), includeFinished: { type: 'boolean' }, limit: { type: 'integer', minimum: 1, maximum: 100 }, offset: { type: 'integer', minimum: 0 } }) },
-  { name: 'bridge_cancel_schedule', description: harnessText('tools.bridge_cancel_schedule.description'), inputSchema: { ...object({ scheduleId: string(harnessText('tools.bridge_cancel_schedule.inputSchema.scheduleId.description')) }), required: ['scheduleId'] } },
-  { name: 'bridge_update_schedule', description: harnessText('tools.bridge_update_schedule.description'), inputSchema: { ...object({ scheduleId: string(harnessText('tools.bridge_update_schedule.inputSchema.scheduleId.description')), ...scheduleTime }), required: ['scheduleId'] } },
-  { name: 'bridge_list_native_sessions', description: harnessText('tools.bridge_list_native_sessions.description'), inputSchema: { ...object({ targetId: string(harnessText('tools.bridge_list_native_sessions.inputSchema.targetId.description')), agent: { type: 'string', enum: ['codex', 'claude'] }, cwd: string(harnessText('tools.bridge_list_native_sessions.inputSchema.cwd.description')), query: string(harnessText('tools.bridge_list_native_sessions.inputSchema.query.description')), cursor: string(harnessText('tools.bridge_list_native_sessions.inputSchema.cursor.description')), limit: { type: 'integer', minimum: 1, maximum: 20 } }), required: ['agent'] } },
-  { name: 'bridge_read_native_session', description: harnessText('tools.bridge_read_native_session.description'), inputSchema: { ...object({ targetId: string(harnessText('tools.bridge_read_native_session.inputSchema.targetId.description')), agent: { type: 'string', enum: ['codex', 'claude'] }, nativeId: string(harnessText('tools.bridge_read_native_session.inputSchema.nativeId.description')), profile: { type: 'string', enum: ['default'] }, limit: { type: 'integer', minimum: 1, maximum: 20 } }), required: ['agent', 'nativeId'] } },
-  { name: 'bridge_adopt_native_session', description: harnessText('tools.bridge_adopt_native_session.description'), inputSchema: { ...object({ targetId: string(harnessText('tools.bridge_adopt_native_session.inputSchema.targetId.description')), agent: { type: 'string', enum: ['codex', 'claude'] }, nativeId: string(harnessText('tools.bridge_adopt_native_session.inputSchema.nativeId.description')), profile: { type: 'string', enum: ['default'] }, expectedRevision: string(harnessText('tools.bridge_adopt_native_session.inputSchema.expectedRevision.description')), title: string(harnessText('tools.bridge_adopt_native_session.inputSchema.title.description')) }), required: ['agent', 'nativeId', 'expectedRevision'] } },
-  { name: 'bridge_check_capabilities', description: harnessText('tools.bridge_check_capabilities.description'), inputSchema: object({ capabilityId: string(harnessText('tools.bridge_check_capabilities.inputSchema.capabilityId.description')), targetId: string(harnessText('tools.bridge_check_capabilities.inputSchema.targetId.description')), agent: { type: 'string', enum: ['codex', 'claude'] }, refresh: { type: 'boolean', description: harnessText('tools.bridge_check_capabilities.inputSchema.refresh.description') } }) },
-  { name: 'bridge_list_targets', description: harnessText('tools.bridge_list_targets.description'), inputSchema: object({ refresh: { type: 'boolean' }, includePresets: { type: 'boolean', description: harnessText('tools.bridge_list_targets.inputSchema.includePresets.description') }, targetId: string(harnessText('tools.bridge_list_targets.inputSchema.targetId.description')), agent: { type: 'string', enum: ['codex', 'claude'] }, query: string(harnessText('tools.bridge_list_targets.inputSchema.query.description')), details: { type: 'boolean', description: harnessText('tools.bridge_list_targets.inputSchema.details.description') } }) },
-  { name: 'bridge_handoff_worker', description: harnessText('tools.bridge_handoff_worker.description'), inputSchema: { ...object({ workerId: string(harnessText('tools.bridge_handoff_worker.inputSchema.workerId.description')) }), required: ['workerId'] } },
-  { name: 'bridge_request_restart', description: harnessText('tools.bridge_request_restart.description'), inputSchema: object({}) },
-  { name: 'bridge_list_workers', description: harnessText('tools.bridge_list_workers.description'), inputSchema: object({ workerId: string(harnessText('tools.bridge_list_workers.inputSchema.workerId.description')) }) },
-  { name: 'bridge_send_user', description: harnessText('tools.bridge_send_user.description'), inputSchema: { ...object({ text: string(harnessText('tools.bridge_send_user.inputSchema.text.description')), targetId: string(harnessText('tools.bridge_send_user.inputSchema.targetId.description')), attachmentPaths: outgoingAttachmentPaths }), required: ['text'] } },
-];
-
 const internalBotCommunicationInstructions = harnessText('controller.bot_communication.internal');
 export const controllerInstructions = harnessText('controller.protocol', { internal_bot_communication: internalBotCommunicationInstructions });
-
-export function controllerToolsForCommunication(enabled?: boolean): typeof controllerTools {
-  if (enabled !== false) return controllerTools;
-  return controllerTools.filter(tool => !internalBotCommunicationTools.has(tool.name)).map(tool => tool.name !== 'bridge_start_collaboration' ? tool : {
-    ...tool,
-    description: harnessText('tools.bridge_start_collaboration.public_only'),
-    inputSchema: { ...tool.inputSchema, properties: { ...(tool.inputSchema.properties as JsonObject), mode: { type: 'string', enum: ['public'] } } },
-  });
-}
 
 export function controllerInstructionsForCommunication(enabled?: boolean): string {
   return harnessText('controller.protocol', { internal_bot_communication: harnessText(enabled === false
@@ -344,7 +282,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       const prior = session.nativeId;
       const response = await session.rpc!.request(prior ? 'thread/resume' : 'thread/start', prior
         ? { ...params, threadId: prior, excludeTurns: true }
-        : { ...params, ephemeral: false, environments: [], selectedCapabilityRoots: [], dynamicTools: controllerToolsForCommunication(this.options.internalBotCommunicationEnabled).map(tool => ({ ...tool, type: 'function' })) }, 20000);
+        : { ...params, ephemeral: false, environments: [], selectedCapabilityRoots: [], dynamicTools: codexDynamicTools(this.options.internalBotCommunicationEnabled) }, 20000);
       if (!isObject(response.thread) || typeof response.thread.id !== 'string' || (prior && response.thread.id !== prior)) throw new Error('Codex 主控续接返回了不同会话；原会话已保留。');
       if (typeof response.modelProvider !== 'string' || response.modelProvider !== provider) throw new Error('Codex 主控回报的供应商与当前配置不一致；原会话已保留，本轮未提交。');
       if (selectedEffort(turn) && typeof response.model === 'string' && response.model !== turn.conversation.model) session.effortCapability = await validateEffort(this, { ...turn.conversation, model: response.model }, selectedEffort(turn)!);
@@ -750,64 +688,21 @@ export class NativeControllerAdapter implements AgentAdapter {
   }
   private async openClaude(turn: AgentTurn, signature: string, home: string): Promise<ControllerSession> {
     let session: ControllerSession;
-    const token = randomUUID();
-    const diagnosticPath = join(this.options.dataDir, 'mcp-diagnostic.jsonl');
-    const diagnostic = (value: JsonObject): void => {
-      try { appendFileSync(diagnosticPath, JSON.stringify({ at: new Date().toISOString(), ...value }) + '\n'); } catch { /* 诊断失败不影响工具执行。 */ }
-    };
-    const server = createServer(async (req, res) => {
-      // This loopback JSON endpoint needs no persistent connection. Fresh sockets
-      // avoid stale pooled connections in the Claude CLI between model responses;
-      // never retry a tool here, since it may already have performed a side effect.
-      res.setHeader('Connection', 'close');
-      const started = Date.now(), requestKey = randomUUID();
-      let method: string | undefined, name: string | undefined, phase = 'received';
-      let requestId: string | number | null = null;
-      diagnostic({ requestKey, event: 'received', httpMethod: req.method, bytes: req.headers['content-length'] ?? null });
-      req.once('aborted', () => diagnostic({ requestKey, event: 'aborted', phase }));
-      res.once('close', () => diagnostic({ requestKey, event: 'closed', phase, method, name, status: res.statusCode, complete: res.writableFinished, ms: Date.now() - started }));
-      if (req.url !== `/${token}` || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
-      try {
-        let bytes = 0; const chunks: Buffer[] = [];
-        for await (const chunk of req) { bytes += chunk.length; if (bytes > 256 * 1024) throw new Error('MCP 请求超过限制。'); chunks.push(chunk as Buffer); }
-        const request: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        if (!isObject(request)) throw new Error('MCP 请求格式无效。');
-        requestId = typeof request.id === 'string' || typeof request.id === 'number' ? request.id : null;
-        method = typeof request.method === 'string' ? request.method : undefined;
-        phase = 'parsed';
-        if (request.id == null) { res.writeHead(202); res.end(); return; }
-        let result: unknown;
-        if (request.method === 'initialize') result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'bridge_controller', version: '1' } };
-        else if (request.method === 'tools/list') result = { tools: controllerToolsForCommunication(this.options.internalBotCommunicationEnabled) };
-        else if (request.method === 'tools/call') {
-          const params = isObject(request.params) ? request.params : {};
-          name = typeof params.name === 'string' ? params.name : undefined; phase = 'tool-matching';
-          if (!session?.active || typeof params.name !== 'string' || !isObject(params.arguments)) throw new Error('没有当前主控轮次或参数无效。');
-          // The assistant/partial event carries the stable model tool-use ID. The MCP
-          // request number alone restarts at zero on process restart and is insufficient.
-          const active = session.active;
-          const matches = (tool: ActiveTurn['pendingClaudeTools'][number]) => tool.name === params.name && tool.args != null && canonicalJSON(tool.args) === canonicalJSON(params.arguments);
-          let index = active.pendingClaudeTools.findIndex(matches);
-          for (let attempt = 0; index < 0 && attempt < 25; attempt++) { await new Promise(resolve => setTimeout(resolve, 20)); index = active.pendingClaudeTools.findIndex(matches); }
-          const nativeTool = index < 0 ? null : active.pendingClaudeTools.splice(index, 1)[0];
-          if (!nativeTool) throw new Error('Claude 工具调用缺少原生调用标识，未执行派发。');
-          phase = 'invoking';
-          result = { content: [{ type: 'text', text: JSON.stringify(await this.invoke(active, params.name, params.arguments, nativeTool.id)) }] };
-          phase = 'invoked';
-        } else result = {};
-        res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));
-      } catch (error) {
-        diagnostic({ requestKey, event: 'error', phase, method, name, errorType: error instanceof Error ? error.name : 'unknown' });
-        const message = safeError(error instanceof Error ? error.message : error, 'MCP 请求失败');
-        // 工具失败是可供模型处理的结果，不能伪装成 HTTP 传输失败。
-        const toolError = method === 'tools/call' && requestId !== null;
-        res.writeHead(toolError ? 200 : 400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: requestId, ...(toolError
-          ? { result: { isError: true, content: [{ type: 'text', text: message }] } }
-          : { error: { code: error instanceof SyntaxError ? -32700 : -32600, message } }) }));
-      }
+    const { server, token } = createClaudeMcpServer({
+      dataDir: this.options.dataDir, internalBotCommunicationEnabled: this.options.internalBotCommunicationEnabled,
+      invoke: async (name, args, matched) => {
+        if (!session?.active) throw new Error('没有当前主控轮次或参数无效。');
+        // Match the stable native tool-use ID, never the process-local MCP request number.
+        const active = session.active;
+        const matches = (tool: ActiveTurn['pendingClaudeTools'][number]) => tool.name === name && tool.args != null && canonicalJSON(tool.args) === canonicalJSON(args);
+        let index = active.pendingClaudeTools.findIndex(matches);
+        for (let attempt = 0; index < 0 && attempt < 25; attempt++) { await new Promise(resolve => setTimeout(resolve, 20)); index = active.pendingClaudeTools.findIndex(matches); }
+        const nativeTool = index < 0 ? null : active.pendingClaudeTools.splice(index, 1)[0];
+        if (!nativeTool) throw new Error('Claude 工具调用缺少原生调用标识，未执行派发。');
+        matched();
+        return this.invoke(active, name, args, nativeTool.id);
+      },
     });
-    server.on('clientError', (error, socket) => { diagnostic({ event: 'client-error', errorType: error.name, code: (error as NodeJS.ErrnoException).code ?? null }); socket.destroy(); });
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('无法启动主控 MCP。');
     try {
