@@ -13,7 +13,7 @@ import { claudeEffortConfiguration } from '../agents/claude-effort.js';
 import { MetadataProbeError } from '../agents/metadata.js';
 import { readCodexModelInfo } from '../agents/codex-models.js';
 import { DeliveryPreparationError, executionErrorEvidence } from '../delivery-errors.js';
-import { FEEDBACK_RULE } from '../controller-feedback.js';
+import { controllerToolHelp, resolveControllerTool, ControllerToolInputError } from './tools/entry.js';
 import { controllerTools, controllerToolsForCommunication } from './tools/catalog.js';
 export { controllerTools, controllerToolsForCommunication } from './tools/catalog.js';
 import { createClaudeMcpServer } from './agents/claude/mcp.js';
@@ -26,12 +26,10 @@ function bridgeClock(): string {
   const now = new Date();
   return harnessText('controller.clock', { utc: now.toISOString(), local: now.toString(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
 }
-const internalBotCommunicationInstructions = harnessText('controller.bot_communication.internal');
-export const controllerInstructions = harnessText('controller.protocol', { internal_bot_communication: internalBotCommunicationInstructions });
+export const controllerInstructions = harnessText('controller.protocol');
 
-export function controllerInstructionsForCommunication(enabled?: boolean): string {
-  return harnessText('controller.protocol', { internal_bot_communication: harnessText(enabled === false
-    ? 'controller.bot_communication.public_only' : 'controller.bot_communication.internal') });
+export function controllerInstructionsForCommunication(_enabled?: boolean): string {
+  return harnessText('controller.protocol');
 }
 
 const disabledFeatures = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'hooks', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'browser_use_full_cdp_access', 'computer_use', 'image_generation', 'view_image', 'workspace_dependencies', 'goals', 'sleep_tool', 'tool_suggest', 'skill_search', 'memories', 'in_app_browser'];
@@ -81,7 +79,7 @@ interface ActiveTurn {
   effortCapability: EffortCapability;
   completed: ReturnType<typeof deferred<AgentResult>>;
   nativeTurnId: string | null;
-  toolCalls: number;
+  toolCalls: number; helpCalls?: number;
   publicCalls: number;
   silent?: boolean;
   restartAccepted: boolean;
@@ -173,8 +171,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     hash.update(cwd); return hash.digest('hex');
   }
   private instructions(): string {
-    const rules = controllerInstructionsForCommunication(this.options.internalBotCommunicationEnabled);
-    return this.options.contextWorkspace ? rules + '\n\n' + workspaceDocuments(this.options.contextWorkspace).text : rules;
+    return workspaceDocuments(this.options.contextWorkspace, { agent: this.options.agent, internalBotCommunicationEnabled: this.options.internalBotCommunicationEnabled }).text;
   }
   private signature(turn: AgentTurn): string {
     return createHash('sha256').update(this.metadataSource(turn.conversation.cwd))
@@ -278,7 +275,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       session.effortConfiguration = selectedEffort(turn) ? { value: selectedEffort(turn)!, source: 'argument' }
         : isEffortLevel(configured.config.model_reasoning_effort) ? { value: configured.config.model_reasoning_effort, source: 'session-settings' } : null;
       if (typeof provider !== 'string' || !provider.trim()) throw new Error('Codex 主控供应商配置无效。');
-      const params: JsonObject = { ...((selectedEffort(turn) ?? configured.config.model_reasoning_effort) ? { config: { model_reasoning_effort: selectedEffort(turn) ?? configured.config.model_reasoning_effort } } : {}), modelProvider: provider, cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'read-only', baseInstructions: this.instructions(), developerInstructions: harnessText('controller.codex_developer'), ...(turn.conversation.model ? { model: turn.conversation.model } : {}) };
+      const params: JsonObject = { ...((selectedEffort(turn) ?? configured.config.model_reasoning_effort) ? { config: { model_reasoning_effort: selectedEffort(turn) ?? configured.config.model_reasoning_effort } } : {}), modelProvider: provider, cwd: turn.conversation.cwd, approvalPolicy: 'never', sandbox: 'read-only', baseInstructions: this.instructions(), developerInstructions: '', ...(turn.conversation.model ? { model: turn.conversation.model } : {}) };
       const prior = session.nativeId;
       const response = await session.rpc!.request(prior ? 'thread/resume' : 'thread/start', prior
         ? { ...params, threadId: prior, excludeTurns: true }
@@ -346,6 +343,9 @@ export class NativeControllerAdapter implements AgentAdapter {
       }
       return existing.promise;
     }
+    let inputError: unknown;
+    try { ({ name, args } = resolveControllerTool(name, args, this.options.internalBotCommunicationEnabled)); }
+    catch (error) { inputError = error; }
     const terminal = name === 'bridge_silent' || name === 'bridge_send_user'
       || ((name === 'bridge_send_message' || name === 'bridge_send_private') && args.finish !== false);
     const work = (async () => {
@@ -359,6 +359,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (active.turn.onPrivateInputCheck && active.privateFinalCallId) return this.privateFinalPendingResult();
         this.rejectSealed(active);
       }
+      if (inputError) throw inputError;
       return this.invokeOnce(active, name, args, callId).finally(() => {
         if (active.privateFinalCallId === callId && !active.sealed) active.privateFinalCallId = undefined;
       });
@@ -394,6 +395,12 @@ export class NativeControllerAdapter implements AgentAdapter {
   }
   private async invokeOnce(active: ActiveTurn, name: string, args: JsonObject, callId: string): Promise<unknown> {
     if (active.turn.preparing) throw new Error('目标会话准备轮次禁止工具、副作用和公开回复。');
+    if (name === 'bridge_help') {
+      if (active.turn.signal.aborted) throw abortError();
+      active.helpCalls = (active.helpCalls ?? 0) + 1;
+      if (active.helpCalls > (this.options.maxToolCalls ?? 12)) throw new ControllerToolInputError('本轮工具说明查询已达上限；可直接调用已明确参数的命令。');
+      return controllerToolHelp(args.command, this.options.internalBotCommunicationEnabled);
+    }
     if (active.replyRecovery) {
       const finalReply = (name === 'bridge_send_user' || name === 'bridge_send_message') && args.finish !== false
         && (args.targetId == null || args.targetId === 'private');
@@ -418,7 +425,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       if (args.id !== undefined && (typeof args.id !== 'string' || !/^[a-f0-9]{64}$/.test(args.id))
         || args.includeDelivered !== undefined && typeof args.includeDelivered !== 'boolean'
         || args.limit !== undefined && (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > 20)) throw new Error('错误回执查询参数无效。');
-      return { ...active.turn.onReadBridgeFeedback(args), rule: FEEDBACK_RULE };
+      return active.turn.onReadBridgeFeedback(args);
     }
     if (name === 'bridge_silent') {
       if (!active.turn.groupContext || !active.turn.onSilent) throw new Error('静默终态只适用于已授权的群参与轮次。');
@@ -462,7 +469,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       }
       if (name === 'bridge_list_workers' && args.details === true && isObject(result) && active.turn.onReadBridgeFeedback) {
         const feedback = active.turn.onReadBridgeFeedback({ limit: 20 });
-        if (feedback.records.length) result = { ...result, bridgeFeedback: { ...feedback, rule: FEEDBACK_RULE } };
+        if (feedback.records.length) result = { ...result, bridgeFeedback: feedback };
       }
       if (isObject(result) && result.sceneRefreshRequired === true && result.performed === false && result.sceneChanged === true) {
         active.sceneRefreshPending = { ...(typeof result.scene === 'string' ? { scene: result.scene } : {}) };
@@ -592,7 +599,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         active.sceneRefreshPending = undefined;
         active.sceneReassessmentStarted = true;
         active.privateFinalCallId = undefined;
-        active.toolCalls = 0;
+        active.toolCalls = 0; active.helpCalls = 0;
         active.pendingClaudeTools = [];
         if (active.nativeTurnId) active.retiredNativeTurnIds.add(active.nativeTurnId);
         active.nativeTurnId = null;
@@ -602,7 +609,7 @@ export class NativeControllerAdapter implements AgentAdapter {
           return;
         }
         const evidence = harnessText('controller.scene_refresh_header')
-          + JSON.stringify({ scene: this.groupScene(pending.scene), rule: 'The original owner, root, authorization and delivery scope are unchanged. Actions with performed=false did not execute. Earlier successful tool receipts remain valid: do not replay them. Reconsider the new evidence, choose useful remaining work or silence, and use existing tools normally. This is the only automatic reassessment for this request.' })
+          + JSON.stringify({ scene: this.groupScene(pending.scene), automaticReassessment: 1, previousActionPerformed: false })
           + '\n' + bridgeClock();
         if (session.rpc) {
           const started = await this.startCodexTurn(session, active, { threadId: session.nativeId, environments: [], input: [],
@@ -619,7 +626,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         // The previous native decision completed. Only a missing, never-sent final may be repaired.
         active.replyRecovery = true;
         active.privateFinalCallId = undefined;
-        active.toolCalls = 0;
+        active.toolCalls = 0; active.helpCalls = 0;
         active.pendingClaudeTools = [];
         if (active.nativeTurnId) active.retiredNativeTurnIds.add(active.nativeTurnId);
         active.nativeTurnId = null;
@@ -631,7 +638,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (active.turn.signal.aborted) throw abortError();
         const evidence = harnessText('controller.reply_recovery_header') + JSON.stringify({
           reason, preparationError, previousDecisionCompleted: true, finalReplySent: false,
-          rule: harnessText('controller.reply_recovery_control')
+          reportRecoveryOnly: true, automaticRecoveryAttempt: 1
         });
         if (session.rpc) {
           const started = await this.startCodexTurn(session, active, { threadId: session.nativeId, environments: [], input: [],
@@ -802,13 +809,15 @@ export class NativeControllerAdapter implements AgentAdapter {
       remaining -= JSON.stringify(value)?.length ?? 4; return value;
     };
     const content = bound(parsed, 0);
-    return { status: 'provided', content, truncated, coverage: harnessText('controller.group_scene_coverage') };
+    return { status: 'provided', content, truncated, coverage: 'bounded' };
   }
   private runtimeContext(turn: AgentTurn, session: ControllerSession, includeTaskChecklist = false): string {
     const info = { agent: turn.conversation.agent, selectedModel: turn.conversation.model ?? null,
       observedModel: session.model ?? turn.conversation.actualModel ?? null,
       selectedEffort: selectedEffort(turn), observedEffort: session.effort ?? turn.conversation.actualEffort ?? null,
-      workerDefaults: this.options.defaultModels ?? {} };
+      workerDefaults: this.options.defaultModels ?? {}, internalBotCommunicationEnabled: this.options.internalBotCommunicationEnabled !== false,
+      ...(turn.event ? { event: { kind: turn.event.kind, introductionRequested: turn.event.introductionRequested === true } } : {}),
+      ...(session.active?.replyRecovery ? { reportRecoveryOnly: true } : {}) };
     const scene = turn.groupContext ? turn.chatScene ?? turn.groupContext.scene : undefined;
     const currentMessage = this.sceneMessage(scene);
     const explicitDelivery = currentMessage && isObject(currentMessage.defaultDelivery) && ['group', 'private', 'internal'].includes(String(currentMessage.defaultDelivery.area)) ? currentMessage.defaultDelivery : undefined;
@@ -817,14 +826,12 @@ export class NativeControllerAdapter implements AgentAdapter {
       original: turn.source?.original ?? (!turn.groupContext && !turn.event ? turn.source ?? null : null),
       requesterPrincipalId: turn.groupContext && !turn.event ? turn.groupContext.principalId : null,
       defaultDelivery: explicitDelivery ?? { area: turn.groupContext ? 'group' : 'private', ...(!turn.groupContext ? { targetId: 'private' } : {}), channelId: turn.source?.channelId ?? turn.groupContext?.originChannelId ?? null },
-      group: turn.groupContext ? { spaceId: turn.groupContext.spaceId, eventId: turn.groupContext.eventId, eventKind: turn.groupContext.eventKind ?? null } : null,
-      rule: harnessText('controller.runtime_source_facts') };
+      group: turn.groupContext ? { spaceId: turn.groupContext.spaceId, eventId: turn.groupContext.eventId, eventKind: turn.groupContext.eventKind ?? null } : null };
     const sceneBlock = scene == null && !turn.groupContext ? '' : harnessText('controller.chat_scene_header') + JSON.stringify(this.groupScene(scene));
-    return '[Bridge chat input; program facts] ' + JSON.stringify(chat) + sceneBlock + '\n' + harnessText('controller.bot_identity_header') + JSON.stringify({ botId: this.options.identity?.botId ?? null, aliases: this.options.identity?.aliases ?? [], rule: 'Aliases are names used to address this Bot; they do not assign a profession, task, identity ownership, or permission. Authorize with real botId/principal/space IDs only.' }) + '\n' + bridgeClock() + harnessText('controller.runtime_facts_header') + JSON.stringify(info)
-      + (turn.bridgeFeedback?.records.length ? harnessText('controller.feedback_header') + JSON.stringify({ ...turn.bridgeFeedback, rule: FEEDBACK_RULE, more: 'For more records use bridge_read_feedback if exposed; existing resumed toolkits can use bridge_list_workers with details=true for pending feedback.' }) : '')
-      + (turn.dispatchFailures?.records.length ? harnessText('controller.dispatch_failure_header') + JSON.stringify({ ...turn.dispatchFailures, rule: harnessText('controller.dispatch_failure_rule') }) : '')
-      + (includeTaskChecklist && turn.taskChecklist ? harnessText('controller.task_checklist_header') + turn.taskChecklist : '')
-      + '\nWorker model: omitted/default inherits this controller selection, then confirmed actual model; another backend uses its bridge worker default. The bridge resolves it before dispatch; never defer to a remote CLI default. Omitted continuation model keeps that worker selection; explicit default reapplies bridge policy. Effort inherits only within the same backend; explicit effort=default uses backend native default. Preserve user aliases and gateway mappings.';
+    return '[Bridge chat input; program facts] ' + JSON.stringify(chat) + sceneBlock + '\n' + harnessText('controller.bot_identity_header') + JSON.stringify({ botId: this.options.identity?.botId ?? null, aliases: this.options.identity?.aliases ?? [] }) + '\n' + bridgeClock() + harnessText('controller.runtime_facts_header') + JSON.stringify(info)
+      + (turn.bridgeFeedback?.records.length ? harnessText('controller.feedback_header') + JSON.stringify(turn.bridgeFeedback) : '')
+      + (turn.dispatchFailures?.records.length ? harnessText('controller.dispatch_failure_header') + JSON.stringify(turn.dispatchFailures) : '')
+      + (includeTaskChecklist && turn.taskChecklist ? harnessText('controller.task_checklist_header') + turn.taskChecklist : '');
   }
 
   async run(turn: AgentTurn): Promise<AgentResult> {

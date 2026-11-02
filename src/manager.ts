@@ -1882,11 +1882,6 @@ export class SessionManager {
       contextId = context?.contextId;
       let eventText = event.purpose === 'housekeeper' ? this.options.housekeeperEventText!(event) : workspaceContext && !target.nativeId && target.contextSeed
         ? `${harnessText('manager.legacy_summary')}${target.contextSeed}\n\n${event.text}` : event.text;
-      if (introductionRequested) {
-        const continuing = this.handoffs.get(target, event.channelId)?.status === 'ready';
-        eventText += '\n\n' + harnessText(continuing ? 'manager.introduction_continue' : 'manager.introduction_new',
-          continuing ? { continuation_evidence: harnessText('manager.continuation_evidence') } : {});
-      }
       const feedback = this.feedbackInput(target, event, current);
       if(event.purpose==='dispatch-failure')this.store.dispatchFailures.reminded(event.taskId,Date.now());
       const result = await this.adapters[target.agent].run({

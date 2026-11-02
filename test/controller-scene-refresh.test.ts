@@ -28,6 +28,7 @@ class SceneProtocol implements RpcTransport {
     if (message.type === 'user') { this.turns++; this.emit({ type: 'system', subtype: 'init', session_id: 'same-native-scene', tools: ['mcp__bridge_controller__bridge_start_worker', 'mcp__bridge_controller__bridge_send_message', 'mcp__bridge_controller__bridge_silent'] }); }
   }
   async call(name: string, args: JsonObject, callId?: string): Promise<JsonObject> {
+    if (!['bridge_claim_work', 'bridge_finish_work'].includes(name)) { args = { command: name, arguments: args }; name = 'bridge_call'; }
     const id = ++this.sequence, nativeId = callId ?? 'scene-call-' + id;
     if (this.agent === 'codex') {
       this.emit({ id, method: 'item/tool/call', params: { threadId: 'same-native-scene', turnId: 'scene-turn-' + this.turns, callId: nativeId, tool: name, arguments: JSON.stringify(args) } });

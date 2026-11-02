@@ -43,7 +43,7 @@ test('native controller exposes target, handoff and restart management through i
     const transport = s.transports[0]!;
     const start = transport.written.find(message => message.method === 'thread/start')?.params as JsonObject;
     const names = (start.dynamicTools as { name: string }[]).map(value => value.name);
-    assert.ok(names.includes('bridge_list_targets')); assert.ok(names.includes('bridge_handoff_worker')); assert.ok(names.includes('bridge_request_restart'));
+    assert.deepEqual(names, ['bridge_help', 'bridge_call']);
     for (const [index, name, args] of [
       [0, 'bridge_list_targets', {}],
       [1, 'bridge_start_worker', { title: '工位任务', prompt: '授权任务', targetId: 'office', cwd: 'Z:\\remote-only' }],
@@ -94,6 +94,8 @@ class FakeTransport implements RpcTransport {
 }
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-native-'));
+  writeFileSync(join(dir, 'README.md'), '# Test rules\n{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}');
+  writeFileSync(join(dir, 'MEMORY.md'), '');
   const userHome = join(dir, 'user'); mkdirSync(join(userHome, '.codex'), { recursive: true });
   writeFileSync(join(userHome, '.codex', 'config.toml'), 'model_provider="a"\n');
   const transports: FakeTransport[] = [], launches: { args: string[]; env: NodeJS.ProcessEnv }[] = [];
@@ -118,6 +120,52 @@ function tool(transport: FakeTransport, id: number, callId: string, name: string
   transport.emit({ id, method: 'item/tool/call', params: { threadId: transport.nativeId,
     turnId: `turn-${transport.turns}`, callId, tool: name, arguments: JSON.stringify(args) } });
 }
+test('native help/call expands complete help, corrects bad arguments and keeps stable dispatch receipts', async () => {
+  const s=setup();s.setMode('hold');
+  try {
+    const running=s.adapter.run(s.makeTurn());await until(()=>s.transports[0]?.turns===1);const t=s.transports[0]!;
+    tool(t,8101,'help','bridge_help',{command:'bridge_start_worker'});
+    await until(()=>t.written.some(m=>m.id===8101&&!m.method));assert.deepEqual(s.invokes,[]);
+    const help=t.written.find(m=>m.id===8101&&!m.method)!.result as JsonObject;
+    assert.match(JSON.stringify(help),/inputSchema|required|prompt/);
+    tool(t,8102,'bad','bridge_call',{command:'bridge_start_worker',arguments:{title:'missing prompt'}});
+    await until(()=>t.written.some(m=>m.id===8102&&!m.method));
+    assert.equal((t.written.find(m=>m.id===8102&&!m.method)!.result as JsonObject).success,false);assert.deepEqual(s.invokes,[]);
+    const input={command:'bridge_start_worker',arguments:{title:'只读任务',prompt:'只返回事实'}};
+    tool(t,8103,'dispatch','bridge_call',input);tool(t,8104,'dispatch','bridge_call',input);
+    await until(()=>t.written.some(m=>m.id===8104&&!m.method));assert.deepEqual(s.invokes,['bridge_start_worker']);
+    tool(t,901,'final','bridge_call',{command:'bridge_send_user',arguments:{text:'已登记。'}});
+    const result=await running;assert.equal(result.controlledOutput,true);assert.deepEqual(s.published.map(p=>p.text),['已登记。']);
+  } finally {await s.cleanup();}
+});
+
+test('generic entry preserves report-only recovery and cannot dispatch through its wrapper',async()=>{
+  const s=setup();s.setMode('hold');
+  try {
+    const turn={...s.makeTurn(),controllerRecovery:true};const running=s.adapter.run(turn);
+    await until(()=>s.transports[0]?.turns===1);const t=s.transports[0]!;t.complete();await until(()=>t.turns===2);
+    assert.match(JSON.stringify(t.written.filter(m=>m.method==='turn/start').at(-1)),/reportRecoveryOnly/);
+    tool(t,8201,'forbidden','bridge_call',{command:'bridge_start_worker',arguments:{title:'禁止重派',prompt:'不应执行'}});
+    await until(()=>t.written.some(m=>m.id===8201&&!m.method));assert.deepEqual(s.invokes,[]);
+    assert.equal((t.written.find(m=>m.id===8201&&!m.method)!.result as JsonObject).success,false);
+    tool(t,902,'recovered-final','bridge_call',{command:'bridge_send_user',arguments:{text:'核对后补发结果。'}});
+    await running;assert.equal(s.published.length,1);assert.equal(s.transports.length,1);
+  } finally {await s.cleanup();}
+});
+
+test('wrapped final delivery waits for admitted management and can be corrected without replaying that command',async()=>{
+  const s=setup();s.setMode('hold');const g=gate();s.holdManagement(g.promise);
+  try {
+    const running=s.adapter.run(s.makeTurn());await until(()=>s.transports[0]?.turns===1);const t=s.transports[0]!;
+    tool(t,8301,'management','bridge_call',{command:'bridge_list_targets',arguments:{}});
+    await until(()=>s.invokes.length===1);
+    tool(t,8302,'premature-final','bridge_call',{command:'bridge_send_user',arguments:{text:'尚未核对的回复'}});
+    await new Promise(resolve=>setTimeout(resolve,5));assert.equal(s.published.length,0);g.release();
+    await until(()=>t.written.some(m=>m.id===8302&&!m.method));assert.equal(s.published.length,0);
+    tool(t,901,'corrected-final','bridge_call',{command:'bridge_send_user',arguments:{text:'已核对回执。'}});
+    await running;assert.deepEqual(s.invokes,['bridge_list_targets']);assert.deepEqual(s.published.map(p=>p.text),['已核对回执。']);
+  } finally {g.release();await s.cleanup();}
+});
 for (const failure of ['error', 'failed'] as const) test(`confirmed final delivery survives native ${failure} while retaining its diagnostic and original session`, async () => {
   const s = setup(); s.setMode('hold');
   try {
@@ -192,7 +240,7 @@ test('persistent controller publishes only explicit messages with native IDs and
     const input = (s.transports[0]!.written.find(message => message.method === 'turn/start')!.params as JsonObject).input as { text: string }[];
     const runtime = input.find(item => item.text?.includes('[Bridge runtime;'))!.text;
     assert.match(runtime, /"observedModel":"gpt-6.1-sol"/); assert.match(runtime, /"observedEffort":"medium"/);
-    assert.match(runtime, /before dispatch/);
+    assert.doesNotMatch(runtime, /Worker model:|before dispatch|\"rule\"/);
   } finally { await s.cleanup(); }
 });
 test('unsupported tool execution is rejected and never dispatched', async () => {
@@ -233,8 +281,8 @@ test('workspace bootstrap can finish quietly and feeds evidence into the same na
     const bridgePrompt = `${created.baseInstructions} ${created.developerInstructions}`;
     assert(!bridgePrompt.includes(turn.event.text));
     assert(!/Chinese|Haru|MyHaruSkills|SuchProject/.test(bridgePrompt));
-    assert.match(bridgePrompt, /user-maintained workspace-context input/);
-    assert.match(bridgePrompt, /need no initialization worker/);
+    assert.match(bridgePrompt, /主控仅使用桥工具/);
+    assert.match(bridgePrompt, /DONE/);
     s.transports[0]!.mode = 'public';
     const next = s.makeTurn(); next.conversation.nativeId = initialized.nativeId;
     const result = await s.adapter.run(next);
@@ -670,7 +718,8 @@ test('Claude maps parallel same-name MCP calls by exact arguments and closes MCP
     assert.deepEqual(publicKeys, ['id-public']);
     assert.ok(receivedContent.some(item => (item as JsonObject).type === 'image'));
     assert.ok(receivedContent.some(item => String((item as JsonObject).text).includes('[Bridge runtime;')));
-    assert.ok(receivedContent.some(item => String((item as JsonObject).text).includes('Preserve user aliases and gateway mappings')));
+    assert.ok(receivedContent.some(item => String((item as JsonObject).text).includes('Bridge runtime')));
+    assert.ok(!receivedContent.some(item => String((item as JsonObject).text).includes('Worker model:')));
     assert.ok(receivedContent.some(item => (item as JsonObject).type === 'text' && String((item as JsonObject).text).includes(JSON.stringify(image))));
     transport.stop = async () => { throw new Error('process exit unconfirmed'); };
     await assert.rejects(adapter.close(), /process exit unconfirmed/);
@@ -899,10 +948,10 @@ test('Codex excludes private group history while retaining actual group source a
     assert.equal(JSON.parse(currentRuntime.split('\n')[0]!.split('] ')[1]!).requesterPrincipalId, 'owner');
     const evidence = (starts[2]!.toolOutput as JsonObject).output as string;
     assert.equal(JSON.parse(evidence.split('\n')[0]!.split('] ')[1]!).requesterPrincipalId, null);
-    assert.deepEqual(starts[2]!.input, []); assert.match(evidence, /background-evidence/); assert.match(evidence, /讨论预算 73/); assert.match(evidence, /not fresh authorization/);
+    assert.deepEqual(starts[2]!.input, []); assert.match(evidence, /background-evidence/); assert.match(evidence, /讨论预算 73/); assert.doesNotMatch(evidence, /"rule":/);
     const thread = s.transports[0]!.written.find(item => item.method === 'thread/start')!.params as JsonObject;
     const tools = thread.dynamicTools as JsonObject[];
-    assert.ok(tools.some(item => item.name === 'bridge_read_group_history'));
+    assert.deepEqual(tools.map(item => item.name), ['bridge_help', 'bridge_call']);
   } finally { await s.cleanup(); }
 });
 
@@ -961,7 +1010,7 @@ test('Claude wire excludes private group history and retains group and backgroun
     const wires = transports.map(transport => JSON.stringify(transport.written.find(item => item.type === 'user')));
     assert.match(wires[0]!, /private-message/); assert.doesNotMatch(wires[0]!, /项目代号青鸟|Bridge chat scene/);
     assert.match(wires[1]!, /actual-author/); assert.match(wires[1]!, /previous/); assert.match(wires[1]!, /项目代号青鸟/);
-    assert.match(wires[2]!, /background-evidence/); assert.match(wires[2]!, /not fresh authorization/);
+    assert.match(wires[2]!, /background-evidence/); assert.doesNotMatch(wires[2]!, /not fresh authorization/);
     const content = (transports[2]!.written.find(item => item.type === 'user')!.message as JsonObject).content as { text: string }[];
     const runtime = content.find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
     const chat = JSON.parse(runtime.split('\n')[0]!.split('] ')[1]!);
@@ -1030,7 +1079,7 @@ test('native preserves direct-recipient facts for ordinary owner group messages 
 test('Memory change refreshes the same Codex native controller without new chat, model change or initializer', async () => {
   const s = setup();
   try {
-    writeFileSync(join(s.dir, 'README.md'), '# Shared rules'); writeFileSync(join(s.dir, 'MEMORY.md'), 'ORIGINAL_OWNER_RULE');
+    writeFileSync(join(s.dir, 'README.md'), '# Shared rules\n{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}'); writeFileSync(join(s.dir, 'MEMORY.md'), 'ORIGINAL_OWNER_RULE');
     const turn = s.makeTurn(); const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
     writeFileSync(join(s.dir, 'MEMORY.md'), 'UPDATED_OWNER_RULE: Client/Lua and MyHaruSkills');
     await s.adapter.run(turn);

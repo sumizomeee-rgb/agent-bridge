@@ -163,7 +163,7 @@ test('工作区初始化和执行目标登记读contextWorkspace，工程执行c
     }, pollIntervalMs: 60_000,
   });
   t.after(() => runtime.close());
-  writeFileSync(join(f.contextWorkspace, 'README.md'), '# Shared rules');
+  writeFileSync(join(f.contextWorkspace, 'README.md'), '# Shared rules\n{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}');
   writeFileSync(join(f.contextWorkspace, 'MEMORY.md'), '# Owner memory');
   const initialized = await runtime.initializeWorkspace(f.turn) as { kind: string; taskId: string; status: string }; await flush();
   assert.equal(initialized.kind, 'workspace-documents'); assert.equal(initialized.status, 'completed');

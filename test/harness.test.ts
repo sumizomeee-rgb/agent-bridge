@@ -4,18 +4,20 @@ import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { workspaceDocuments } from '../src/controller/workspace-documents.js';
 import { harnessCatalog, harnessCatalogPath, harnessText, parseHarnessCatalog, renderHarnessPrompt, renderHarnessReferences } from '../src/harness.js';
-import { controllerInstructions, controllerInstructionsForCommunication, controllerTools } from '../src/controller/native.js';
+import { controllerInstructions, controllerInstructionsForCommunication, controllerToolsForCommunication } from '../src/controller/native.js';
 
 const project = fileURLToPath(new URL('../..', import.meta.url));
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 const fixture = (text = '正文 {{value}}') => `version = 1\n[prompts.fixture]\npurpose = "用途"\naudience = "助手"\ninjection = "需要时"\nactivation = "下轮"\nsource = "fixture"\ntext = ${JSON.stringify(text)}\n`;
 
-test('controller protocol and complete tool schemas preserve the reviewed continuation boundary', () => {
-  // Reviewed common catalog, including optional cross-controller history selection.
-  assert.equal(sha(controllerInstructions), '0ca41c42786ba1fcadf0265c3df0493d4841b939160e757aeb879055ec8b0e4b');
-  assert.equal(sha(controllerInstructionsForCommunication(false)), 'dfd033c5ed83a3f4d352609498392f2a4059dbca8350fbeed4653b06caab3b61');
-  assert.equal(sha(JSON.stringify(controllerTools.filter(tool => !['bridge_list_dispatch_failures', 'bridge_ack_dispatch_failure'].includes(tool.name)))), 'b6e54bc227d5e31e138c514614aa4a77616e7f61eb379b730545a98955dec1c8');
+test('context contraction preserves reviewed command schemas and essential turn boundaries', () => {
+  assert.ok(controllerInstructions.length < 800);
+  assert.match(controllerInstructions, /finish=false/);
+  assert.match(controllerInstructions, /DONE/);
+  assert.match(controllerInstructions, /performed=false/);
+  assert.equal(sha(JSON.stringify(controllerToolsForCommunication(false).map(tool => ({name:tool.name,inputSchema:tool.inputSchema}))).replace(/\\r\\n/g, '\\n')), '5b56c7dafad224c137c496e2178167e554af26bb098691aab4737a25d55e40a0');
   assert.equal(controllerInstructionsForCommunication(true), controllerInstructions);
 });
 
@@ -67,11 +69,11 @@ test('one summary-worker prompt serves every window and generated README uses th
   assert.ok(event.endsWith('{{source_text}}'));
 });
 
-test('initialization introductions and receipt failure prefixes preserve their original exact wording', () => {
-  const common = ["请通过 bridge_send_user 向原发送者主动回复一次，用自己的话按以下编号分点汇报理解，每点一两句：","1. 我的职责与能力：结合已读取的 README、当前聊天平台及主控规则，简述自己负责什么、当前能做什么。","2. 你的偏好：概括已读取的 MEMORY 中影响后续协作的主要偏好，不全文复述。"];
-  const tail = ["仅依据已读取的内容；缺失或未读到的内容如实说明，不凑数，不把文件声明的能力说成实际验证成功。","保持简短，不照抄调查或交接摘要；详细路径、任务编号等仅在影响下一步时提及。不因此启动额外任务，回复后结束本轮。]"];
-  assert.equal(harnessText('manager.introduction_new'), ['[桥程序：用户 /new 的工作区初始化已完成。', ...common, ...tail].join('\n'));
-  assert.equal(harnessText('manager.introduction_continue', { continuation_evidence: harnessText('manager.continuation_evidence') }),
-    ['[桥程序：用户 /new continue 的初始化和续接已完成。', ...common, '3. 续接理解：概括当前目标、已确认进展、关键纠正，以及真正待办或未知与下一步。', harnessText('manager.continuation_evidence'), ...tail].join('\n'));
-  assert.equal(harnessText('worker.initialization_repair_failed', { error: '原始 {{diagnostic}}' }), '上一轮只读初始化已经正常返回，但回执校验失败：原始 {{diagnostic}}');
+test('initialization introduction rules have one declared README source', () => {
+  const text=workspaceDocuments().text;
+  assert.match(text,/introductionRequested=true/);
+  assert.match(text,/职责与能力、主要偏好/);
+  assert.equal(harnessCatalog().prompts['manager.introduction_new'],undefined);
+  assert.equal(harnessCatalog().prompts['manager.introduction_continue'],undefined);
+  assert.equal(harnessText('worker.initialization_repair_failed',{error:'原始 {{diagnostic}}'}),'上一轮只读初始化已经正常返回，但回执校验失败：原始 {{diagnostic}}');
 });

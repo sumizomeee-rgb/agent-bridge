@@ -31,6 +31,7 @@ class PrivateProtocol implements RpcTransport {
     if (message.type === 'user') { this.turns++; this.emit({ type: 'system', subtype: 'init', session_id: 'same-private-native', tools: ['mcp__bridge_controller__bridge_start_worker', 'mcp__bridge_controller__bridge_send_message', 'mcp__bridge_controller__bridge_send_user'] }); }
   }
   async call(name: string, args: JsonObject, callId?: string, nativeTurn = this.turns): Promise<{ ok: boolean; value: JsonObject }> {
+    if (!['bridge_help', 'bridge_call'].includes(name)) { args = { command: name, arguments: args }; name = 'bridge_call'; }
     const id = ++this.sequence, toolId = callId ?? 'private-call-' + id;
     if (this.agent === 'codex') {
       this.emit({ id, method: 'item/tool/call', params: { threadId: 'same-private-native', turnId: 'private-turn-' + nativeTurn, callId: toolId, tool: name, arguments: JSON.stringify(args) } });
@@ -83,12 +84,13 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控实际协
   const names = ['bridge_search_chat_history', 'bridge_read_chat_history', 'bridge_list_tasks', 'bridge_update_tasks'];
   if (agent === 'codex') {
     const started = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
-    assert(names.every(name => (started.dynamicTools as JsonObject[]).some(tool => tool.name === name)));
+    assert.deepEqual((started.dynamicTools as JsonObject[]).map(tool => tool.name), ['bridge_help', 'bridge_call']);
   } else {
     const response = await fetch(f.protocol.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'tools/list' }) });
     const body = await response.json() as { result: { tools: { name: string }[] } };
-    assert(names.every(name => body.result.tools.some(tool => tool.name === name)));
+    assert.deepEqual(body.result.tools.map(tool => tool.name), ['bridge_help', 'bridge_call']);
   }
+  for (const command of names) { const help=await f.protocol.call('bridge_help',{command}); assert.equal(help.ok,true); assert.equal(help.value.name,command); assert.ok(help.value.inputSchema); }
   assert.match(JSON.stringify(f.protocol.written), /Bridge task checklist/);
   const found = await f.protocol.call(names[0]!, { query: '免打扰' });
   assert.equal(found.ok, true); assert.match(JSON.stringify(found.value), /先排除免打扰/);
@@ -111,12 +113,13 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控真实协
   const names = ['bridge_read_file', 'bridge_list_directory'];
   if (agent === 'codex') {
     const started = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
-    assert(names.every(name => (started.dynamicTools as JsonObject[]).some(tool => tool.name === name)));
+    assert.deepEqual((started.dynamicTools as JsonObject[]).map(tool => tool.name), ['bridge_help', 'bridge_call']);
   } else {
     const response = await fetch(f.protocol.mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'tools/list' }) });
     const body = await response.json() as { result: { tools: { name: string }[] } };
-    assert(names.every(name => body.result.tools.some(tool => tool.name === name)));
+    assert.deepEqual(body.result.tools.map(tool => tool.name), ['bridge_help', 'bridge_call']);
   }
+  for (const command of names) { const help=await f.protocol.call('bridge_help',{command}); assert.equal(help.ok,true); assert.equal(help.value.name,command); }
   assert.doesNotMatch(JSON.stringify(f.protocol.written), /只在工具调用后返回的资料/);
   const read = await f.protocol.call(names[0]!, { path }); assert.equal(read.ok, true); assert.match(JSON.stringify(read.value), /只在工具调用后返回的资料/);
   const list = await f.protocol.call(names[1]!, { path: f.path }); assert.equal(list.ok, true); assert.match(JSON.stringify(list.value), /lookup.txt/);

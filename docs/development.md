@@ -9,9 +9,11 @@
 - `src/controller/agents/codex/dynamic-tools.ts` 将同一工具目录转换为 Codex 原生动态工具定义。
 - `src/controller/native.ts` 负责原生进程、会话和轮次生命周期；兼容导出共用工具，已有调用方无需迁移入口。
 
-两种接入继续提供完整工具定义；目录拆分不实现按需展开，也不改变权限、派工、调用编号、回执或启动方式。源码可在运行时编辑；构建和部署完成后，代码在受控重启时加载，工作区文案仍遵循原有刷新机制。
+新建主控只向两端 CLI 注册 `bridge_help`、`bridge_call`。README 引用同一工具登记的一句话目录；`bridge_help` 指定名称后返回完整说明与 schema，`bridge_call` 先按该 schema 校验，再还原为真实命令进入原有权限、调用编号、恢复与交付封闭校验。参数错误作为可纠正工具结果返回。旧 Codex 原生会话继续接受其已登记的直接命令，需 `/new c` 才更新为两个入口；Claude MCP 按当前目录重建。工具说明查询不执行管理动作，也不消耗原有管理调用预算，另受同额度查询次数限制。
 
-用户斜杠命令用法见 usage.md，部署、初始化与文件清理机制见 deployment.md；工作区 README 仅保留主控行为约定，不维护重复工具手册。
+`src/controller/workspace-documents.ts` 只从工作区 README 装配固定指令。`{{include:bridge/controller-protocol}}`、`{{include:bridge/agent-instructions}}`、`{{include:bridge/tool-index}}`、`{{include:workspace/MEMORY.md}}` 为登记的非递归引用；正文中的 `{{bridge_root}}`、`{{workspace_root}}` 在装配时解析。缺失必要引用、重复、未知引用或无效文件会明确标记不完整，不另行暗加协议或 MEMORY。MEMORY 保留原文，其内容不再作为模板解析。每轮只带来源、投递、时间、模型、任务与事件状态；限制恢复模式用数据标记，规则留在 README，既有执行工具封锁保持。源码在受控重启后加载；骨架生成器只复制带占位符的 README，迁移不改源码。
+
+用户斜杠命令用法见 usage.md，部署、初始化与文件清理机制见 deployment.md；工作区 README 是固定初始化唯一入口，完整工具手册按需展开。
 
 ## 助手缓存与跨主控历史
 

@@ -75,7 +75,7 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
     dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
     defaultAgent: 'codex', defaultModels: { codex: 'offline-model', claude: 'offline-model' }, controllerMode: options.controller !== false,
     proxyUrl: null, commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, maxImageBytes: 100 };
-  mkdirSync(config.workspace, { recursive: true }); writeFileSync(join(config.workspace, 'README.md'), '# Shared fixture'); writeFileSync(join(config.workspace, 'MEMORY.md'), '# Owner rules');
+  mkdirSync(config.workspace, { recursive: true }); writeFileSync(join(config.workspace, 'README.md'), '# Shared fixture\n{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}'); writeFileSync(join(config.workspace, 'MEMORY.md'), '# Owner rules');
   const execution = { codex: new LocalAdapter(), claude: new LocalAdapter() }, controllers = { codex: new LocalAdapter(true), claude: new LocalAdapter(true) };
   const groups: IncomingDM[] = [], initialization: string[] = [], groupCompletions: TaskCompletionEvent[] = []; let ready = 0, reconnected = 0;
   let activeController: string | null = null;

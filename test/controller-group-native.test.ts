@@ -46,10 +46,11 @@ test('关闭后台 Bot 互通后原生工具清单只允许公开协作，缓存
   const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
   const start = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
   const tools = start.dynamicTools as Array<{ name: string; inputSchema: JsonObject }>;
-  for (const name of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff']) assert.equal(tools.some(tool => tool.name === name), false);
-  const collaboration = tools.find(tool => tool.name === 'bridge_start_collaboration')!;
-  assert.deepEqual(((collaboration.inputSchema.properties as JsonObject).mode as JsonObject).enum, ['public']);
-  for (const name of ['bridge_silent', 'bridge_start_worker', 'bridge_send_message']) assert.equal(tools.some(tool => tool.name === name), true);
+  assert.deepEqual(tools.map(tool=>tool.name), ['bridge_help','bridge_call']);
+  f.protocol.emit({id:290,method:'item/tool/call',params:{threadId:'native-group',turnId:'turn-1',callId:'help-public',tool:'bridge_help',arguments:JSON.stringify({command:'bridge_start_collaboration'})}});
+  await until(()=>!!reply(f.protocol,290));
+  const collaboration=JSON.parse(((reply(f.protocol,290)!.contentItems as JsonObject[])[0]!.text as string));
+  assert.deepEqual(collaboration.inputSchema.properties.mode.enum,['public']);
   for (const [index, name] of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff', 'bridge_start_collaboration'].entries()) {
     const id = 300 + index;
     f.protocol.emit({ id, method: 'item/tool/call', params: { threadId: 'native-group', turnId: 'turn-1', callId: 'cached-' + name,
@@ -69,9 +70,11 @@ test('缺省后台 Bot 互通保留原有工具及两种协作模式', async t =
   const f = setup(t); const running = f.adapter.run(f.turn); await until(() => f.protocol.turns === 1);
   const start = f.protocol.written.find(message => message.method === 'thread/start')!.params as JsonObject;
   const tools = start.dynamicTools as Array<{ name: string; inputSchema: JsonObject }>;
-  for (const name of ['bridge_send_bot', 'bridge_propose_handoff', 'bridge_accept_handoff']) assert.equal(tools.some(tool => tool.name === name), true);
-  const collaboration = tools.find(tool => tool.name === 'bridge_start_collaboration')!;
-  assert.deepEqual(((collaboration.inputSchema.properties as JsonObject).mode as JsonObject).enum, ['internal', 'public']);
+  assert.deepEqual(tools.map(tool=>tool.name), ['bridge_help','bridge_call']);
+  f.protocol.emit({id:319,method:'item/tool/call',params:{threadId:'native-group',turnId:'turn-1',callId:'help-internal',tool:'bridge_help',arguments:JSON.stringify({command:'bridge_start_collaboration'})}});
+  await until(()=>!!reply(f.protocol,319));
+  const collaboration=JSON.parse(((reply(f.protocol,319)!.contentItems as JsonObject[])[0]!.text as string));
+  assert.deepEqual(collaboration.inputSchema.properties.mode.enum,['internal','public']);
   f.protocol.tool(320, 'bridge_silent'); await until(() => !!reply(f.protocol, 320)); f.protocol.complete(); await running;
 });
 

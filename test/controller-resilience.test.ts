@@ -410,7 +410,7 @@ test('failed accepted worker report continues saved evidence once; execution too
   const params = next.written.find(message => message.method === 'turn/start')!.params as JsonObject;
   assert.deepEqual(params.input, []);
   assert.match(JSON.stringify(params.toolOutput), /Saved worker result/);
-  assert.match(JSON.stringify(params.toolOutput), /only recovery attempt/);
+  assert.match(JSON.stringify(params.toolOutput), /reportRecoveryOnly/);
   next.tool('bridge_start_worker', { title: 'must not replay', prompt: 'do it again' }, 151);
   await until(() => next.written.some(message => message.id === 151));
   assert.deepEqual(s.management, ['bridge_list_workers']);

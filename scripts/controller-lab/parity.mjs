@@ -18,7 +18,8 @@ function tree(root) {
 }
 function sourceSnapshot(root) {
   const result = { src: tree(join(root, 'src')), test: tree(join(root, 'test')),
-    harness: existsSync(join(root, 'harness')) ? tree(join(root, 'harness')) : null };
+    harness: existsSync(join(root, 'harness')) ? tree(join(root, 'harness')) : null,
+    workspaceTemplate: existsSync(join(root, 'workspace-template')) ? tree(join(root, 'workspace-template')) : null };
   for (const name of ['tsconfig.json', 'package.json', 'package-lock.json']) {
     result[name] = existsSync(join(root, name)) ? createHash('sha256').update(readFileSync(join(root, name))).digest('hex') : null;
   }
@@ -26,7 +27,8 @@ function sourceSnapshot(root) {
 }
 function runtimeSnapshot(root, includeTests) {
   return { src: tree(join(root, 'dist/src')), ...(includeTests ? { test: tree(join(root, 'dist/test')) } : {}),
-    harness: existsSync(join(root, 'harness')) ? tree(join(root, 'harness')) : null };
+    harness: existsSync(join(root, 'harness')) ? tree(join(root, 'harness')) : null,
+    workspaceTemplate: existsSync(join(root, 'workspace-template')) ? tree(join(root, 'workspace-template')) : null };
 }
 function same(actual, expected, description) {
   // Do not dump whole source hashes or compiler diagnostics into chat errors.
@@ -44,7 +46,7 @@ export async function verifyParity({ root, sourceRoot = root, runDir, includeTes
   child.stdout.resume(); child.stderr.resume();
   const code = await new Promise((accept, reject) => { child.once('error', reject); child.once('close', accept); });
   assert.equal(code, 0, 'Fresh reference build failed; run the normal build for diagnostics');
-  const expected = { src: tree(join(reference, 'src')), ...(includeTests ? { test: tree(join(reference, 'test')) } : {}), harness: source.harness };
+  const expected = { src: tree(join(reference, 'src')), ...(includeTests ? { test: tree(join(reference, 'test')) } : {}), harness: source.harness, workspaceTemplate: source.workspaceTemplate };
   same(runtime, expected, 'Runtime differs from a fresh source build (missing, stale or modified files); rebuild before testing');
   const assertUnchanged = () => {
     same(sourceSnapshot(sourceRoot), source, 'Source changed during the lab run; result invalid');

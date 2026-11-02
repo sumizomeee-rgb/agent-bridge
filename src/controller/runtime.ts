@@ -606,7 +606,7 @@ export class ControllerRuntime {
       const hex = createHash('sha256').update('workspace-documents:' + origin.conversationId).digest('hex');
       const id = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join('-');
       const task = this.registry.register(context, '工作区文件载入', id);
-      const documents = workspaceDocuments(this.config.contextWorkspace ?? this.config.workspace);
+      const documents = workspaceDocuments(this.config.contextWorkspace ?? this.config.workspace, { agent: turn.conversation.agent });
       const result = documents.errors.length ? '工作区文件未完整载入：\n' + documents.errors.join('\n')
         : '桥已直接载入 README.md 和 MEMORY.md 完整原文，无需初始化助手。\n' + documents.files.join('\n');
       const receipt = { kind: 'workspace-documents', taskId: task.taskId, status: documents.errors.length ? 'failed' : 'completed' };

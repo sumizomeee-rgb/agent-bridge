@@ -7,9 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 /** The production catalog, deployment service and SSH adapter are never replaced here. */
-export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort = 'xhigh' }) {
+export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort = 'xhigh', sourceConfigRoot, contextWorkspace, exerciseNew = false }) {
   const load = file => import(pathToFileURL(join(root, 'dist/src', file)));
-  const { loadHostConfig, agentEnvironment } = await load('config.js');
+  const { loadHostConfig, agentEnvironment } = sourceConfigRoot
+    ? await import(pathToFileURL(join(sourceConfigRoot, 'dist/src/config.js'))) : await load('config.js');
   const { workspaceFile } = await load('workspace-layout.js');
   const { HostRuntime } = await load('host-runtime.js');
   const { BotRuntime } = await load('bot-runtime.js');
@@ -27,7 +28,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
   const directory = join(runDir, 'configured-' + agent), workspace = join(directory, 'workspace');
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(workspace, 'README.md'), '隔离主控测试。只执行明确的只读测试任务，不开展业务工作。\n');
-  const context = source.contextWorkspace ?? source.workspace;
+  const context = contextWorkspace ?? source.contextWorkspace ?? source.workspace;
   const model = controllerModel ?? (agent === 'codex' ? 'gpt-6-luna' : 'haiku');
   // Preserve real registration/routing; only conversations, task journals and output are isolated.
   const labApplicationId = source.platform === 'feishu' ? 'cli_lab' + process.pid : String(700000000000000000n + BigInt(process.pid));
@@ -57,7 +58,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
     while (!predicate()) { assert(Date.now() < end, 'Lab deadline: ' + label); await delay(100); }
   };
   try {
-    store = new SessionStore(config.dataDir);
+
     catalog = new TargetCatalogService(config, execution);
     const computers = await catalog.listTargets(context, true);
     const selected = targets?.length ? computers.filter(c => targets.includes(c.id)) : computers;
@@ -78,6 +79,8 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       principals: [{ id: principalId, accounts: { [config.botId]: rawOwner } }] },
       { version: 3, status: 'complete', migrationId: 'configured-lab', migratedAt: new Date().toISOString(), bots: [] },
       async () => { throw new Error('Test does not restart the production bridge'); }, text => { receipt.hostLog ??= []; receipt.hostLog.push(text); save(); });
+    // Read the same host-owned active-controller binding as the actual manager.
+    store = new SessionStore(config.dataDir, host.hooks(config).manager.binding);
     const sink = { sendText: async (channel, text, options) => {
       assert.equal(channel, channelId); assert(!options?.files?.length, 'No business attachments in configured tests');
       receipt.deliveries.push({ at: new Date().toISOString(), text }); save();
@@ -97,6 +100,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
         const adapters = {};
         for (const selectedAgent of ['codex', 'claude']) adapters[selectedAgent] = new NativeControllerAdapter(source.commands[selectedAgent], env, {
           agent: selectedAgent, dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace, metadataAdapter: execution[selectedAgent], defaultModels: config.defaultModels,
+          internalBotCommunicationEnabled: sourceHost.internalBotCommunicationEnabled,
           invokeTool: (turn, name, args, id) => invokeTracked(invoke, turn, name, args, id) });
         native = adapters[agent]; return adapters;
       },
@@ -115,11 +119,11 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
     }
     conversation = store.createConversation(config.allowedUserIds[0], agent, workspace, { controllerMode: true });
     store.setActive(conversation.userId, conversation.id); store.setModel(conversation.id, model); store.setEffort(conversation.id, controllerEffort);
-    host.store.setController(config.botId, principalId, { conversationId: conversation.id, generation: 1, agent, nativeId: null, model, effort: controllerEffort }, 0);
+
     async function invokeTracked(invoke, turn, name, args, id) {
         const event = { name, callId: id, at: new Date().toISOString(), targetId: args.targetId, status: 'running' };
         receipt.tools.push(event); save();
-        assert(['bridge_list_targets', 'bridge_list_workers', 'bridge_start_worker'].includes(name), 'Lab forbids unrelated management');
+        assert(['bridge_list_targets', 'bridge_list_workers', 'bridge_start_worker', 'bridge_delivery_targets'].includes(name), 'Lab forbids unrelated management');
         if (name === 'bridge_start_worker') {
           assert.equal(args.targetId, receipt.expected.targetId, 'Unexpected test computer');
           assert.equal(args.prompt, receipt.expected.prompt, 'Worker task changed');
@@ -147,8 +151,9 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       await receive({ id, text, userId: conversation.userId, channelId, attachments: [],
         source: { messageId: id, userId: conversation.userId, channelId, authorType: 'user' } });
       assert(bot.ingress.getMessage(id), 'Ingress rejected test envelope');
-      await wait(() => ['completed', 'failed', 'cancelled'].includes(store.getMessage(id)?.state) && manager.isIdle(), label);
-      assert.equal(store.getMessage(id).state, 'completed');
+      await wait(() => ['completed', 'failed', 'cancelled', 'command'].includes(store.getMessage(id)?.state) && manager.isIdle(), label);
+      if (text.startsWith('/')) assert(['command', 'completed'].includes(store.getMessage(id).state));
+      else assert.equal(store.getMessage(id).state, 'completed');
       if (text.startsWith('/')) assert(receipt.deliveries.length > deliveryCount, 'Slash reply was not delivered');
       else assert.equal(store.getMessage(id).replyState, 'delivered');
     };
@@ -156,9 +161,25 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       await deployments.check();
       for (const { target, cwd } of bindings) assert.equal((await deployments.ensure(target, cwd)).state, 'ready', target.id + ' executor not ready');
     });
+    if (exerciseNew) {
+      const intro = await check('ordinary /new introduces once without an initialization worker', async () => {
+        const previous = conversation.id, workers = runtime.store.workers().length;
+        await send('context-new', '/new');
+        conversation = store.getActive(config.allowedUserIds[0]);
+        assert(conversation && conversation.id !== previous, 'New controller was not created');
+        await wait(() => store.workspaceNotice(conversation.id)?.state === 'delivered' && manager.isIdle(), 'new introduction');
+        assert.equal(store.workspaceNotice(conversation.id).outcome, 'ready');
+        conversation = store.getConversation(conversation.id);
+        assert(conversation.nativeId, 'Introduction did not bind a real native session');
+        assert.equal(runtime.store.workers().length, workers, 'Ordinary new unexpectedly spawned an initializer');
+        receipt.introduction = { conversationId: conversation.id, nativeId: conversation.nativeId, notice: store.workspaceNotice(conversation.id) };
+      });
+      if (intro.status !== 'passed') return;
+    }
     const discovery = await check('registered discovery through real private ingress', async () => {
+      const start = receipt.tools.length;
       await send('configured-discovery', '这是已授权的隔离测试，只使用桥工具。调用一次 bridge_list_targets 获取真实电脑和助手清单，随后简短回复 LAB_CONFIGURED_ROSTER，不派工。');
-      assert.equal(receipt.tools.filter(t => t.name === 'bridge_list_targets').length, 1);
+      assert.equal(receipt.tools.slice(start).filter(t => t.name === 'bridge_list_targets').length, 1);
     });
     if (discovery.status !== 'passed') return;
     let number = 0;

@@ -69,30 +69,10 @@ try {
         }
     }
 
-    # README 的行为文案来自版本化提示词表；此生成器仍不依赖 Node 或第三方 TOML 库。
+    # README 与骨架保持同一份源码；include 和路径占位符仅在主控初始化时展开。
     $renderedReadme = $null
     if (![IO.File]::Exists((Join-Path $workspace 'README.md'))) {
-        $readmeTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'README.md'), [Text.Encoding]::UTF8)
-        $catalogPath = Join-Path $PSScriptRoot 'harness\prompts.toml'
-        if (![IO.File]::Exists($catalogPath) -or ([IO.FileInfo]$catalogPath).Length -gt 524288) {
-            throw '缺少或超限的提示词配置：harness/prompts.toml'
-        }
-        $catalogText = [IO.File]::ReadAllText($catalogPath, [Text.Encoding]::UTF8)
-        $crlf = [string]::Concat([char]13, [char]10)
-        $newline = if ($readmeTemplate.Contains($crlf)) { $crlf } else { [string][char]10 }
-        $renderedReadme = $readmeTemplate
-        $references = [Regex]::Matches($readmeTemplate, '\{\{harness\.(?<id>[A-Za-z][A-Za-z0-9_.-]*)\}\}')
-        foreach ($reference in $references) {
-            $promptId = $reference.Groups['id'].Value
-            $entryPattern = '(?ms)^\[prompts\."' + [Regex]::Escape($promptId) + '"\]\r?\n(?<entry>.*?)(?=^\[prompts\.|\z)'
-            $entry = [Regex]::Match($catalogText, $entryPattern)
-            $body = [Regex]::Match($entry.Groups['entry'].Value, "(?s)text = '''\r?\n(?<text>.*?)'''")
-            if (!$entry.Success -or !$body.Success -or [string]::IsNullOrWhiteSpace($body.Groups['text'].Value)) {
-                throw "README 提示词无效：$promptId"
-            }
-            $bodyText = $body.Groups['text'].Value -replace '\r?\n', $newline
-            $renderedReadme = $renderedReadme.Replace($reference.Value, $bodyText)
-        }
+        $renderedReadme = [IO.File]::ReadAllText((Join-Path $templateRoot 'README.md'), [Text.Encoding]::UTF8)
     }
 
     $privateRoot = Join-Path $workspace 'bridge-agent-presets\private'

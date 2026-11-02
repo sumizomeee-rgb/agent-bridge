@@ -115,7 +115,8 @@ test('workspace initializer relocates with its templates to a project path conta
     assert.ok(!existsSync(join(relocated, 'node_modules')));
     const workspace = join(root, '目标 工作区');
     requireSuccess(run(workspace, root, join(relocated, 'init-workspace.ps1')));
-    assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').includes(customFollowup));
+    assert.deepEqual(readFileSync(join(workspace, 'README.md')), readFileSync(join(relocated, 'workspace-template', 'README.md')));
+    assert.ok(readFileSync(join(workspace, 'README.md'), 'utf8').includes('{{include:bridge/tool-index}}'));
     assert.ok(!readFileSync(join(workspace, 'README.md'), 'utf8').includes('{{harness.'));
     assert.deepEqual(parseTargetRegistry(JSON.parse(readFileSync(join(workspace, 'bridge-remote-agents/registry.json'), 'utf8').replace(/^\uFEFF/, ''))), []);
   } finally { cleanup(); }

@@ -3,7 +3,7 @@ import { appendFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { isObject, safeError, type JsonObject } from '../../../agents/process.js';
-import { controllerToolsForCommunication } from '../../tools/catalog.js';
+import { controllerEntryTools } from '../../tools/entry.js';
 
 interface ClaudeMcpOptions {
   dataDir: string;
@@ -41,7 +41,7 @@ export function createClaudeMcpServer(options: ClaudeMcpOptions) {
         if (request.id == null) { res.writeHead(202); res.end(); return; }
         let result: unknown;
         if (request.method === 'initialize') result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'bridge_controller', version: '1' } };
-        else if (request.method === 'tools/list') result = { tools: controllerToolsForCommunication(options.internalBotCommunicationEnabled) };
+        else if (request.method === 'tools/list') result = { tools: controllerEntryTools };
         else if (request.method === 'tools/call') {
           const params = isObject(request.params) ? request.params : {};
           name = typeof params.name === 'string' ? params.name : undefined; phase = 'tool-matching';

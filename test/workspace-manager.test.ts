@@ -46,7 +46,7 @@ class Controller implements AgentAdapter {
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'bridge-workspace-flow-'));
   const shared = join(root, 'shared'); mkdirSync(shared);
-  writeFileSync(join(shared, 'README.md'), '# Shared bridge rules\nRules remain verbatim.\n');
+  writeFileSync(join(shared, 'README.md'), '# Shared bridge rules\nRules remain verbatim.\n{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}\n');
   writeFileSync(join(shared, 'MEMORY.md'), '# Memory\n- 工位派工优先 Client／Lua，流程遵循 MyHaruSkills\n- 不擅自换模型\n');
   const config: BridgeConfig = { token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: shared, contextWorkspace: shared, workingCwd: shared,
     controllerMode: true, dataDir: join(root, 'data'), attachmentsDir: join(root, 'attachments'), logsDir: join(root, 'logs'), proxyUrl: null,
