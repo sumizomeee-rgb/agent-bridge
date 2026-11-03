@@ -43,6 +43,11 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} validates effor
       assert.equal(args[args.indexOf('--resume') + 1], 'same'); assert.deepEqual(reports, [null]);
     }
     turn.conversation.effort = agent === 'codex' ? 'high' : 'xhigh';
+    await adapter.run(turn);
+    adapter.getModelInfo = async () => { throw new Error('强度传参不应查询模型目录'); };
+    turn.conversation.model = 'custom-gateway-alias';
+    await adapter.run(turn);
+    turn.conversation.effort = agent === 'codex' ? 'bad!' : 'ultra';
     await assert.rejects(adapter.run(turn), /不支持/);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -81,15 +86,17 @@ test('capabilities distinguish supported/unsupported/unknown and trust only expl
   assert.equal(modelEffortCapability(resolved, { ...target, model: 'HAIKU' }).status, 'unknown');
   const adapter = { run: async () => { throw new Error('no generation'); }, interrupt: async () => {}, close: async () => {},
     getModelInfo: async () => ({ defaultModel: 'haiku', models: [{ id: 'haiku', displayName: 'Haiku', supportedEfforts: [] }] }) };
-  await assert.rejects(validateEffort(adapter, target, 'high'), /不支持可调/);
-  await assert.rejects(validateEffort(adapter, target, 'xhigh'), /不支持可调/);
+  assert.equal((await validateEffort(adapter, target, 'high')).status, 'unknown');
+  assert.equal((await validateEffort(adapter, target, 'xhigh')).status, 'unknown');
   adapter.getModelInfo = async () => ({ defaultModel: 'haiku', models: [] });
   for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
     const capability = await validateEffort(adapter, { ...target, model: 'deepseek-v4.1-flash' }, effort);
     assert.equal(capability.status, 'unknown'); assert.deepEqual(capability.levels, []);
   }
-  await assert.rejects(validateEffort(adapter, target, 'ultra'), /Claude CLI 不支持/);
-  await assert.rejects(validateEffort(adapter, { ...target, agent: 'codex' }, 'high'), /不能确认兼容性/);
+  await assert.rejects(validateEffort(adapter, target, 'ultra'), /claude CLI 不支持/);
+  adapter.getModelInfo = async () => { throw new Error('强度不依赖目录'); };
+  assert.equal((await validateEffort(adapter, { ...target, agent: 'codex' }, 'high')).status, 'unknown');
+  assert.equal((await validateEffort(adapter, { ...target, agent: 'codex' }, 'future-level')).status, 'unknown');
 });
 
 test('Claude filters invalid external persisted effort without mutating source settings', () => {

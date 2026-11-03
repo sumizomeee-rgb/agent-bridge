@@ -103,8 +103,9 @@ test('普通固定默认与父模型/强度独立；单次明确选择覆盖默�
     const explicit = await f.launch({ assistant: { kind: 'ordinary', agent: 'codex', model: 'gpt-6.1-sol' } });
     assert.equal(f.runtime.store.getWorker(explicit.workerId)!.model, 'gpt-6.1-sol'); assert.equal(f.runtime.store.getWorker(explicit.workerId)!.effort, null);
     assert.equal(f.turn.conversation.model, 'gpt-6.1-sol'); assert.equal(f.turn.conversation.effort, 'medium');
-    await f.runtime.workerDefaultCommand('agentworker local codex gpt-6-luna ultra');
-    await assert.rejects(f.launch(), /不支持 ultra/);
+    await f.runtime.workerDefaultCommand('agentworker local codex gpt-6-luna future-level');
+    const future = await f.launch(); assert.equal(f.runtime.store.getWorker(future.workerId)!.effort, 'future-level');
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker local claude haiku ultra'), /不支持强度/);
     await f.runtime.workerDefaultCommand('agentworker local clear'); assert.deepEqual(f.runtime.store.workerDefault('local'), { kind: 'follow' });
   } finally { await f.close(); }
 });
@@ -195,6 +196,22 @@ test('历史续接助手支持默认切换后端；默认预设不可用时明�
     assert.equal(unavailable.runtime.store.workers().length, 0); assert.equal(unavailable.runtime.store.jobs().length, 0);
     assert.equal(unavailable.turns.length, 0); assert.equal(unavailable.runtime.store.getWorkspaceInitialization('parent'), undefined);
   } finally { await unavailable.close(); }
+});
+
+test('预设强度在目录失效时仍按Agent原样保存派工；预约default清覆盖', async () => {
+  const f = fixture();
+  try {
+    f.catalog.adapterFor({ id: 'local', label: 'local', transport: 'local', agent: 'codex', cwd: f.dir, agentCommand: f.config.commands.codex }).getModelInfo = async () => { throw new Error('模型目录不可用'); };
+    await f.runtime.workerDefaultCommand('agentworker home preset home-luna xhigh');
+    const first = await f.launch({ targetId: 'home' }); await flush();
+    assert.equal(f.runtime.store.getWorker(first.workerId)!.effort, 'xhigh');
+    assert.equal(f.turns[0]!.conversation.effort, 'xhigh');
+    const scheduled = await f.launch({ targetId: 'home', effort: 'default', afterSeconds: 60 }, 'bridge_schedule_worker');
+    assert.equal(f.runtime.store.getSchedule(scheduled.scheduleId!)!.worker!.effort, null);
+    assert.deepEqual(f.runtime.store.workerDefault('home'), { kind: 'preset', presetId: 'home-luna', effort: 'xhigh' });
+    await f.runtime.workerDefaultCommand('agentworker home preset home-luna default');
+    assert.deepEqual(f.runtime.store.workerDefault('home'), { kind: 'preset', presetId: 'home-luna', effort: null });
+  } finally { await f.close(); }
 });
 
 test('斜杠菜单、私聊命令与实际默认设置同路；无模型回合、不改群命令', async () => {

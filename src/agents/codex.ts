@@ -238,7 +238,6 @@ export class CodexAdapter implements AgentAdapter {
       if (resumeId && thread.thread.id !== resumeId) {
         throw new Error('Codex 续接返回了不同会话；原会话已保留，本轮任务尚未提交。');
       }
-      if (effort && typeof thread.model === 'string' && thread.model !== turn.conversation.model) currentCapability = await validateEffort(this, { ...turn.conversation, model: thread.model }, effort);
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
       if (typeof thread.model === 'string' && thread.model) reportModel(thread.model);

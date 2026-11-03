@@ -8,7 +8,7 @@ import { rebindTaskOrigin, type TaskContextFile, type TaskOrigin, type TaskRegis
 import { ControllerStore } from './store.js';
 import { parseWorkerDefaultCommand, workerChoice, workerChoiceText, workerDefaultUsage, workerTargetId, type WorkerChoice } from './worker-selection.js';
 import { isModelId } from '../config.js';
-import { resolveDefaultModel, validateEffort } from '../effort.js';
+import { resolveDefaultModel, validateAgentEffort, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
@@ -254,7 +254,7 @@ export class ControllerRuntime {
     if (value === undefined) return inherited;
     if (value === 'default') return null;
     const effort = text(value, '思考强度', 32);
-    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(effort)) throw new Error(`${agent} 强度标识无效。`); return effort;
+    validateAgentEffort(agent, effort); return effort;
   }
   private adoptionResult(worker: ControllerWorker): Record<string, unknown> {
     return { workerId: worker.id, status: 'idle', ownership: 'bridge', adopted: true, nativeId: worker.nativeId,
@@ -538,6 +538,11 @@ export class ControllerRuntime {
       const choice = command.choice!;
       if (choice?.kind === 'ordinary' && !target.assistants.some(item => item.kind === 'ordinary' && item.agent === choice.agent)) throw new Error('该电脑未登记所选普通引擎，默认设置未改变。');
       if (choice?.kind === 'preset' && !target.assistants.some(item => item.kind === 'preset' && item.presetId === choice.presetId)) throw new Error('预设未启用或不属于所选电脑，默认设置未改变。');
+      if (choice && choice.kind !== 'follow' && choice.effort) {
+        const agent = choice.kind === 'ordinary' ? choice.agent
+          : target.assistants.find(item => item.kind === 'preset' && item.presetId === choice.presetId)!.agent;
+        validateAgentEffort(agent, choice.effort);
+      }
       this.store.setWorkerDefault(command.targetId!, choice);
       view = await this.workerChoices({ targetId: command.targetId });
     }

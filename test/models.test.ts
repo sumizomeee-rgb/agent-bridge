@@ -349,7 +349,7 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} metadata无user
   }
 });
 
-test('effort is per conversation, survives reopen, rejects incompatible model changes and preserves native ID', async t => {
+test('effort is per conversation, survives reopen, retains effort across model changes and preserves native ID', async t => {
   const { f, send, inspect } = fixture(t);
   await send('hello'); await waitFor(() => f.replies.length > 0);
   const nativeId = inspect(s => s.getActive('owner')!.nativeId);
@@ -359,30 +359,31 @@ test('effort is per conversation, survives reopen, rejects incompatible model ch
   assert.equal(inspect(s => s.getActive('owner')!.nativeId), nativeId);
   assert.match(f.replies.at(-1)!.text, /尚未由 CLI 确认/);
   await send('/effort'); assert.match(f.replies.at(-1)!.text, /强度选择：xhigh/);
-  await send('/model gpt-5.6-sol'); assert.equal(inspect(s => s.getActive('owner')!.model), 'gpt-6.1-sol');
-  await send('/effort xhigh', 'other'); assert.equal(inspect(s => s.getActive('other')!.effort), null);
+  await send('/model gpt-5.6-sol'); assert.equal(inspect(s => s.getActive('owner')!.model), 'gpt-5.6-sol');
+  await send('/effort xhigh', 'other'); assert.equal(inspect(s => s.getActive('other')!.effort), 'xhigh');
   await send('/effort default'); assert.equal(inspect(s => s.getActive('owner')!.effort), null);
 });
 
-test('Claude rejects Codex xhigh and unconfirmed model capability, accepts native supported levels', async t => {
+test('Claude accepts its CLI levels independently of model metadata', async t => {
   const { f, send, inspect } = fixture(t);
   f.claude.metadata = async () => ({ defaultModel: 'sonnet', models: [{ id: 'sonnet', displayName: 'Sonnet', supportedEfforts: ['low', 'medium', 'high'] }, { id: 'haiku', displayName: 'Haiku', supportedEfforts: [] }] });
-  await send('/agent claude'); await send('/effort xhigh'); assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+  await send('/agent claude'); await send('/effort xhigh'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'xhigh');
   await send('/effort high'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'high');
-  await send('/model haiku'); assert.equal(inspect(s => s.getActive('owner')!.model), null);
-  await send('/effort max'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'high');
+  await send('/model haiku'); assert.equal(inspect(s => s.getActive('owner')!.model), 'haiku');
+  await send('/effort max'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'max');
+  await send('/effort ultra'); assert.equal(inspect(s => s.getActive('owner')!.effort), 'max');
   await send('/effort default'); await send('/model custom unknown'); await send('/effort high');
-  assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+  assert.equal(inspect(s => s.getActive('owner')!.effort), 'high');
 });
 
 test('effort lookup races cannot overwrite a changed session or newly queued work', async t => {
   const { f, send, inspect } = fixture(t);
   await send('/model gpt-6.1-sol');
-  let accept!: (info: AgentModelInfo) => void;
-  f.codex.metadata = () => new Promise(resolve => { accept = resolve; });
-  const setting = send('/effort xhigh'); await waitFor(() => !!accept);
-  await send('queued'); accept(catalog); await setting;
-  assert.equal(inspect(s => s.getActive('owner')!.effort), null);
+  f.codex.metadata = async () => { throw new Error('不应为强度查询目录'); };
+  await send('/effort xhigh'); await send('queued');
+  assert.equal(inspect(s => s.getActive('owner')!.effort), 'xhigh');
+  await send('/effort high');
+  assert.equal(inspect(s => s.getActive('owner')!.effort), 'xhigh');
   await waitFor(() => f.codex.calls.length === 1);
 });
 
@@ -399,8 +400,8 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 强度元数据
   const adapter = f[agent]; const generated = adapter.calls.length;
   adapter.metadata = async () => { throw new Error('模型元数据查询超时'); };
   await send('/effort');
-  assert.match(f.replies.at(-1)!.text, agent === 'claude' ? /CLI 尚未提供/ : /查询超时/);
-  await send(`/effort ${selected}`); assert.match(f.replies.at(-1)!.text, /命令失败.*查询超时/);
+  assert.match(f.replies.at(-1)!.text, /Agent 强度参数/);
+  await send(`/effort ${selected}`); assert.match(f.replies.at(-1)!.text, /已设置/);
   assert.equal(inspect(s => s.getActive('owner')!.effort), selected);
   assert.equal(inspect(s => s.getActive('owner')!.nativeId), nativeId);
   assert.equal(adapter.calls.length, generated);

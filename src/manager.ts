@@ -1,6 +1,6 @@
 import { NumberedChoiceError, NumberedChoices } from './numbered-choices.js';
 import { promptShortcut, readPromptShortcuts } from './prompt-shortcuts.js';
-import { effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
+import { agentEffortProtocol, effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -872,8 +872,9 @@ export class SessionManager {
   private async handleEffort(message: BridgeMessage, argument: string, reply: (text: string) => Promise<void>): Promise<void> {
     const target = this.ensureActive(message.userId);
     if (!argument || argument === 'list') {
-      const info = await this.modelInfo(target);
-      await reply(`${target.agent}\n${this.modelStatus(target)}\n当前模型支持强度：${effortCapabilityText(modelEffortCapability(info, target))}\n/effort level 设置；/effort default 使用 CLI 默认。`);
+      let info: AgentModelInfo = { models: [], defaultModel: target.model ?? null };
+      try { info = await this.modelInfo(target); } catch { /* 模型参考不可用不影响 Agent 参数列表。 */ }
+      await reply(`${target.agent}\n${this.modelStatus(target)}\nAgent 强度参数：${agentEffortProtocol[target.agent].levels?.join('、') ?? '合法强度字符串（由 Codex CLI 接收）'}\n模型能力参考（不阻止传参）：${effortCapabilityText(modelEffortCapability(info, target))}\n/effort level 设置；/effort default 使用 CLI 默认。`);
       return;
     }
     const busy = () => this.running.get(message.userId)?.conversationId === target.id || this.workers.has(target.id) || this.store.pendingCount(target.id) > 0;

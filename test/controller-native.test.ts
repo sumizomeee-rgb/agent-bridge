@@ -785,8 +785,8 @@ test('Codex controller validates on its own initialized connection and reuses un
     const first = await s.adapter.run(turn); turn.conversation.nativeId = first.nativeId;
     const transport = s.transports[0]!;
     const methods = transport.written.map(m => m.method);
-    assert(methods.indexOf('initialize') < methods.indexOf('model/list'));
-    assert(methods.indexOf('model/list') < methods.indexOf('thread/start'));
+    assert.equal(methods.includes('model/list'), false);
+    assert(methods.indexOf('initialize') < methods.indexOf('thread/start'));
     assert(methods.indexOf('thread/start') < methods.indexOf('turn/start'));
     const reads = methods.filter(m => m === 'model/list').length;
     await s.adapter.run(turn);
@@ -799,7 +799,7 @@ test('Codex controller validates on its own initialized connection and reuses un
     assert.equal(s.metadataReads, 1);
     await s.adapter.run(turn);
     assert.equal(s.transports.length, 2); assert.equal(transport.stopped, true); assert.equal(s.metadataReads, 1);
-    assert(s.transports[1]!.written.some(m => m.method === 'model/list'));
+    assert.equal(s.transports[1]!.written.some(m => m.method === 'model/list'), false);
     assert.equal((s.transports[1]!.written.find(m => m.method === 'thread/resume')!.params as JsonObject).threadId, first.nativeId);
   } finally { await s.cleanup(); }
 });
@@ -807,7 +807,7 @@ test('Codex controller validates on its own initialized connection and reuses un
 test('Codex controller keeps unsupported effort out of thread and turn submission', async () => {
   const s = setup(); s.disableMetadata();
   try {
-    const turn = s.makeTurn(); turn.conversation.model = 'gpt-6.1-sol'; turn.conversation.effort = 'ultra';
+    const turn = s.makeTurn(); turn.conversation.model = 'gpt-6.1-sol'; turn.conversation.effort = 'invalid!';
     await assert.rejects(s.adapter.run(turn), /不支持/);
     assert.equal(s.metadataReads, 0); assert.equal(s.transports.length, 1);
     assert(s.transports[0]!.stopped);
@@ -840,7 +840,8 @@ test('controller effort changes resume original native thread and read CLI setti
     assert.equal(resumed.config, undefined);
     const start = s.transports[2]!.written.find(m => m.method === 'turn/start')!.params as JsonObject;
     assert.equal(start.effort, undefined);
-    turn.conversation.effort = 'ultra'; await assert.rejects(s.adapter.run(turn), /不支持/);
+    turn.conversation.effort = 'future-level'; await s.adapter.run(turn);
+    assert.equal((s.transports.at(-1)!.written.find(m => m.method === 'turn/start')!.params as JsonObject).effort, 'future-level');
   } finally { await s.cleanup(); }
 });
 
@@ -895,11 +896,12 @@ test('Claude controller passes its own effort with same native resume and leaves
     assert.equal(launches[0]![launches[0]!.indexOf('--effort') + 1], 'high');
     assert.equal(launches[0]![launches[0]!.indexOf('--resume') + 1], 'claude-original');
     assert.deepEqual(reports, [null]);
-    assert.equal(metadataReads, 1);
+    assert.equal(metadataReads, 0);
     assert.equal((await adapter.run(turn)).nativeId, 'claude-original');
-    assert.equal(metadataReads, 1); assert.equal(launches.length, 1);
-    turn.conversation.effort = 'xhigh'; await assert.rejects(adapter.run(turn), /不支持/);
-    assert.equal(launches.length, 1);
+    assert.equal(metadataReads, 0); assert.equal(launches.length, 1);
+    turn.conversation.effort = 'xhigh'; await adapter.run(turn);
+    assert.equal(launches.at(-1)![launches.at(-1)!.indexOf('--effort') + 1], 'xhigh');
+    turn.conversation.effort = 'ultra'; await assert.rejects(adapter.run(turn), /不支持/);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

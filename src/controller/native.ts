@@ -282,7 +282,6 @@ export class NativeControllerAdapter implements AgentAdapter {
         : { ...params, ephemeral: false, environments: [], selectedCapabilityRoots: [], dynamicTools: codexDynamicTools(this.options.internalBotCommunicationEnabled) }, 20000);
       if (!isObject(response.thread) || typeof response.thread.id !== 'string' || (prior && response.thread.id !== prior)) throw new Error('Codex 主控续接返回了不同会话；原会话已保留。');
       if (typeof response.modelProvider !== 'string' || response.modelProvider !== provider) throw new Error('Codex 主控回报的供应商与当前配置不一致；原会话已保留，本轮未提交。');
-      if (selectedEffort(turn) && typeof response.model === 'string' && response.model !== turn.conversation.model) session.effortCapability = await validateEffort(this, { ...turn.conversation, model: response.model }, selectedEffort(turn)!);
       session.nativeId = response.thread.id; turn.onNativeId?.(session.nativeId);
       if (typeof response.model === 'string') { session.model = response.model; turn.onModel?.(session.model); }
       if (!selectedEffort(turn) && (typeof response.reasoningEffort === 'string' || response.reasoningEffort === null)) { session.effort = response.reasoningEffort; turn.onReasoningEffort?.(session.effort); }

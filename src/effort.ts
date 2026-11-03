@@ -42,23 +42,24 @@ export function effortCapabilityText(capability: EffortCapability): string {
 ${capability.resolvedModel ? `别名解析：${capability.resolvedModel}；` : ''}能力信息不代表网关实际执行已验证。`;
 }
 
-export async function validateEffort(adapter: AgentAdapter, target: Conversation, effort: string): Promise<EffortCapability> {
-  if (!isEffortLevel(effort)) throw new Error(`${target.agent} 不支持强度 ${effort}。`);
-  const info = await adapter.getModelInfo?.(target.cwd, target);
-  const capability = modelEffortCapability(info ?? { models: [], defaultModel: null }, target);
-  if (capability.status === 'unknown') {
-    // Claude 允许传入 CLI 支持的值；模型兼容性及实际执行强度仍保持未知。
-    if (target.agent === 'claude') {
-      if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
-        throw new Error(`Claude CLI 不支持强度 ${effort}；可用值：low、medium、high、xhigh、max。`);
-      }
-      return capability;
-    }
-    throw new Error('CLI 未提供该模型的有效强度元数据，不能确认兼容性；请使用 effort=default 或选择有元数据的模型。');
+/** 强度属于目标 Agent 的原生协议；模型目录仅用于展示，不能决定网关兼容性。 */
+export const agentEffortProtocol = {
+  codex: { levels: null, parameter: 'model_reasoning_effort / turn/start.effort' },
+  claude: { levels: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: '--effort' },
+} satisfies Record<AgentName, { levels: readonly string[] | null; parameter: string }>;
+
+export function validateAgentEffort(agent: AgentName, effort: string): void {
+  const protocol = agentEffortProtocol[agent];
+  // 当前 Codex app-server 的 ReasoningEffort 是字符串，不是固定档位枚举。
+  if (!isEffortLevel(effort) || protocol.levels && !protocol.levels.includes(effort)) {
+    throw new Error(`${agent} CLI 不支持强度 ${effort}；${protocol.levels ? `可用值：${protocol.levels.join('、')}` : '须为合法强度参数'}。`);
   }
-  if (capability.status !== 'supported') throw new Error('该模型不支持可调 effort；请使用 effort=default。');
-  if (!capability.levels.includes(effort)) throw new Error(`该模型不支持 ${effort}；支持值：${capability.levels.join('、')}。`);
-  return capability;
+}
+
+export async function validateEffort(_adapter: AgentAdapter, target: Conversation, effort: string): Promise<EffortCapability> {
+  validateAgentEffort(target.agent, effort);
+  // 接受参数不构成目标模型或网关已支持的证据，也不发起模型目录查询。
+  return normalizeEffortCapability(target.agent, undefined, { source: `${target.agent}-cli-argument`, modelId: target.model ?? null });
 }
 
 /** Explicit default is resolved per launch, never persisted as a model ID. */

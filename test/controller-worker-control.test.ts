@@ -176,7 +176,7 @@ test('conversational non-default dispatch independently selects child model and 
 test('invalid worker selections reject before enqueuing while explicit defaults remain child-scoped', async () => {
   const f = setup();
   try {
-    await assert.rejects(launch(f, { effort: 'invented' }), /不支持/);
+    await assert.rejects(launch(f, { effort: 'invalid!' }), /不支持/);
     await assert.rejects(launch(f, { model: '--bad model' }), /模型/);
     await assert.rejects(launch(f, { agent: 'claude', effort: 'ultra' }), /不支持/);
     assert.equal(f.runtime.store.jobs().length, 0);
@@ -344,61 +344,43 @@ test('worker overview excludes other users and shows actual running-round start,
 });
 
 
-test('model/effort incompatibility rejects before start/next persistence and never changes active work', async () => {
+test('陌生模型目录不拒绝显式强度；续聊清覆盖保留原生ID', async () => {
   const f = setup();
   try {
-    for (const model of ['unsupported', 'unknown']) {
-      await assert.rejects(launch(f, { model, effort: 'high' }), /不支持|不能确认/);
-      assert.equal(f.runtime.store.workers().length, 0); assert.equal(f.runtime.store.jobs().length, 0);
-    }
-    const h = await launch(f); await flush();
+    f.codex.getModelInfo = async () => { throw new Error('强度不查询模型目录'); };
+    const h = await launch(f, { model: 'custom-terra', effort: 'xhigh' }); await flush();
     const before = structuredClone(f.runtime.store.getWorker(h.workerId)!);
-    for (const model of ['unsupported', 'unknown']) {
-      await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'invalid next', delivery: 'next', model }), /不支持|不能确认/);
-      assert.deepEqual(f.runtime.store.getWorker(h.workerId), before); assert.equal(f.runtime.store.jobs().length, 1);
-    }
-    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'current change', model: 'gpt-6-astra' }), /delivery=next/);
-    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'default next', delivery: 'next', model: 'default', effort: 'default' }) as Handle;
-    assert.deepEqual(f.runtime.store.getJob(next.jobId!)!.execution, { model: 'gpt-6.1-sol', effort: null });
-    assert.deepEqual(f.runtime.store.getWorker(h.workerId), { ...before, updatedAt: f.runtime.store.getWorker(h.workerId)!.updatedAt });
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'current change', model: 'custom-next' }), /delivery=next/);
+    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'default next', delivery: 'next', model: 'custom-next', effort: 'default' }) as Handle;
+    assert.deepEqual(f.runtime.store.getJob(next.jobId!)!.execution, { model: 'custom-next', effort: null });
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.effort, 'xhigh');
     f.codex.finish(h.workerId); await flush(); await flush();
-    assert.equal(f.runtime.store.getWorker(h.workerId)!.model, 'gpt-6.1-sol');
-    assert.equal(f.runtime.store.getWorker(h.workerId)!.modelPolicy, undefined);
+    assert.equal(f.runtime.store.getWorker(h.workerId)!.effort, null);
     assert.equal(f.codex.turns[1]!.conversation.nativeId, before.nativeId);
     f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }
 });
 
-test('queued capability changes fail before applying the snapshot or launching another turn', async () => {
+test('排队后模型目录变化不降低指定强度或阻止CLI调用', async () => {
   const f = setup();
   try {
     const h = await launch(f); await flush();
-    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', {
-      workerId: h.workerId, prompt: 'next with changed model', delivery: 'next', model: 'gpt-6-astra', effort: 'high',
-    }) as Handle;
-    const before = structuredClone(f.runtime.store.getWorker(h.workerId)!);
-    f.codex.getModelInfo = async () => ({ defaultModel: 'gpt-6.1-sol', models: [
-      { id: 'gpt-6-astra', displayName: 'Changed capability', supportedEfforts: [] },
-    ] });
+    const next = await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'next', delivery: 'next', model: 'custom-next', effort: 'high' }) as Handle;
+    f.codex.getModelInfo = async () => { throw new Error('目录不可用'); };
     f.codex.finish(h.workerId); await flush(); await flush();
-    assert.equal(f.runtime.store.getJob(next.jobId!)!.status, 'failed');
-    assert.match(f.runtime.store.getJob(next.jobId!)!.result!, /不支持可调/);
-    assert.deepEqual(f.runtime.store.getWorker(h.workerId), before);
-    assert.equal(f.codex.turns.length, 1);
+    assert.equal(f.runtime.store.getJob(next.jobId!)!.status, 'running');
+    assert.equal(f.codex.turns.length, 2); assert.equal(f.codex.turns[1]!.effort, 'high');
+    f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }
 });
 
-test('capability lookup racing worker handoff does not enqueue or overwrite ownership', async () => {
+test('已交接worker仍拒绝续聊，不依赖模型能力查询', async () => {
   const f = setup();
   try {
     const h = await launch(f); await flush();
-    let release!: () => void; const query = new Promise<void>(resolve => { release = resolve; });
-    const metadata = f.codex.getModelInfo.bind(f.codex);
-    f.codex.getModelInfo = async () => { await query; return metadata(); };
-    const next = f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'next', delivery: 'next' });
-    await flush(); const worker = f.runtime.store.getWorker(h.workerId)!; worker.ownership = 'user'; f.runtime.store.saveWorker(worker);
-    release(); await assert.rejects(next, /交接给用户/); assert.equal(f.runtime.store.jobs().length, 1);
-    assert.equal(f.runtime.store.getWorker(h.workerId)!.ownership, 'user');
+    const worker = f.runtime.store.getWorker(h.workerId)!; worker.ownership = 'user'; f.runtime.store.saveWorker(worker);
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: h.workerId, prompt: 'next', delivery: 'next' }), /交接给用户/);
+    assert.equal(f.runtime.store.jobs().length, 1);
     f.codex.finish(h.workerId); await flush();
   } finally { await f.cleanup(); }
 });

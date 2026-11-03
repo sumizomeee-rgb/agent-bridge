@@ -182,19 +182,15 @@ test('scheduled worker committed before crash starts from its saved queue once a
   } finally { await second?.close(); await f.runtime.close(); f.registry.close(); }
 });
 
-test('reset during model validation prevents a late schedule registration', async () => {
+test('预约显式强度不依赖目录；已结束父轮不能再登记', async () => {
   const f = fixture();
   try {
-    let entered!: () => void, release!: () => void;
-    const validating = new Promise<void>(resolve => { entered = resolve; });
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    const info = await f.codex.getModelInfo();
-    f.codex.getModelInfo = async () => { entered(); await gate; return info; };
-    const creating = f.runtime.invoke(f.turn, 'bridge_schedule_worker', { afterSeconds: 30, title: '晚到登记', prompt: '不能创建' });
-    const rejected = assert.rejects(creating, /本轮已结束/);
-    await validating; await f.runtime.detachConversation('parent-A'); release(); await rejected;
-    f.advance(31000); await f.runtime.poll();
-    assert.equal(f.runtime.store.schedules().length, 0); assert.equal(f.codex.turns.length, 0);
+    f.codex.getModelInfo = async () => { throw new Error('强度不查询目录'); };
+    const plan = await f.runtime.invoke(f.turn, 'bridge_schedule_worker', { model: 'custom-terra', effort: 'xhigh', afterSeconds: 30, title: '预约', prompt: '短任务' }) as { scheduleId: string };
+    assert.equal(f.runtime.store.getSchedule(plan.scheduleId)!.worker!.effort, 'xhigh');
+    await f.runtime.detachConversation('parent-A');
+    await assert.rejects(f.runtime.invoke(f.turn, 'bridge_schedule_worker', { afterSeconds: 30, title: '晚到登记', prompt: '不能创建' }), /本轮已结束/);
+    assert.equal(f.runtime.store.schedules().length, 1); assert.equal(f.codex.turns.length, 0);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 

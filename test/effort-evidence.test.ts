@@ -46,7 +46,7 @@ test('effort capability levels come only from the selected backend adapter and a
   const capability = normalizeEffortCapability('claude', ['low', 'xhigh'], { source: 'cli-models', modelId: 'custom' }); assert.equal(capability.status, 'supported');
   const target: AgentTurn['conversation'] = { id: 'c', userId: 'u', agent: 'claude', nativeId: null, model: 'custom', cwd: '.', title: '', createdAt: '', updatedAt: '' };
   const adapter = { async run(): Promise<never> { throw Error('no generation'); }, async close() {}, async interrupt() {}, async getModelInfo() { return { defaultModel: 'custom', models: [{ id: 'custom', displayName: 'Custom', effortCapability: capability }] }; } };
-  assert.equal((await validateEffort(adapter, target, 'xhigh')).status, 'supported'); await assert.rejects(validateEffort(adapter, target, 'ultra'), /不支持 ultra/);
+  assert.equal((await validateEffort(adapter, target, 'xhigh')).status, 'unknown'); await assert.rejects(validateEffort(adapter, target, 'ultra'), /不支持强度 ultra/);
 });
 
 test('Claude only observes explicit response effort and never infers a level from model names or thinking', () => {

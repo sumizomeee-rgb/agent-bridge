@@ -1,5 +1,5 @@
 import { isModelId } from '../config.js';
-import { isEffortLevel } from '../effort.js';
+import { isEffortLevel, validateAgentEffort } from '../effort.js';
 import type { AgentName } from '../types.js';
 
 /** Per Bot and per machine. A follow policy is dynamic, never a model snapshot. */
@@ -25,6 +25,7 @@ export function workerChoice(value: unknown, allowFollow = false): WorkerChoice 
   if (args.kind === 'ordinary') {
     if (args.agent !== 'codex' && args.agent !== 'claude') throw new Error('普通助手须明确指定 codex 或 claude。');
     if (typeof args.model !== 'string' || args.model === 'default' || !isModelId(args.model)) throw new Error('普通助手须明确指定模型，不能用 model=default 代替助手选择。');
+    if (effort) validateAgentEffort(args.agent, effort);
     return { kind: 'ordinary', agent: args.agent, model: args.model, effort };
   }
   if (args.kind === 'preset') {
