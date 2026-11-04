@@ -1,6 +1,7 @@
 import { harnessText } from '../harness.js';
 import { claudeModelSettings, createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { workspaceDocuments } from './workspace-documents.js';
+import { refreshControllerCodexLogin } from './codex-credentials.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, lstatSync, statSync, appendFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -239,6 +240,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       const sourceConfig = userFiles[0]!;
       writeFileSync(join(home, 'config.toml'), isolatedCodexConfig(existsSync(sourceConfig) ? readFileSync(sourceConfig, 'utf8') : ''), 'utf8');
       this.copyCredential(userFiles[1]!, join(home, 'auth.json'));
+      refreshControllerCodexLogin(userFiles[1]!, join(home, 'auth.json'));
     } else {
       for (const file of userFiles.slice(1)) this.copyCredential(file, join(home, file.endsWith('.credentials.json') ? '.credentials.json' : '.claude.json'));
     }

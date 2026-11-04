@@ -321,6 +321,26 @@ test('CC Switch changes rebuild the process while retaining the original native 
     assert.equal(resumed.threadId, first.nativeId); assert.equal(resumed.modelProvider, 'current-provider');
   } finally { await s.cleanup(); }
 });
+test('Codex new controller inherits a refreshed login and still honors an explicit API-key switch', async () => {
+  const s = setup();
+  const login = (expires: number) => JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'test-account',
+    access_token: 'test.' + Buffer.from(JSON.stringify({ exp: expires })).toString('base64url') + '.test', refresh_token: 'test-' + expires } });
+  const source = join(s.userHome, '.codex', 'auth.json');
+  const expired = login(Math.floor(Date.now() / 1000) - 3600), fresh = login(Math.floor(Date.now() / 1000) + 86400);
+  writeFileSync(source, expired);
+  try {
+    await s.adapter.run(s.makeTurn());
+    writeFileSync(join(s.launches[0]!.env.CODEX_HOME!, 'auth.json'), fresh);
+    const next = s.makeTurn(); next.conversation.id = 'conversation-2';
+    await s.adapter.run(next);
+    assert.equal(readFileSync(join(s.launches[1]!.env.CODEX_HOME!, 'auth.json'), 'utf8'), fresh);
+    const key = '{"OPENAI_API_KEY":"test-placeholder"}'; writeFileSync(source, key);
+    const switched = s.makeTurn(); switched.conversation.id = 'conversation-3';
+    await s.adapter.run(switched);
+    assert.equal(readFileSync(join(s.launches[2]!.env.CODEX_HOME!, 'auth.json'), 'utf8'), key);
+  } finally { await s.cleanup(); }
+});
+
 test('source auth deletion clears the isolated credential instead of retaining a stale login', async () => {
   const s = setup(); const auth = join(s.userHome, '.codex', 'auth.json'); writeFileSync(auth, '{"OPENAI_API_KEY":"isolated-test-placeholder"}');
   try {
