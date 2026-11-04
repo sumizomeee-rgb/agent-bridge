@@ -133,11 +133,12 @@ export function workerOverview(items: readonly WorkerOverview[], scope: 'current
       const model = item.model ? clean(item.model, 60).replace(/^gpt-/i, '') : '模型未知';
       const effort = workerEffort(item);
       const status = item.archivedAt && item.processStopped === true && !item.running && !item.queued ? '📁 已归档' : ['uncertain', 'handoff-pending', 'handed-off', 'retiring'].includes(item.status) ? states[item.status] : item.running ? states.running : item.queued ? states.queued : states[item.status];
-      const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? '尚未开始' : '耗时未回报';
+      const elapsed = item.status === 'uncertain' ? '耗时未知' : item.running ? elapsedText(item.startedAt, now) : item.endedAt ? elapsedText(item.startedAt, Date.parse(item.endedAt)) : item.queued ? item.resultKnown && item.processStopped === false ? '等待上轮 CLI 退出' : '尚未开始' : '耗时未回报';
       const lines = [`${index + 1}. ${dispatchLabel(item)} · ${clean(item.targetId === 'local' ? '桥电脑' : item.targetLabel, 40)} · ${agentLabel(item.agent)} · ${model} · ${effort} · ${shortWorkerId(item, items)}`,
         `${status} · ${elapsed}${item.queued ? ` · 等待${item.queued}轮` : ''}`, `任务：${clean(item.title, 70)}`];
       if (scope === 'all') lines.push(`主控：${clean(item.conversationTitle ?? item.conversationId, 40)}`);
       if (item.archivedAt) lines.push(`归档：${clean(item.archiveReason ?? '已确认停止，保留异常历史', 80)}`);
+      if (item.status === 'queued' && item.statusReason) lines.push(`等待原因：${clean(item.statusReason, 180)}`);
       if (item.blocked || workerReviewEvidence(item) || item.statusReason && ['uncertain', 'failed', 'handoff-pending'].includes(item.status)) lines.push(`${item.status === 'failed' && item.processStopped === true ? '失败原因' : '需核对'}：${workerReviewEvidence(item) ?? clean(item.statusReason ?? '任务已阻塞', 180)}`);
       return { kind: 'entry', text: lines.join('\n') };
     }) : [{ kind: 'text', text: view === 'history' ? `${label}没有历史助手。` : `${label}没有正在执行、排队或待核对的助手。` }], footer: view === 'history' ? '/workers 查看未结束助手 · /workers history details 查看历史详情。' : '/workers history 查看历史 · /workers details 查看完整 ID 与回执。' };

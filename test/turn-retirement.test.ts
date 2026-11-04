@@ -108,13 +108,32 @@ test('桥先交付完成报告并显示收尾；同一 worker 后续排队，退
     assert.equal(waiting.startedAt, null); assert.equal(waiting.endedAt, null); assert.equal(isActiveWorker(waiting), true);
     const displayed = formatWorkerOverview([waiting], 'current');
     assert.match(displayed, /等待执行/); assert.match(displayed, /明确的新任务/);
-    assert.doesNotMatch(displayed, /本轮完成|CLI 收尾中|独立任务/);
+    assert.match(displayed, /等待上轮 CLI 退出/); assert.match(displayed, /CLI 收尾未确认/);
+    assert.doesNotMatch(displayed, /尚未开始|独立任务/);
     f.release(); await until(() => f.events.length === 2);
     assert.equal(f.calls.length, 2); assert.equal(f.runtime.store.getJob(first.jobId)!.status, 'completed');
     assert.equal(f.runtime.store.getJob(first.jobId)!.processStopped, true);
     assert.equal(f.calls[1]!.conversation.nativeId, 'native-runtime');
   } finally { f.release(); await f.runtime.close(); f.registry.close(); }
 });
+test('收尾阻塞只在有排队续聊时通知一次主控，重启保留告警去重和原任务结果', async () => {
+  const f = runtimeFixture(); let recovered: ControllerRuntime | undefined, now = Date.now();
+  Object.assign(f.callbacks, { now: () => now });
+  try {
+    const first = await f.runtime.invoke(f.parent, 'bridge_start_worker', { title: '已完成任务', prompt: '原任务' }) as { workerId: string; jobId: string };
+    await until(() => f.events.length === 1);
+    now += 31_000; await f.runtime.poll(); assert.equal(f.events.length, 1);
+    await f.runtime.invoke(f.parent, 'bridge_continue_worker', { workerId: first.workerId, prompt: '真实后续任务' });
+    await f.runtime.poll(); assert.equal(f.events.length, 2); assert.match(f.events[1]!.text, /后续续聊尚未执行/);
+    await f.runtime.poll(); assert.equal(f.events.length, 2); assert.equal(f.calls.length, 1);
+    assert.equal(f.runtime.store.getJob(first.jobId)!.status, 'completed');
+    await f.runtime.close();
+    recovered = new ControllerRuntime(f.config, { codex: f.adapter, claude: f.adapter }, f.registry, f.callbacks);
+    await recovered.start(); await recovered.poll(); assert.equal(f.events.length, 2); assert.equal(f.calls.length, 1);
+    f.release(); await until(() => f.calls.length === 2); await pause(); assert.equal(f.calls.length, 2);
+  } finally { f.release(); await recovered?.close(); await f.runtime.close(); f.registry.close(); }
+});
+
 test('桥重启保留完成报告；新适配器的空 interrupt 不构成停止证明，也不重放旧任务', async () => {
   const f = runtimeFixture(); let recovered: ControllerRuntime | undefined;
   try {

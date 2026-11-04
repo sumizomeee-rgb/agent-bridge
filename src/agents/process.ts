@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { stopCompletedCli } from './completed-cli-stop.js';
 import type { AgentCommand, AgentResult } from '../types.js';
 
 export type JsonObject = Record<string, unknown>;
@@ -59,7 +60,7 @@ export interface AgentStopEvidence {
   taskkillExitCode: number | null;
   durationMs: number;
   phaseMs: Partial<Record<'gracefulWait' | 'treeKill' | 'exitWait' | 'stdioDrain', number>>;
-  completion: 'pending' | 'graceful-exit' | 'tree-stop' | 'transport-closed' | 'not-started' | 'unconfirmed';
+  completion: 'pending' | 'graceful-exit' | 'cli-stop' | 'tree-stop' | 'transport-closed' | 'not-started' | 'unconfirmed';
 }
 
 /** Copy only diagnostic metadata, never commands, environment or output. */
@@ -72,7 +73,7 @@ export function stopEvidenceFromError(error: unknown): AgentStopEvidence | undef
     || typeof value.taskkillAttempted !== 'boolean' || !number(value.durationMs)
     || !code(value.exitCode) || !code(value.taskkillExitCode)
     || !(value.signalCode === null || typeof value.signalCode === 'string')
-    || !['pending', 'graceful-exit', 'tree-stop', 'transport-closed', 'not-started', 'unconfirmed'].includes(String(value.completion))) return undefined;
+    || !['pending', 'graceful-exit', 'cli-stop', 'tree-stop', 'transport-closed', 'not-started', 'unconfirmed'].includes(String(value.completion))) return undefined;
   const phaseMs: AgentStopEvidence['phaseMs'] = {};
   for (const key of ['gracefulWait', 'treeKill', 'exitWait', 'stdioDrain'] as const) {
     if (isObject(value.phaseMs) && number(value.phaseMs[key])) phaseMs[key] = value.phaseMs[key] as number;
@@ -107,11 +108,20 @@ export function processStopFailure(error: unknown, result = completedResultFromE
 }
 
 /** 原生成功回执与 CLI 收尾独立；失败只保留诊断，退出证明前仍由适配器持有会话。 */
-export function retireCompletedTurn(transport: Pick<JsonLineProcess, 'stop'> & Partial<Pick<JsonLineProcess, 'stopEvidence'>>,
+export function retireCompletedTurn(transport: Pick<JsonLineProcess, 'stop'> & Partial<Pick<JsonLineProcess, 'stopEvidence' | 'retireCompleted' | 'onStopped'>>,
   result: AgentResult, stopped: () => void): void {
   result.processStopped = false;
+  let released = false, removeStopped: (() => void) | undefined;
+  const release = () => {
+    if (released) return;
+    released = true; result.processStopped = true;
+    if (transport.stopEvidence) result.stopEvidence = transport.stopEvidence;
+    removeStopped?.();
+    try { stopped(); } catch (error) { result.cleanupError = safeError(error instanceof Error ? error.message : error, 'CLI 收尾资源清理未完成'); }
+  };
+  removeStopped = transport.onStopped?.(release);
   void (async () => {
-    try { await transport.stop(true); result.processStopped = true; stopped(); }
+    try { await (transport.retireCompleted?.() ?? transport.stop(true)); release(); }
     catch (error) { result.cleanupError = safeError(error instanceof Error ? error.message : error, 'CLI 收尾未确认'); }
     finally { if (transport.stopEvidence) result.stopEvidence = transport.stopEvidence; }
   })();
@@ -143,8 +153,10 @@ export class JsonLineProcess {
   private readonly phaseMs: AgentStopEvidence['phaseMs'] = {};
   private completion: AgentStopEvidence['completion'] = 'pending';
   private stopConfirmed = false;
+  private completedStop: Promise<void> | null = null;
+  private completedStopRequested = false;
 
-  constructor(command: AgentCommand, extraArgs: string[], cwd: string, env: NodeJS.ProcessEnv,
+  constructor(private readonly command: AgentCommand, extraArgs: string[], cwd: string, env: NodeJS.ProcessEnv,
     private readonly stopHelper?: (script: string, command: string) => ChildProcessWithoutNullStreams) {
     this.child = spawn(command.command, [...command.args, ...extraArgs], {
       cwd, env: { ...process.env, ...env }, shell: false, windowsHide: true,
@@ -165,7 +177,7 @@ export class JsonLineProcess {
       this.exited.resolve();
       // A descendant may still own stdout/stderr after the actual CLI exits.
       const timer = setTimeout(() => {
-        if (this.gracefulRetirement && !this.forceRequested) this.establishStop('graceful-exit');
+        if (this.gracefulRetirement && !this.forceRequested && !this.completedStopRequested) this.establishStop('graceful-exit');
         else if (!this.closed.settled) this.fail(new Error(`Agent 进程已断开（退出码 ${code ?? '无'}，信号 ${signal ?? '无'}）。`));
       }, 100);
       timer.unref();
@@ -244,7 +256,7 @@ export class JsonLineProcess {
   confirmStopped(): boolean {
     if (!this.stopConfirmed) {
       if (this.exited.settled && this.treeKillSucceeded) this.establishStop('tree-stop');
-      else if (this.exited.settled && this.gracefulRetirement && !this.forceRequested) this.establishStop('graceful-exit');
+      else if (this.exited.settled && this.gracefulRetirement && !this.forceRequested && !this.completedStopRequested) this.establishStop('graceful-exit');
       else if (this.closed.settled && !this.child.pid) this.establishStop('not-started');
     }
     return this.stopConfirmed;
@@ -298,6 +310,28 @@ export class JsonLineProcess {
     if (this.forceRequested) return this.requestForcedStop();
     this.lastGraceful = true; this.gracefulRetirement = true;
     return this.gracefulStop ??= this.stopGraceful();
+  }
+
+  /** Successful native result only; explicit cancellation retains its separate tree-stop contract. */
+  retireCompleted(): Promise<void> {
+    if (this.confirmStopped()) return Promise.resolve();
+    return this.completedStop ??= (async () => {
+      try { await this.stop(true); return; } catch (error) { if (this.forceRequested) throw error; }
+      if (this.confirmStopped()) return;
+      this.completedStopRequested = true;
+      const cleanup = await stopCompletedCli(this.child, this.command);
+      if (this.forceRequested) { await this.forcedStop; return; }
+      if (!cleanup.authorized) this.completedStopRequested = false;
+      await within(this.exited.promise, 1000);
+      if (!cleanup.authorized && this.exited.settled) {
+        this.confirmStopped(); return;
+      }
+      if (!cleanup.stopped || !this.exited.settled) throw new AgentProcessStopError(this.child.pid, undefined,
+        cleanup.reason ? { cause: new Error(cleanup.reason) } : undefined, this.stopEvidence);
+      this.lastGraceful = false;
+      await within(this.closed.promise, 100);
+      this.establishStop('cli-stop');
+    })();
   }
 
   private unknownStop(): AgentProcessStopError {
@@ -442,7 +476,7 @@ export class JsonRpcTimeoutError extends Error {
   constructor(readonly method: string) { super(`Codex ${method} 等待响应超时。`); this.name = 'JsonRpcTimeoutError'; }
 }
 
-export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'canRetryStop'>>;
+export type RpcTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'canRetryStop' | 'retireCompleted'>>;
 
 export class JsonRpcClient {
   private nextId = 1;

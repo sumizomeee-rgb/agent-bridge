@@ -336,6 +336,7 @@ export class ControllerRuntime {
         ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
         ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
+          : !active && nextQueued && this.retirementPending(worker.id) ? { statusReason: '上一轮已完成，CLI 收尾未确认；后续指令尚未执行' }
           : latest?.cancelReason ? { statusReason: latest.cancelReason }
           : latest?.interrupted ? { statusReason: latest.result ?? '本轮执行失败，退出已确认；主控可核对后续接。' } : {}),
         lastResultPreview: latest?.result == null ? null : listText(latest.result, 180),
@@ -1464,7 +1465,9 @@ export class ControllerRuntime {
       for (const job of this.store.jobs(worker!.id).filter(job => job.status === 'uncertain' && job.processStopped !== true || ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false)) {
         try {
           if (await this.adapter(worker!).confirmStopped?.(worker!.id, job.id) !== true
-            && !(worker!.target?.transport !== 'ssh' && ['completed', 'failed'].includes(job.status) && !!job.nativeResult && this.localExitConfirmed(job))) continue;
+            && !(worker!.target?.transport !== 'ssh' && ['completed', 'failed'].includes(job.status) && !!job.nativeResult && this.localExitConfirmed(job))) {
+            await this.notifyRetirementBlocked(worker, job); continue;
+          }
           const current = this.store.getJob(job.id);
           if (current && ['uncertain', 'completed', 'failed'].includes(current.status) && current.processStopped !== true)
             this.store.setJob(current.id, current.status, { processStopped: true, ...(current.status !== 'uncertain' && current.nativeResult ? { nativeResult: { ...current.nativeResult, processStopped: true } } : {}) });
@@ -1478,6 +1481,22 @@ export class ControllerRuntime {
       // Rotate unresolved guards so a persistently unreachable machine cannot starve later ones.
       if (this.unconfirmedStops.has(worker!.id)) { this.unconfirmedStops.delete(worker!.id); this.unconfirmedStops.add(worker!.id); }
     }
+  }
+  private async notifyRetirementBlocked(worker: ControllerWorker, job: ControllerJob): Promise<void> {
+    if (!job.nativeResult || !['completed', 'failed'].includes(job.status) || job.processStopped !== false
+      || this.now() - Date.parse(job.updatedAt) < 30_000 || !this.store.nextJob(worker.id)
+      || (job.wakeAllowed ?? worker.wakeAllowed) === false || job.cancelReason || worker.ownership === 'user'
+      || worker.handoffPending || this.store.isConversationPaused(job.origin.conversationId) || this.isDraining()) return;
+    const hash = createHash('sha256').update(`retirement-blocked:${job.id}`).digest('hex').slice(0, 32);
+    const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20)}`;
+    if (this.registry.getTask(id)) return;
+    const context = this.registry.createContext({ ...job.origin, purpose: 'host-event' });
+    try {
+      this.registry.register(JSON.parse(readFileSync(context.contextPath, 'utf8')) as TaskContextFile, '助手 CLI 收尾受阻', id);
+      const changed = this.registry.acceptObservedResult(id, 'failed',
+        `workerId: ${worker.id}\njobId: ${job.id}\n原生报告已保存，但 CLI 退出仍未确认，后续续聊尚未执行。未重做已完成操作；同一原生会话的并发锁仍保留。`);
+      if (changed) await this.notify(id);
+    } finally { this.registry.closeContext(context.contextId); }
   }
   private async observeStalls(): Promise<void> {
     if (!this.callbacks.onStall) return;
