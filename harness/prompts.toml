@@ -2176,3 +2176,15 @@ injection = "README 工具目录引用与 bridge_help 短目录"
 activation = "下次装配目录时读取；不提前注入完整参数"
 source = "src/controller/tools/entry.ts:controllerToolIndex"
 text = "确认接受待交接任务。"
+
+[prompts."worker.remote_output_guidance"]
+purpose = "远端新助手的临时产物位置约定"
+audience = "远端执行助手"
+injection = "普通及预设远端助手首次新建时附加；续聊不重复"
+activation = "桥加载派工逻辑需重启；正文下一次取用时读取配置。"
+source = "src/controller/runtime.ts:worker turn"
+text = '''
+
+临时脚本、截图、日志等任务产物统一放在 {{remote_root}}/tmp/<任务名>/；正式工程文件仍放所属项目。
+
+'''

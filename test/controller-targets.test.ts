@@ -286,13 +286,15 @@ test('asynchronous target resolution coalesces stable call IDs and workspace ini
 test('remote current supplements, next-turn continuation and cancellation use the persisted target adapter', async () => {
   const f = fixture();
   try {
-    const a = await launch(f); await flush();
+    const a = await launch(f, { agent: 'codex', model: 'user-alias', effort: 'medium' }); await flush();
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '当前补充' }); await flush();
     assert.equal(f.remote.supplements.length, 1); assert.equal(f.local.supplements.length, 0);
     await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: a.workerId, prompt: '下一轮', delivery: 'next' });
     f.binding.alias = 'changed-registration';
     f.remote.finish(a.workerId); await flush();
     assert.equal(f.remote.turns.length, 2); assert.equal(f.remote.turns[1]!.conversation.nativeId, `remote-${a.workerId}`);
+    assert.ok(f.remote.turns[0]!.text.includes(f.binding.remoteRoot! + '/tmp/<任务名>/'));
+    assert.ok(!f.remote.turns[1]!.text.includes('/tmp/<任务名>/'));
     assert.equal(f.adapters.at(-1)!.alias, 'office-alias');
     const cancelled = await f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: a.workerId }) as { stopped: boolean; scope: string; target: ExecutionTargetBinding };
     assert.equal(cancelled.stopped, true); assert.equal(cancelled.scope, 'remote-agent-process'); assert.equal(cancelled.target.id, 'office');

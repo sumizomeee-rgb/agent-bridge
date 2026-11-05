@@ -1191,7 +1191,7 @@ export class ControllerRuntime {
       const previous = this.store.jobs(worker.id).filter(value => value.id !== job.id && !['queued', 'cancelled'].includes(value.status)).at(-1);
       const recovery = previous?.interrupted ? harnessText('worker.interrupted_recovery') : '';
       const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'housekeeper' ? '' : job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction
-          + (worker.target?.transport === 'ssh' ? '' : workspaceOutputGuidance(this.config.contextWorkspace ?? this.config.workspace))) + recovery + job.prompt, imagePaths: job.imagePaths,
+          + (worker.target?.transport === 'ssh' ? (!worker.nativeId && worker.target.remoteRoot ? harnessText('worker.remote_output_guidance', { remote_root: worker.target.remoteRoot }) : '') : workspaceOutputGuidance(this.config.contextWorkspace ?? this.config.workspace))) + recovery + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), ...(job.origin.purpose === 'housekeeper' ? { readOnly: true } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
         onReady: () => { state.ready = true; this.pumpSupplements(workerId, state); },
         onActivity: activity => {
