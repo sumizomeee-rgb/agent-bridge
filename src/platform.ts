@@ -72,6 +72,7 @@ export class PlatformTransport {
     return this.transport.readForwardedContent(this.transport instanceof FeishuTransport ? message : this.unscoped(message), signal);
   }
   downloadImages(message: IncomingDM): Promise<string[]> { return this.transport.downloadImages(this.transport instanceof FeishuTransport ? message : this.unscoped(message)); }
+  downloadFiles(message: IncomingDM, imagePaths: string[] = []) { return this.transport.downloadFiles(this.transport instanceof FeishuTransport ? message : this.unscoped(message), imagePaths); }
   async markReplyDelivered(messages: Array<Pick<BridgeMessage, 'id' | 'channelId'> & { text?: string; isGroup?: boolean }>): Promise<void> {
     if (this.config.features?.reactions === false) return;
     await this.transport.markReplyDelivered(this.transport instanceof FeishuTransport ? messages : messages.map(message => ({ ...message, id: this.raw(message.id), channelId: this.raw(message.channelId) })));
@@ -84,6 +85,7 @@ export class PlatformTransport {
   setWorkCounts(counts: WorkCounts): void { if (this.transport instanceof DiscordTransport) this.transport.setWorkCounts(counts); }
   async syncSlashCommands(): Promise<void> { if (this.config.features?.nativeCommands !== false) await this.transport.syncSlashCommands(); }
   failureText(error: unknown): string {
+    if (error instanceof Error && error.message.startsWith('附件接收失败：')) return error.message;
     if (this.transport instanceof FeishuTransport && error instanceof Error && /^(附件已收到但未交给模型：|图片超过|图片总量超过|附件内容不是|飞书图片无法下载)/.test(error.message)) return error.message;
     return ingressFailureText(error);
   }

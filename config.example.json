@@ -10,6 +10,10 @@
   "workspaceRoot": ".local/workspaces",
   "dataDir": ".local/data",
   "maxFileBytesByPlatform": { "discord": 20971520, "feishu": 30000000 },
+  "incomingAttachmentLimitsByPlatform": {
+    "discord": { "maxFileBytes": 104857600, "maxTotalBytes": 209715200, "maxAttachments": 10 },
+    "feishu": { "maxFileBytes": 104857600, "maxTotalBytes": 209715200, "maxAttachments": 10 }
+  },
   "commands": {
     "codex": {
       "command": ".local/runtime/win-x64/node.exe",

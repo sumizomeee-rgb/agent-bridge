@@ -1,4 +1,5 @@
 import { configuredFileLimit } from './attachment-limits.js';
+import { incomingFileLimits } from './incoming-files.js';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,6 +65,9 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
     (platformLimits as Record<string, unknown> | undefined)?.[profile.platform] ?? raw.maxFileBytes);
   if (raw.controllerMode != null && typeof raw.controllerMode !== 'boolean') throw new Error('controllerMode 必须是布尔值');
   if (raw.internalBotCommunicationEnabled !== undefined && typeof raw.internalBotCommunicationEnabled !== 'boolean') throw new Error('internalBotCommunicationEnabled 必须是布尔值');
+  const incomingRaw = raw.incomingAttachmentLimitsByPlatform;
+  if (incomingRaw != null && (typeof incomingRaw !== 'object' || Array.isArray(incomingRaw) || Object.keys(incomingRaw).some(key => key !== 'discord' && key !== 'feishu'))) throw new Error('incomingAttachmentLimitsByPlatform 含未知平台或格式无效。');
+  const incomingLimits = Object.fromEntries(['discord', 'feishu'].map(platform => [platform, incomingFileLimits((incomingRaw as Record<string, unknown> | undefined)?.[platform])]));
   const dataDir = localPath(raw.dataDir, '.local/data');
   const scopePrefix = profileScope(profile);
   const config: BridgeConfig = {
@@ -76,6 +80,7 @@ function buildConfig(raw: Record<string, unknown>, profile: BotProfile, portOver
     attachmentsDir: localPath(raw.attachmentsDir, `.local/data/attachments/${profile.name}`),
     logsDir: localPath(raw.logsDir, `.local/logs/${profile.name}`), maxImageBytes: 20 * 1024 * 1024,
     defaultModels, modelOptions, maxFileBytes: maxFileBytes as number,
+    incomingAttachmentLimits: incomingLimits[profile.platform],
     controllerMode: raw.controllerMode === true,
     internalBotCommunicationEnabled: raw.internalBotCommunicationEnabled !== false,
   };

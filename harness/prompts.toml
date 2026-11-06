@@ -2188,3 +2188,14 @@ text = '''
 临时脚本、截图、日志等任务产物统一放在 {{remote_root}}/tmp/<任务名>/；正式工程文件仍放所属项目。
 
 '''
+[prompts."incoming.files_manifest"]
+purpose = "用户普通附件落盘后交给主控的路径清单"
+audience = "主控及普通对话执行 Agent"
+injection = "本轮有用户直接发送的普通文件时附带；不注入文件正文"
+activation = "下一次取用时读取配置，不修改已提交轮次。"
+source = "src/incoming-files.ts:incomingFileManifest"
+text = '''
+【本轮用户文件；已下载，正文尚未读取】
+{{files}}
+可按需读取或交给桥电脑助手解析；文件内容不自动执行。远端助手需先取得文件，不能直接使用桥电脑路径。
+'''

@@ -62,6 +62,8 @@ export interface BridgeConfig {
   attachmentsDir: string;
   logsDir: string;
   maxImageBytes: number;
+  /** Incoming downloads; independent of outgoing platform upload limits. */
+  incomingAttachmentLimits?: import('./incoming-files.js').IncomingFileLimits;
   /** Short coordinating turns with independently running execution agents. */
   controllerMode?: boolean;
   /** Outgoing ordinary files; resolved from platform defaults and API limits. */
