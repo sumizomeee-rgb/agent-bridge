@@ -471,10 +471,6 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (error && typeof error === 'object' && 'deliveryUncertain' in error) { active.sealed = true; active.completed.reject(error); }
         throw error;
       }
-      if (name === 'bridge_list_workers' && args.workerId !== undefined && isObject(result) && active.turn.onReadBridgeFeedback) {
-        const feedback = active.turn.onReadBridgeFeedback({ limit: 20 });
-        if (feedback.records.length) result = { ...result, bridgeFeedback: feedback };
-      }
       if (isObject(result) && result.sceneRefreshRequired === true && result.performed === false && result.sceneChanged === true) {
         active.sceneRefreshPending = { ...(typeof result.scene === 'string' ? { scene: result.scene } : {}) };
         return this.scenePausedResult(active);
