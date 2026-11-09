@@ -63,5 +63,5 @@ export function codexToolContent(value: unknown) {
 export function mcpToolContent(value: unknown) {
   return value instanceof ControllerImageResult
     ? [{ type: 'text', text: JSON.stringify(value.metadata) }, { type: 'image', mimeType: 'image/png', data: value.data }]
-    : [{ type: 'text', text: JSON.stringify(value) }];
+    : [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }];
 }

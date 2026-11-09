@@ -1189,3 +1189,21 @@ test('private runtime facts appear once, refresh on change and keep repeated pri
   assert.ok(context(1).length < 240);
  } finally { await s.cleanup(); }
 });
+
+test('Codex bridge_call file reads pass through compact presentation before native serialization', async () => {
+  const s = setup(); s.setMode('hold');
+  s.holdManagement(Promise.resolve({ path: 'C:\\notes.txt', resolvedPath: 'C:\\notes.txt', encoding: 'utf-8', bytes: 6,
+    sha256: 'a'.repeat(64), totalLines: 1, changedDuringRead: false, next: null, lines: [{ line: 1, startColumn: 1, text: '正文' }] }));
+  try {
+    const running = s.adapter.run(s.makeTurn()); await until(() => s.transports[0]?.turns === 1); const transport = s.transports[0]!;
+    tool(transport, 8800, 'compact-read', 'bridge_call', { command: 'bridge_read_file', arguments: { path: 'C:\\notes.txt' } });
+    await until(() => transport.written.some(value => value.id === 8800 && !value.method));
+    const response = transport.written.find(value => value.id === 8800 && !value.method)!.result as any;
+    assert.equal(response.success, true);
+    const text = JSON.parse(response.contentItems[0].text);
+    assert.equal(typeof text, 'string'); assert.ok(text.includes('\n1|正文\n'));
+    assert.deepEqual(s.invokes, ['bridge_read_file']);
+    tool(transport, 901, 'compact-read-final', 'bridge_call', { command: 'bridge_send_user', arguments: { text: '已核对。' } });
+    await running;
+  } finally { await s.cleanup(); }
+});
