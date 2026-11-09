@@ -59,7 +59,10 @@ export const controllerTools: { name: string; description: string; inputSchema: 
   { name: 'bridge_list_targets', description: harnessText('tools.bridge_list_targets.description'), inputSchema: object({ refresh: { type: 'boolean' }, includePresets: { type: 'boolean', description: harnessText('tools.bridge_list_targets.inputSchema.includePresets.description') }, targetId: string(harnessText('tools.bridge_list_targets.inputSchema.targetId.description')), agent: { type: 'string', enum: ['codex', 'claude'] }, query: string(harnessText('tools.bridge_list_targets.inputSchema.query.description')), details: { type: 'boolean', description: harnessText('tools.bridge_list_targets.inputSchema.details.description') } }) },
   { name: 'bridge_handoff_worker', description: harnessText('tools.bridge_handoff_worker.description'), inputSchema: { ...object({ workerId: string(harnessText('tools.bridge_handoff_worker.inputSchema.workerId.description')) }), required: ['workerId'] } },
   { name: 'bridge_request_restart', description: harnessText('tools.bridge_request_restart.description'), inputSchema: object({}) },
-  { name: 'bridge_list_workers', description: harnessText('tools.bridge_list_workers.description'), inputSchema: object({ workerId: string(harnessText('tools.bridge_list_workers.inputSchema.workerId.description')) }) },
+  { name: 'bridge_list_workers', description: harnessText('tools.bridge_list_workers.description'), inputSchema: object({ workerId: string(harnessText('tools.bridge_list_workers.inputSchema.workerId.description')),
+    resultOffset: { type: 'integer', minimum: 0, default: 0 },
+    limit: { type: 'integer', minimum: 1, maximum: 20, default: 10 }, offset: { type: 'integer', minimum: 0, default: 0 },
+    view: { type: 'string', enum: ['all', 'active'], default: 'all' } }) },
   { name: 'bridge_send_user', description: harnessText('tools.bridge_send_user.description'), inputSchema: { ...object({ text: string(harnessText('tools.bridge_send_user.inputSchema.text.description')), targetId: string(harnessText('tools.bridge_send_user.inputSchema.targetId.description')), attachmentPaths: outgoingAttachmentPaths }), required: ['text'] } },
 ];
 

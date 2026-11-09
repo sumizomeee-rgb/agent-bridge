@@ -57,7 +57,7 @@ export class HousekeeperService {
       if (current.run?.workerId) await this.callbacks.cancel(current.run.workerId);
       return '事务巡视已关闭；停止后续巡视，正在总结的助手已请求取消。主控已开展的其他任务继续。';
     }
-    if (current?.enabled) return '事务巡视已开启，保持原开启时间和消费进度。\n' + this.status(current);
+    if (current?.enabled) return '事务巡视已开启，原计划和进度保留。';
     if (current?.run && !this.canReplaceRun(current)) return '事务巡视保持关闭：上一轮摘要助手尚未确认停止或提交仍在处理中，保留原执行登记，未重复启动。主控和其他任务可继续；稍后再开启或用 /housekeeper off 重试停止。';
     const now = this.time();
     const value: HousekeeperState = { version: 1, enabled: true, epoch: randomUUID(), intervalMinutes: 20,
@@ -65,7 +65,7 @@ export class HousekeeperService {
       enabledAt: now, nextAt: now, failures: 0 };
     // A new enable interval starts at this owner command. Previous raw data is preserved.
     this.store.save(value); this.kick();
-    return '事务巡视已开启：立即检查一次，此后每20分钟检查开启后的增量。使用笔记本当前默认助手，只总结给主控；是否跟进或通知由主控判断。跨 /new 和桥重启保留。';
+    return '已开启事务巡视：立即检查，此后每20分钟检查增量；使用笔记本默认助手向主控汇总。跨新会话和重启保留。';
   }
   status(value = this.store.read()): string {
     if (!value) return '事务巡视：关闭（默认）。\n/housekeeper on 开启；/housekeeper off 关闭。';

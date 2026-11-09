@@ -1,4 +1,6 @@
 import { harnessText } from '../harness.js';
+import { extname } from 'node:path';
+import { ControllerImageResult, pngImage } from './image-content.js';
 import { constants } from 'node:fs';
 import { open, opendir, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
@@ -76,6 +78,16 @@ async function readFile(input: unknown, signal: AbortSignal) {
   signal.throwIfAborted();
   const sha256 = hash(bytes);
   if (a.expectedSha256 !== undefined && a.expectedSha256 !== sha256) throw new Error('文件已变化，请从所需位置重新读取，避免混用不同版本。');
+  const image = pngImage(bytes);
+  if (image) {
+    if (['startLine', 'startColumn', 'maxLines', 'encoding'].some(key => a[key] !== undefined)) throw new Error('PNG 图片不接受文本分页或编码参数。');
+    if (changedDuringRead) throw new Error('图片读取期间已变化，请重新核对。');
+    return new ControllerImageResult({ rule, path: requestedPath, resolvedPath: path, bytes: bytes.length, sha256,
+      changedDuringRead, mediaType: 'image/png', ...image }, bytes.toString('base64'));
+  }
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg'].includes(extname(path).toLowerCase())
+    || bytes[0] === 0xff && bytes[1] === 0xd8 || bytes.toString('ascii', 0, 4) === 'RIFF' || bytes.toString('ascii', 0, 3) === 'GIF')
+    throw new Error('图片损坏或格式不受支持；目前仅直接读取已校验的 PNG。');
   const decoded = decode(bytes, a.encoding), lines = decoded.text.split(/\r\n|\n|\r/);
   if (lines.at(-1) === '') lines.pop();
   const output: Array<{ line: number; startColumn: number; text: string }> = [];

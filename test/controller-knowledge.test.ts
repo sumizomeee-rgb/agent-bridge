@@ -82,7 +82,8 @@ test('清单跨 new、后端和重启保留；取消/暂停/替代不变，工�
   f.store.setActive('owner', f.fresh.id); f.restart();
   const saved = f.store.knowledge.list(scope, { id: 'goal' }).task!;
   assert.equal(saved.state, 'in_progress'); assert.equal(saved.requirements, '先排除免打扰'); assert.equal(saved.version, 1);
-  assert.match(f.store.knowledge.summary(scope), /goal/); assert.match(f.store.knowledge.summary(scope), /paused/);
+  assert.deepEqual(JSON.parse(f.store.knowledge.summary(scope)).counts, { in_progress: 1, paused: 1 });
+  assert.doesNotMatch(f.store.knowledge.summary(scope), /交付真实目标|核验交付/);
   assert.doesNotMatch(f.store.knowledge.summary(scope), /"id":"cancelled"|"id":"superseded"/);
   for (const state of ['cancelled', 'paused', 'superseded']) assert.equal(f.store.knowledge.list(scope, { id: state }).task!.state, state);
   assert.equal(f.store.knowledge.list({ ...scope, channelId: 'another' }, { id: 'goal' }).task, null);

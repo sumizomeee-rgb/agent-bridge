@@ -15,7 +15,7 @@ function imageMediaType(bytes: Buffer): string {
   throw new Error('Claude 支持 PNG、JPEG、GIF 和 WebP 图片；该附件格式无法识别。');
 }
 
-type ClaudeTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop' | 'endInput'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'stopEvidence'>>;
+type ClaudeTransport = Pick<JsonLineProcess, 'onMessage' | 'onFailure' | 'write' | 'stop' | 'endInput'> & Partial<Pick<JsonLineProcess, 'confirmStopped' | 'stopEvidence' | 'retireCompleted'>>;
 
 /** Claude CLI structured streaming input; prompts never pass through a shell. */
 export class ClaudeAdapter implements AgentAdapter {
@@ -107,7 +107,7 @@ export class ClaudeAdapter implements AgentAdapter {
     };
     const conversationId = turn.conversation.id;
     if (this.retirements.has(conversationId)) {
-      try { await this.executions.get(conversationId)?.stop(true); }
+      try { const prior = this.executions.get(conversationId); await (prior?.retireCompleted?.() ?? prior?.stop(true)); }
       catch (error) { throw new Error('上一轮已完成，CLI 仍在收尾；本轮尚未提交。', { cause: error }); }
     }
     if (this.active.has(conversationId)) throw new Error('该 Claude 会话仍在执行任务。');
@@ -339,6 +339,6 @@ export class ClaudeAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([this.metadata.close()]));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => { const prior = this.executions.get(id)!; return this.retirements.has(id) ? prior.retireCompleted?.() ?? prior.stop(true) : cancel(); }).concat([this.metadata.close()]));
   }
 }

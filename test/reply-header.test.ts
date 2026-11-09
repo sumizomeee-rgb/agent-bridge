@@ -173,7 +173,7 @@ test('/agent 菜单和同后端选择不重置，来回切换向前交接并保�
   const { f, send, respond, inspect } = fixture(t);
   await send('/agent');
   assert.match(f.replies.at(-1)!.text, /Codex CLI/);
-  assert.match(f.replies.at(-1)!.text, /Claude Code/);
+  assert.match(f.replies.at(-1)!.text, /\/agent claude/);
   assert.equal(inspect(store => store.getActive('owner')), null);
   await respond('codex context');
   await send('/model custom chosen-codex-model');
@@ -212,7 +212,8 @@ test('/agent 不从历史列表猜目标后端分支，即使同用户和目录�
   await send('/agent claude');
   assert.notEqual(inspect(store => store.getActive('owner'))!.id, expected.id);
   assert.equal(inspect(store => store.getActive('owner'))!.nativeId, null);
-  assert.match(f.replies.at(-1)!.text, /原生会话：下轮创建/);
+  assert.match(f.replies.at(-1)!.text, /普通助手与定时计划保留/);
+  assert.doesNotMatch(f.replies.at(-1)!.text, /原生会话：|会话：/);
   assert.equal(f.claude.turns.length, 0);
 });
 

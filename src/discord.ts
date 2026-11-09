@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { receiveIncomingFiles, type IncomingFile } from './incoming-files.js';
 import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -563,6 +564,21 @@ export class DiscordTransport {
 
   async readForwardedContent(message: IncomingDM): Promise<ForwardedContent | undefined> { return copyForwarded(message.forwarded); }
 
+  async downloadFiles(message: IncomingDM, imagePaths: string[] = []): Promise<IncomingFile[]> {
+    return receiveIncomingFiles(this.config, message, imagePaths, async item => {
+      let url = attachmentUrl(item.url);
+      for (let redirects = 0; redirects <= 3; redirects++) {
+        const response = await this.httpFetch(url, { dispatcher: this.cdnDispatcher, redirect: 'manual',
+          signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(120_000)]) });
+        if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+        await response.body?.cancel();
+        const location = response.headers.get('location');
+        if (!location || redirects === 3) throw new Error('附件接收失败：下载重定向无效。');
+        url = attachmentUrl(new URL(location, url).toString());
+      }
+      throw new Error('附件接收失败：下载重定向无效。');
+    });
+  }
   async downloadImages(message: IncomingDM): Promise<string[]> {
     try { return await this.prepareImages(message); }
     catch (error) { throw new ImagePreparationError(error); }

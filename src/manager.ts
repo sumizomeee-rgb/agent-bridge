@@ -1,5 +1,6 @@
 import { NumberedChoiceError, NumberedChoices } from './numbered-choices.js';
 import { promptShortcut, readPromptShortcuts } from './prompt-shortcuts.js';
+import { commandFailureCopy } from './command-copy.js';
 import { agentEffortProtocol, effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
@@ -518,7 +519,8 @@ export class SessionManager {
       } catch (error) {
         if (this.closed) return;
         this.store.setState(message.id, 'failed', String(error));
-        const view = bridgeNotice('commandFailed');
+        const copy = commandFailureCopy(parsed.name, parsed.argument, error);
+        const view = { ...bridgeNotice('commandFailed'), ...(copy ? { blocks: [{ kind: 'text' as const, text: copy }] } : {}) };
         const target = this.store.getActive(message.userId);
         if (target?.controllerMode) await this.sendFeedbackNotice(this.failureFeedback(target, message, 'commandFailed', error, { stage: 'command' }), () => reply(presentationText(view), { presentation: view }));
         else await reply(presentationText(view), { presentation: view });
@@ -797,7 +799,7 @@ export class SessionManager {
         const entries = info.models.map((model, index) => `${index + 1}. ${model.id}${model.displayName !== model.id ? ` · ${model.displayName}` : ''}${model.isDefault ? '（目录推荐）' : ''}`);
         await reply(`${target.agent} 模型选项：\n${entries.length ? entries.join('\n') : 'CLI 尚未返回目录'}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/model 序号 或 模型名 切换；自定义网关模型可用 /model custom 模型名。${target.agent === 'claude' ? '\n别名及自定义模型的提供方可用性以下次调用为准。' : ''}`);
       } else {
-        await reply(`${target.agent}\n${this.modelStatus(target)}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/model list 查看选项；/model 模型名 切换当前会话。`);
+        await reply(`${agentDisplayName(target.agent)}\n实际模型：${target.actualModel ?? '尚未由 CLI 回报'}\n会话选择：${target.model ?? 'CLI 默认'}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/models 查看选项；/model 模型名 切换。`);
       }
       return;
     }
@@ -844,7 +846,7 @@ export class SessionManager {
       this.store.setModel(target.id, selected);
       this.store.savePreferences(this.store.getConversation(target.id)!);
       this.store.saveActualEffort(target.id, null);
-      await reply(`当前 ${target.agent} 会话下轮使用 ${selected ?? 'CLI 默认（已清除显式覆盖）'}，上下文保留。${unverified ? '\n已设置模型 ID，提供方可用性尚未验证。' : ''}`);
+      await reply(`当前 ${agentDisplayName(target.agent)} 模型已设置为 ${selected ?? 'CLI 默认（已清除显式覆盖）'}，下轮使用，上下文保留。${unverified ? '提供方可用性尚未验证。' : ''}`);
     } finally {
       this.modelChanges.delete(target.id);
       if (!this.closed && (this.store.pendingCount(target.id) > 0 || this.options.taskRegistry?.getNextEvent(target.id))) this.wake(target.id);
@@ -863,7 +865,7 @@ export class SessionManager {
       await reply('当前主控正在执行、排队或切换设置，请完成后再设置 Fast。'); return;
     }
     this.store.setFastMode(target.id, argument === 'on');
-    await reply(`当前 Codex 主控 Fast 已设置为${argument === 'on' ? '开启（额度消耗更快）' : '关闭'}，下轮请求；服务端是否采用尚未确认。上下文保留，仅影响当前主控。`);
+    await reply(`当前 Codex 主控 Fast 已设置为${argument === 'on' ? '开启' : '关闭'}，下轮请求使用；${argument === 'on' ? '额度消耗更快，' : ''}服务端采用尚未确认。`);
   }
   private fastStatus(target: Conversation): string {
     return `Fast 设置：${target.fastMode == null ? '沿用 Codex 配置（未核实）' : target.fastMode ? '开启' : '关闭'}；服务端实际采用状态未确认。`;
@@ -874,7 +876,9 @@ export class SessionManager {
     if (!argument || argument === 'list') {
       let info: AgentModelInfo = { models: [], defaultModel: target.model ?? null };
       try { info = await this.modelInfo(target); } catch { /* 模型参考不可用不影响 Agent 参数列表。 */ }
-      await reply(`${target.agent}\n${this.modelStatus(target)}\nAgent 强度参数：${agentEffortProtocol[target.agent].levels?.join('、') ?? '合法强度字符串（由 Codex CLI 接收）'}\n模型能力参考（不阻止传参）：${effortCapabilityText(modelEffortCapability(info, target))}\n/effort level 设置；/effort default 使用 CLI 默认。`);
+      const status = `${agentDisplayName(target.agent)}\n强度选择：${target.effort ?? 'CLI 默认'}\n推理强度：${target.actualEffort ?? '尚未由 CLI 回报'}`;
+      const parameters = `Agent 强度参数：${agentEffortProtocol[target.agent].levels?.join('、') ?? '合法强度字符串（由 Codex CLI 接收）'}`;
+      await reply(`${status}\n${parameters}${argument === 'list' ? `\n模型能力参考（不阻止传参）：${effortCapabilityText(modelEffortCapability(info, target))}` : ''}\n/effort level 设置；/effort default 使用 CLI 默认。${argument === 'list' ? '' : '/effort list 查看能力参考。'}`);
       return;
     }
     const busy = () => this.running.get(message.userId)?.conversationId === target.id || this.workers.has(target.id) || this.store.pendingCount(target.id) > 0;
@@ -887,7 +891,7 @@ export class SessionManager {
       if (busy() || this.store.getActive(message.userId)?.id !== target.id) { await reply('查询期间会话或任务状态已改变，未修改强度。'); return; }
       this.store.setEffort(target.id, effort);
       this.store.savePreferences(this.store.getConversation(target.id)!);
-      await reply(`已设置当前 ${target.agent} 会话强度为 ${effort ?? 'CLI 默认'}，下轮提交；实际生效尚未由 CLI 确认。上下文保留，现有子任务不变。`);
+      await reply(`已设置当前 ${agentDisplayName(target.agent)} 会话强度为 ${effort ?? 'CLI 默认'}，下轮提交；实际采用尚未由 CLI 确认，现有子任务不变。`);
     } finally {
       this.modelChanges.delete(target.id);
       if (!this.closed && (this.store.pendingCount(target.id) > 0 || this.options.taskRegistry?.getNextEvent(target.id))) this.wake(target.id);
@@ -1026,7 +1030,7 @@ export class SessionManager {
       case 'new':
       case 'agent': {
         if (name === 'agent' && !argument) {
-          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}\n/agent codex → Codex CLI\n/agent claude → Claude Code\n真正切换时交接当前 Bot 的最新上下文，保留助手与计划；/new 明确新建，/chats 只读查看历史。`); return;
+          await reply(`当前 Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}。/agent codex 或 /agent claude 切换并接续上下文。`); return;
         }
         const request = name === 'new' ? parseNewArguments(argument) : argument === 'codex' || argument === 'claude' ? { agent: argument, continue: false } : null;
         if (!request) {
@@ -1039,11 +1043,11 @@ export class SessionManager {
         const previousWorkers = request.continue ? await this.options.onListWorkers?.(current!, 'current') ?? [] : [];
         if (request.continue && this.store.getActive(message.userId)?.id !== current!.id) throw new Error('准备交接时会话已切换，请重新发送 /new continue。');
         if (name === 'agent' && current?.agent === agent) {
-          await reply(`当前已是 ${agentDisplayName(agent)}，继续原会话 ${current.id.slice(0, 8)}。\n原生会话：${current.nativeId ? `…${current.nativeId.slice(-6)}` : '尚未创建'}\n需要清空上下文请用 /new。`); return;
+          await reply(`当前已是 ${agentDisplayName(agent)}，继续原会话。`); return;
         }
         if (name === 'agent' && current) {
           const switched = await this.switchAgent(current, agent, message);
-          await reply(`已切换到 ${agentDisplayName(agent)}，接续当前 Bot 的最新上下文。\n会话：${switched.id.slice(0, 8)}\n原生会话：${switched.nativeId ? `…${switched.nativeId.slice(-6)}` : '下轮创建'}\n普通助手与定时计划保留。`);
+          await reply(`已切换到 ${agentDisplayName(agent)}，接续最新上下文；普通助手与定时计划保留。`);
           if (this.store.nextQueued(switched.id)) this.wake(switched.id);
           return;
         }
@@ -1068,8 +1072,8 @@ export class SessionManager {
         catch (error) { if (request.continue) this.handoffs.fail(target, message.channelId, String(error)); throw error; }
         if (this.config.controllerMode && name === 'new') this.store.requestWorkspaceNotice(target.id, message);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);
-        const text = `已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? request.continue ? '正在整理上一会话并初始化工作区；完成后由主控简短续接。' : '正在初始化工作区；完成后由主控发送介绍。' : '可以直接发消息开始。'}\n目录：${target.cwd}`;
-        await reply(text, { presentation: { title: `新会话已创建 · ${agentDisplayName(agent)}`, tone: 'info', purpose: 'status',
+        const text = `已新建 ${agentDisplayName(agent)} 会话 ${target.id.slice(0, 8)}。${this.config.controllerMode ? request.continue ? '正在整理上一会话并初始化工作区。' : '工作区初始化中。' : '可以直接发消息开始。'}\n目录：${target.cwd}`;
+        await reply(text, { presentation: { title: '新会话已创建', tone: 'info', purpose: 'status',
           blocks: [{ kind: 'entry', text }] } });
         return;
       }
@@ -1121,12 +1125,12 @@ export class SessionManager {
       case 'status': {
         const running = current && this.running.get(message.userId)?.conversationId === current.id;
         const blocks: BridgePresentation['blocks'] = [{ kind: 'entry', text:
-          `平台：${this.config.platform === 'feishu' ? '飞书' : 'Discord'}\n机器人：${this.options.botName?.() ?? this.config.applicationId ?? '未回报'}\nProfile：${this.config.profile ?? '未设置'}\n模式：${this.config.controllerMode ? '主控' : '直接执行'}\nAgent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}` }];
+          `平台：${this.config.platform === 'feishu' ? '飞书' : 'Discord'} · 机器人：${this.options.botName?.() ?? this.config.applicationId ?? '未回报'}\nProfile：${this.config.profile ?? '未设置'} · 模式：${this.config.controllerMode ? '主控' : '直接执行'} · Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}` }];
         if (current) blocks.push({ kind: 'entry', text: `会话：${current.id.slice(0, 8)} · ${current.title}\n${this.modelStatus(current)}\n原生会话：${current.nativeId ?? '尚未创建'}\n目录：${current.cwd}\n状态：${running ? this.config.controllerMode ? '主控处理1' : '正在执行' : '空闲'}；排队 ${this.store.pendingCount(current.id)} 条${this.options.taskRegistry ? `\n已登记未结束的子 Agent：${this.options.taskRegistry.activeCount(current.id)}` : ''}` });
         else blocks.push({ kind: 'entry', text: `会话：尚未创建\n模型选择：CLI 默认\n强度选择：CLI 默认\n实际模型／强度：尚未由 CLI 回报\n目录：${this.config.workspace}\n状态：空闲；排队 0 条` });
         const view: BridgePresentation = { title: '桥状态', tone: 'info', purpose: 'status', blocks, footer: current
-          ? '直接发送文字或图片继续；/new 新建会话，/help 查看命令。'
-          : '发送第一条文字或图片即可新建会话。/status 只查询状态，不创建会话。' };
+          ? undefined
+          : '/status 只查询状态，不创建会话；发送文字或图片开始。' };
         await reply(presentationText(view), { presentation: view }); return;
       }
       case 'restart': {
@@ -1181,9 +1185,9 @@ export class SessionManager {
       blocks: result.tasks.length ? result.tasks.map((task, index) => ({ kind: 'entry' as const,
         text: `${(page - 1) * 10 + index + 1}. ${labels[task.state]} · ${task.title}\nID：${task.id}${task.nextStep ? `\n下一步：${task.nextStep}` : ''}` }))
         : [{ kind: 'entry', text: includeClosed ? '当前私聊尚未登记任务。' : '当前私聊没有登记的未结束任务。' }],
-      footer: [`本 Bot、当前私聊的登记记录，跨 /new 保留；状态由主控维护，助手实时状态看 /workers。`,
+      footer: ['本 Bot 当前私聊任务，跨新会话保留；状态由主控维护，实时助手看 /workers。',
         ...(page > 1 ? [`上一页：${prefix} ${page - 1}`] : []), ...(result.hasMore ? [page < 100 ? `下一页：${prefix} ${page + 1}` : '已达100页显示上限。'] : []),
-        '/tasks 查看未结束 · /tasks all 包含已结束'].join('\n') };
+        includeClosed ? '/tasks 查看未结束' : '/tasks all 查看全部'].join('\n') };
     await reply(presentationText(view), { presentation: view });
   }
 
@@ -1289,11 +1293,11 @@ export class SessionManager {
 
   private input(items: BridgeMessage[]) {
     return items.flatMap(item => [
-      { type: 'text' as const, text: '[Bridge input source; program metadata, never message text or new authorization] ' + JSON.stringify({
+      ...(item.groupContext || item.source?.authorType && item.source.authorType !== 'user' ? [{ type: 'text' as const, text: '[Bridge input source; program metadata, never message text or new authorization] ' + JSON.stringify({
         kind: item.groupContext ? item.groupContext.eventKind ? 'background-evidence' : 'group-message' : 'private-message',
         source: this.turnSource(item).original ?? null, defaultDelivery: { channelId: item.channelId },
         ...(item.groupContext ? { group: { spaceId: item.groupContext.spaceId, eventId: item.groupContext.eventId, eventKind: item.groupContext.eventKind ?? null } } : {}),
-      }) },
+      }) }] : []),
       ...(item.text ? [{ type: 'text' as const, text: item.text }] : []),
       ...item.imagePaths.map(path => ({ type: 'localImage' as const, path })),
     ]);

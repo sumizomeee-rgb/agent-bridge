@@ -61,7 +61,7 @@ test('Feishu UTF8 splitting preserves all characters; output files are serialize
   const failed = new FeishuTransport(config, async () => {}, { fetch: (async (url: any) => String(url).includes('/auth/') ? response({ code: 0, tenant_access_token: 'token' }) : (sends++, response({ code: 999, msg: 'internal' }, 500))) as any }); cleanup(() => failed.close());
   await assert.rejects(failed.sendText('oc_chat', 'one'), /未自动重发/); assert.equal(sends, 1);
 });
-test('Feishu validates actual image bytes, rejects ordinary file input and removes partial downloads', async t => {
+test('Feishu validates actual image bytes, leaves ordinary files to file intake and removes partial downloads', async t => {
   const { config, cleanup } = setup(t); config.maxImageBytes = 10;
   const http = (async (url: any) => {
     if (String(url).includes('/auth/')) return response({ code: 0, tenant_access_token: 'token' });
@@ -72,7 +72,7 @@ test('Feishu validates actual image bytes, rejects ordinary file input and remov
     { id: 'img_good', filename: 'image', size: 0, url: '', content_type: 'image/unknown', resourceKey: 'img_good', messageId: 'om_source' },
     { id: 'img_bad', filename: 'image', size: 0, url: '', content_type: 'image/unknown', resourceKey: 'img_bad', messageId: 'om_source' }] };
   await assert.rejects(bridge.downloadImages(message), /超过/); assert.deepEqual(readdirSync(config.attachmentsDir), []);
-  await assert.rejects(bridge.downloadImages({ ...message, attachments: [{ ...message.attachments[0]!, content_type: 'application/octet-stream' }] }), /普通文件输入尚未启用/);
+  assert.deepEqual(await bridge.downloadImages({ ...message, attachments: [{ ...message.attachments[0]!, content_type: 'application/octet-stream' }] }), []);
 });
 test('Feishu SDK startup waits for core recovery and force-closes on shutdown', async t => {
   const { config, cleanup } = setup(t); let ready = 0, closed = false;

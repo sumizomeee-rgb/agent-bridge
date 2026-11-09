@@ -10,7 +10,7 @@ const agentOption: CommandOption = { type: 'string', name: 'agent', description:
 /** 两个平台的唯一命令定义；平台菜单只做参数编码。 */
 export const COMMANDS: CommandDefinition[] = [
   { name: 'group', contexts: ['group'], help: '/group start|stop：激活或停用当前工作群', description: '激活、刷新或停用当前工作群', options: [{ type: 'string', name: 'action', description: 'start 激活／刷新，stop 停用', required: true, choices: [{ name: 'start', value: 'start' }, { name: 'stop', value: 'stop' }] }] },
-  { name: 'new', help: "/new [continue] [codex|claude]：新建会话；continue 提炼上一会话后续接。两者都会取消旧定时", description: '新建会话，可提炼上一会话后续接', options: [{ ...agentOption, description: '新会话使用的 Agent；留空沿用当前 Agent' }, { type: 'boolean', name: 'continue', description: '初始化时提炼上一会话；仍取消旧定时，不接管旧助手' }] },
+  { name: 'new', help: "/new [continue] [codex|claude]：新建会话；continue 提炼上一会话后续接", description: '新建会话，可提炼上一会话后续接', options: [{ ...agentOption, description: '新会话使用的 Agent；留空沿用当前 Agent' }, { type: 'boolean', name: 'continue', description: '初始化时提炼上一会话；不接管旧助手' }] },
   { name: 'agent', help: "/agent [codex|claude]：查看或切换 Agent，交接当前主控的最新上下文", description: '切换 Agent 并交接当前最新上下文', options: [agentOption] },
   { name: 'chats', help: "/chats：只读查看当前 bot 下自己的历史会话", description: '只读查看自己的历史会话' },
   { name: 'cwd', help: "/cwd 路径：在指定目录新建会话", description: '在指定工作目录新建会话', options: [
@@ -64,7 +64,7 @@ export function commandHelp(controllerMode = false): string {
 export function groupCommands(): CommandDefinition[] {
   return COMMANDS.filter(c => ['group', 'status', 'workers', 'new', 'stop', 'help'].includes(c.name)).map(c => ({
     ...c, contexts: ['group'], options: c.name === 'new' ? [] : c.options,
-    help: c.name === 'new' ? '/new：重置本群全部成员，影响其私聊和其他群，取消旧定时' : c.name === 'stop' ? '/stop：停止本群成员的主控、助手与预约，影响其所有入口' : c.help,
+    help: c.name === 'new' ? '/new：重置本群全部成员，影响其私聊和其他群' : c.name === 'stop' ? '/stop：停止本群成员的主控、助手与预约，影响其所有入口' : c.help,
   }));
 }
 export function parseNewArguments(argument: string): { agent?: 'codex' | 'claude'; continue: boolean } | null {

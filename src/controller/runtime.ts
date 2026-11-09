@@ -8,7 +8,7 @@ import { rebindTaskOrigin, type TaskContextFile, type TaskOrigin, type TaskRegis
 import { ControllerStore } from './store.js';
 import { parseWorkerDefaultCommand, workerChoice, workerChoiceText, workerDefaultUsage, workerTargetId, type WorkerChoice } from './worker-selection.js';
 import { isModelId } from '../config.js';
-import { resolveDefaultModel, validateAgentEffort, validateEffort } from '../effort.js';
+import { resolveDefaultModel, validateEffort } from '../effort.js';
 import type { NativeSessionRef } from '../native-sessions.js';
 import type { WorkCounts, WorkerOverview } from '../overview.js';
 import { observeActivity } from '../agents/activity.js';
@@ -254,7 +254,7 @@ export class ControllerRuntime {
     if (value === undefined) return inherited;
     if (value === 'default') return null;
     const effort = text(value, '思考强度', 32);
-    validateAgentEffort(agent, effort); return effort;
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(effort)) throw new Error(`${agent} 强度标识无效。`); return effort;
   }
   private adoptionResult(worker: ControllerWorker): Record<string, unknown> {
     return { workerId: worker.id, status: 'idle', ownership: 'bridge', adopted: true, nativeId: worker.nativeId,
@@ -336,6 +336,7 @@ export class ControllerRuntime {
         ...(worker.archivedAt ? { archivedAt: worker.archivedAt, archiveReason: worker.archiveReason } : {}),
         ...(worker.handoffPending || worker.adoption?.status === 'pending' ? { statusReason: '交接或接管回执尚未确认' }
           : worker.supersededBy ? { statusReason: `已转交直属助手 ${worker.supersededBy}` }
+          : !active && nextQueued && this.retirementPending(worker.id) ? { statusReason: '上一轮已完成，CLI 收尾未确认；后续指令尚未执行' }
           : latest?.cancelReason ? { statusReason: latest.cancelReason }
           : latest?.interrupted ? { statusReason: latest.result ?? '本轮执行失败，退出已确认；主控可核对后续接。' } : {}),
         lastResultPreview: latest?.result == null ? null : listText(latest.result, 180),
@@ -526,7 +527,7 @@ export class ControllerRuntime {
   async workerDefaultCommand(argument: string): Promise<string> {
     if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或重启，暂不能修改默认助手。');
     const command = parseWorkerDefaultCommand(argument);
-    let view = await this.workerChoices({ targetId: command.targetId });
+    const view = await this.workerChoices({ targetId: command.targetId });
     if (command.index !== undefined) {
       const candidates = await this.numberedWorkerCandidates(view.computers[0]!);
       const chosen = this.numberedWorkers.select(command.targetId!, command.index, candidates).choice;
@@ -538,13 +539,15 @@ export class ControllerRuntime {
       const choice = command.choice!;
       if (choice?.kind === 'ordinary' && !target.assistants.some(item => item.kind === 'ordinary' && item.agent === choice.agent)) throw new Error('该电脑未登记所选普通引擎，默认设置未改变。');
       if (choice?.kind === 'preset' && !target.assistants.some(item => item.kind === 'preset' && item.presetId === choice.presetId)) throw new Error('预设未启用或不属于所选电脑，默认设置未改变。');
-      if (choice && choice.kind !== 'follow' && choice.effort) {
-        const agent = choice.kind === 'ordinary' ? choice.agent
-          : target.assistants.find(item => item.kind === 'preset' && item.presetId === choice.presetId)!.agent;
-        validateAgentEffort(agent, choice.effort);
-      }
       this.store.setWorkerDefault(command.targetId!, choice);
-      view = await this.workerChoices({ targetId: command.targetId });
+      const saved = this.store.workerDefault(command.targetId!);
+      if (!saved) return `已清除${target.label} [${target.targetId}]默认助手：未设置。`;
+      if (saved.kind === 'follow') return `已设置${target.label} [${target.targetId}]默认助手：跟随当前主控的后端、模型和强度。`;
+      const agentName = (agent: AgentName) => agent === 'claude' ? 'Claude' : 'Codex';
+      const effort = saved.effort ? ` · 强度 ${saved.effort}` : '';
+      if (saved.kind === 'ordinary') return `已设置${target.label} [${target.targetId}]默认普通助手：${agentName(saved.agent)} · ${saved.model}${effort}。`;
+      const preset = target.assistants.filter(item => item.kind === 'preset').find(item => item.presetId === saved.presetId)!;
+      return `已设置${target.label} [${target.targetId}]默认助手：${preset.label ?? saved.presetId}（${agentName(preset.agent)} · ${preset.model}${effort}）。`;
     }
     if (command.targetId && !('choice' in command)) {
       const computer = view.computers[0]!;
@@ -561,7 +564,7 @@ export class ControllerRuntime {
       `普通助手：${computer.assistants.filter(item => item.kind === 'ordinary').map(item => item.agent).join('、') || '无'}（明确选择模型与强度）`,
       ...computer.assistants.filter(item => item.kind === 'preset').map(item => `预设：${item.label} [${item.presetId}] · ${item.agent} · ${item.model}`),
     ].join('\n'));
-    return [('choice' in command ? '默认助手已保存，仅影响此后新建派工。' : '各电脑默认助手与登记候选'), ...lines, workerDefaultUsage].join('\n\n');
+    return ['各电脑默认助手与登记候选', ...lines, workerDefaultUsage].join('\n\n');
   }
   private async numberedWorkerCandidates(computer: Awaited<ReturnType<ControllerRuntime['workerChoices']>>['computers'][number]) {
     const workspace = this.config.contextWorkspace ?? this.config.workspace;
@@ -1015,15 +1018,26 @@ export class ControllerRuntime {
           dueAt: this.dueAt(args), status: 'pending', taskId: null, createdAt: this.timestamp(), updatedAt: this.timestamp() };
         this.store.addSchedule(value); result = this.scheduleView(value, true);
       } else {
-        const args = object(input, ['workerId']);
+        const args = object(input, ['workerId', 'limit', 'offset', 'view', 'resultOffset']);
         const details = args.workerId !== undefined;
-        const workers = details ? [this.ownedWorker(origin, args.workerId)] : this.store.workers()
-          .filter(worker => this.workerScope(worker, origin));
+        const resultOffset = args.resultOffset ?? 0;
+        if (!Number.isSafeInteger(resultOffset) || Number(resultOffset) < 0 || !details && args.resultOffset !== undefined) throw new Error('resultOffset 仅用于指定助手的结果分页。');
+        const limit = args.limit ?? 10, offset = args.offset ?? 0, view = args.view ?? 'all';
+        if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 20
+          || !Number.isSafeInteger(offset) || Number(offset) < 0 || !['all', 'active'].includes(String(view))) throw new Error('助手分页参数无效。');
+        const all = details ? [this.ownedWorker(origin, args.workerId)] : this.store.workers()
+          .filter(worker => this.workerScope(worker, origin))
+          .filter(worker => view === 'all' || worker.blocked || this.retirementPending(worker.id)
+            || this.store.jobs(worker.id).some(job => ['queued', 'running', 'uncertain'].includes(job.status)))
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
+        const workers = details ? all : all.slice(Number(offset), Number(offset) + Number(limit));
         let previewBytes = 8 * 1024;
         const preview = (value: string): string => {
           const result = listText(value, 256, previewBytes); previewBytes -= Buffer.byteLength(result, 'utf8'); return result;
         };
-        result = { workers: workers.map(worker => {
+        result = { total: all.length, hasMore: !details && Number(offset) + workers.length < all.length,
+          nextOffset: !details && Number(offset) + workers.length < all.length ? Number(offset) + workers.length : null,
+          details: 'bridge_list_workers({workerId}) 展开结果与回执；view=active 仅查看活动助手。定时计划用 bridge_list_schedules。', workers: workers.map(worker => {
           const jobs = this.store.jobs(worker.id);
           const latest = worker.blocked ? jobs.findLast(job => job.status === 'uncertain') ?? jobs.at(-1)
             : jobs.findLast(job => ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false) ?? latestWorkerJob(jobs);
@@ -1042,6 +1056,16 @@ export class ControllerRuntime {
             reason: value.reason ? listText(value.reason, 256) : null, reasonTruncated: (value.reason?.length ?? 0) > 256 });
           const lastResult = latest?.result == null ? null : controllerWorkerReport(latest.result);
           const lastResultPreview = lastResult == null ? null : preview(lastResult);
+          if (details && Number(resultOffset) > (lastResult?.length ?? 0)) throw new Error('resultOffset 超出结果长度。');
+          const resultChunk = lastResult == null ? null : listText(lastResult.slice(Number(resultOffset)), 4096);
+          if (!details) return { workerId: worker.id, title: listText(worker.title, 160), agent: worker.agent,
+            model: worker.actualModel ?? worker.model, target: worker.target ? { id: worker.target.id, label: worker.target.label } : null,
+            running: jobs.some(job => job.status === 'running'), queued: jobs.filter(job => job.status === 'queued').length,
+            blocked: worker.blocked === true, retiring: this.retirementPending(worker.id),
+            ownership: worker.ownership ?? 'bridge', archivedAt: worker.archivedAt ?? null,
+            lastStatus: worker.blocked ? 'uncertain' : latest?.status ?? 'idle', lastJobId: latest?.id ?? null,
+            progress: progressSummary, hasResult: latest?.result != null, lastResultPreview,
+            lastResultPreviewTruncated: lastResult != null && lastResultPreview !== lastResult };
           return { workerId: worker.id, title: worker.title, agent: worker.agent, model: worker.model, actualModel: worker.actualModel,
             source: { kind: worker.origin.groupContext ? 'group' : 'private', channelId: worker.origin.channelId,
               ...(worker.origin.groupContext ? { spaceId: worker.origin.groupContext.spaceId } : {}) },
@@ -1056,12 +1080,12 @@ export class ControllerRuntime {
             progress: details ? { ...progressSummary, lastActivity: progress?.lastActivity ?? null, lastTool: progress?.lastTool ?? null, activeTools: progress?.activeTools ?? [] } : progressSummary,
             hasResult: latest?.result != null, lastResultPreview,
             lastResultPreviewTruncated: lastResult != null && lastResultPreview !== lastResult, supplementCounts,
-            ...(details ? { lastResult: lastResult == null ? null : listText(lastResult, 4096),
-              lastResultTruncated: (lastResult?.length ?? 0) > 4096, activeSupplements: active.map(receipt),
+            ...(details ? { lastResult: resultChunk, resultOffset, totalResultChars: lastResult?.length ?? 0,
+              nextResultOffset: lastResult != null && Number(resultOffset) + resultChunk!.length < lastResult.length ? Number(resultOffset) + resultChunk!.length : null,
+              lastResultTruncated: lastResult != null && Number(resultOffset) + resultChunk!.length < lastResult.length, activeSupplements: active.map(receipt),
               supplements: history.slice(-20).map(receipt), supplementsTotal: supplements.length,
               supplementsTruncated: history.length > 20 } : {}) };
-        }), schedules: details ? [] : this.store.schedules().filter(value => this.scheduleScope(value, origin) && value.status === 'pending')
-          .map(value => { const textPreview = preview(value.text); return { scheduleId: value.id, kind: value.kind, dueAt: value.dueAt, textPreview, textPreviewTruncated: textPreview !== value.text }; }) };
+        }) };
       }
       if (workspaceInitialization) this.store.saveWorkspaceInitialization(origin.conversationId, result);
       else if (key) this.store.saveCall(key, fingerprint, result);
@@ -1195,7 +1219,7 @@ export class ControllerRuntime {
       const previous = this.store.jobs(worker.id).filter(value => value.id !== job.id && !['queued', 'cancelled'].includes(value.status)).at(-1);
       const recovery = previous?.interrupted ? harnessText('worker.interrupted_recovery') : '';
       const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'housekeeper' ? '' : job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction
-          + (worker.target?.transport === 'ssh' ? '' : workspaceOutputGuidance(this.config.contextWorkspace ?? this.config.workspace))) + recovery + job.prompt, imagePaths: job.imagePaths,
+          + (worker.target?.transport === 'ssh' ? (!worker.nativeId && worker.target.remoteRoot ? harnessText('worker.remote_output_guidance', { remote_root: worker.target.remoteRoot }) : '') : workspaceOutputGuidance(this.config.contextWorkspace ?? this.config.workspace))) + (!worker.nativeId && !['housekeeper', 'workspace-context'].includes(job.origin.purpose ?? '') ? harnessText('worker.concise_delivery') : '') + recovery + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), ...(job.origin.purpose === 'housekeeper' ? { readOnly: true } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
         onReady: () => { state.ready = true; this.pumpSupplements(workerId, state); },
         onActivity: activity => {
@@ -1469,7 +1493,9 @@ export class ControllerRuntime {
       for (const job of this.store.jobs(worker!.id).filter(job => job.status === 'uncertain' && job.processStopped !== true || ['completed', 'failed'].includes(job.status) && !!job.nativeResult && job.processStopped === false)) {
         try {
           if (await this.adapter(worker!).confirmStopped?.(worker!.id, job.id) !== true
-            && !(worker!.target?.transport !== 'ssh' && ['completed', 'failed'].includes(job.status) && !!job.nativeResult && this.localExitConfirmed(job))) continue;
+            && !(worker!.target?.transport !== 'ssh' && ['completed', 'failed'].includes(job.status) && !!job.nativeResult && this.localExitConfirmed(job))) {
+            await this.notifyRetirementBlocked(worker, job); continue;
+          }
           const current = this.store.getJob(job.id);
           if (current && ['uncertain', 'completed', 'failed'].includes(current.status) && current.processStopped !== true)
             this.store.setJob(current.id, current.status, { processStopped: true, ...(current.status !== 'uncertain' && current.nativeResult ? { nativeResult: { ...current.nativeResult, processStopped: true } } : {}) });
@@ -1483,6 +1509,22 @@ export class ControllerRuntime {
       // Rotate unresolved guards so a persistently unreachable machine cannot starve later ones.
       if (this.unconfirmedStops.has(worker!.id)) { this.unconfirmedStops.delete(worker!.id); this.unconfirmedStops.add(worker!.id); }
     }
+  }
+  private async notifyRetirementBlocked(worker: ControllerWorker, job: ControllerJob): Promise<void> {
+    if (!job.nativeResult || !['completed', 'failed'].includes(job.status) || job.processStopped !== false
+      || this.now() - Date.parse(job.updatedAt) < 30_000 || !this.store.nextJob(worker.id)
+      || (job.wakeAllowed ?? worker.wakeAllowed) === false || job.cancelReason || worker.ownership === 'user'
+      || worker.handoffPending || this.store.isConversationPaused(job.origin.conversationId) || this.isDraining()) return;
+    const hash = createHash('sha256').update(`retirement-blocked:${job.id}`).digest('hex').slice(0, 32);
+    const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20)}`;
+    if (this.registry.getTask(id)) return;
+    const context = this.registry.createContext({ ...job.origin, purpose: 'host-event' });
+    try {
+      this.registry.register(JSON.parse(readFileSync(context.contextPath, 'utf8')) as TaskContextFile, '助手 CLI 收尾受阻', id);
+      const changed = this.registry.acceptObservedResult(id, 'failed',
+        `workerId: ${worker.id}\njobId: ${job.id}\n原生报告已保存，但 CLI 退出仍未确认，后续续聊尚未执行。未重做已完成操作；同一原生会话的并发锁仍保留。`);
+      if (changed) await this.notify(id);
+    } finally { this.registry.closeContext(context.contextId); }
   }
   private async observeStalls(): Promise<void> {
     if (!this.callbacks.onStall) return;

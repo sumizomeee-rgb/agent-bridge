@@ -1,3 +1,5 @@
+import { incomingFileManifest, type IncomingFile } from './incoming-files.js';
+import { unlink } from 'node:fs/promises';
 import type { DiscordAttachment, IncomingDM } from './types.js';
 import { clipHistoryText } from './group-history.js';
 
@@ -61,9 +63,14 @@ export function renderForwarded(value: ForwardedContent): string {
 export interface ForwardedReader {
   readForwardedContent?(message: IncomingDM, signal?: AbortSignal): Promise<ForwardedContent | undefined>;
   downloadImages(message: IncomingDM): Promise<string[]>;
+  downloadFiles?(message: IncomingDM, imagePaths?: string[]): Promise<IncomingFile[]>;
 }
 export async function prepareIncomingMessage(reader: ForwardedReader, message: IncomingDM, outerText = message.text): Promise<{ text: string; imagePaths: string[] }> {
   const imagePaths = await reader.downloadImages(message);
+  let files: IncomingFile[];
+  try { files = await reader.downloadFiles?.(message, imagePaths) ?? []; }
+  catch (error) { await Promise.all(imagePaths.map(path => unlink(path).catch(() => {}))); throw error; }
+  outerText = [outerText, incomingFileManifest(files)].filter(Boolean).join('\n\n');
   if (!message.forwarded) return { text: outerText, imagePaths };
   let content: ForwardedContent;
   try { content = copyForwarded(await reader.readForwardedContent?.(message) ?? message.forwarded) ?? { status: 'unavailable', messages: [], notes: ['转发引用格式无效，正文未读取。'] }; }

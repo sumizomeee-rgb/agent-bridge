@@ -84,7 +84,9 @@ test('housekeeper defaults off, requires the owner and opens an immediate fixed 
   const f=fixture();t.after(()=>f.close());f.setScan(o=>snapshot(o,0));
   await f.service.poll();assert.equal(f.scans.length,0);assert.match(f.service.status(),/关闭.*默认/);
   assert.match(await f.service.command(f.message('other'),'on'),/主人/);assert.equal(f.service.store.read(),null);
-  assert.match(await f.service.command(f.message(),'on'),/20分钟/);
+  const reply=await f.service.command(f.message(),'on');
+  assert.match(reply,/20分钟/);assert.match(reply,/增量.*笔记本默认助手.*主控/);assert.match(reply,/跨新会话和重启保留/);
+  assert.doesNotMatch(reply,/本轮：|最近成功：|开启时间：|是否跟进/);
   const enabled=f.service.store.read()!;assert.equal(enabled.nextAt,enabled.enabledAt);assert.equal(enabled.intervalMinutes,20);
   await f.service.poll();assert.equal(f.scans.length,1);assert.equal(f.dispatches.length,0);
   const acknowledged=f.service.store.read()!;assert(acknowledged.cursor);assert.equal(acknowledged.nextAt,'2026-10-30T00:20:00.000Z');
@@ -96,7 +98,11 @@ test('housekeeper defaults off, requires the owner and opens an immediate fixed 
 test('repeated on preserves progress and epoch, off cancels only its own summary worker',async t=>{
   const f=fixture();t.after(()=>f.close());await f.service.command(f.message(),'on');await f.service.poll();
   const before=f.service.store.read()!;f.advance(60000);
-  await f.service.command(f.message('owner','enable-2'),'on');const after=f.service.store.read()!;
+  const repeated=await f.service.command(f.message('owner','enable-2'),'on');
+  assert.equal(repeated,'事务巡视已开启，原计划和进度保留。');
+  assert.doesNotMatch(repeated,/本轮：|最近成功：|开启时间：|\n/);
+  assert.match(await f.service.command(f.message(),'status'),/本轮：.*最近成功：/);
+  const after=f.service.store.read()!;
   assert.equal(after.epoch,before.epoch);assert.equal(after.enabledAt,before.enabledAt);assert.equal(after.authorizationMessageId,'enable-1');
   assert.deepEqual(after.run,before.run);assert.equal(f.dispatches.length,1);
   await f.service.command(f.message(),'off');assert.deepEqual(f.cancelled,['worker-1']);

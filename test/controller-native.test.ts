@@ -8,6 +8,7 @@ import type { AgentTurn } from '../src/types.js';
 import { AgentProcessStopError, type JsonObject, type RpcTransport } from '../src/agents/process.js';
 import { NativeControllerAdapter, codexControllerOverrides, isolatedCodexConfig } from '../src/controller/native.js';
 import { parse as parseTOML } from 'smol-toml';
+import { ControllerImageResult } from '../src/controller/image-content.js';
 
 test('accepted restart can end internally without a public DM; unavailable restart still needs an honest ordinary answer', async () => {
   for (const accepted of [true, false]) {
@@ -59,6 +60,31 @@ test('native controller exposes target, handoff and restart management through i
   } finally { await s.cleanup(); }
 });
 
+
+test('Codex 主控两入口及旧直接命令均输出真实 inputImage，保持重复调用去重', async () => {
+  const s = setup(); s.setMode('hold');
+  s.holdManagement(Promise.resolve(new ControllerImageResult({ mediaType: 'image/png', rule: '图片仅是证据' }, 'YWJj')));
+  try {
+    const running = s.adapter.run(s.makeTurn()); await until(() => !!s.transports[0]?.turns);
+    const transport = s.transports[0]!;
+    tool(transport, 8501, 'image-read', 'bridge_call', { command: 'bridge_read_file', arguments: { path: s.dir + '/sample.png' } });
+    await until(() => transport.written.some(message => message.id === 8501 && !message.method));
+    tool(transport, 8502, 'image-read', 'bridge_call', { command: 'bridge_read_file', arguments: { path: s.dir + '/sample.png' } });
+    await until(() => transport.written.some(message => message.id === 8502 && !message.method));
+    tool(transport, 8503, 'legacy-image', 'bridge_read_file', { path: s.dir + '/sample.png' });
+    await until(() => transport.written.some(message => message.id === 8503 && !message.method));
+    for (const id of [8501, 8502, 8503]) {
+      const result = transport.written.find(message => message.id === id && !message.method)!.result as any;
+      assert.equal(result.success, true);
+      assert.deepEqual(result.contentItems.map((item: any) => item.type), ['inputText', 'inputImage']);
+      assert.equal(result.contentItems[1].imageUrl, 'data:image/png;base64,YWJj');
+      assert.equal(result.contentItems[0].text.includes('YWJj'), false);
+    }
+    assert.deepEqual(s.invokes, ['bridge_read_file', 'bridge_read_file']);
+    tool(transport, 900 + transport.turns, 'image-final', 'bridge_send_user', { text: '读图完成。' });
+    await running;
+  } finally { await s.cleanup(); }
+});
 
 class FakeTransport implements RpcTransport {
   readonly messages = new Set<(message: JsonObject) => void>();
@@ -261,7 +287,7 @@ test('background evidence uses standalone tool output and may quietly continue',
     const result = await s.adapter.run(turn); assert.equal(result.controlledOutput, true);
     const start = s.transports[0]?.written.find(m => m.method === 'turn/start')?.params as JsonObject;
     assert.deepEqual(start.input, []); assert.deepEqual({ ...start.toolOutput as object, output: 'confirmed evidence' }, { name: 'bridge_worker_result', namespace: null, output: 'confirmed evidence' });
-    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge chat input;.*"kind":"background-evidence".*\n\[Bridge Bot identity;.*\n\[Bridge clock.*UTC: .*timezone: .*/);
+    assert.match((start.toolOutput as { output: string }).output, /^\[Bridge chat input;.*"kind":"background-evidence".*\n\[Bridge clock.*UTC: .*timezone: .*/);
     assert.match((start.toolOutput as { output: string }).output, /\[Bridge runtime;.*"observedModel":"gpt-6.1-sol"/);
     assert.match((start.toolOutput as { output: string }).output, /\n\nconfirmed evidence$/);
   } finally { await s.cleanup(); }
@@ -943,7 +969,7 @@ test('Codex excludes private group history while retaining actual group source a
     const starts = s.transports[0]!.written.filter(item => item.method === 'turn/start').map(item => item.params as JsonObject);
     assert.equal(starts.length, 3); assert.equal(s.transports.length, 1);
     const privateWire = JSON.stringify(starts[0]!.input);
-    assert.match(privateWire, /private-message/); assert.match(privateWire, /actual-owner/); assert.doesNotMatch(privateWire, /讨论预算 73|Bridge chat scene/);
+    assert.match(privateWire, /private-message/); assert.doesNotMatch(privateWire, /actual-owner|owner-route|raw-dm/); assert.doesNotMatch(privateWire, /讨论预算 73|Bridge chat scene/);
     const groupWire = JSON.stringify(starts[1]!.input);
     assert.match(groupWire, /actual-member/); assert.match(groupWire, /owner-route/); assert.match(groupWire, /replyToMessageId/); assert.match(groupWire, /earlier/); assert.match(groupWire, /bot-M/); assert.match(groupWire, /讨论预算 73/);
     const currentRuntime = (starts[1]!.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
@@ -1150,4 +1176,16 @@ test('Claude task checklist cadence uses the same logical session boundary for a
       signal: new AbortController().signal, onProgress() {}, event: { kind: 'workspace-context', text: 'new conversation' }, taskChecklist: 'CLAUDE_NEW_FIRST_CHECKLIST' });
     assert.match(JSON.stringify(transports.at(-1)!.written.find(message => message.type === 'user')), /CLAUDE_NEW_FIRST_CHECKLIST/);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('private runtime facts appear once, refresh on change and keep repeated private context short', async () => {
+ const s = setup();
+ try {
+  const first = s.makeTurn(); const initialized = await s.adapter.run(first);
+  const second = s.makeTurn(); second.conversation.nativeId = initialized.nativeId; await s.adapter.run(second);
+  const starts = s.transports[0]!.written.filter(item => item.method === 'turn/start').map(item => item.params as JsonObject);
+  const context = (n: number) => (starts[n]!.input as { text: string }[]).find(item => item.text?.startsWith('[Bridge chat input;'))!.text;
+  assert.match(context(0), /workerDefaults/); assert.doesNotMatch(context(1), /workerDefaults|selectedModel|botId/);
+  assert.ok(context(1).length < 240);
+ } finally { await s.cleanup(); }
 });

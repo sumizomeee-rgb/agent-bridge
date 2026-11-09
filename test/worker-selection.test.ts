@@ -86,6 +86,48 @@ test('编号默认选择绑定本Bot本电脑最近清单，含普通模型和�
   } finally { await f.close(); }
 });
 
+test('默认设置成功仅确认目标、助手、模型及显式强度；查询保留清单', async () => {
+  const f = fixture(); try {
+    f.enableLocalPreset();
+    const check = (reply: string, expected: string) => {
+      assert.equal(reply, expected);
+      assert.doesNotMatch(reply, /\n|\/default|预设：|\d+\. 预设/);
+    };
+    check(await f.runtime.workerDefaultCommand('agentworker home preset home-luna'), '已设置home [home]默认助手：家用 Luna（Codex · gpt-6-luna）。');
+    check(await f.runtime.workerDefaultCommand('agentworker home preset home-luna xhigh'), '已设置home [home]默认助手：家用 Luna（Codex · gpt-6-luna · 强度 xhigh）。');
+    check(await f.runtime.workerDefaultCommand('agentworker home preset home-luna default'), '已设置home [home]默认助手：家用 Luna（Codex · gpt-6-luna）。');
+    check(await f.runtime.workerDefaultCommand('agentworker local claude haiku low'), '已设置当前桥电脑 [local]默认普通助手：Claude · haiku · 强度 low。');
+    check(await f.runtime.workerDefaultCommand('agentworker local codex gpt-6-luna default'), '已设置当前桥电脑 [local]默认普通助手：Codex · gpt-6-luna。');
+    const list = await f.runtime.workerDefaultCommand('agentworker local');
+    assert.match(list, /2\. 预设 本机 SOL/); assert.match(list, /普通 codex/); assert.match(list, /\/default agentworker local/);
+    check(await f.runtime.workerDefaultCommand('agentworker local 2 xhigh'), '已设置当前桥电脑 [local]默认助手：本机 SOL（Codex · gpt-6.1-sol · 强度 xhigh）。');
+    const ordinary = list.split('\n').find(line => line.includes('普通 codex · gpt-6-luna'))!.split('.')[0];
+    check(await f.runtime.workerDefaultCommand(`agentworker local ${ordinary} low`), '已设置当前桥电脑 [local]默认普通助手：Codex · gpt-6-luna · 强度 low。');
+    check(await f.runtime.workerDefaultCommand('agentworker local 1'), '已设置当前桥电脑 [local]默认助手：跟随当前主控的后端、模型和强度。');
+    check(await f.runtime.workerDefaultCommand('agentworker local follow'), '已设置当前桥电脑 [local]默认助手：跟随当前主控的后端、模型和强度。');
+    check(await f.runtime.workerDefaultCommand('agentworker local clear'), '已设置当前桥电脑 [local]默认助手：跟随当前主控的后端、模型和强度。');
+    check(await f.runtime.workerDefaultCommand('agentworker home clear'), '已清除home [home]默认助手：未设置。');
+    const all = await f.runtime.workerDefaultCommand('agentworker');
+    assert.match(all, /普通助手：/); assert.match(all, /预设：家用 Luna/); assert.match(all, /\/default agentworker/);
+    assert.equal(f.turns.length, 0);
+  } finally { await f.close(); }
+});
+
+test('默认设置错误仍提供纠正信息且不改变已保存选择', async () => {
+  const f = fixture(); try {
+    await f.runtime.workerDefaultCommand('agentworker home preset home-luna');
+    for (const args of ['agentworker home preset', 'agentworker home clear extra', 'agentworker home codex', 'agentworker home 1 low extra']) {
+      await assert.rejects(f.runtime.workerDefaultCommand(args), /\/default agentworker/);
+    }
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker home follow'), /仅用于/);
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker home codex default'), /明确指定模型/);
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker home 1'), /未查看/);
+    await f.runtime.workerDefaultCommand('agentworker home');
+    await assert.rejects(f.runtime.workerDefaultCommand('agentworker home 999'), /编号超出清单范围/);
+    assert.deepEqual(f.runtime.store.workerDefault('home'), { kind: 'preset', presetId: 'home-luna', effort: null });
+  } finally { await f.close(); }
+});
+
 test('初始桥电脑动态跟随；远端省略或 default 均拒绝且不留下 worker/job', async () => {
   const f = fixture(); try {
     const first = await f.launch(); assert.equal(f.runtime.store.getWorker(first.workerId)!.model, 'gpt-6.1-sol');
@@ -222,7 +264,7 @@ test('斜杠菜单、私聊命令与实际默认设置同路；无模型回合�
   try {
     const encoded = slashText({ name: 'default', options: [{ type: 3, name: 'args', value: 'agentworker home preset home-luna xhigh' }] });
     assert('text' in encoded); await manager.handle({ id: 'command-1', userId: 'owner', channelId: 'local-sink', text: encoded.text, imagePaths: [] });
-    assert.equal(f.runtime.store.workerDefault('home')!.kind, 'preset'); assert(replies.some(s => s.includes('默认助手已保存')));
+    assert.equal(f.runtime.store.workerDefault('home')!.kind, 'preset'); assert.deepEqual(replies, ['已设置home [home]默认助手：家用 Luna（Codex · gpt-6-luna · 强度 xhigh）。']);
     await manager.handle({ id: 'command-2', userId: 'owner', channelId: 'local-sink', text: '/default agentworker', imagePaths: [] });
     assert(replies.some(s => s.includes('[local]') && s.includes('[home]'))); assert(!GROUP_SLASH_COMMANDS.some(c => c.name === 'default'));
     assert.throws(() => parseWorkerDefaultCommand('agentworker home follow'), /仅用于/);

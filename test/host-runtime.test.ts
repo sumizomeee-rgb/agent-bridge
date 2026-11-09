@@ -1122,6 +1122,9 @@ test('successful group reset suppresses per-Bot introduction notices and keeps o
     assert.deepEqual(f.managers.get(botId)!.knownDMChannels(), []);
   }
   assert.equal(f.replies.filter(r => /已提交本群/.test(r.text)).length, 1);
+  const receipt = f.replies.find(r => /已提交本群/.test(r.text))!.text;
+  assert.match(receipt, /正在分别初始化.*影响这些 Bot 的私聊和其他群.*批次/);
+  assert.doesNotMatch(receipt, /旧定时已取消/);
 });
 
 test('any member private reset cancels an already received broadcast even when it only mentions A', { timeout: 10000 }, async t => {

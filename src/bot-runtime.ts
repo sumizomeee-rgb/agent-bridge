@@ -48,7 +48,7 @@ export interface BotRuntimeHooks {
   onReconnect?(): Promise<void>;
 }
 
-export type BotTransport = Pick<PlatformTransport, keyof PlatformTransport>;
+export type BotTransport = Pick<PlatformTransport, Exclude<keyof PlatformTransport, 'downloadFiles'>> & Partial<Pick<PlatformTransport, 'downloadFiles'>>;
 type Adapters = Record<'codex' | 'claude', AgentAdapter>;
 type ToolInvoker = (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string) => Promise<unknown>;
 type BotTargetCatalog = ControllerTargetCatalog & Pick<TargetCatalogService, 'computerOverview' | 'close'>;

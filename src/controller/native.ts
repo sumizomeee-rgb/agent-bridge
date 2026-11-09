@@ -1,6 +1,8 @@
 import { harnessText } from '../harness.js';
+import { compactControllerReceipt } from './tool-receipt.js';
 import { claudeModelSettings, createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
 import { workspaceDocuments } from './workspace-documents.js';
+import { refreshControllerCodexLogin } from './codex-credentials.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, lstatSync, statSync, appendFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -17,6 +19,7 @@ import { controllerToolHelp, resolveControllerTool, ControllerToolInputError } f
 import { controllerTools, controllerToolsForCommunication } from './tools/catalog.js';
 export { controllerTools, controllerToolsForCommunication } from './tools/catalog.js';
 import { createClaudeMcpServer } from './agents/claude/mcp.js';
+import { codexToolContent } from './image-content.js';
 import { codexDynamicTools } from './agents/codex/dynamic-tools.js';
 import type { ControllerSubmission, ControllerTurnState } from '../controller-lifecycle.js';
 import { assertBotCommunicationAllowed } from '../bot-communication.js';
@@ -119,6 +122,7 @@ interface ControllerSession {
   effortConfiguration?: EffortConfiguration | null;
   effortCapability?: EffortCapability;
   metadataSource?: string;
+  runtimeFacts?: string;
 }
 
 interface ControllerProcessProof {
@@ -239,6 +243,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       const sourceConfig = userFiles[0]!;
       writeFileSync(join(home, 'config.toml'), isolatedCodexConfig(existsSync(sourceConfig) ? readFileSync(sourceConfig, 'utf8') : ''), 'utf8');
       this.copyCredential(userFiles[1]!, join(home, 'auth.json'));
+      refreshControllerCodexLogin(userFiles[1]!, join(home, 'auth.json'));
     } else {
       for (const file of userFiles.slice(1)) this.copyCredential(file, join(home, file.endsWith('.credentials.json') ? '.credentials.json' : '.claude.json'));
     }
@@ -329,7 +334,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       const callId = typeof params.callId === 'string' ? params.callId : typeof params.itemId === 'string' ? params.itemId : null;
       if (!callId) throw new Error('主控工具请求缺少稳定调用标识。');
       const value = await this.invoke(session.active, params.tool, args, callId);
-      session.transport.write({ id: message.id, result: { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(value ?? null) }] } });
+      session.transport.write({ id: message.id, result: { success: true, contentItems: codexToolContent(value) } });
     } catch (error) { session.transport.write({ id: message.id, result: { success: false, contentItems: [{ type: 'inputText', text: safeError(error instanceof Error ? error.message : error, '主控工具失败') }] } }); }
   }
   private async invoke(active: ActiveTurn, name: string, args: JsonObject, callId: string): Promise<unknown> {
@@ -466,7 +471,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         if (error && typeof error === 'object' && 'deliveryUncertain' in error) { active.sealed = true; active.completed.reject(error); }
         throw error;
       }
-      if (name === 'bridge_list_workers' && args.details === true && isObject(result) && active.turn.onReadBridgeFeedback) {
+      if (name === 'bridge_list_workers' && args.workerId !== undefined && isObject(result) && active.turn.onReadBridgeFeedback) {
         const feedback = active.turn.onReadBridgeFeedback({ limit: 20 });
         if (feedback.records.length) result = { ...result, bridgeFeedback: feedback };
       }
@@ -487,7 +492,7 @@ export class NativeControllerAdapter implements AgentAdapter {
         active.publicationPromise = publication;
         try { await publication; } catch (error) { active.completed.reject(error); throw error; }
       }
-      return result;
+      return compactControllerReceipt(name, result);
     }
     if (typeof args.text !== 'string' || !args.text.trim() || args.text.length > 16000) throw new Error('公开消息需要有效文字。');
     if (args.targetId != null && (typeof args.targetId !== 'string' || !args.targetId.trim())) throw new Error('投递目标ID无效。');
@@ -815,19 +820,29 @@ export class NativeControllerAdapter implements AgentAdapter {
       observedModel: session.model ?? turn.conversation.actualModel ?? null,
       selectedEffort: selectedEffort(turn), observedEffort: session.effort ?? turn.conversation.actualEffort ?? null,
       workerDefaults: this.options.defaultModels ?? {}, internalBotCommunicationEnabled: this.options.internalBotCommunicationEnabled !== false,
-      ...(turn.event ? { event: { kind: turn.event.kind, introductionRequested: turn.event.introductionRequested === true } } : {}),
       ...(session.active?.replyRecovery ? { reportRecoveryOnly: true } : {}) };
     const scene = turn.groupContext ? turn.chatScene ?? turn.groupContext.scene : undefined;
     const currentMessage = this.sceneMessage(scene);
     const explicitDelivery = currentMessage && isObject(currentMessage.defaultDelivery) && ['group', 'private', 'internal'].includes(String(currentMessage.defaultDelivery.area)) ? currentMessage.defaultDelivery : undefined;
-    const chat = { ...(currentMessage ? { currentMessage } : {}), kind: turn.event ? 'background-evidence' : turn.groupContext ? 'group-message' : 'private-message',
+    const chat = { ...(turn.event ? { event: { kind: turn.event.kind, introductionRequested: turn.event.introductionRequested === true } } : {}), ...(currentMessage ? { currentMessage } : {}), kind: turn.event ? 'background-evidence' : turn.groupContext ? 'group-message' : 'private-message',
       route: turn.source ? { messageId: turn.source.messageId, userId: turn.source.userId, channelId: turn.source.channelId } : null,
       original: turn.source?.original ?? (!turn.groupContext && !turn.event ? turn.source ?? null : null),
       requesterPrincipalId: turn.groupContext && !turn.event ? turn.groupContext.principalId : null,
       defaultDelivery: explicitDelivery ?? { area: turn.groupContext ? 'group' : 'private', ...(!turn.groupContext ? { targetId: 'private' } : {}), channelId: turn.source?.channelId ?? turn.groupContext?.originChannelId ?? null },
       group: turn.groupContext ? { spaceId: turn.groupContext.spaceId, eventId: turn.groupContext.eventId, eventKind: turn.groupContext.eventKind ?? null } : null };
     const sceneBlock = scene == null && !turn.groupContext ? '' : harnessText('controller.chat_scene_header') + JSON.stringify(this.groupScene(scene));
-    return '[Bridge chat input; program facts] ' + JSON.stringify(chat) + sceneBlock + '\n' + harnessText('controller.bot_identity_header') + JSON.stringify({ botId: this.options.identity?.botId ?? null, aliases: this.options.identity?.aliases ?? [] }) + '\n' + bridgeClock() + harnessText('controller.runtime_facts_header') + JSON.stringify(info)
+    const facts = JSON.stringify({ botId: this.options.identity?.botId ?? null, aliases: this.options.identity?.aliases ?? [], ...info });
+    const changed = session.runtimeFacts !== facts;
+    session.runtimeFacts = facts;
+    // Private routes and authorization stay in program state; group/cross-Bot attribution remains explicit.
+    const context = !turn.groupContext && !turn.event
+      ? '[Bridge chat input; program facts] ' + JSON.stringify({ kind: 'private-message', defaultDelivery: 'current-private',
+        ...(turn.source?.original?.authorType && turn.source.original.authorType !== 'user' ? { original: turn.source.original } : {}) })
+      : '[Bridge chat input; program facts] ' + JSON.stringify(chat) + sceneBlock;
+    return context + '\n' + (!turn.groupContext && !turn.event
+      ? '[Bridge clock] ' + new Date().toLocaleString('sv-SE') + ' ' + Intl.DateTimeFormat().resolvedOptions().timeZone
+      : bridgeClock())
+      + (changed ? harnessText('controller.runtime_facts_header') + facts : '')
       + (turn.bridgeFeedback?.records.length ? harnessText('controller.feedback_header') + JSON.stringify(turn.bridgeFeedback) : '')
       + (turn.dispatchFailures?.records.length ? harnessText('controller.dispatch_failure_header') + JSON.stringify(turn.dispatchFailures) : '')
       + (includeTaskChecklist && turn.taskChecklist ? harnessText('controller.task_checklist_header') + turn.taskChecklist : '');

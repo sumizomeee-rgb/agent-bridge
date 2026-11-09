@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { isObject, safeError, type JsonObject } from '../../../agents/process.js';
 import { controllerEntryTools } from '../../tools/entry.js';
+import { mcpToolContent } from '../../image-content.js';
 
 interface ClaudeMcpOptions {
   dataDir: string;
@@ -46,7 +47,7 @@ export function createClaudeMcpServer(options: ClaudeMcpOptions) {
           const params = isObject(request.params) ? request.params : {};
           name = typeof params.name === 'string' ? params.name : undefined; phase = 'tool-matching';
           if (typeof params.name !== 'string' || !isObject(params.arguments)) throw new Error('没有当前主控轮次或参数无效。');
-          result = { content: [{ type: 'text', text: JSON.stringify(await options.invoke(params.name, params.arguments, () => { phase = 'invoking'; })) }] };
+          result = { content: mcpToolContent(await options.invoke(params.name, params.arguments, () => { phase = 'invoking'; })) };
           phase = 'invoked';
         } else result = {};
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));

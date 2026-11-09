@@ -624,7 +624,7 @@ export class HostRuntime {
           channelId: bot.config.scopePrefix! + this.rawSpace(bot.config.botId!, group.spaceId), text: '/new', imagePaths: [] };
         bot.manager.commitPreparedReset(target, message, true, true);
       }
-      await this.controlReply(group.receiverBotId, source, `已提交本群 ${prepared.length} 个 Bot 的新会话，正在分别初始化。影响这些 Bot 的私聊和其他群；旧定时已取消。批次：${id.slice(0, 12)}`);
+      await this.controlReply(group.receiverBotId, source, `已提交本群 ${prepared.length} 个 Bot 的新会话，正在分别初始化。影响这些 Bot 的私聊和其他群。批次：${id.slice(0, 12)}`);
     } catch (error) {
       prepared.forEach(({ bot, target }) => bot.manager.abortPreparedReset(target)); throw error;
     } finally { group.memberBotIds.forEach(id => this.paused.delete(id)); }

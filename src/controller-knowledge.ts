@@ -200,11 +200,10 @@ export class ControllerKnowledgeJournal {
     } catch (error) { if (this.db.isTransaction) this.db.exec('ROLLBACK'); throw error; }
   }
   summary(scope: KnowledgeScope): string {
-    const rows = this.db.prepare("SELECT value_json FROM controller_checklist WHERE scope=? AND state NOT IN ('done','cancelled','superseded') ORDER BY updated_at DESC,id LIMIT 11").all(scopeKey(scope));
-    return JSON.stringify({ rule, tasks: rows.slice(0, 10).map(row => {
-      const task = JSON.parse(String(row.value_json)) as ChecklistTask;
-      return { id: task.id, version: task.version, title: task.title.slice(0, 160), state: task.state, nextStep: task.nextStep.slice(0, 160) };
-    }), hasMore: rows.length > 10, details: 'bridge_list_tasks; original messages: bridge_search_chat_history / bridge_read_chat_history. These tools are available directly; do not dispatch a worker just to recall this chat.' });
+    const rows = this.db.prepare("SELECT state,count(*) AS n FROM controller_checklist WHERE scope=? AND state NOT IN ('done','cancelled','superseded') GROUP BY state").all(scopeKey(scope));
+    if (!rows.length) return '';
+    return JSON.stringify({ counts: Object.fromEntries(rows.map(row => [String(row.state), Number(row.n)])),
+      reminder: '按需用 bridge_list_tasks 查看清单并主动跟进；沿用有效授权，保留暂停和取消状态。' });
   }
   invoke(scope: KnowledgeScope, name: string, input: unknown, callId: string): unknown {
     switch (name) {

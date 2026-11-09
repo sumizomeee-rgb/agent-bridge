@@ -17,6 +17,7 @@ import { FeishuOutbox } from './feishu-outbox.js';
 import { deliveryDiagnostic, errorEvidence, FeishuRequestError, type DeliveryDiagnostic } from './delivery-errors.js';
 
 import { copyForwarded, renderForwarded, type ForwardedContent } from './forwarded.js';
+import { receiveIncomingFiles, incomingImage, type IncomingFile } from './incoming-files.js';
 import { readFeishuForwarded } from './feishu-forward.js';
 
 type Json = Record<string, any>;
@@ -391,11 +392,21 @@ export class FeishuTransport {
       return data.items;
     }, signal);
   }
+  async downloadFiles(message: IncomingDM, imagePaths: string[] = []): Promise<IncomingFile[]> {
+    return receiveIncomingFiles(this.config, message, imagePaths, async item => {
+      if (!item.resourceKey || !/^om_[a-zA-Z0-9_-]+$/.test(item.messageId ?? '')) throw new Error('附件接收失败：飞书文件资源标识无效。');
+      const token = await this.tenantToken();
+      return this.http(`${this.apiBase}/im/v1/messages/${item.messageId}/resources/${encodeURIComponent(item.resourceKey)}?type=file`, {
+        headers: { Authorization: `Bearer ${token}` }, redirect: 'error',
+        signal: AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(120_000)]), ...(this.dispatcher ? { dispatcher: this.dispatcher } : {}),
+      });
+    });
+  }
   async downloadImages(message: IncomingDM): Promise<string[]> {
     if (message.attachments.length > 10) throw new Error('图片超过每轮 10 张上限。');
     const files: string[] = []; let total = 0;
     try {
-    for (const item of message.attachments) {
+    for (const item of message.attachments.filter(incomingImage)) {
       if (item.content_type !== 'image/unknown' || !item.resourceKey || !/^om_[a-zA-Z0-9_-]+$/.test(item.messageId ?? '')) throw new Error('附件已收到但未交给模型：当前仅支持用户图片输入，普通文件输入尚未启用。');
       const token = await this.tenantToken();
       const response = await this.http(`${this.apiBase}/im/v1/messages/${item.messageId}/resources/${encodeURIComponent(item.resourceKey)}?type=image`, {

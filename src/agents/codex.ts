@@ -63,7 +63,7 @@ export class CodexAdapter implements AgentAdapter {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
     const conversationId = turn.conversation.id;
     if (this.retirements.has(conversationId)) {
-      try { await this.executions.get(conversationId)?.stop(true); }
+      try { const prior = this.executions.get(conversationId); await (prior?.retireCompleted?.() ?? prior?.stop(true)); }
       catch (error) { throw new Error('上一轮已完成，CLI 仍在收尾；本轮尚未提交。', { cause: error }); }
     }
     if (this.active.has(conversationId)) throw new Error('该 Codex 会话仍在执行任务。');
@@ -238,6 +238,7 @@ export class CodexAdapter implements AgentAdapter {
       if (resumeId && thread.thread.id !== resumeId) {
         throw new Error('Codex 续接返回了不同会话；原会话已保留，本轮任务尚未提交。');
       }
+      if (effort && typeof thread.model === 'string' && thread.model !== turn.conversation.model) currentCapability = await validateEffort(this, { ...turn.conversation, model: thread.model }, effort);
       nativeId = thread.thread.id;
       turn.onNativeId?.(nativeId);
       if (typeof thread.model === 'string' && thread.model) reportModel(thread.model);
@@ -312,6 +313,6 @@ export class CodexAdapter implements AgentAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...this.active.entries()].map(([id, cancel]) => this.retirements.has(id) ? this.executions.get(id)!.stop(true) : cancel()).concat([this.metadata.close()]));
+    await Promise.all([...this.active.entries()].map(([id, cancel]) => { const prior = this.executions.get(id)!; return this.retirements.has(id) ? prior.retireCompleted?.() ?? prior.stop(true) : cancel(); }).concat([this.metadata.close()]));
   }
 }

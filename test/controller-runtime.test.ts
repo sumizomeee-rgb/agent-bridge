@@ -1251,3 +1251,30 @@ test('policy report keeps raw evidence, normalizes parent completion and worker 
     assert.equal(f.codex.turns.length, 1); assert.equal(f.claude.turns.length, 0);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
+
+test('compact worker pages stay bounded, preserve scoped details and inject delivery only for new ordinary workers', async () => {
+ const f = fixture();
+ try {
+  const first = await launch(f.runtime, f.turn, { model: 'gpt-6.1-sol' }); await flush();
+  const second = await launch(f.runtime, f.turn, { model: 'gpt-6.1-sol' }); await flush();
+  const page = await f.runtime.invoke(f.turn, 'bridge_list_workers', { limit: 1 }) as any;
+  assert.equal(page.total, 2); assert.equal(page.workers.length, 1); assert.equal(page.hasMore, true);
+  assert.equal(page.workers[0].cwd, undefined); assert.equal(page.workers[0].nativeId, undefined);
+  const next = await f.runtime.invoke(f.turn, 'bridge_list_workers', { limit: 1, offset: page.nextOffset }) as any;
+  assert.notEqual(page.workers[0].workerId, next.workers[0].workerId);
+  const detail = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: first.workerId }) as any;
+  assert.equal(detail.workers[0].cwd, f.dir);
+  assert.match(f.codex.turns[0]!.text, /较长证据与明细保存到文件/);
+  f.codex.finish(first.workerId, '证据'.repeat(3000)); f.codex.finish(second.workerId); await flush();
+  const report = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: first.workerId }) as any;
+  const rest = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: first.workerId, resultOffset: report.workers[0].nextResultOffset }) as any;
+  assert.equal(report.workers[0].lastResult + rest.workers[0].lastResult, '证据'.repeat(3000));
+  assert.equal(rest.workers[0].nextResultOffset, null);
+  await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: first.workerId, prompt: '继续' }); await flush();
+  assert.doesNotMatch(f.codex.turns.at(-1)!.text, /较长证据与明细保存到文件/);
+  f.codex.finish(first.workerId); await flush();
+  const active = await f.runtime.invoke(f.turn, 'bridge_list_workers', { view: 'active' }) as any;
+  assert.equal(active.total, 0);
+  await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { limit: 21 }), /分页参数/);
+ } finally { await f.runtime.close(); f.registry.close(); }
+});
