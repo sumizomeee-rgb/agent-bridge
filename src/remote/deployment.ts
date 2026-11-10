@@ -71,9 +71,9 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
   });
 }
 export function ps(value: string): string { return "'" + value.replaceAll("'", "''") + "'"; }
-export function remotePowerShell(target: ExecutionTargetBinding, script: string, cwd: string): Promise<string> {
+export function remotePowerShell(target: ExecutionTargetBinding, script: string, cwd: string, timeout = 90_000): Promise<string> {
   return command('ssh', ['-F', target.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', target.alias!,
-    'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$env:NODE_NO_WARNINGS='1';" + script, 'utf16le').toString('base64')], cwd);
+    'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';$env:NODE_NO_WARNINGS='1';" + script, 'utf16le').toString('base64')], cwd, timeout);
 }
 export async function deployExecutor(target: ExecutionTargetBinding, release: ExecutorRelease, cwd: string): Promise<DeploymentResult> {
   if (!/^[A-Za-z]:[\\/]/.test(target.remoteRoot!)) throw new Error('自动执行器更新目前支持已登记的 Windows 目标。');
@@ -86,7 +86,7 @@ export async function deployExecutor(target: ExecutionTargetBinding, release: Ex
   await remotePowerShell(target, `if([Environment]::MachineName -ine ${ps(target.expectedHostname!)}){throw 'Wrong target'};New-Item -ItemType Directory -Force -Path ${ps(stage)}|Out-Null`, cwd);
   await command('scp', ['-q', '-F', target.sshConfig!, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
     release.archive, release.installer, release.helper, `${target.alias}:${stage}/`], cwd);
-  const output = await remotePowerShell(target, `& ${ps(stage + '/update-remote-agent.ps1')} -Root ${ps(target.remoteRoot!)} -NodePath ${ps(target.nodePath!)} -ExpectedHostname ${ps(target.expectedHostname!)} -Release ${ps(release.id)} -ArchiveHash ${ps(release.sha256)}`, cwd);
+  const output = await remotePowerShell(target, `& ${ps(stage + '/update-remote-agent.ps1')} -Root ${ps(target.remoteRoot!)} -NodePath ${ps(target.nodePath!)} -ExpectedHostname ${ps(target.expectedHostname!)} -Release ${ps(release.id)} -ArchiveHash ${ps(release.sha256)}`, cwd, 660_000);
   const result = JSON.parse(output) as DeploymentResult;
   if (!['ready', 'busy'].includes(result.state)) throw new Error('执行器更新没有返回可核对结果。');
   return result;

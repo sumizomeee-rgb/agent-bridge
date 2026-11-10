@@ -11,6 +11,7 @@ try {
  $helper=Join-Path $PSScriptRoot 'remote-update-helper.mjs'
  function Probe { $text=& $NodePath $helper inspect $resolvedRoot $ExpectedHostname;if($LASTEXITCODE -ne 0){throw 'Cannot verify executor state'};$text|ConvertFrom-Json }
  $probe=Probe
+ $needsSessionMigration=(Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
  if($probe.online -and $probe.release -eq $Release){@{state='ready';release=$Release}|ConvertTo-Json -Compress;return}
  if(!$probe.idle){@{state='busy';reason='Waiting for active or unconfirmed work; automatic retry pending'}|ConvertTo-Json -Compress;return}
  $archive=Join-Path $PSScriptRoot 'runtime.tgz'
@@ -70,7 +71,6 @@ try {
   if((Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath).State -ne 'Running'){Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath}
  }
  # A one-time user-profile migration runs after the new daemon owns its IPC endpoint.
- $needsSessionMigration=(Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
  $deadline=[DateTime]::UtcNow.AddSeconds($(if($needsSessionMigration){600}else{35}))
  for($attempt=0;[DateTime]::UtcNow -lt $deadline;$attempt++){
   Start-Sleep -Seconds 1
