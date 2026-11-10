@@ -69,7 +69,9 @@ try {
   }
   if((Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath).State -ne 'Running'){Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath}
  }
- $deadline=[DateTime]::UtcNow.AddSeconds(35)
+ # A one-time user-profile migration runs after the new daemon owns its IPC endpoint.
+ $needsSessionMigration=(Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
+ $deadline=[DateTime]::UtcNow.AddSeconds($(if($needsSessionMigration){600}else{35}))
  for($attempt=0;[DateTime]::UtcNow -lt $deadline;$attempt++){
   Start-Sleep -Seconds 1
   if($attempt -eq 2){Recover-IdleLauncher}
@@ -78,7 +80,10 @@ try {
  }
  throw 'New executor did not become ready'
 } catch {
- if($switched){
+ $layoutMigrated=$needsSessionMigration -and (Test-Path -LiteralPath (Join-Path $data 'session-home-migration.json'))
+ # Once verified histories have moved, the old program cannot read the new layout.
+ # Keep the checked new release selected; a later readiness check may finish recovery.
+ if($switched -and !$layoutMigrated){
   if($null -eq $previous){Remove-Item -LiteralPath $pointer -ErrorAction SilentlyContinue}else{[IO.File]::WriteAllText($pointer,$previous)}
   [IO.File]::WriteAllBytes($launcher,$oldLauncher)
   # The update supervisor retries the restored pointer; never kill a new process that may own work.

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { parse } from 'smol-toml';
 import { WorkerSessionAdapter, WorkerSessionRuntime } from '../src/agents/worker-session.js';
+import { sessionHome } from '../src/agents/session-home.js';
 import { PresetRuntime, PresetAgentAdapter } from '../src/presets/runtime.js';
 import { AgentProcessStopError, completedResultFromError } from '../src/agents/process.js';
 import type { AgentAdapter, AgentCommand, AgentTurn } from '../src/types.js';
@@ -25,6 +26,17 @@ function fixture(t: test.TestContext) {
   t.after(() => { assert.ok(resolve(root).startsWith(resolve(tmpdir()) + sep)); rmSync(root, { recursive: true, force: true }); });
   return { root, user, data, privateRoot, runtime: new WorkerSessionRuntime(data, user), command: { command: process.execPath, args: [] } };
 }
+test('session storage belongs to the user, scopes bot registrations, and refuses unmigrated history', t => {
+  const f = fixture(t);
+  const first = sessionHome(f.data, f.user, 'worker', 'codex', 'worker-A');
+  assert.ok(first.startsWith(join(f.user, '.codex', 'bridge') + sep));
+  assert.notEqual(first, sessionHome(join(f.root, 'other-bot'), f.user, 'worker', 'codex', 'worker-A'));
+  assert.notEqual(first, sessionHome(f.data, f.user, 'preset', 'codex', 'worker-A'));
+  mkdirSync(join(f.data, 'worker-homes', 'codex', 'worker-A'), { recursive: true });
+  assert.throws(() => f.runtime.prepare('codex', 'worker-A', 'old-native', 'hidden', {}), /旧目录尚未迁移/);
+  assert.equal(existsSync(first), false);
+});
+
 test('ordinary hidden sessions retain credentials and history across runtime reconstruction without touching native history', t => {
   const f = fixture(t), env = f.runtime.prepare('codex', 'worker-A', null, 'hidden', {}), home = env.CODEX_HOME!;
   assert.notEqual(home, join(f.user, '.codex')); assert.equal(env.CODEX_SQLITE_HOME, home);

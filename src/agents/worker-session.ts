@@ -6,6 +6,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import type { AgentAdapter, AgentCommand, AgentName, AgentResult, AgentSupplement, AgentTurn, Conversation, SessionVisibility, SteerResult } from '../types.js';
 import { CodexAdapter } from './codex.js';
 import { ClaudeAdapter } from './claude.js';
+import { sessionHome } from './session-home.js';
 import { abortError, completedResultFromError, isObject, processStopFailure } from './process.js';
 
 export function sessionVisibility(value: unknown): SessionVisibility | undefined {
@@ -88,7 +89,7 @@ export class WorkerSessionRuntime {
   constructor(readonly dataRoot: string, private readonly userHome = homedir()) {}
   prepare(agent: AgentName, workerId: string, nativeId: string | null, visibility: SessionVisibility, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(workerId)) throw new Error('助手编号无效。');
-    const home = join(this.dataRoot, 'worker-homes', agent, workerId), env = { ...process.env, ...baseEnv };
+    const home = sessionHome(this.dataRoot, this.userHome, 'worker', agent, workerId), env = { ...process.env, ...baseEnv };
     const location = pinSessionLocation(home, agent, visibility, nativeId, env, this.userHome)!;
     if (visibility === 'hidden') {
       const ready = join(home, 'profile-ready');

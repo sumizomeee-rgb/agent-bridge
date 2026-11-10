@@ -87,7 +87,8 @@ test('独立配置覆盖继承环境，凭据只在子进程环境，快照不�
       const path = join(prepared.env.CODEX_HOME!, 'preset-binding.json');
       assert.ok(!readFileSync(path, 'utf8').includes('private-test-key'));
       assert.deepEqual(readdirSync(prepared.env.CODEX_HOME!).sort(), ['config.toml', 'preset-binding.json']);
-      assert.deepEqual(readdirSync(f.user), []);
+      assert.deepEqual(readdirSync(f.user), ['.codex']);
+      assert.deepEqual(readdirSync(join(f.user, '.codex')), ['bridge']);
     } finally { await prepared.close(); }
   } finally { f.close(); }
 });
@@ -239,7 +240,8 @@ test('Claude预设固定主模型、四档别名和内部子助手，新建与�
     assert.equal(inherited.ANTHROPIC_MODEL, 'wrong-main');
     assert.equal(inherited.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '0');
     assert.equal(readFileSync(join(f.privateRoot, 'profiles.json'), 'utf8'), before);
-    assert.deepEqual(readdirSync(f.user), []);
+    assert.deepEqual(readdirSync(f.user), ['.claude']);
+    assert.deepEqual(readdirSync(join(f.user, '.claude')), ['bridge']);
   } finally { f.close(); }
 });
 

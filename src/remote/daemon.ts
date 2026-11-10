@@ -1,4 +1,4 @@
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
 import { stoppedExecutionFailure } from '../agents/interrupted-execution.js';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, renameSync } from 'node:fs';
 import { lstat, realpath, open, readFile, writeFile } from 'node:fs/promises';
@@ -8,6 +8,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { WorkerSessionAdapter, WorkerSessionRuntime, sessionVisibility } from '../agents/worker-session.js';
+import { migrateSessionHomes } from '../agents/session-home-migration.js';
 import { PresetRuntime, PresetAgentAdapter, assertPresetBinding } from '../presets/runtime.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
@@ -122,8 +123,8 @@ export class RemoteDaemon {
   private readonly workerSessions: WorkerSessionRuntime;
   constructor(readonly root: string, readonly config: RemoteDaemonConfig, private readonly options: RemoteDaemonOptions = {}) {
     if (hostname().toLowerCase() !== config.expectedHostname.toLowerCase()) throw new Error('远端电脑名称与登记不一致，拒绝启动。');
-    this.workerSessions = new WorkerSessionRuntime(remoteDataDirectory(root));
-    this.presetRuntime = new PresetRuntime(join(root, '.local', 'agent-presets'), remoteDataDirectory(root));
+    this.workerSessions = new WorkerSessionRuntime(remoteDataDirectory(root), options.nativeSessionOptions?.userHome);
+    this.presetRuntime = new PresetRuntime(join(root, '.local', 'agent-presets'), remoteDataDirectory(root), options.nativeSessionOptions?.userHome);
     this.dataDirectory = remoteDataDirectory(root); this.store = new RemoteStore(this.dataDirectory);
     this.nativeSessions = new NativeSessionService(this.dataDirectory, config.engines, { ...options.nativeSessionOptions, env: this.environment(), leaseStore: this.store.nativeLeases, legacyOwnership: ref => this.store.nativeOwnership(ref), rebind: (ref, userId, workerId, cwd) => this.store.adoptSession(ref, userId, workerId, cwd) });
     const tokenFile = join(this.dataDirectory, 'ipc-token');
@@ -136,6 +137,10 @@ export class RemoteDaemon {
     await new Promise<void>((resolveValue, reject) => { this.server!.once('error', reject); this.server!.listen(remoteEndpoint(this.root), () => { this.server!.off('error', reject); resolveValue(); }); });
     // Only the daemon that acquired the IPC endpoint may reconcile the journal.
     // A duplicate service launch must never mutate another daemon's live jobs.
+    if (this.isUpdateIdle()) {
+      try { migrateSessionHomes(this.dataDirectory, this.options.nativeSessionOptions?.userHome ?? homedir(), true); }
+      catch (error) { await this.close(); throw error; }
+    }
     for (const job of this.store.jobs()) if (job.status === 'uncertain' && completedRetirementFailure(job)) this.store.update(job.dispatchId, { status: 'completed' });
     for (const job of this.store.jobs()) if (job.status === 'running') this.store.update(job.dispatchId, { status: 'uncertain', ready: false, error: '远端托管器曾中断，原生进程及结果需核实；未重新执行任务。' });
     this.httpServer = createHttpServer((request, response) => {

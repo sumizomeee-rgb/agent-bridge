@@ -51,7 +51,9 @@ Claude 预设主模型通过 `--model` 指定，同时在进程环境设置 `ANT
 
 ## 原生历史可见性
 
-`bridge_start_worker` 与 `bridge_schedule_worker` 都支持 `sessionVisibility: "hidden" | "visible"`。新助手默认 `hidden`：普通和预设会话保留在桥管理的持久目录，仍在 `/workers` 登记，可续聊、恢复和并发派发。用户明确要求“可追溯、放进原生历史列表”时才传 `visible`。可见性随执行目标登记和预约一起保存，续聊不能切换；缺少字段的旧助手继续沿用旧目录，不迁移、不改写旧历史。
+`bridge_start_worker` 与 `bridge_schedule_worker` 都支持 `sessionVisibility: "hidden" | "visible"`。新助手默认 `hidden`：普通和预设会话保留在目标用户的 `.codex/bridge/<登记编号>/worker|preset/<助手ID>` 或 `.claude/bridge/...`，仍在 `/workers` 登记，可续聊、恢复和并发派发，不进入普通 CLI 历史列表。用户明确要求“可追溯、放进原生历史列表”时才传 `visible`。可见性随执行目标登记和预约一起保存，续聊不能切换；缺少字段的旧助手保留原有可见性语义。
+
+`session-home-root.json` 在各 Bot 数据目录或执行器 `.local/remote` 中保存稳定登记编号；移动项目不会改变用户目录绑定。已有远端执行器通过原有空闲更新流程升级后，在新进程独占 IPC 且持久任务记录确认空闲时自动迁移；离线电脑仍在下次启动或派工检查时处理。本机桥升级前先停止桥，再用 `node scripts/migrate-session-homes.mjs --offline-apply <数据目录>` 迁移。迁移逐文件校验，保留配置、预设快照、会话正文与状态数据库，改写 Codex 索引中的旧历史路径，只移除已核实的诊断日志数据库。未迁移的旧目录、目标冲突或未完成迁移会明确报错，不用空目录替代旧会话。执行器目录不再保存 `worker-homes`、`preset-homes`；用户侧目录属于持久数据，不能作为临时垃圾清理。
 
 普通隐藏助手从目标机原生 profile 复制配置与文件凭据，技能、插件等能力目录保持链接，不复制历史会话。复制后的凭据可由该 CLI 自行刷新，不回写原生 profile；使用独立 OS keyring 身份或依赖 profile 外相对路径的自定义配置需另行验证。预设助手继续使用自己的供应商快照和进程环境，不继承当前 CC Switch 线路。
 

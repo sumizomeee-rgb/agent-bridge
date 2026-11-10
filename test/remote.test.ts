@@ -76,7 +76,7 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'bridge-remote-test-')); const natives: FakeNative[] = [];
   const command = { command: process.execPath, args: [] };
   const daemonConfig: RemoteDaemonConfig = { version: 1, expectedHostname: hostname(), engines: { codex: { agentCommand: command, defaultCwd: root }, claude: { agentCommand: command, defaultCwd: root } } };
-  const daemon = new RemoteDaemon(root, daemonConfig, { adapterFactory: () => { const native = new FakeNative(); natives.push(native); return native; } });
+  const daemon = new RemoteDaemon(root, daemonConfig, { nativeSessionOptions: { userHome: join(root, 'isolated-user') }, adapterFactory: () => { const native = new FakeNative(); natives.push(native); return native; } });
   const config: BridgeConfig = { token: 'unused', allowedUserIds: ['user'], defaultAgent: 'codex', workspace: root, proxyUrl: null, commands: { codex: command, claude: command },
     dataDir: join(root, 'local-data'), attachmentsDir: root, logsDir: root, maxImageBytes: 20 * 1024 * 1024, maxFileBytes: 24 * 1024 * 1024 };
   const binding: ExecutionTargetBinding = { id: 'station', label: '工位', transport: 'ssh', expectedHostname: hostname(), sshConfig: join(root, 'ssh-config'), alias: 'station', remoteRoot: root, nodePath: process.execPath, agent: 'codex', agentCommand: command, cwd: root };

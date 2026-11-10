@@ -13,6 +13,7 @@ import { readMaterials } from './materials.js';
 import { exposeCodexHistory, pinSessionLocation } from '../agents/worker-session.js';
 import { startPresetConnect } from './connect.js';
 import { inheritCodexCapabilities, writeCodexPresetRouting } from './capabilities.js';
+import { sessionHome } from '../agents/session-home.js';
 import type { LaunchProfile, PresetBinding } from './types.js';
 
 export function profileFingerprint(profile: LaunchProfile): string { return createHash('sha256').update(JSON.stringify(profile)).digest('hex'); }
@@ -68,7 +69,7 @@ export class PresetRuntime {
     if (profile.revision !== revision || profile.agent !== agent || profile.model !== model) throw new Error('预设目录与目标机配置不一致，未回退默认配置。');
     return { profileId, revision, agent, model, fingerprint: profileFingerprint(profile) };
   }
-  private home(workerId: string, binding: PresetBinding): string { return join(this.dataRoot, 'preset-homes', binding.agent, presetId(workerId)); }
+  private home(workerId: string, binding: PresetBinding): string { return sessionHome(this.dataRoot, this.userHome, 'preset', binding.agent, presetId(workerId)); }
   async pin(binding: PresetBinding, workerId: string, nativeId: string | null, visibility?: SessionVisibility, env: NodeJS.ProcessEnv = process.env): Promise<void> {
     await this.profile(binding, workerId, nativeId, true);
     pinSessionLocation(this.home(workerId, binding), binding.agent, visibility, nativeId, env, this.userHome);
