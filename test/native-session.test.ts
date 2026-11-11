@@ -92,6 +92,16 @@ test('expired one-shot summary indexes are preserved without pretending their re
   assert.deepEqual({...target.prepare('SELECT * FROM threads WHERE id=?').get('expired-summary')},{id:'expired-summary',rollout_path:expired,source:'mcp'});target.close();
 });
 
+test('an already deleted test transcript keeps its old index without blocking available history',async t=>{
+  const f=fixture(t),db=new DatabaseSync(join(f.home,'state_5.sqlite'));
+  const missing=join(f.root,'old-test-fixture','sessions','deleted.jsonl');
+  db.prepare('INSERT INTO threads VALUES(?,?,?)').run('deleted-test',missing,'vscode');db.close();
+  await migrateNativeSessionHomes(f.data,f.user,true);
+  const target=new DatabaseSync(join(f.native,'state_5.sqlite'),{readOnly:true});
+  assert.equal(target.prepare('SELECT rollout_path FROM threads WHERE id=?').get('deleted-test')?.rollout_path,missing);target.close();
+  assert.ok(existsSync(join(f.native,'sessions','session.jsonl')));
+});
+
 test('Windows extended legacy paths resolve to the already relocated transcript', {skip:process.platform!=='win32'},async t=>{
   const f=fixture(t),db=new DatabaseSync(join(f.home,'state_5.sqlite'));
   const legacy='\\\\?\\'+join(f.data,'worker-homes','codex','worker-A','sessions','session.jsonl');

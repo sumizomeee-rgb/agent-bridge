@@ -3,7 +3,6 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSy
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { sessionHomePath } from './session-home.js';
-import { tmpdir } from 'node:os';
 
 const quote = (name: string) => '"' + name.replaceAll('"', '""') + '"';
 const hash = (value: Buffer) => createHash('sha256').update(value).digest('hex');
@@ -88,10 +87,15 @@ async function mergeDatabase(source: string, destination: string, oldHomes: stri
               row.rollout_path = oldHome ? join(nativeHome, relative(normalPath(oldHome), path)) : path;
               if (typeof row.source === 'string' && ['vscode', 'cli', 'exec', 'mcp', 'unknown'].includes(row.source)) row.source = visibility === 'hidden' ? 'mcp' : 'cli';
               if (!existsSync(String(row.rollout_path))) {
-                const part = relative(tmpdir(), String(row.rollout_path));
-                // Older one-shot summaries intentionally retired these transcripts.
-                // Retain their existing index/projection data; do not invent content.
-                if (!/^bridge-codex-readonly-[A-Za-z0-9_-]+[/\\]sessions[/\\]/.test(part)) throw new Error(`原生索引对应的历史文件缺失：${row.id} ${row.rollout_path}`);
+                const suffix = path.replaceAll('\\', '/').match(/\/(sessions|archived_sessions)\/(.+\.jsonl)$/);
+                const safe = suffix && !suffix[2]!.split('/').some(p => p === '..' || p === '.' || !p);
+                const currentSource = safe ? join(oldHomes[0]!, suffix[1]!, ...suffix[2]!.split('/')) : path;
+                const recovered = safe ? join(nativeHome, suffix[1]!, ...suffix[2]!.split('/')) : null;
+                if (recovered && existsSync(recovered) && basename(recovered).includes(String(row.id))) row.rollout_path = recovered;
+                else if (existsSync(path) || existsSync(currentSource)) throw new Error(`原生正文复制后缺失：${row.id} ${row.rollout_path}`);
+                // Failed starts, retired summaries and deleted test fixtures can
+                // leave stale indexes. Preserve those existing records and their
+                // projection data; do not invent a transcript that never survived.
               }
               threads++;
             }
