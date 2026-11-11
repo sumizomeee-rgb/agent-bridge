@@ -55,7 +55,7 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
     collect(directory); for (const child of Object.keys(pkg.dependencies ?? {})) include(child);
   };
   for (const name of ['smol-toml', 'ws', 'https-proxy-agent', 'undici']) include(name);
-  for (const path of ['package.json', 'scripts/start-remote-agent.ps1', 'scripts/remote-update-helper.mjs', 'scripts/update-remote-agent.ps1', 'scripts/migrate-session-homes.mjs'])
+  for (const path of ['package.json', 'scripts/start-remote-agent.ps1', 'scripts/remote-update-helper.mjs', 'scripts/update-remote-agent.ps1', 'scripts/migrate-session-homes.mjs', 'scripts/migrate-native-sessions.mjs', 'scripts/install-native-session-runtime.ps1'])
     files.set(path, hash(readFileSync(join(root, path))));
   const entries = Object.fromEntries([...files].sort(([a], [b]) => a.localeCompare(b)));
   const id = hash(JSON.stringify(entries)), directory = join(root, '.local', 'executor-releases', id);

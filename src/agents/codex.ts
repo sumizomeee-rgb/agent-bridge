@@ -1,4 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
+import { codexSessionLaunch, ensureNativeAppServer } from './native-session.js';
 import { readCodexModelInfo } from './codex-models.js';
 import { MetadataProbeError, MetadataProbes } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
@@ -18,10 +19,11 @@ export class CodexAdapter implements AgentAdapter {
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
     private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport =
-      (command, args, cwd, env) => new JsonLineProcess(command, args, cwd, env)) {}
+      (command, args, cwd, env) => { const launch = codexSessionLaunch(command, args, env); return new JsonLineProcess(launch.command, launch.args, cwd, env); }) {}
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
+    await ensureNativeAppServer(this.env);
     const priorRetirement = this.metadata.prepare(); if (priorRetirement) await priorRetirement;
     // 元数据查询不需要用户 MCP、hooks 或其他工具；认证与模型路由保留在独立临时 home。
     const readonly = readOnlyRuntime('codex', this.env);
@@ -48,6 +50,7 @@ export class CodexAdapter implements AgentAdapter {
   async run(turn: AgentTurn): Promise<AgentResult> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');
     if (turn.signal.aborted) throw abortError();
+    await ensureNativeAppServer(this.env);
     turn = await resolveDefaultModel(this, turn);
     const effort = selectedEffort(turn);
     const capability = effort ? await validateEffort(this, turn.conversation, effort)

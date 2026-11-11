@@ -11,7 +11,7 @@ try {
  $helper=Join-Path $PSScriptRoot 'remote-update-helper.mjs'
  function Probe { $text=& $NodePath $helper inspect $resolvedRoot $ExpectedHostname;if($LASTEXITCODE -ne 0){throw 'Cannot verify executor state'};$text|ConvertFrom-Json }
  $probe=Probe
- $needsSessionMigration=(Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
+ $needsSessionMigration=!(Test-Path -LiteralPath (Join-Path $data 'native-session-migration.json')) -or (Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
  if($probe.online -and $probe.release -eq $Release){@{state='ready';release=$Release}|ConvertTo-Json -Compress;return}
  if(!$probe.idle){@{state='busy';reason='Waiting for active or unconfirmed work; automatic retry pending'}|ConvertTo-Json -Compress;return}
  $archive=Join-Path $PSScriptRoot 'runtime.tgz'
@@ -80,7 +80,7 @@ try {
  }
  throw 'New executor did not become ready'
 } catch {
- $layoutMigrated=$needsSessionMigration -and (Test-Path -LiteralPath (Join-Path $data 'session-home-migration.json'))
+ $layoutMigrated=$needsSessionMigration -and ((Test-Path -LiteralPath (Join-Path $data 'session-home-migration.json')) -or (Test-Path -LiteralPath (Join-Path $data 'native-session-migration.json')))
  # Once verified histories have moved, the old program cannot read the new layout.
  # Keep the checked new release selected; a later readiness check may finish recovery.
  if($switched -and !$layoutMigrated){

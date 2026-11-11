@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { executionErrorEvidence } from '../delivery-errors.js';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,7 @@ import type { AgentAdapter, AgentCommand, AgentName, AgentResult, AgentSupplemen
 import { CodexAdapter } from './codex.js';
 import { ClaudeAdapter } from './claude.js';
 import { sessionHome } from './session-home.js';
+import { nativeSessionEnvironment } from './native-session.js';
 import { abortError, completedResultFromError, isObject, processStopFailure } from './process.js';
 
 export function sessionVisibility(value: unknown): SessionVisibility | undefined {
@@ -24,7 +25,7 @@ export function setSessionEnvironment(env: NodeJS.ProcessEnv, name: string, valu
 export function nativeProfileHome(agent: AgentName, env: NodeJS.ProcessEnv, userHome = homedir()): string {
   return resolve(environmentValue(env, agent === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR') ?? join(userHome, agent === 'codex' ? '.codex' : '.claude'));
 }
-interface SessionLocation { version: 1; visibility: SessionVisibility; profileHome: string; sqliteHome: string }
+interface SessionLocation { version: 2; visibility: SessionVisibility; profileHome: string; sqliteHome: string }
 /** Kept next to the worker, never in the shared user profile. Absence preserves legacy launches. */
 export function pinSessionLocation(home: string, agent: AgentName, visibility: SessionVisibility | undefined, nativeId: string | null,
   env: NodeJS.ProcessEnv, userHome = homedir()): SessionLocation | undefined {
@@ -32,7 +33,8 @@ export function pinSessionLocation(home: string, agent: AgentName, visibility: S
   const marker = join(home, 'session-location.json');
   if (existsSync(marker)) {
     const saved = JSON.parse(readFileSync(marker, 'utf8')) as SessionLocation;
-    if (saved.version !== 1 || saved.visibility !== visibility || !isAbsolute(saved.profileHome) || !isAbsolute(saved.sqliteHome)) throw new Error('助手的会话可见性或目录绑定不同，禁止切换。');
+    if (saved.version !== 2) throw new Error('助手历史尚未并入原生目录，请先执行离线迁移。');
+    if (saved.visibility !== visibility || !isAbsolute(saved.profileHome) || !isAbsolute(saved.sqliteHome)) throw new Error('助手的会话可见性或目录绑定不同，禁止切换。');
     return saved;
   }
   if (visibility === undefined) return undefined;
@@ -40,7 +42,7 @@ export function pinSessionLocation(home: string, agent: AgentName, visibility: S
   mkdirSync(home, { recursive: true });
   if (lstatSync(home).isSymbolicLink()) throw new Error('助手运行目录不能是链接。');
   const profileHome = nativeProfileHome(agent, env, userHome);
-  const saved: SessionLocation = { version: 1, visibility, profileHome,
+  const saved: SessionLocation = { version: 2, visibility, profileHome,
     sqliteHome: resolve(environmentValue(env, 'CODEX_SQLITE_HOME') ?? profileHome) };
   writeFileSync(marker, JSON.stringify(saved), { flag: 'wx', mode: 0o600 });
   return saved;
@@ -60,64 +62,19 @@ export function exposeCodexHistory(home: string, location: { profileHome: string
   for (const name of ['sessions', 'archived_sessions']) linkDirectory(join(location.profileHome, name), join(home, name));
 }
 
-// A hidden profile keeps its configuration/history pinned, but its copied ChatGPT
-// login must not stay stale after the original profile renews the same account.
-function refreshChatGPTCredentials(home: string, source: string): void {
-  const destination = join(home, 'auth.json'), sourcePath = join(source, 'auth.json');
-  if (!existsSync(destination) || !existsSync(sourcePath)) return;
-  const readAuth = (bytes: Buffer): { accountId: string; expires: number } | null => {
-    try {
-      const value: unknown = JSON.parse(bytes.toString('utf8'));
-      if (!isObject(value) || !isObject(value.tokens) || value.OPENAI_API_KEY
-        || value.auth_mode != null && value.auth_mode !== 'chatgpt') return null;
-      const { account_id: accountId, access_token: accessToken } = value.tokens;
-      if (typeof accountId !== 'string' || !accountId || typeof accessToken !== 'string') return null;
-      const payload: unknown = JSON.parse(Buffer.from(accessToken.split('.')[1] ?? '', 'base64url').toString('utf8'));
-      // Metadata only selects a fresher local cache; Codex still authenticates it.
-      return isObject(payload) && typeof payload.exp === 'number' && Number.isFinite(payload.exp)
-        ? { accountId, expires: payload.exp * 1000 } : null;
-    } catch { return null; }
-  };
-  const sourceBytes = readFileSync(sourcePath), current = readAuth(readFileSync(destination)), fresh = readAuth(sourceBytes);
-  if (!current || !fresh || current.accountId !== fresh.accountId || fresh.expires <= Date.now() || fresh.expires <= current.expires) return;
-  const temporary = destination + '.' + randomUUID() + '.tmp';
-  try { writeFileSync(temporary, sourceBytes, { flag: 'wx', mode: 0o600 }); renameSync(temporary, destination); }
-  finally { if (existsSync(temporary)) unlinkSync(temporary); }
-}
-
 export class WorkerSessionRuntime {
   constructor(readonly dataRoot: string, private readonly userHome = homedir()) {}
   prepare(agent: AgentName, workerId: string, nativeId: string | null, visibility: SessionVisibility, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(workerId)) throw new Error('助手编号无效。');
     const home = sessionHome(this.dataRoot, this.userHome, 'worker', agent, workerId), env = { ...process.env, ...baseEnv };
     const location = pinSessionLocation(home, agent, visibility, nativeId, env, this.userHome)!;
-    if (visibility === 'hidden') {
-      const ready = join(home, 'profile-ready');
-      if (!existsSync(ready)) {
-        if (nativeId) throw new Error('助手私有配置不完整，未尝试默认目录续接。');
-        const source = location.profileHome;
-        const names = agent === 'codex' ? ['config.toml', 'auth.json', 'AGENTS.md', 'instructions.md', 'models_cache.json']
-          : ['settings.json', 'settings.local.json', '.credentials.json', '.claude.json'];
-        if (agent === 'codex' && existsSync(source)) names.push(...readdirSync(source).filter(name => /^[A-Za-z0-9_.-]+\.config\.toml$/.test(name)));
-        for (const name of names) {
-          const from = join(source, name);
-          if (existsSync(from)) copyFileSync(from, join(home, name));
-        }
-        if (agent === 'claude' && !existsSync(join(home, '.claude.json')) && existsSync(join(this.userHome, '.claude.json'))) copyFileSync(join(this.userHome, '.claude.json'), join(home, '.claude.json'));
-        for (const name of ['skills', 'plugins', 'agents', 'commands', 'hooks', 'rules', 'output-styles']) {
-          if (existsSync(join(source, name)) && !existsSync(join(home, name))) symlinkSync(join(source, name), join(home, name), process.platform === 'win32' ? 'junction' : 'dir');
-        }
-        writeFileSync(ready, '1', { flag: 'wx', mode: 0o600 });
-      }
-      if (agent === 'codex') refreshChatGPTCredentials(home, location.profileHome);
-    }
+    nativeSessionEnvironment(env, visibility);
     if (agent === 'codex') {
-      setSessionEnvironment(env, 'CODEX_HOME', visibility === 'hidden' ? home : location.profileHome);
-      setSessionEnvironment(env, 'CODEX_SQLITE_HOME', visibility === 'hidden' ? home : location.sqliteHome);
+      setSessionEnvironment(env, 'CODEX_HOME', location.profileHome);
+      setSessionEnvironment(env, 'CODEX_SQLITE_HOME', location.sqliteHome);
     } else {
-      setSessionEnvironment(env, 'CLAUDE_CONFIG_DIR', visibility === 'hidden' ? home : location.profileHome);
+      setSessionEnvironment(env, 'CLAUDE_CONFIG_DIR', location.profileHome);
       setSessionEnvironment(env, 'DISABLE_AUTOUPDATER', '1');
-      if (visibility === 'visible') setSessionEnvironment(env, 'CLAUDE_CODE_ENTRYPOINT', 'local-agent');
     }
     return env;
   }

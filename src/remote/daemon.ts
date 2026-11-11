@@ -9,6 +9,7 @@ import { createServer as createHttpServer, type Server as HttpServer } from 'nod
 import { spawn } from 'node:child_process';
 import { WorkerSessionAdapter, WorkerSessionRuntime, sessionVisibility } from '../agents/worker-session.js';
 import { migrateSessionHomes } from '../agents/session-home-migration.js';
+import { migrateNativeSessionHomes } from '../agents/native-session-migration.js';
 import { PresetRuntime, PresetAgentAdapter, assertPresetBinding } from '../presets/runtime.js';
 import { CodexAdapter } from '../agents/codex.js';
 import { ClaudeAdapter } from '../agents/claude.js';
@@ -115,6 +116,7 @@ export class RemoteDaemon {
   private server: Server | null = null;
   private httpServer: HttpServer | null = null;
   private closing = false;
+  private initializing = false;
   private nativeClosing = false;
   private maintenance: { lease: string; until: number } | null = null;
   private readonly nativeOperations = new Set<Promise<unknown>>();
@@ -133,12 +135,17 @@ export class RemoteDaemon {
     if (!/^[a-f0-9]{64}$/.test(this.token)) throw new Error('远端 IPC 凭据无效。');
   }
   async listen(): Promise<void> {
+    this.initializing = true;
     this.server = createServer(socket => this.connection(socket));
     await new Promise<void>((resolveValue, reject) => { this.server!.once('error', reject); this.server!.listen(remoteEndpoint(this.root), () => { this.server!.off('error', reject); resolveValue(); }); });
     // Only the daemon that acquired the IPC endpoint may reconcile the journal.
     // A duplicate service launch must never mutate another daemon's live jobs.
     if (this.isUpdateIdle()) {
-      try { migrateSessionHomes(this.dataDirectory, this.options.nativeSessionOptions?.userHome ?? homedir(), true); }
+      try {
+        const userHome = this.options.nativeSessionOptions?.userHome ?? homedir();
+        migrateSessionHomes(this.dataDirectory, userHome, true);
+        await migrateNativeSessionHomes(this.dataDirectory, userHome, true);
+      }
       catch (error) { await this.close(); throw error; }
     }
     for (const job of this.store.jobs()) if (job.status === 'uncertain' && completedRetirementFailure(job)) this.store.update(job.dispatchId, { status: 'completed' });
@@ -175,6 +182,7 @@ export class RemoteDaemon {
     const metadata = { version: 1, hostname: hostname(), port: address.port, token: this.token };
     const temporary = join(this.dataDirectory, `endpoint-${randomUUID()}.tmp`);
     writeFileSync(temporary, JSON.stringify(metadata), { flag: 'wx', mode: 0o600 }); renameSync(temporary, join(this.dataDirectory, 'endpoint.json'));
+    this.initializing = false;
   }
   private connection(socket: Socket): void {
     this.sockets.add(socket); socket.setEncoding('utf8'); let buffer = '';
@@ -195,6 +203,7 @@ export class RemoteDaemon {
   }
   private respond(socket: Socket, response: RemoteResponse): void { if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`); }
   async handle(method: string, raw: unknown): Promise<unknown> {
+    if (this.initializing) throw new Error('执行器正在准备原生会话目录，尚未就绪。');
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
     if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, presetDispatch: 1, sessionVisibility: 1,
       deployment: { release: this.options.release ?? process.env.BRIDGE_EXECUTOR_RELEASE ?? null, maintenance: 1 },

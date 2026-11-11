@@ -10,6 +10,7 @@ import { parseLaunchProfiles, PresetRuntime, PresetAgentAdapter, PresetResultUnk
 import { startPresetConnect } from '../src/presets/connect.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig } from '../src/types.js';
 import type { PresetBinding } from '../src/presets/types.js';
+import { sessionHome } from '../src/agents/session-home.js';
 import { completedResultFromError } from '../src/agents/process.js';
 import { TargetCatalogService } from '../src/remote/catalog.js';
 
@@ -84,11 +85,11 @@ test('独立配置覆盖继承环境，凭据只在子进程环境，快照不�
       assert.equal(prepared.env.BRIDGE_PRESET_API_KEY, 'private-test-key');
       assert.ok(prepared.command.args.includes('model_provider="bridge_preset"'));
       assert.ok(!JSON.stringify(prepared.command).includes('private-test-key'));
-      const path = join(prepared.env.CODEX_HOME!, 'preset-binding.json');
+      const path = join(sessionHome(f.data,f.user,'preset','codex','worker-A'), 'preset-binding.json');
       assert.ok(!readFileSync(path, 'utf8').includes('private-test-key'));
-      assert.deepEqual(readdirSync(prepared.env.CODEX_HOME!).sort(), ['config.toml', 'preset-binding.json']);
+      assert.deepEqual(readdirSync(prepared.env.CODEX_HOME!).sort(), ['archived_sessions', 'config.toml', 'sessions']);
       assert.deepEqual(readdirSync(f.user), ['.codex']);
-      assert.deepEqual(readdirSync(join(f.user, '.codex')), ['bridge']);
+      assert.deepEqual(readdirSync(join(f.user, '.codex')).sort(), ['archived_sessions', 'bridge', 'sessions']);
     } finally { await prepared.close(); }
   } finally { f.close(); }
 });
@@ -107,11 +108,11 @@ test('已登记助手续聊使用原快照，预设编辑不改变旧线路，�
   } finally { f.close(); }
 });
 
-test('不同助手有独立会话目录；同一预设不共用可变进程环境', async () => {
+test('同一预设共享配置和原生历史目录，各进程的凭据环境仍独立', async () => {
   const f = fixture();
   try {
     const binding = await f.binding(), first = await f.runtime.prepare(binding, 'worker-A', null, f.command, {}), second = await f.runtime.prepare(binding, 'worker-B', null, f.command, {});
-    assert.notEqual(first.env.CODEX_HOME, second.env.CODEX_HOME); assert.notEqual(first.env, second.env);
+    assert.equal(first.env.CODEX_HOME, second.env.CODEX_HOME); assert.equal(first.env.CODEX_SQLITE_HOME, join(f.user,'.codex')); assert.notEqual(first.env, second.env);
     first.env.BRIDGE_PRESET_API_KEY = 'changed'; assert.equal(second.env.BRIDGE_PRESET_API_KEY, 'private-test-key');
     await first.close(); await second.close();
   } finally { f.close(); }

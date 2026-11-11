@@ -88,7 +88,7 @@ Codex 每轮读取当前工作目录的生效配置，按当前供应商直接�
 
 在实际工作区维护 `bridge-remote-agents/registry.json`（`version: 1`），格式见 `workspace-template/bridge-remote-agents/example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
 
-主控按需使用 `bridge_list_targets` 查询，再在 `bridge_start_worker` 指定 `targetId`。登记不等于实时在线，派发时核对目标电脑、引擎和远端目录；不会因目标失败而悄悄改在本机执行。远端执行器运行在目标电脑，在自己的 `.local/remote` 保存任务登记与回执，助手的 CLI 配置、原生会话和索引保存在对应用户的 `.codex/bridge/`、`.claude/bridge/`，隐藏与可见行为不变。管理接口仅监听目标机 127.0.0.1，通过 SSH 本地转发和私有认证连接；连接元数据由 SSH 内部读取，不写进登记表。断线重连和桥恢复查询同一派发编号，不重复提交原任务。续接、工作中补充、停止、任务数字表情、读图与文件回传共用既有能力；远端产物下载到该 Bot 的 `.local/data/bots/<平台>/<应用ID>/outgoing/remote` 后回传。
+主控按需使用 `bridge_list_targets` 查询，再在 `bridge_start_worker` 指定 `targetId`。登记不等于实时在线，派发时核对目标电脑、引擎和远端目录；不会因目标失败而悄悄改在本机执行。远端执行器在自己的 `.local/remote` 保存任务登记与回执；助手历史由原生 CLI 保存在对应用户的 `.codex/sessions`、`.claude/projects` 及原生索引，`.codex/bridge/`、`.claude/bridge/` 只保留绑定、共享预设配置与运行时。显隐通过原生来源筛选实现，详见[预设与原生历史](presets.md#原生历史可见性)。管理接口仅监听目标机 127.0.0.1，通过 SSH 本地转发和私有认证连接。断线重连和桥恢复查询同一派发编号，不重复提交原任务。续接、工作中补充、停止、读图与文件回传沿用既有协议。
 
 目标机首次安装时放置已构建代码和 `package.json`，在 `<运行目录>/.local/remote/config.json` 写入 `version`、`expectedHostname`、可选 `proxyPort` 和与登记一致的 `engines`。以目标用户的独立登录启动任务运行 `scripts/start-remote-agent.ps1 -Root <运行目录> -NodePath <目标Node>`，使用该用户原有 CLI、认证和技能；执行器不需要 Discord Token。执行任务采用与本机直属 Agent 相同的全权限参数。
 
