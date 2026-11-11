@@ -11,7 +11,8 @@ try {
  $helper=Join-Path $PSScriptRoot 'remote-update-helper.mjs'
  function Probe { $text=& $NodePath $helper inspect $resolvedRoot $ExpectedHostname;if($LASTEXITCODE -ne 0){throw 'Cannot verify executor state'};$text|ConvertFrom-Json }
  $probe=Probe
- $needsSessionMigration=!(Test-Path -LiteralPath (Join-Path $data 'native-session-migration.json')) -or (Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
+ $nativeMigration=Join-Path $data 'native-session-migration.json'
+ $needsSessionMigration=!(Test-Path -LiteralPath $nativeMigration) -or !(Get-Content -LiteralPath $nativeMigration -Raw|ConvertFrom-Json).complete -or (Test-Path -LiteralPath (Join-Path $data 'worker-homes')) -or (Test-Path -LiteralPath (Join-Path $data 'preset-homes'))
  if($probe.online -and $probe.release -eq $Release){@{state='ready';release=$Release}|ConvertTo-Json -Compress;return}
  if(!$probe.idle){@{state='busy';reason='Waiting for active or unconfirmed work; automatic retry pending'}|ConvertTo-Json -Compress;return}
  $archive=Join-Path $PSScriptRoot 'runtime.tgz'

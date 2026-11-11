@@ -91,3 +91,21 @@ test('expired one-shot summary indexes are preserved without pretending their re
   const target=new DatabaseSync(join(f.native,'state_5.sqlite'),{readOnly:true});
   assert.deepEqual({...target.prepare('SELECT * FROM threads WHERE id=?').get('expired-summary')},{id:'expired-summary',rollout_path:expired,source:'mcp'});target.close();
 });
+
+test('Windows extended legacy paths resolve to the already relocated transcript', {skip:process.platform!=='win32'},async t=>{
+  const f=fixture(t),db=new DatabaseSync(join(f.home,'state_5.sqlite'));
+  const legacy='\\\\?\\'+join(f.data,'worker-homes','codex','worker-A','sessions','session.jsonl');
+  db.prepare('UPDATE threads SET rollout_path=?').run(legacy);db.close();
+  await migrateNativeSessionHomes(f.data,f.user,true);
+  const target=new DatabaseSync(join(f.native,'state_5.sqlite'),{readOnly:true});
+  assert.equal(target.prepare('SELECT rollout_path FROM threads').get()?.rollout_path,join(f.native,'sessions','session.jsonl'));target.close();
+});
+
+test('a later conflict keeps every source in the batch, including already staged workers',async t=>{
+  const f=fixture(t),other=sessionHomePath(f.data,f.user,'worker','codex','worker-B');
+  mkdirSync(join(other,'sessions'),{recursive:true});writeFileSync(join(other,'session-location.json'),readFileSync(join(f.home,'session-location.json')));
+  writeFileSync(join(other,'sessions','session.jsonl'),'{"type":"session_meta","payload":{"source":"vscode","different":true}}\n');
+  await assert.rejects(migrateNativeSessionHomes(f.data,f.user,true),/冲突/);
+  assert.ok(existsSync(join(f.home,'auth.json')));assert.ok(existsSync(join(f.home,'state_5.sqlite')));
+  assert.equal(JSON.parse(readFileSync(join(f.home,'session-location.json'),'utf8')).version,1);
+});

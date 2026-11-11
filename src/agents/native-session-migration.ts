@@ -9,6 +9,9 @@ const quote = (name: string) => '"' + name.replaceAll('"', '""') + '"';
 const hash = (value: Buffer) => createHash('sha256').update(value).digest('hex');
 function inside(root: string, path: string): boolean { const part = relative(root, path); return !!part && part !== '..' && !part.startsWith('..' + sep) && !isAbsolute(part); }
 function same(a: unknown, b: unknown): boolean { return a instanceof Uint8Array && b instanceof Uint8Array ? Buffer.from(a).equals(Buffer.from(b)) : a === b; }
+function normalPath(path: string): string {
+  return process.platform === 'win32' ? path.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '') : path;
+}
 
 /** Preserve byte offsets used by the paginated history projection. */
 export function nativeRolloutBytes(bytes: Buffer, source: 'mcp' | 'cli'): Buffer {
@@ -44,12 +47,16 @@ function mergeFiles(source: string, destination: string, transform: (path: strin
 }
 
 const runtimeTables = new Set(['sqlite_sequence', 'backfill_state', 'rollout_migration_state', 'rollout_migration_skipped_rollouts', 'jobs', 'consolidation_progress', 'remote_control_enrollments', 'external_agent_config_imports']);
-async function mergeDatabase(source: string, destination: string, oldHome: string, nativeHome: string, visibility: 'hidden' | 'visible'): Promise<number> {
+async function mergeDatabase(source: string, destination: string, oldHomes: string[], nativeHome: string, visibility: 'hidden' | 'visible', checked: Set<string>): Promise<number> {
   const old = new DatabaseSync(source, { readOnly: true });
   try {
     if (old.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok') throw new Error('原生源数据库损坏。');
     const target = new DatabaseSync(destination);
     try {
+      if (!checked.has(destination)) {
+        if (target.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok') throw new Error('原生目标数据库校验失败。');
+        checked.add(destination);
+      }
       target.exec('PRAGMA busy_timeout=10000; BEGIN IMMEDIATE');
       let threads = 0;
       try {
@@ -75,8 +82,9 @@ async function mergeDatabase(source: string, destination: string, oldHome: strin
           const insert = target.prepare(`INSERT INTO ${quote(name)} (${names.map(quote).join(',')}) VALUES (${names.map(() => '?').join(',')})`);
           for (const row of old.prepare(`SELECT * FROM ${quote(name)}`).all()) {
             if (name === 'threads') {
-              const path = String(row.rollout_path);
-              if (inside(oldHome, path)) row.rollout_path = join(nativeHome, relative(oldHome, path));
+              const path = normalPath(String(row.rollout_path));
+              const oldHome = oldHomes.find(home => inside(normalPath(home), path));
+              row.rollout_path = oldHome ? join(nativeHome, relative(normalPath(oldHome), path)) : path;
               if (typeof row.source === 'string' && ['vscode', 'cli', 'exec', 'mcp', 'unknown'].includes(row.source)) row.source = visibility === 'hidden' ? 'mcp' : 'cli';
               if (!existsSync(String(row.rollout_path))) {
                 const part = relative(tmpdir(), String(row.rollout_path));
@@ -95,7 +103,6 @@ async function mergeDatabase(source: string, destination: string, oldHome: strin
           }
         }
         target.exec('COMMIT');
-        if (target.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok') throw new Error('原生目标数据库校验失败。');
         return threads;
       } catch (error) { if (target.isTransaction) target.exec('ROLLBACK'); throw error; }
     } finally { target.close(); }
@@ -105,6 +112,8 @@ async function mergeDatabase(source: string, destination: string, oldHome: strin
 /** Offline only: native applications and this data root's workers must be stopped. */
 export async function migrateNativeSessionHomes(dataRoot: string, userHome: string, apply = false) {
   const report: { home: string; agent: string; files: number; threads: number; migrated: boolean }[] = [];
+  const checked = new Set<string>();
+  const pending: { home: string; marker: string; location: Record<string, unknown>; evidence: Map<string, string>; record: typeof report[number] }[] = [];
   const journal = join(dataRoot, 'native-session-migration.json');
   if (apply) { mkdirSync(dataRoot, { recursive: true }); writeFileSync(journal, JSON.stringify({ version: 2, complete: false, homes: report }), { mode: 0o600 }); }
   for (const agent of ['codex', 'claude'] as const) for (const kind of ['worker', 'preset'] as const) {
@@ -138,11 +147,29 @@ export async function migrateNativeSessionHomes(dataRoot: string, userHome: stri
       for (const name of directories) mergeFiles(join(home, name), join(native, name), (path, bytes) =>
         agent === 'codex' && path.endsWith('.jsonl') ? nativeRolloutBytes(bytes, location.visibility === 'hidden' ? 'mcp' : 'cli') : bytes, evidence);
       let threads = 0;
-      if (agent === 'codex') for (const name of readdirSync(home).filter(n => /^(?:state|thread_history|goals|queue|memories)_\d+\.sqlite$/.test(n))) {
-        threads += await mergeDatabase(join(home, name), join(sqlite, name), home, native, location.visibility);
+      const oldHomes = [home, join(dataRoot, `${kind}-homes`, agent, id)];
+      const audit = join(home, 'migration-verified');
+      if (existsSync(audit)) {
+        const previous = readFileSync(audit, 'utf8');
+        if (isAbsolute(previous) && previous.replaceAll('\\', '/').endsWith(`/${kind}-homes/${agent}/${id}`)) oldHomes.push(previous);
       }
-      // No source is retired until every transcript and database has been verified.
-      for (const [file, before] of evidence) if (hash(readFileSync(file)) !== before) throw new Error('迁移期间原会话发生变化，旧目录保留。');
+      if (agent === 'codex') for (const name of readdirSync(home).filter(n => /^(?:state|thread_history|goals|queue|memories)_\d+\.sqlite$/.test(n))) {
+        threads += await mergeDatabase(join(home, name), join(sqlite, name), oldHomes, native, location.visibility, checked);
+      }
+      const record = { home, agent, files: evidence.size, threads, migrated: false };
+      report.push(record); pending.push({ home, marker, location, evidence, record });
+      writeFileSync(journal, JSON.stringify({ version: 2, complete: false, homes: report }), { mode: 0o600 });
+    }
+  }
+  // Check each shared database once per batch, not once for every old worker.
+  // Keep all remaining sources until the entire batch passes verification.
+  for (const path of checked) {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { if (db.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok') throw new Error('原生目标数据库校验失败，旧目录保留。'); }
+    finally { db.close(); }
+  }
+  for (const { evidence } of pending) for (const [file, before] of evidence) if (hash(readFileSync(file)) !== before) throw new Error('迁移期间原会话发生变化，旧目录保留。');
+  for (const { home, marker, location, record } of pending) {
       const retained = new Set(['session-location.json', 'preset-binding.json']);
       for (const name of readdirSync(home)) if (!retained.has(name)) {
         const path = join(home, name);
@@ -150,9 +177,8 @@ export async function migrateNativeSessionHomes(dataRoot: string, userHome: stri
         rmSync(path, { recursive: true, force: true });
       }
       const temporary = marker + '.native'; writeFileSync(temporary, JSON.stringify({ ...location, version: 2 }), { flag: 'wx', mode: 0o600 }); renameSync(temporary, marker);
-      report.push({ home, agent, files: evidence.size, threads, migrated: true });
+      record.migrated = true;
       writeFileSync(journal, JSON.stringify({ version: 2, complete: false, homes: report }), { mode: 0o600 });
-    }
   }
   if (apply) writeFileSync(journal, JSON.stringify({ version: 2, complete: true, homes: report }, null, 2), { mode: 0o600 });
   return report;
