@@ -109,3 +109,17 @@ test('a later conflict keeps every source in the batch, including already staged
   assert.ok(existsSync(join(f.home,'auth.json')));assert.ok(existsSync(join(f.home,'state_5.sqlite')));
   assert.equal(JSON.parse(readFileSync(join(f.home,'session-location.json'),'utf8')).version,1);
 });
+
+test('Claude imports transcripts by original ID while keeping independent auto-memory away from current user memory',async t=>{
+  const f=fixture(t),home=sessionHomePath(f.data,f.user,'worker','claude','claude-A'),native=join(f.user,'.claude'),project='C--Project';
+  mkdirSync(join(home,'projects',project,'memory'),{recursive:true});mkdirSync(join(native,'projects',project,'memory'),{recursive:true});
+  writeFileSync(join(home,'session-location.json'),JSON.stringify({version:1,visibility:'hidden',profileHome:native,sqliteHome:native}));
+  writeFileSync(join(home,'projects',project,'memory','MEMORY.md'),'old worker memory');
+  writeFileSync(join(native,'projects',project,'memory','MEMORY.md'),'current user memory');
+  writeFileSync(join(home,'projects',project,'original-id.jsonl'),'{"sessionId":"original-id","entrypoint":"sdk-cli"}\n');
+  await migrateNativeSessionHomes(f.data,f.user,true);
+  assert.equal(readFileSync(join(native,'projects',project,'memory','MEMORY.md'),'utf8'),'current user memory');
+  const scope=JSON.parse(readFileSync(join(f.data,'session-home-root.json'),'utf8')).scope;
+  assert.equal(readFileSync(join(native,'projects',project,'memory','bridge-imports',scope,'worker-claude-A','MEMORY.md'),'utf8'),'old worker memory');
+  assert.equal(readFileSync(join(native,'projects',project,'original-id.jsonl'),'utf8'),'{"sessionId":"original-id","entrypoint":"sdk-cli"}\n');
+});

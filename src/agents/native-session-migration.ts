@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { sessionHomePath } from './session-home.js';
 import { tmpdir } from 'node:os';
@@ -39,6 +39,7 @@ function mergeFiles(source: string, destination: string, transform: (path: strin
   const target = path === source ? destination : join(destination, relative(source, path));
   if (stat.isDirectory()) { mkdirSync(target, { recursive: true }); for (const name of readdirSync(path)) mergeFiles(source, destination, transform, evidence, join(path, name)); return; }
   if (!stat.isFile()) throw new Error('历史包含未知文件类型。');
+  mkdirSync(dirname(target), { recursive: true });
   const before = readFileSync(path), next = transform(path, before);
   if (existsSync(target)) { if (!readFileSync(target).equals(next)) throw new Error(`原生历史文件冲突，未覆盖：${target}`); }
   else { const temporary = target + '.bridge-migration'; writeFileSync(temporary, next, { flag: 'wx' }); renameSync(temporary, target); }
@@ -143,9 +144,25 @@ export async function migrateNativeSessionHomes(dataRoot: string, userHome: stri
       mkdirSync(native, { recursive: true }); mkdirSync(sqlite, { recursive: true });
       const evidence = new Map<string, string>();
       const directories = agent === 'codex' ? ['sessions', 'archived_sessions', 'shell_snapshots']
-        : ['projects', 'session-env', 'file-history', 'todos', 'tasks', 'plans', 'shell-snapshots'];
+        : ['session-env', 'file-history', 'todos', 'tasks', 'plans', 'shell-snapshots'];
       for (const name of directories) mergeFiles(join(home, name), join(native, name), (path, bytes) =>
         agent === 'codex' && path.endsWith('.jsonl') ? nativeRolloutBytes(bytes, location.visibility === 'hidden' ? 'mcp' : 'cli') : bytes, evidence);
+      if (agent === 'claude' && existsSync(join(home, 'projects'))) {
+        const projects = join(home, 'projects');
+        if (lstatSync(projects).isSymbolicLink()) mergeFiles(projects, join(native, 'projects'), (_, bytes) => bytes, evidence);
+        else for (const project of readdirSync(projects)) {
+          const directory = join(projects, project);
+          if (!lstatSync(directory).isDirectory() || lstatSync(directory).isSymbolicLink()) throw new Error('Claude 项目历史包含未知链接或文件。');
+          for (const entry of readdirSync(directory)) {
+            // Old workers had independent auto-memory. Preserve those files without
+            // replacing or auto-loading them as the ordinary user's current memory.
+            const destination = entry === 'memory' ? join(native, 'projects', project, 'memory', 'bridge-imports', basename(dirname(parent)), `${kind}-${id}`)
+              : entry === 'sessions-index.json' ? join(native, 'projects', project, 'bridge-imports', basename(dirname(parent)), `${kind}-${id}`, entry)
+              : join(native, 'projects', project, entry);
+            mergeFiles(join(directory, entry), destination, (_, bytes) => bytes, evidence);
+          }
+        }
+      }
       let threads = 0;
       const oldHomes = [home, join(dataRoot, `${kind}-homes`, agent, id)];
       const audit = join(home, 'migration-verified');
