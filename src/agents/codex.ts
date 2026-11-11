@@ -18,8 +18,13 @@ export class CodexAdapter implements AgentAdapter {
   private readonly metadata = new MetadataProbes();
 
   constructor(private readonly command: AgentCommand, private readonly env: NodeJS.ProcessEnv,
-    private readonly createTransport: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport =
-      (command, args, cwd, env) => { const launch = codexSessionLaunch(command, args, env); return new JsonLineProcess(launch.command, launch.args, cwd, env); }) {}
+    private readonly transportFactory: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport =
+      (command, args, cwd, env) => new JsonLineProcess(command, args, cwd, env)) {}
+
+  private createTransport(command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv): RpcTransport {
+    const launch = codexSessionLaunch(command, args, env);
+    return this.transportFactory(launch.command, launch.args, cwd, env);
+  }
 
   async getModelInfo(cwd: string): Promise<AgentModelInfo> {
     if (this.closed) throw new Error('Codex 适配器已关闭。');

@@ -4,6 +4,9 @@ import { CodexAdapter } from '../src/agents/codex.js';
 import { completedResultFromError } from '../src/agents/process.js';
 import type { JsonObject, RpcTransport } from '../src/agents/process.js';
 import type { AgentTurn } from '../src/types.js';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 class Transport implements RpcTransport {
   messages = new Set<(message: JsonObject) => void>();
@@ -40,6 +43,18 @@ class Transport implements RpcTransport {
   complete() { this.emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] } } }); }
   async stop() {}
 }
+
+test('native session source is resolved before an injected executor process tracker sees the launch',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tracked-native-launch-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const binary=join(root,'codex-app-server.exe');writeFileSync(binary,'fixture');mkdirSync(join(root,'native'));
+  const transport=new Transport();let launched=false;
+  const adapter=new CodexAdapter({command:'node',args:['codex.js']},{BRIDGE_SESSION_SOURCE:'mcp',BRIDGE_CODEX_APP_SERVER:binary,CODEX_HOME:join(root,'native'),CODEX_SQLITE_HOME:join(root,'native')},(command,args)=>{
+    assert.equal(command.command,binary);assert.deepEqual(args.slice(0,2),['--session-source','app-server']);assert.equal(args.includes('app-server'),true);assert.equal(args[0]==='app-server',false);launched=true;return transport;
+  });
+  let ready!:()=>void;const started=new Promise<void>(r=>ready=r);
+  const run=adapter.run({conversation:{id:'tracked',userId:'probe',agent:'codex',nativeId:null,model:'gpt-6-luna',title:'',cwd:root,createdAt:'',updatedAt:''},text:'hello',imagePaths:[],signal:new AbortController().signal,onProgress(){},onReady:ready});
+  try{await started;assert.ok(launched);transport.complete();await run;}finally{await adapter.close();}
+});
 async function fixture() {
   const transport = new Transport();
   const adapter = new CodexAdapter({ command: 'unused', args: [] }, {}, () => transport);
