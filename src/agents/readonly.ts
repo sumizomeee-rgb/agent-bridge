@@ -42,6 +42,10 @@ export function readOnlyRuntime(agent: 'codex' | 'claude', env: NodeJS.ProcessEn
     const value = isObject(settings) ? settings : {};
     const routingEnv = isObject(value.env) ? Object.fromEntries(Object.entries(value.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : {};
     copy(join(source, '.credentials.json'), '.credentials.json'); copy(join(userHome, '.claude.json'), '.claude.json');
+    if (env.BRIDGE_SESSION_SOURCE) {
+      const projects = join(source, 'projects'); mkdirSync(projects, { recursive: true });
+      symlinkSync(projects, join(root, 'projects'), process.platform === 'win32' ? 'junction' : 'dir');
+    }
     return { env: { ...routingEnv, ...env, CLAUDE_CONFIG_DIR: root, BRIDGE_TASK_CONTEXT: undefined, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
       args: ['--tools', 'Read,Glob,Grep', '--disallowedTools', 'Bash,Edit,Write,NotebookEdit,Agent,Task', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
         '--no-chrome', '--disable-slash-commands', '--setting-sources', '', '--settings', JSON.stringify({ ...claudeModelSettings(value), env: routingEnv })], cleanup };

@@ -83,6 +83,17 @@ test('retiring a read-only configuration preserves native history and canonicali
   }finally{runtime.cleanup();}
 });
 
+test('retiring a read-only Claude configuration keeps its native project transcript',t=>{
+  const root=mkdtempSync(join(tmpdir(),'readonly-claude-history-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const home=join(root,'native');mkdirSync(home);writeFileSync(join(home,'settings.json'),'{}');
+  const runtime=readOnlyRuntime('claude',{CLAUDE_CONFIG_DIR:home,BRIDGE_SESSION_SOURCE:'mcp',USERPROFILE:root});
+  try{
+    const project=join(runtime.env.CLAUDE_CONFIG_DIR!,'projects','C--Project');mkdirSync(project);writeFileSync(join(project,'native-id.jsonl'),'native Claude history');
+    runtime.cleanup();assert.equal(readFileSync(join(home,'projects','C--Project','native-id.jsonl'),'utf8'),'native Claude history');
+    assert.equal(existsSync(runtime.env.CLAUDE_CONFIG_DIR!),false);
+  }finally{runtime.cleanup();}
+});
+
 test('expired one-shot summary indexes are preserved without pretending their retired transcript exists',async t=>{
   const f=fixture(t),db=new DatabaseSync(join(f.home,'state_5.sqlite'));
   const expired=join(tmpdir(),'bridge-codex-readonly-old123','sessions','expired.jsonl');
