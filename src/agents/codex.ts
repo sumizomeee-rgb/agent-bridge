@@ -1,5 +1,5 @@
 import { readOnlyRuntime } from './readonly.js';
-import { codexSessionLaunch, ensureNativeAppServer } from './native-session.js';
+import { canonicalizeCodexHistory, codexSessionLaunch, ensureNativeAppServer } from './native-session.js';
 import { readCodexModelInfo } from './codex-models.js';
 import { MetadataProbeError, MetadataProbes } from './metadata.js';
 import { createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
@@ -284,6 +284,7 @@ export class CodexAdapter implements AgentAdapter {
       turn.signal.removeEventListener('abort', onAbort);
       try {
         const released = () => {
+          canonicalizeCodexHistory(readonly?.env ?? this.env, nativeId ?? undefined);
           this.active.delete(conversationId); this.stopped.add(conversationId);
           this.executions.delete(conversationId); this.retirements.delete(conversationId);
           this.retirementCleanups.get(conversationId)?.(); this.retirementCleanups.delete(conversationId);

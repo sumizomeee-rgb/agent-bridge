@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { codexSessionLaunch } from '../src/agents/native-session.js';
+import { canonicalizeCodexHistory, codexSessionLaunch } from '../src/agents/native-session.js';
+import { readOnlyRuntime } from '../src/agents/readonly.js';
 import { migrateNativeSessionHomes, nativeRolloutBytes } from '../src/agents/native-session-migration.js';
 import { sessionHomePath } from '../src/agents/session-home.js';
 import { WorkerSessionRuntime } from '../src/agents/worker-session.js';
@@ -66,4 +67,27 @@ test('a native transcript collision stops before retiring original history or co
   await assert.rejects(migrateNativeSessionHomes(f.data,f.user,true),/冲突/);
   assert.ok(existsSync(join(f.home,'auth.json')));assert.ok(readFileSync(join(f.home,'sessions','session.jsonl')).equals(f.bytes));
   assert.equal(JSON.parse(readFileSync(join(f.home,'session-location.json'),'utf8')).version,1);
+});
+
+test('retiring a read-only configuration preserves native history and canonicalizes its index before removing links',t=>{
+  const root=mkdtempSync(join(tmpdir(),'readonly-history-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const home=join(root,'native');mkdirSync(home);writeFileSync(join(home,'config.toml'),'');
+  const runtime=readOnlyRuntime('codex',{CODEX_HOME:home,CODEX_SQLITE_HOME:home,BRIDGE_SESSION_SOURCE:'mcp'});
+  try{
+    const temporary=join(runtime.env.CODEX_HOME!,'sessions','native.jsonl');writeFileSync(temporary,'durable history');
+    const db=new DatabaseSync(join(home,'state_5.sqlite'));db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)');db.prepare('INSERT INTO threads VALUES(?,?)').run('own-thread',temporary);db.close();
+    canonicalizeCodexHistory(runtime.env,'own-thread');runtime.cleanup();
+    assert.equal(readFileSync(join(home,'sessions','native.jsonl'),'utf8'),'durable history');
+    const check=new DatabaseSync(join(home,'state_5.sqlite'),{readOnly:true});assert.equal(check.prepare('SELECT rollout_path FROM threads').get()?.rollout_path,join(home,'sessions','native.jsonl'));check.close();
+    assert.equal(existsSync(runtime.env.CODEX_HOME!),false);
+  }finally{runtime.cleanup();}
+});
+
+test('expired one-shot summary indexes are preserved without pretending their retired transcript exists',async t=>{
+  const f=fixture(t),db=new DatabaseSync(join(f.home,'state_5.sqlite'));
+  const expired=join(tmpdir(),'bridge-codex-readonly-old123','sessions','expired.jsonl');
+  db.prepare('INSERT INTO threads VALUES(?,?,?)').run('expired-summary',expired,'vscode');db.close();
+  await migrateNativeSessionHomes(f.data,f.user,true);
+  const target=new DatabaseSync(join(f.native,'state_5.sqlite'),{readOnly:true});
+  assert.deepEqual({...target.prepare('SELECT * FROM threads WHERE id=?').get('expired-summary')},{id:'expired-summary',rollout_path:expired,source:'mcp'});target.close();
 });

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSy
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { sessionHomePath } from './session-home.js';
+import { tmpdir } from 'node:os';
 
 const quote = (name: string) => '"' + name.replaceAll('"', '""') + '"';
 const hash = (value: Buffer) => createHash('sha256').update(value).digest('hex');
@@ -77,7 +78,12 @@ async function mergeDatabase(source: string, destination: string, oldHome: strin
               const path = String(row.rollout_path);
               if (inside(oldHome, path)) row.rollout_path = join(nativeHome, relative(oldHome, path));
               if (typeof row.source === 'string' && ['vscode', 'cli', 'exec', 'mcp', 'unknown'].includes(row.source)) row.source = visibility === 'hidden' ? 'mcp' : 'cli';
-              if (!existsSync(String(row.rollout_path))) throw new Error('原生索引对应的历史文件缺失。');
+              if (!existsSync(String(row.rollout_path))) {
+                const part = relative(tmpdir(), String(row.rollout_path));
+                // Older one-shot summaries intentionally retired these transcripts.
+                // Retain their existing index/projection data; do not invent content.
+                if (!/^bridge-codex-readonly-[A-Za-z0-9_-]+[/\\]sessions[/\\]/.test(part)) throw new Error(`原生索引对应的历史文件缺失：${row.id} ${row.rollout_path}`);
+              }
               threads++;
             }
             const found = get.get(...keys.map(k => row[k] as SQLInputValue));

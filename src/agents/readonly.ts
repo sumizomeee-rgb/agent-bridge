@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parse, stringify } from 'smol-toml';
@@ -29,6 +29,11 @@ export function readOnlyRuntime(agent: 'codex' | 'claude', env: NodeJS.ProcessEn
       config.features = { ...features, code_mode_host: true, shell_tool: true, unified_exec: true };
       config.sandbox_mode = 'read-only'; config.approval_policy = 'never';
       writeFileSync(join(root, 'config.toml'), stringify(config), { encoding: 'utf8', mode: 0o600 }); copy(join(source, 'auth.json'), 'auth.json');
+      // Restrict configuration and tools without making the worker's history disposable.
+      if (env.BRIDGE_SESSION_SOURCE && env.CODEX_SQLITE_HOME) for (const name of ['sessions', 'archived_sessions']) {
+        const destination = join(source, name); mkdirSync(destination, { recursive: true });
+        symlinkSync(destination, join(root, name), process.platform === 'win32' ? 'junction' : 'dir');
+      }
       return { env: { ...env, CODEX_HOME: root, BRIDGE_TASK_CONTEXT: undefined }, args: ['-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"', '-c', 'mcp_servers={}', '-c', 'plugins={}', '-c', 'agents.enabled=false'], cleanup };
     }
     const source = env.CLAUDE_CONFIG_DIR || process.env.CLAUDE_CONFIG_DIR || join(userHome, '.claude');

@@ -1,8 +1,9 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import type { AgentCommand, SessionVisibility } from '../types.js';
 
 export const nativeSessionRuntimeVersion = '0.160.0';
@@ -48,4 +49,20 @@ export function codexSessionLaunch(command: AgentCommand, args: string[], env: N
 export function nativeSessionEnvironment(env: NodeJS.ProcessEnv, visibility: SessionVisibility): void {
   env.BRIDGE_SESSION_SOURCE = visibility === 'hidden' ? 'mcp' : 'cli';
   env.CLAUDE_CODE_ENTRYPOINT = visibility === 'hidden' ? 'sdk-cli' : 'local-agent';
+}
+
+/** Resolve shared transcript links before an isolated configuration is retired. */
+export function canonicalizeCodexHistory(env: NodeJS.ProcessEnv, nativeId?: string): void {
+  const root = env.CODEX_SQLITE_HOME;
+  if (!root || !nativeId || !existsSync(root)) return;
+  for (const name of readdirSync(root).filter(n => /^state_\d+\.sqlite$/.test(n))) {
+    const db = new DatabaseSync(join(root, name));
+    try {
+      db.exec('PRAGMA busy_timeout=5000');
+      const row = db.prepare('SELECT rollout_path FROM threads WHERE id=?').get(nativeId);
+      if (!row || typeof row.rollout_path !== 'string' || !existsSync(row.rollout_path)) continue;
+      const path = realpathSync(row.rollout_path);
+      if (path !== row.rollout_path) db.prepare('UPDATE threads SET rollout_path=? WHERE id=? AND rollout_path=?').run(path, nativeId, row.rollout_path);
+    } finally { db.close(); }
+  }
 }
