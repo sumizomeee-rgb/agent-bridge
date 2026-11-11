@@ -24,7 +24,7 @@ export class RemoteStore {
       CREATE TABLE IF NOT EXISTS processes(job TEXT NOT NULL,pid INTEGER NOT NULL,identity TEXT,closed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job,pid));`);
     const columns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map(row => String(row.name)));
     if (!columns.has('user_id')) this.db.exec('ALTER TABLE sessions ADD COLUMN user_id TEXT');
-    this.nativeLeases = new NativeSessionLeaseStore('', this.db);
+    this.nativeLeases = new NativeSessionLeaseStore(join(directory, 'controller.sqlite'), this.db);
   }
   jobs(): RemoteJob[] { return (this.db.prepare('SELECT data FROM jobs').all() as { data: string }[]).map(row => JSON.parse(row.data) as RemoteJob); }
   job(id: string): RemoteJob | null { const row = this.db.prepare('SELECT data FROM jobs WHERE id=?').get(id) as { data: string } | undefined; return row ? JSON.parse(row.data) as RemoteJob : null; }
@@ -75,7 +75,12 @@ export class RemoteStore {
     const session = this.session(ref.nativeId); if (!session) return null;
     if (session.agent !== ref.agent) throw new Error('此原生编号已登记为另一引擎的会话。');
     const jobs = this.jobs().filter(job => job.workerId === session.worker);
+    const request = jobs.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt)).map(job => this.request(job.dispatchId)).find(Boolean);
+    const execution = request ? { workerId: session.worker, model: request.model, effort: request.effort ?? null,
+      ...(request.modelPolicy ? { modelPolicy: request.modelPolicy } : {}),
+      ...(request.preset ? { preset: request.preset } : {}), ...(request.sessionVisibility ? { sessionVisibility: request.sessionVisibility } : {}) } : this.nativeLeases.execution(ref);
     return { userId: session.userId ?? 'unknown-owner', workerId: session.worker, state: session.ownership === 'user' ? 'user' : 'bridge', revision: 0, cwd: session.cwd,
+      ...(execution ? { execution } : {}),
       busy: jobs.some(job => job.status === 'running' || ['completed', 'failed'].includes(job.status) && !!job.result && job.stopped !== true), blocked: jobs.some(job => job.status === 'uncertain') };
   }
   /** Called inside the native lease transaction after fresh file-holder/terminal checks. */

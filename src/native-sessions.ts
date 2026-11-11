@@ -1,4 +1,5 @@
-import type { AgentCommand, AgentName } from './types.js';
+import type { AgentCommand, AgentName, SessionVisibility } from './types.js';
+import type { PresetBinding } from './presets/types.js';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, openSync, closeSync, readSync, readdirSync, realpathSync, statSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -10,10 +11,16 @@ import { parse as parseToml } from 'smol-toml';
 export interface NativeSessionRef { agent: AgentName; profile: 'default'; nativeId: string }
 export interface NativeSessionQuery { agent: AgentName; userId: string; cwd?: string; cursor?: string; limit?: number; query?: string }
 export interface NativeSessionOwnership { userId: string; workerId: string; state: 'bridge' | 'user'; revision: number }
+/** Target-owned launch choices, never supplied by the controller's adoption request. */
+export interface NativeSessionExecution {
+  workerId: string; model: string | null; effort: string | null; modelPolicy?: 'cli-default';
+  preset?: PresetBinding; sessionVisibility?: SessionVisibility;
+}
 export interface NativeSessionSummary {
   ref: NativeSessionRef; nativeId: string; profile: 'default'; cwd: string; title: string;
   model: string | null; effort: string | null; provider: string | null; revision: string;
   actualModel?: string | null; recordedCliVersion?: string | null;
+  execution?: NativeSessionExecution;
   validation?: { provider: 'provider-id-only' | 'not-recorded'; inference: 'not-tested'; cli: 'entry-present' | 'not-checked' };
   health: 'healthy' | 'busy' | 'unknown' | 'incompatible'; busyEvidence: string[];
   ownership?: NativeSessionOwnership; reason?: string;
@@ -32,7 +39,7 @@ export class NativeAdoptionRejectedError extends Error {
   constructor(message: string) { super(message); this.name = 'NativeAdoptionRejectedError'; }
 }
 
-export interface NativeLegacyOwnership extends NativeSessionOwnership { busy: boolean; blocked: boolean; cwd: string }
+export interface NativeLegacyOwnership extends NativeSessionOwnership { busy: boolean; blocked: boolean; cwd: string; execution?: NativeSessionExecution }
 interface LeaseRow extends NativeSessionOwnership { adopted: boolean }
 interface RecordInfo { ref: NativeSessionRef; path: string; cwd: string; title: string; model: string | null; actualModel?: string | null; effort: string | null; provider: string | null; version?: string }
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
@@ -61,12 +68,29 @@ export class NativeSessionLeaseStore {
   private readonly db: DatabaseSync;
   private readonly own: boolean;
   private closed = false;
-  constructor(path: string, db?: DatabaseSync) {
+  constructor(readonly path: string, db?: DatabaseSync) {
     if (!db) mkdirSync(dirname(path), { recursive: true });
     this.own = !db; this.db = db ?? new DatabaseSync(path);
     this.db.exec(`CREATE TABLE IF NOT EXISTS native_session_leases (
       ref TEXT PRIMARY KEY,user_id TEXT NOT NULL,worker_id TEXT NOT NULL,state TEXT NOT NULL,revision INTEGER NOT NULL,adopted INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS native_session_adoptions (id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result_json TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS native_session_adoptions (id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS native_session_execution (ref TEXT PRIMARY KEY,value_json TEXT NOT NULL);`);
+  }
+  execution(ref: NativeSessionRef): NativeSessionExecution | undefined {
+    const row = this.db.prepare('SELECT value_json FROM native_session_execution WHERE ref=?').get(key(ref));
+    return row ? JSON.parse(String(row.value_json)) as NativeSessionExecution : undefined;
+  }
+  rememberExecution(ref: NativeSessionRef, execution: NativeSessionExecution): void {
+    this.db.prepare('INSERT INTO native_session_execution VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value_json=excluded.value_json').run(key(ref), JSON.stringify(execution));
+  }
+  startUser(ref: NativeSessionRef, workerId: string): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const lease = this.get(ref);
+      if (!lease || lease.state !== 'user' || lease.workerId !== workerId) throw new Error('此交接命令已失效，会话已交回桥或转交其他助手。');
+      this.db.prepare('UPDATE native_session_leases SET revision=revision+1 WHERE ref=?').run(key(ref));
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   get(ref: NativeSessionRef): LeaseRow | null {
     const row = this.db.prepare('SELECT * FROM native_session_leases WHERE ref=?').get(key(ref));
@@ -92,9 +116,11 @@ export class NativeSessionLeaseStore {
       if (legacy?.busy || legacy?.blocked) throw new Error('旧桥任务仍在执行或结果未知，不能接管。');
       const revision = (old?.revision ?? 0) + 1;
       rebind?.();
+      const execution = info.execution ? { ...info.execution, workerId: args.workerId } : undefined;
+      if (execution) this.rememberExecution(args.ref, execution);
       this.db.prepare(`INSERT INTO native_session_leases VALUES(?,?,?,?,?,1) ON CONFLICT(ref) DO UPDATE SET
         user_id=excluded.user_id,worker_id=excluded.worker_id,state='bridge',revision=excluded.revision,adopted=1`).run(key(args.ref), userId, args.workerId, 'bridge', revision);
-      const result: NativeSessionAdoption = { ...info, workerId: args.workerId, userId, adoptionId: args.adoptionId,
+      const result: NativeSessionAdoption = { ...info, ...(execution ? { execution } : {}), workerId: args.workerId, userId, adoptionId: args.adoptionId,
         status: 'adopted', leaseRevision: revision, ownership: { userId, workerId: args.workerId, state: 'bridge', revision } };
       this.db.prepare('INSERT INTO native_session_adoptions VALUES(?,?,?)').run(args.adoptionId, hash, JSON.stringify(result));
       this.db.exec('COMMIT'); return result;
@@ -151,6 +177,8 @@ export interface NativeSessionServiceOptions {
   busyProbe?: (path: string) => Promise<NativeBusyEvidence>;
   legacyOwnership?: (ref: NativeSessionRef) => NativeLegacyOwnership | null;
   rebind?: (ref: NativeSessionRef, userId: string, workerId: string, cwd: string) => void;
+  validateExecution?: (ref: NativeSessionRef, execution: NativeSessionExecution) => Promise<void>;
+  prepareAdoption?: (ref: NativeSessionRef, execution: NativeSessionExecution, workerId: string) => Promise<void>;
 }
 export class NativeSessionService {
   readonly leases: NativeSessionLeaseStore;
@@ -169,11 +197,14 @@ export class NativeSessionService {
       if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='controller_workers'").get()) return null;
       for (const row of db.prepare('SELECT value_json FROM controller_workers').all()) {
         const worker = JSON.parse(String(row.value_json));
-        if (worker.agent !== ref.agent || worker.nativeId !== ref.nativeId || worker.target?.transport === 'ssh') continue;
+        if (worker.agent !== ref.agent || worker.nativeId !== ref.nativeId || worker.target?.transport === 'ssh' || worker.supersededBy) continue;
         if (adopting && worker.id === adopting.workerId && worker.origin.userId === adopting.userId && worker.adoption?.id === adopting.adoptionId && worker.adoption.status === 'pending') continue;
         const jobs = db.prepare('SELECT status FROM controller_jobs WHERE worker_id=?').all(worker.id);
         return { userId: worker.origin.userId, workerId: worker.id, state: worker.ownership === 'user' ? 'user' : 'bridge', revision: 0,
-          cwd: worker.cwd, busy: !(runOwner?.workerId === worker.id && runOwner?.userId === worker.origin.userId) && jobs.some(job => ['queued', 'running'].includes(String(job.status))), blocked: worker.blocked === true || jobs.some(job => job.status === 'uncertain') };
+          cwd: worker.cwd, execution: { workerId: worker.id, model: worker.model ?? null, effort: worker.effort ?? null,
+            ...(worker.modelPolicy ? { modelPolicy: worker.modelPolicy } : {}), ...(worker.target?.preset ? { preset: worker.target.preset } : {}),
+            ...(worker.target?.sessionVisibility ? { sessionVisibility: worker.target.sessionVisibility } : {}) },
+          busy: !(runOwner?.workerId === worker.id && runOwner?.userId === worker.origin.userId) && jobs.some(job => ['queued', 'running'].includes(String(job.status))), blocked: worker.blocked === true || jobs.some(job => job.status === 'uncertain') };
       }
       return null;
     } finally { db.close(); }
@@ -255,6 +286,7 @@ export class NativeSessionService {
     const lease = this.leases.get(info.ref), legacy = this.legacy(info.ref, adopting, runOwner);
     if (lease && lease.userId !== userId || legacy && legacy.userId !== userId) throw new Error('原生会话属于其他用户，不能读取。');
     const ownership = lease ?? legacy ?? undefined;
+    const execution = legacy?.execution ?? this.leases.execution(info.ref);
     let health: NativeSessionSummary['health'] = 'unknown', reason = '仅发现历史记录，尚未核验当前持有者。';
     const messages: NativeSessionRead['messages'] = [];
     let clippedMessages = false;
@@ -295,14 +327,22 @@ export class NativeSessionService {
       const busy = await (this.options.busyProbe ?? probeNativeFileHolders)(path); busyEvidence = busy.evidence;
       health = busy.status === 'clear' ? 'healthy' : busy.status === 'busy' ? 'busy' : 'unknown'; reason = health === 'healthy' ? '' : '原会话持有者尚未释放或无法确认。';
     }
+    let executionError: string | undefined;
+    if (execution?.preset) {
+      try {
+        if (!this.options.validateExecution) throw new Error('目标未配置原助手线路验证，未回退普通助手。');
+        await this.options.validateExecution(info.ref, execution);
+      } catch (error) { executionError = error instanceof Error ? error.message : '原助手线路不可用。'; }
+    }
     if (info.ref.agent === 'codex') {
       const configPath = join(this.homes.codex, 'config.toml');
-      let provider: unknown = 'openai';
-      try { if (existsSync(configPath)) provider = parseToml(readFileSync(configPath, 'utf8')).model_provider ?? 'openai'; }
+      let provider: unknown = execution?.preset ? 'bridge_preset' : 'openai';
+      try { if (!execution?.preset && existsSync(configPath)) provider = parseToml(readFileSync(configPath, 'utf8')).model_provider ?? 'openai'; }
       catch { throw new Error('当前 Codex 供应商配置无法安全读取；未修改配置。'); }
       if (info.provider && provider !== info.provider) { health = 'incompatible'; reason = '会话记录的供应商与当前用户 CLI 配置不同；未修改路由或另开会话。'; }
     }
-    const revision = fingerprint({ id: info.ref.nativeId, agent: info.ref.agent, bytes: data.bytes, mtime: data.mtime, cwd: info.cwd, model: info.model, effort: info.effort, provider: info.provider, leaseRevision: lease?.revision ?? 0 });
+    if (executionError) { health = 'incompatible'; reason = executionError; }
+    const revision = fingerprint({ id: info.ref.nativeId, agent: info.ref.agent, bytes: data.bytes, mtime: data.mtime, cwd: info.cwd, model: info.model, effort: info.effort, provider: info.provider, leaseRevision: lease?.revision ?? 0, execution });
     let budget = 32 * 1024; const boundedMessages: NativeSessionRead['messages'] = [];
     for (const message of messages.slice(-20).reverse()) {
       const raw = Buffer.from(message.text); if (budget <= 0) break;
@@ -311,7 +351,7 @@ export class NativeSessionService {
       const text = raw.length <= budget ? message.text : raw.subarray(0, end).toString('utf8');
       budget -= Buffer.byteLength(text); boundedMessages.unshift({ ...message, text });
     }
-    return { ref: info.ref, nativeId: info.ref.nativeId, profile: 'default', cwd: info.cwd, title: info.title, model: info.model, actualModel: info.actualModel ?? null, effort: info.effort, provider: info.provider, recordedCliVersion: info.version ?? null,
+    return { ref: info.ref, nativeId: info.ref.nativeId, profile: 'default', cwd: info.cwd, title: info.title, model: info.model, actualModel: info.actualModel ?? null, effort: info.effort, provider: info.provider, recordedCliVersion: info.version ?? null, ...(execution ? { execution } : {}),
       validation: { provider: info.provider ? 'provider-id-only' : 'not-recorded', inference: 'not-tested', cli: cliPresent ? 'entry-present' : 'not-checked' },
       revision, health, busyEvidence, ...(ownership ? { ownership: { userId: ownership.userId, workerId: ownership.workerId, state: ownership.state, revision: ownership.revision } } : {}), ...(reason ? { reason } : {}), messages: boundedMessages, truncated: data.partial || clippedMessages || messages.length > boundedMessages.length || budget === 0 };
   }
@@ -341,6 +381,12 @@ export class NativeSessionService {
     if (info.health !== 'healthy') throw new Error(`原生会话尚不能接管：${info.reason ?? info.health}`);
     const current = await this.inspect(record, userId, true, adopting);
     if (current.revision !== info.revision || current.health !== 'healthy') throw new Error('原生会话在准备接管时再次发生变化，未接管。');
+    if (current.execution) {
+      if (this.options.prepareAdoption) await this.options.prepareAdoption(args.ref, current.execution, args.workerId);
+      else if (current.execution.preset || current.execution.sessionVisibility) throw new Error('目标尚未支持原助手配置接回，未领取会话。');
+      const final = await this.inspect(record, userId, true, adopting);
+      if (final.revision !== current.revision || final.health !== 'healthy') throw new Error('准备原助手配置期间会话发生变化，未接管。');
+    }
     const { messages: _messages, truncated: _truncated, ...summary } = current;
     claiming = true;
     return this.leases.claim(summary, userId, args, this.legacy(args.ref, adopting), this.options.rebind ? () => this.options.rebind!(args.ref, userId, args.workerId, current.cwd) : undefined);
@@ -358,6 +404,19 @@ export class NativeSessionService {
   bindRunOwnership(ref: NativeSessionRef, userId: string, workerId: string): void {
     if (!this.leases.get(ref)) { const old = this.legacy(ref); if (old && (old.userId !== userId || old.workerId !== workerId || old.state !== 'bridge')) throw new Error('旧会话已交给用户或另一 worker，必须显式接管。'); }
     this.leases.bind(ref, userId, workerId);
+  }
+  transcriptPath(ref: NativeSessionRef): string {
+    validRef(ref); const record = this.records(ref.agent).find(item => item.ref.nativeId === ref.nativeId);
+    if (!record) throw new Error('原生会话记录不可用。'); return this.checkedPath(record.path, ref.agent);
+  }
+  async prepareHandoff(ref: NativeSessionRef): Promise<NativeSessionRead> {
+    const owner = this.leases.get(ref) ?? this.legacy(ref);
+    if (!owner) throw new Error('此会话没有桥持有登记，不能交接。');
+    const info = await this.read(owner.userId, ref, { limit: 1 });
+    if (info.health !== 'healthy') throw new Error(`原会话尚不能交接：${info.reason ?? info.health}`);
+    if (!this.leases.get(ref)) this.leases.bind(ref, owner.userId, owner.workerId);
+    if (info.execution) this.leases.rememberExecution(ref, info.execution);
+    return info;
   }
   close(): void { this.leases.close(); }
 }

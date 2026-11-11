@@ -267,7 +267,7 @@ export class ControllerRuntime {
     if (!catalog?.adoptNativeSession) throw new Error('原生会话接管服务未配置');
     await this.authorizeNativeAccess(worker.origin, worker.target.id);
     const currentBinding = await this.resolveTarget(worker.origin.cwd, worker.target.id, worker.agent);
-    const route = (binding: ExecutionTargetBinding) => canonical({ ...binding, cwd: undefined });
+    const route = (binding: ExecutionTargetBinding) => canonical({ ...binding, cwd: undefined, preset: undefined, sessionVisibility: undefined });
     if (route(currentBinding) !== route(worker.target)) throw new Error('接管期间电脑登记已改变，不能使用旧连接自动恢复；需先核对原接管结果');
     let receipt;
     try {
@@ -737,10 +737,14 @@ export class ControllerRuntime {
       if (existing) {
         const result = this.adoptionResult(existing); if (key) this.store.saveCall(key, fingerprint, result); return result;
       }
+      if (previous.some(worker => worker.target?.preset || worker.target?.sessionVisibility) && !candidate.execution) throw new Error('目标未返回原助手配置，不能接回成普通助手；请先更新执行器。');
       const worker: ControllerWorker = { id: randomUUID(), origin, agent: ref.agent, nativeId: ref.nativeId,
         cwd: candidate.cwd, title: args.title === undefined ? candidate.title : text(args.title, 'title', 1024),
-        model: candidate.model, actualModel: candidate.actualModel ?? candidate.model, effort: candidate.effort, actualEffort: candidate.effort,
-        target: { ...binding, cwd: candidate.cwd }, ownership: 'bridge', imagePaths: [], wakeAllowed: true, blocked: true,
+        model: candidate.execution ? candidate.execution.model : candidate.model, actualModel: candidate.actualModel ?? candidate.model,
+        effort: candidate.execution ? candidate.execution.effort : candidate.effort, actualEffort: candidate.effort,
+        ...(candidate.execution?.modelPolicy ? { modelPolicy: candidate.execution.modelPolicy } : {}),
+        target: { ...binding, cwd: candidate.cwd, ...(candidate.execution?.preset ? { preset: candidate.execution.preset } : {}),
+          ...(candidate.execution?.sessionVisibility ? { sessionVisibility: candidate.execution.sessionVisibility } : {}) }, ownership: 'bridge', imagePaths: [], wakeAllowed: true, blocked: true,
         createdAt: this.timestamp(), updatedAt: this.timestamp(), adoption: { id: randomUUID(), ref, expectedRevision,
           status: 'pending', previousWorkers: previous.map(value => value.id), ...(key ? { callKey: key } : {}) } };
       this.store.transaction(() => {
@@ -787,8 +791,6 @@ export class ControllerRuntime {
         || this.store.supplements().some(value => value.workerId === worker.id && ['pending', 'steering'].includes(value.status))) {
         throw new Error('只能交接已确认空闲的子 Agent；活动、排队或未知任务需要先处理');
       }
-      if (worker.target?.sessionVisibility === 'hidden') throw new Error('该助手创建时设为隐藏，不能通过用户默认 CLI 交接；需要原生历史可见时请明确新建 visible 助手。');
-      if (worker.target?.preset && worker.target.sessionVisibility !== 'visible') throw new Error('预设会话尚未提供保留私有目录的人工接管，桥内续聊仍可用。');
       if (!worker.nativeId) throw new Error('子 Agent 尚未建立真实原生会话，不能交接');
       if (!this.callbacks.targetCatalog) throw new Error('桥尚未配置会话交接服务');
       const binding = worker.target ?? await this.resolveTarget(worker.cwd, 'local', worker.agent, worker.cwd);

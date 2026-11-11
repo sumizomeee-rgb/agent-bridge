@@ -23,6 +23,7 @@ import { observeActivity } from '../agents/activity.js';
 import { executionErrorEvidence } from '../delivery-errors.js';
 import { completedRetirementFailure } from '../agents/retirement.js';
 import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
+import { userHandoffCommand } from '../agents/user-handoff.js';
 
 function blocksWorkerContinuation(job: RemoteJob): boolean {
   return job.status === 'running' || job.status === 'uncertain' && !stoppedExecutionFailure({
@@ -128,7 +129,13 @@ export class RemoteDaemon {
     this.workerSessions = new WorkerSessionRuntime(remoteDataDirectory(root), options.nativeSessionOptions?.userHome);
     this.presetRuntime = new PresetRuntime(join(root, '.local', 'agent-presets'), remoteDataDirectory(root), options.nativeSessionOptions?.userHome);
     this.dataDirectory = remoteDataDirectory(root); this.store = new RemoteStore(this.dataDirectory);
-    this.nativeSessions = new NativeSessionService(this.dataDirectory, config.engines, { ...options.nativeSessionOptions, env: this.environment(), leaseStore: this.store.nativeLeases, legacyOwnership: ref => this.store.nativeOwnership(ref), rebind: (ref, userId, workerId, cwd) => this.store.adoptSession(ref, userId, workerId, cwd) });
+    this.nativeSessions = new NativeSessionService(this.dataDirectory, config.engines, { ...options.nativeSessionOptions, env: this.environment(), leaseStore: this.store.nativeLeases,
+      legacyOwnership: ref => this.store.nativeOwnership(ref), rebind: (ref, userId, workerId, cwd) => this.store.adoptSession(ref, userId, workerId, cwd),
+      validateExecution: async (ref, execution) => { if (execution.preset) await this.presetRuntime.validate(execution.preset, execution.workerId, ref.nativeId); },
+      prepareAdoption: async (ref, execution, workerId) => {
+        if (execution.preset) await this.presetRuntime.restore(execution.preset, execution.workerId, workerId, ref.nativeId, execution.sessionVisibility);
+        else if (execution.sessionVisibility) this.workerSessions.restore(ref.agent, execution.workerId, workerId, ref.nativeId, execution.sessionVisibility);
+      } });
     const tokenFile = join(this.dataDirectory, 'ipc-token');
     if (!existsSync(tokenFile)) writeFileSync(tokenFile, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
     this.token = readFileSync(tokenFile, 'utf8').trim();
@@ -325,15 +332,17 @@ export class RemoteDaemon {
     }
     if (nativeId) {
       if (raw.preset) { const owner = this.store.session(nativeId); if (!owner || owner.worker !== workerId || owner.userId !== userId || owner.agent !== agent || owner.cwd !== cwd || owner.ownership !== 'bridge') throw new Error('预设原生会话归属不符。'); }
-      else await this.nativeSessions.assertRunOwnership({ agent, profile: 'default', nativeId }, userId, workerId);
+      await this.nativeSessions.assertRunOwnership({ agent, profile: 'default', nativeId }, userId, workerId);
       this.store.bindSession(nativeId, workerId, agent, cwd, userId);
     }
     if (raw.model != null && (typeof raw.model !== 'string' || !isModelId(raw.model))) throw new Error('模型选择无效。');
     if (raw.effort != null && (typeof raw.effort !== 'string' || raw.effort.length > 50)) throw new Error('推理强度无效。');
+    if (raw.modelPolicy !== undefined && raw.modelPolicy !== 'cli-default') throw new Error('模型选择策略无效。');
     if (!Array.isArray(raw.imagePaths) || raw.imagePaths.length > 32 || typeof raw.acceptSupplements !== 'boolean') throw new Error('图片或补充选项无效。');
     const imagePaths = await Promise.all(raw.imagePaths.map(path => this.uploadedPath(path)));
     const request: RemoteDispatch = { ...(visibility ? { sessionVisibility: visibility } : {}), ...(raw.preset ? { preset: raw.preset as import('../presets/types.js').PresetBinding } : {}), dispatchId: id, workerId, userId, agent, agentCommand: engine.agentCommand, cwd,
       nativeId, text: text(raw.text, '任务文字'), imagePaths, model: raw.model as string | null,
+      ...(raw.modelPolicy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}),
       ...(raw.effort != null ? { effort: raw.effort as string } : {}), acceptSupplements: raw.acceptSupplements,
       ...(raw.input !== undefined ? { input: await this.input(raw.input) } : {}) };
     // Check again after filesystem awaits. The SQLite insert/active check is synchronous.
@@ -541,14 +550,14 @@ export class RemoteDaemon {
     } else if (job.stopped !== true) throw new Error('远端停止结果尚未确认。');
     this.releaseTracked(dispatchId); return { stopped: true };
   }
-  private async handoff(raw: Record<string, unknown>): Promise<{ stopped: true; nativeId: string }> {
+  private async handoff(raw: Record<string, unknown>): Promise<{ stopped: true; nativeId: string; resumeCommand: string }> {
     const nativeId = identifier(raw.nativeId, '原生会话编号'); const agent = this.agent(raw.agent); const cwd = text(raw.cwd, '工作目录', 4000);
     const session = this.store.session(nativeId);
     if (!session || session.agent !== agent || session.cwd !== cwd) throw new Error('远端会话不存在或引擎/工作目录不符。');
-    if (this.store.jobs().some(job => job.nativeId === nativeId && (this.store.request(job.dispatchId)?.sessionVisibility === 'hidden'
-      || this.store.request(job.dispatchId)?.preset && this.store.request(job.dispatchId)?.sessionVisibility !== 'visible'))) throw new Error('隐藏或旧预设会话不能通过默认目录交接。');
     for (const job of this.store.jobs().filter(item => item.nativeId === nativeId)) if (job.status === 'running' || job.status === 'uncertain') await this.interrupt(job.dispatchId);
-    this.store.handoff(nativeId); return { stopped: true, nativeId };
+    const ref: NativeSessionRef = { agent, profile: 'default', nativeId }, info = await this.nativeSessions.prepareHandoff(ref);
+    const resumeCommand = userHandoffCommand(this.dataDirectory, join(this.root, '.local', 'agent-presets'), this.config.engines[agent]!.agentCommand, info, this.nativeSessions.transcriptPath(ref), this.nativeSessions.leases.path);
+    this.store.handoff(nativeId); return { stopped: true, nativeId, resumeCommand };
   }
   private async upload(raw: Record<string, unknown>): Promise<{ path: string; offset: number; complete: boolean }> {
     const hash = text(raw.sha256, '附件校验', 64); if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('附件校验无效。');

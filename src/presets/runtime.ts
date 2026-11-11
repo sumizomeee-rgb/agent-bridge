@@ -75,7 +75,14 @@ export class PresetRuntime {
     await this.profile(binding, workerId, nativeId, true);
     pinSessionLocation(this.home(workerId, binding), binding.agent, visibility ?? 'hidden', nativeId, {}, this.userHome);
   }
-  async validate(binding: PresetBinding, workerId?: string, nativeId?: string | null): Promise<void> { await this.profile(binding, workerId, nativeId, false); }
+  async validate(binding: PresetBinding, workerId?: string, nativeId?: string | null): Promise<void> { await this.credential(await this.profile(binding, workerId, nativeId, false)); }
+  async restore(binding: PresetBinding, sourceWorkerId: string, workerId: string, nativeId: string, visibility?: SessionVisibility): Promise<void> {
+    const profile = await this.profile(binding, sourceWorkerId, nativeId, false);
+    const home = this.home(workerId, binding), path = join(home, 'preset-binding.json');
+    if (existsSync(path)) await this.profile(binding, workerId, nativeId, false);
+    else { mkdirSync(home, { recursive: true }); writeFileSync(path, JSON.stringify({ binding, profile }), { flag: 'wx', mode: 0o600 }); }
+    pinSessionLocation(home, binding.agent, visibility ?? 'hidden', null, {}, this.userHome);
+  }
   private async profile(binding: PresetBinding, workerId?: string, nativeId?: string | null, pin = false): Promise<LaunchProfile> {
     assertPresetBinding(binding);
     const home = workerId ? this.home(workerId, binding) : undefined, path = home ? join(home, 'preset-binding.json') : undefined;
@@ -99,17 +106,9 @@ export class PresetRuntime {
   async prepare(binding: PresetBinding, workerId: string, nativeId: string | null, original: AgentCommand, baseEnv: NodeJS.ProcessEnv, visibility?: SessionVisibility): Promise<PreparedPreset> {
     const profile = await this.profile(binding, workerId, nativeId, true);
     const location = pinSessionLocation(this.home(workerId, binding), binding.agent, visibility ?? 'hidden', nativeId, {}, this.userHome)!;
-    const managed = (await readMaterials(this.privateRoot, parseLaunchProfiles)).map(source => source.credentials[profile.credentialId]).filter(value => value !== undefined);
-    if (managed.length > 1) throw new Error('不同工作区的预设凭据引用冲突。');
-    let credential: Record<string, unknown> | undefined = managed[0];
-    if (!credential) {
-      const raw = await readPrivateJson(join(this.privateRoot, 'credentials.json'));
-      if (!isObject(raw) || raw.version !== 1 || !isObject(raw.credentials) || !isObject(raw.credentials[profile.credentialId])) throw new Error('目标机预设凭据引用不可用。');
-      credential = raw.credentials[profile.credentialId] as Record<string, unknown>;
-    }
-    const key = binding.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey;
-    if (typeof key !== 'string' || !key || /[\r\n\0]/.test(key)) throw new Error('目标机预设认证材料无效。');
-    const env: NodeJS.ProcessEnv = { ...process.env, ...baseEnv };
+    const credential = await this.credential(profile);
+    const key = (binding.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey) as string;
+    const env = { ...process.env, ...baseEnv };
     const cleared = new Set(['CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_API_KEY', 'CLAUDE_CONFIG_DIR', 'BRIDGE_PRESET_API_KEY', 'BRIDGE_PRESET_PROVIDER', 'NO_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
     for (const name of Object.keys(env)) {
       const key = name.toUpperCase();
@@ -154,6 +153,19 @@ export class PresetRuntime {
       }
       return { command, env, close: async () => { await relay?.close(); } };
     } catch (error) { await relay?.close(); throw error; }
+  }
+  private async credential(profile: LaunchProfile): Promise<Record<string, unknown>> {
+    const managed = (await readMaterials(this.privateRoot, parseLaunchProfiles)).map(source => source.credentials[profile.credentialId]).filter(value => value !== undefined);
+    if (managed.length > 1) throw new Error('不同工作区的预设凭据引用冲突。');
+    let credential: Record<string, unknown> | undefined = managed[0];
+    if (!credential) {
+      const raw = await readPrivateJson(join(this.privateRoot, 'credentials.json'));
+      if (!isObject(raw) || raw.version !== 1 || !isObject(raw.credentials) || !isObject(raw.credentials[profile.credentialId])) throw new Error('目标机预设凭据引用不可用。');
+      credential = raw.credentials[profile.credentialId] as Record<string, unknown>;
+    }
+    const key = profile.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey;
+    if (typeof key !== 'string' || !key || /[\r\n\0]/.test(key)) throw new Error('目标机预设认证材料无效。');
+    return credential;
   }
 }
 

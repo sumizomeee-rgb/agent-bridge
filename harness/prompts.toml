@@ -1038,7 +1038,7 @@ source = "src/controller/tools/catalog.ts"
 text = '''
 Relinquish an idle child to the user with verified machine, directory and resume instructions. Do not continue it until verified reverse adoption.
 
-交还所有权后主控不得继续使用，直到重新核实并反向接管。'''
+普通、预设及隐藏助手均可交还，返回命令保留原配置。用户退出 CLI 后，可读取并反向接管同一会话，反复交接；交还后主控不得直接继续使用。'''
 
 [prompts."tools.bridge_handoff_worker.inputSchema.workerId.description"]
 purpose = "工具 bridge_handoff_worker 的 inputSchema.workerId 说明"

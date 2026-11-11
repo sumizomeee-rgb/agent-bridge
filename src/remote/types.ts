@@ -41,6 +41,7 @@ export interface RemoteDispatch {
   dispatchId: string; workerId: string; userId: string; agent: AgentName; agentCommand: AgentCommand;
   nativeId: string | null; cwd: string; text: string; imagePaths: string[]; input?: AgentInput[];
   model: string | null; effort?: string; acceptSupplements: boolean;
+  modelPolicy?: 'cli-default';
 }
 export interface RemoteArtifact {
   id: string; filename: string; description?: string; image: boolean;

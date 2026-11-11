@@ -64,6 +64,12 @@ export function exposeCodexHistory(home: string, location: { profileHome: string
 
 export class WorkerSessionRuntime {
   constructor(readonly dataRoot: string, private readonly userHome = homedir()) {}
+  restore(agent: AgentName, sourceWorkerId: string, workerId: string, nativeId: string, visibility: SessionVisibility): void {
+    const source = sessionHome(this.dataRoot, this.userHome, 'worker', agent, sourceWorkerId);
+    const location = pinSessionLocation(source, agent, visibility, nativeId, {}, this.userHome)!;
+    const env = agent === 'codex' ? { CODEX_HOME: location.profileHome, CODEX_SQLITE_HOME: location.sqliteHome } : { CLAUDE_CONFIG_DIR: location.profileHome };
+    pinSessionLocation(sessionHome(this.dataRoot, this.userHome, 'worker', agent, workerId), agent, visibility, null, env, this.userHome);
+  }
   prepare(agent: AgentName, workerId: string, nativeId: string | null, visibility: SessionVisibility, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(workerId)) throw new Error('助手编号无效。');
     const home = sessionHome(this.dataRoot, this.userHome, 'worker', agent, workerId), env = { ...process.env, ...baseEnv };

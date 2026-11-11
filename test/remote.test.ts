@@ -5,6 +5,7 @@ import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { connect } from 'node:net';
+import { DatabaseSync } from 'node:sqlite';
 import type { AgentAdapter, AgentResult, AgentSupplement, AgentTurn, BridgeConfig, SteerResult } from '../src/types.js';
 import { RemoteDaemon, remoteEndpoint } from '../src/remote/daemon.js';
 import { RemoteAgentAdapter } from '../src/remote/adapter.js';
@@ -76,7 +77,7 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'bridge-remote-test-')); const natives: FakeNative[] = [];
   const command = { command: process.execPath, args: [] };
   const daemonConfig: RemoteDaemonConfig = { version: 1, expectedHostname: hostname(), engines: { codex: { agentCommand: command, defaultCwd: root }, claude: { agentCommand: command, defaultCwd: root } } };
-  const daemon = new RemoteDaemon(root, daemonConfig, { nativeSessionOptions: { userHome: join(root, 'isolated-user') }, adapterFactory: () => { const native = new FakeNative(); natives.push(native); return native; } });
+  const daemon = new RemoteDaemon(root, daemonConfig, { nativeSessionOptions: { userHome: join(root, 'isolated-user'), busyProbe: async () => ({ status: 'clear', evidence: [] }) }, adapterFactory: () => { const native = new FakeNative(); natives.push(native); return native; } });
   const config: BridgeConfig = { token: 'unused', allowedUserIds: ['user'], defaultAgent: 'codex', workspace: root, proxyUrl: null, commands: { codex: command, claude: command },
     dataDir: join(root, 'local-data'), attachmentsDir: root, logsDir: root, maxImageBytes: 20 * 1024 * 1024, maxFileBytes: 24 * 1024 * 1024 };
   const binding: ExecutionTargetBinding = { id: 'station', label: '工位', transport: 'ssh', expectedHostname: hostname(), sshConfig: join(root, 'ssh-config'), alias: 'station', remoteRoot: root, nodePath: process.execPath, agent: 'codex', agentCommand: command, cwd: root };
@@ -88,6 +89,16 @@ function fixture() {
   const turn = (dispatchId = randomUUID()): AgentTurn => ({ dispatchId, conversation: { id: randomUUID(), userId: 'owner', agent: 'codex', nativeId: null,
     cwd: root, title: 'remote', createdAt: 'now', updatedAt: 'now' }, text: '检查隔离目录', imagePaths: [], acceptSupplements: true, signal: new AbortController().signal, onProgress: () => {} });
   return { root, daemon, natives, config, binding, adapter, request, turn, calls, disconnect: () => { disconnect = true; } };
+}
+function nativeHistory(root: string, nativeId: string, provider = 'openai'): void {
+  const home = join(root, 'isolated-user', '.codex'), directory = join(home, 'sessions'); mkdirSync(directory, { recursive: true });
+  const path = join(directory, nativeId + '.jsonl');
+  writeFileSync(path, JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: root } }) + '\n' + JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) + '\n');
+  const db = new DatabaseSync(join(home, 'state_5.sqlite'));
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,rollout_path TEXT,cwd TEXT,model_provider TEXT,title TEXT,archived INTEGER,updated_at INTEGER)');
+    db.prepare('INSERT OR REPLACE INTO threads VALUES(?,?,?,?,?,0,1)').run(nativeId, path, root, provider, 'fixture');
+  } finally { db.close(); }
 }
 
 test('执行器更新租约只在空闲时取得，阻止新派工和原生查询，取消后恢复且不杀助手', async () => {
@@ -156,7 +167,9 @@ test('handoff confirms owned CLI termination and prevents bridge resuming the us
   const f = fixture();
   try {
     const a = f.request(); await f.daemon.handle('dispatch', a); await tick(); const nativeId = f.natives[0]!.nativeId;
-    assert.deepEqual(await f.daemon.handle('handoff', { nativeId, cwd: f.root, agent: 'codex' }), { nativeId, stopped: true });
+    nativeHistory(f.root, nativeId);
+    const handed = await f.daemon.handle('handoff', { nativeId, cwd: f.root, agent: 'codex' }) as { nativeId: string; stopped: boolean; resumeCommand: string };
+    assert.equal(handed.nativeId, nativeId); assert.equal(handed.stopped, true); assert.match(handed.resumeCommand, /user-handoff/);
     assert.equal(f.natives[0]!.interrupts, 1); assert.equal(f.daemon.store.session(nativeId)!.ownership, 'user');
     await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId })), /交给用户/);
   } finally { await f.daemon.close(); }
@@ -406,7 +419,7 @@ test('remote launch configuration survives storage and polling separately from n
 });
 
 
-test('remote preset binding is durable, cannot be removed or moved, and rejects default-home handoff before interruption', async () => {
+test('remote preset binding is durable and cannot be removed or moved', async () => {
   const f = fixture();
   try {
     const privateRoot = join(f.root, '.local', 'agent-presets'); mkdirSync(privateRoot, { recursive: true });
@@ -422,8 +435,8 @@ test('remote preset binding is durable, cannot be removed or moved, and rejects 
     await f.daemon.handle('dispatch', a); await tick();
     assert.deepEqual(f.daemon.store.request(a.dispatchId)!.preset, preset);
     const nativeId = f.natives[0]!.nativeId;
-    await assert.rejects(f.daemon.handle('handoff', { nativeId, agent: a.agent, cwd: a.cwd }), /预设/);
     assert.equal(f.natives[0]!.interrupts, 0); f.natives[0]!.finish(); await tick(); await tick();
+    nativeHistory(f.root, nativeId, 'bridge_preset');
     await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId, model: preset.model })), /预设线路/);
     await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId, model: preset.model, preset: { ...preset, id: 'other' } })), /预设线路/);
     profile.baseUrl = 'https://new.example'; writeFileSync(join(privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [profile] }));
@@ -450,7 +463,7 @@ test('remote visibility is transported and frozen; malformed input and old execu
     const a = f.request({ sessionVisibility: 'hidden' }); await f.daemon.handle('dispatch', a); await tick(); f.natives[0]!.finish(); await tick(); await tick();
     assert.equal(f.daemon.store.request(a.dispatchId)!.sessionVisibility, 'hidden');
     await assert.rejects(f.daemon.handle('dispatch', f.request({ workerId: a.workerId, nativeId: f.daemon.store.job(a.dispatchId)!.nativeId, sessionVisibility: 'visible' })), /不能更换会话可见性/);
-    await assert.rejects(f.daemon.handle('handoff', { nativeId: f.daemon.store.job(a.dispatchId)!.nativeId, agent: a.agent, cwd: a.cwd }), /隐藏/);
+    await assert.rejects(f.daemon.handle('handoff', { nativeId: f.daemon.store.job(a.dispatchId)!.nativeId, agent: a.agent, cwd: a.cwd }), /原生会话/);
     const calls: string[] = [];
     const old: RemoteClient = { request: async <T>(method: string) => { calls.push(method); return { version: 1, hostname: hostname(), engines: ['codex'], presetDispatch: 1 } as T; }, close: async () => {} };
     const adapter = new RemoteAgentAdapter({ ...f.binding, sessionVisibility: 'hidden' }, f.config, { clientFactory: () => old });

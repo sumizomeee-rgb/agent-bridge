@@ -132,6 +132,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
           ...(this.binding.sessionVisibility ? { sessionVisibility: this.binding.sessionVisibility } : {}),
           agent: this.binding.agent, agentCommand: this.binding.agentCommand, nativeId: turn.conversation.nativeId, cwd: this.binding.cwd,
           text: turn.text, imagePaths, model: turn.conversation.model ?? null, acceptSupplements: turn.acceptSupplements === true,
+          ...(turn.conversation.modelPolicy ? { modelPolicy: turn.conversation.modelPolicy } : {}),
           ...(turn.effort ? { effort: turn.effort } : {}), ...(turn.input ? { input: await this.inputs(turn.input) } : {}) };
         // Once submitted, losing the response is ambiguous. Never dispatch a second prompt.
         if (turn.signal.aborted || execution.cancelled) throw Object.assign(new Error('远端任务尚未派发，已取消。'), { name: 'AbortError' });
@@ -242,7 +243,7 @@ export class RemoteAgentAdapter implements AgentAdapter {
       const previous = this.client; this.client = null; void previous?.close().catch(() => {}); return false;
     }
   }
-  async handoff(nativeId: string, cwd: string): Promise<void> { await this.validate(); await this.connection().request('handoff', { nativeId, cwd, agent: this.binding.agent }); }
+  async handoff(nativeId: string, cwd: string): Promise<{ resumeCommand?: string }> { await this.validate(); return this.connection().request('handoff', { nativeId, cwd, agent: this.binding.agent }); }
   /** Closing an SSH transport detaches only; the independently hosted native task survives. */
   async close(): Promise<void> { this.closed = true; await this.client?.close(); this.client = null; }
 }
