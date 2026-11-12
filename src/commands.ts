@@ -27,7 +27,9 @@ export const COMMANDS: CommandDefinition[] = [
     { type: 'string', name: 'mode', description: '留空查询；on 开启（额度消耗更快），off 关闭', choices: [{ name: '开启', value: 'on' }, { name: '关闭', value: 'off' }] },
   ] },
   { name: 'models', help: "/models：列出当前 Agent 的模型选项", description: '列出当前 Agent 的模型选项' },
-  { name: 'status', help: "/status：查看桥、模型、会话、运行与排队状态", description: '查看当前模型、会话和排队情况' },
+  { name: 'status', help: "/status [host]：查看桥和会话状态；host 查看桥电脑 CPU、内存及进程前5", description: '查看会话状态或桥电脑资源快照', options: [
+    { type: 'string', name: 'scope', description: '留空查看会话；host 查看桥电脑 CPU、内存及进程前5', choices: [{ name: '桥电脑资源', value: 'host' }] },
+  ] },
   { name: 'computers', help: "/computers [refresh|cached] [details]：查看登记电脑、连接与 CLI 入口", description: '查看已登记电脑、连接状态和 Agent CLI 入口', options: [
     { type: 'boolean', name: 'refresh', description: '默认重新检查；关闭后查看已有检查' },
     { type: 'boolean', name: 'details', description: '展开完整检查信息；默认简要展示' },

@@ -55,6 +55,7 @@ export function slashText(data: unknown, context: 'dm' | 'group' = 'dm'): { text
     case 'new': return { text: `/new${values.get('continue') ? ' continue' : ''}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'agent': return { text: `/${definition.name}${values.has('agent') ? ` ${values.get('agent')}` : ''}` };
     case 'default': return { text: `/default ${values.get('args') ?? 'agentworker'}` };
+    case 'status': return { text: `/status${values.has('scope') ? ` ${values.get('scope')}` : ''}` };
     case 'housekeeper': return { text: `/housekeeper ${values.get('action') ?? 'status'}` };
     case 'prompt': return { text: `/prompt${values.has('number') ? ` ${values.get('number')}` : ''}` };
     case 'tasks': return { text: `/tasks${values.has('args') ? ` ${values.get('args')}` : ''}` };

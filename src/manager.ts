@@ -1,4 +1,5 @@
 import { NumberedChoiceError, NumberedChoices } from './numbered-choices.js';
+import { collectHostSnapshot, hostStatusPresentation, type HostSnapshot } from './host-status.js';
 import { promptShortcut, readPromptShortcuts } from './prompt-shortcuts.js';
 import { commandFailureCopy } from './command-copy.js';
 import { agentEffortProtocol, effortCapabilityText, modelEffortCapability, validateEffort } from './effort.js';
@@ -78,6 +79,7 @@ export interface SessionManagerOptions {
   onDiagnostic?: (message: string) => void;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
   onRequestRestart?: (origin: RestartOrigin) => Promise<RestartReceipt>;
+  onHostStatus?: () => Promise<HostSnapshot>;
 }
 
 export class SessionManager {
@@ -1123,6 +1125,11 @@ export class SessionManager {
       case 'tasks': { await this.replyTasks(message, argument, reply); return; }
       case 'workers': { await this.replyWorkers(message.userId, argument, reply); return; }
       case 'status': {
+        if (argument.toLowerCase() === 'host') {
+          const view = hostStatusPresentation(await (this.options.onHostStatus ?? collectHostSnapshot)());
+          await reply(presentationText(view), { presentation: view }); return;
+        }
+        if (argument) { await reply('用法：/status 查看会话；/status host 查看桥电脑资源快照。'); return; }
         const running = current && this.running.get(message.userId)?.conversationId === current.id;
         const blocks: BridgePresentation['blocks'] = [{ kind: 'entry', text:
           `平台：${this.config.platform === 'feishu' ? '飞书' : 'Discord'} · 机器人：${this.options.botName?.() ?? this.config.applicationId ?? '未回报'}\nProfile：${this.config.profile ?? '未设置'} · 模式：${this.config.controllerMode ? '主控' : '直接执行'} · Agent：${agentDisplayName(current?.agent ?? this.config.defaultAgent)}` }];
