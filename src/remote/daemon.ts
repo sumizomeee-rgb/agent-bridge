@@ -24,6 +24,7 @@ import { executionErrorEvidence } from '../delivery-errors.js';
 import { completedRetirementFailure } from '../agents/retirement.js';
 import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
 import { userHandoffCommand } from '../agents/user-handoff.js';
+import { ExecutorMessages, executorMessageRequest } from '../executor-messages.js';
 
 function blocksWorkerContinuation(job: RemoteJob): boolean {
   return job.status === 'running' || job.status === 'uncertain' && !stoppedExecutionFailure({
@@ -103,6 +104,7 @@ export interface RemoteDaemonOptions {
   adapterFactory?: (agent: AgentName, dispatch: RemoteDispatch, track: (process: JsonLineProcess) => void) => AgentAdapter;
 }
 export class RemoteDaemon {
+  private messageStore?: ExecutorMessages;
   readonly store: RemoteStore;
   readonly dataDirectory: string;
   readonly nativeSessions: NativeSessionService;
@@ -212,6 +214,10 @@ export class RemoteDaemon {
   async handle(method: string, raw: unknown): Promise<unknown> {
     if (this.initializing) throw new Error('执行器正在准备原生会话目录，尚未就绪。');
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
+    if (method.startsWith('messages/')) {
+      this.messageStore ??= new ExecutorMessages(this.root, this.options.nativeSessionOptions?.userHome);
+      return executorMessageRequest(this.messageStore, method, raw);
+    }
     if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, presetDispatch: 1, sessionVisibility: 1,
       deployment: { release: this.options.release ?? process.env.BRIDGE_EXECUTOR_RELEASE ?? null, maintenance: 1 },
       cliEntries: Object.fromEntries(Object.entries(this.config.engines).map(([agent, engine]) => [agent, existsSync(engine!.agentCommand.command) && engine!.agentCommand.args.filter(arg => isAbsolute(arg) && /\.(?:js|mjs|cjs)$/i.test(arg)).every(arg => existsSync(arg)) ? 'ready' : 'unavailable'])) };
@@ -621,6 +627,6 @@ export class RemoteDaemon {
     for (const socket of this.sockets) socket.destroy();
     if (this.httpServer) { this.httpServer.closeAllConnections(); await new Promise<void>(resolveValue => this.httpServer!.close(() => resolveValue())); }
     if (this.server) await new Promise<void>(resolveValue => this.server!.close(() => resolveValue()));
-    this.store.close();
+    this.messageStore?.close(); this.store.close();
   }
 }

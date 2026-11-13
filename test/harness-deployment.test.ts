@@ -29,11 +29,12 @@ test('an executor release includes versioned prompts, loads them after extractio
     rmSync(temporary, { recursive: true, force: true });
   });
   const root = join(temporary, '部署 工程'), unpacked = join(temporary, '执行器 已解压');
-  for (const directory of ['dist/src', 'harness', 'scripts', 'node_modules']) mkdirSync(join(root, directory), { recursive: true });
+  for (const directory of ['dist/src', 'harness', 'executor', 'scripts', 'node_modules']) mkdirSync(join(root, directory), { recursive: true });
+  writeFileSync(join(root, 'executor/README.md'), '通信入口');
   writeFileSync(join(root, 'package.json'), '{"name":"harness-fixture","type":"module"}');
   copyFileSync(join(project, 'dist/src/harness.js'), join(root, 'dist/src/harness.js'));
   writeFileSync(join(root, 'harness/prompts.toml'), catalog('迁移后仍可读取 {{value}}'));
-  for (const name of ['start-remote-agent.ps1', 'remote-update-helper.mjs', 'update-remote-agent.ps1']) writeFileSync(join(root, 'scripts', name), 'fixture');
+  for (const name of ['start-remote-agent.ps1', 'remote-update-helper.mjs', 'update-remote-agent.ps1', 'message-controller.ps1', 'migrate-session-homes.mjs', 'migrate-native-sessions.mjs', 'install-native-session-runtime.ps1']) writeFileSync(join(root, 'scripts', name), 'fixture');
   copyPackage(realpathSync(join(project, 'node_modules/smol-toml')), join(root, 'node_modules/smol-toml'));
   for (const name of ['ws', 'https-proxy-agent', 'undici']) {
     mkdirSync(join(root, 'node_modules', name), { recursive: true });
@@ -42,6 +43,8 @@ test('an executor release includes versioned prompts, loads them after extractio
   const release = await executorRelease(root);
   const manifest = JSON.parse(readFileSync(join(root, '.local/executor-releases', release.id, 'payload/release.json'), 'utf8'));
   assert.match(manifest.files['harness/prompts.toml'], /^[a-f0-9]{64}$/);
+  assert.match(manifest.files['executor/README.md'], /^[a-f0-9]{64}$/);
+  assert.match(manifest.files['scripts/message-controller.ps1'], /^[a-f0-9]{64}$/);
   mkdirSync(unpacked);
   await exec('tar', ['-xzf', release.archive, '-C', unpacked], { windowsHide: true });
   const entry = pathToFileURL(join(unpacked, 'dist/src/harness.js')).href;

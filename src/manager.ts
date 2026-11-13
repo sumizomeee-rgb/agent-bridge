@@ -23,6 +23,7 @@ import type { ControllerSupplement, WorkerPolicyReport } from './controller/runt
 import { collectOutgoingAttachments, collectOutgoingPaths } from './artifacts.js';
 import { listPresets } from './presets/registry.js';
 import type { TaskCompletionEvent, TaskRegistry, TaskContextFile, TaskOrigin } from './tasks.js';
+import { executorTaskId } from './executor-messages.js';
 import { dispatchFailureOperations, type DispatchFailureScope, type DispatchFailureRecord } from './dispatch-failures.js';
 import type { HousekeeperState } from './housekeeper/store.js';
 import { harnessText } from './harness.js';
@@ -1723,6 +1724,11 @@ export class SessionManager {
     this.refreshTaskCounts();
     for (const event of this.options.taskRegistry.queuedEvents()) {
       if (!this.config.allowedUserIds.includes(event.userId) || this.options.authorizeUser?.(event.userId) === false || (this.resetCommands.has(event.userId) && event.purpose !== 'workspace-context')) continue;
+      if (event.purpose === 'executor-message') {
+        const active = this.store.getActive(event.userId);
+        if (!active?.nativeId || !active.controllerMode || this.waitingForWorkspaceIntroduction(active)) continue;
+        this.options.taskRegistry.retargetExecutorMessage(event.id, active); this.wake(active.id); continue;
+      }
       if (!this.store.getConversation(event.conversationId)) {
         if (this.options.taskRegistry.claimEvent(event.id)) this.options.taskRegistry.markUncertain(event.id, '原父会话不存在');
         continue;
@@ -1805,9 +1811,31 @@ export class SessionManager {
     }
     return { state, processed: known?.result.controlledOutput === true || state === 'delivered' && known !== null, ...(safeToRetry ? { safeToRetry: true as const } : {}) };
   }
+  acceptExecutorMessage(worker: import('./controller/runtime-types.js').ControllerWorker, message: import('./executor-messages.js').ExecutorMessage): boolean {
+    const target = this.currentConversation(worker.origin.userId);
+    const source = this.store.getMessage(worker.origin.originMessageId);
+    if (!target?.nativeId || !target.controllerMode || !source || source.userId !== target.userId || worker.id !== message.workerId
+      || !this.options.taskRegistry) return false;
+    const privateSource = this.store.latestMessage(target.id);
+    if (worker.origin.groupContext && !privateSource) return false;
+    const origin: TaskOrigin = { userId: target.userId, channelId: privateSource?.channelId ?? worker.origin.channelId,
+      originMessageId: privateSource?.id ?? worker.origin.originMessageId,
+      conversationId: target.id, nativeId: target.nativeId, agent: target.agent, cwd: target.cwd,
+      purpose: 'executor-message', executorMessageId: message.id, executorWorkerId: worker.id };
+    this.options.taskRegistry.enqueueExecutorMessage(origin, message.id,
+      harnessText('manager.executor_message', { message_id: message.id, worker_id: worker.id, agent: worker.agent,
+        native_id: worker.nativeId ?? '尚未绑定', computer: worker.target?.label ?? '桥电脑', body: message.text }));
+    return true;
+  }
   private completionTarget(event: TaskCompletionEvent): Conversation | null {
     const target = this.store.getConversation(event.conversationId);
     const origin = this.store.getMessage(event.originMessageId);
+    if (event.purpose === 'executor-message') {
+      return target?.controllerMode && origin?.userId === event.userId && target.userId === event.userId
+        && origin.channelId === event.channelId && target.agent === event.agent && target.cwd === event.cwd
+        && event.taskId === executorTaskId(event.executorMessageId ?? '') && !!event.executorWorkerId
+        && this.config.allowedUserIds.includes(event.userId) && this.options.authorizeUser?.(event.userId) !== false ? target : null;
+    }
     // Even a corrupt completion journal cannot select another person's DM or session.
     const workspaceContext = event.purpose === 'workspace-context' && target?.controllerMode;
     const housekeeper = event.housekeeperAuthorization === true && /^\/housekeeper\s+on$/i.test(origin?.text.trim() ?? '')
@@ -1821,6 +1849,12 @@ export class SessionManager {
 
   private async processCompletion(event: TaskCompletionEvent): Promise<void> {
     const registry = this.options.taskRegistry!;
+    if (event.purpose === 'executor-message') {
+      const active = this.currentConversation(event.userId);
+      if (!active?.nativeId || !active.controllerMode) return;
+      // The Bot owns this message, not a retired controller session. Never adopt the sender's CLI.
+      event = { ...event, conversationId: active.id, nativeId: active.nativeId, agent: active.agent, cwd: active.cwd };
+    }
     if(event.purpose==='dispatch-failure'){
       if(event.dispatchFailureReviewId!==event.taskId||!this.validDispatchFailureReview(event.taskId,event.groupContext)){
         if(registry.claimEvent(event.id))registry.markDelivered(event.id);return;
@@ -1910,13 +1944,13 @@ export class SessionManager {
         ...(this.config.controllerMode ? { taskChecklist: this.store.knowledge.summary(this.knowledgeScope(event.userId, event.channelId)) } : {}),
         bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
         dispatchFailures: this.store.dispatchFailures.read(this.dispatchFailureScope(target,event)),
-        controllerRecovery: this.config.controllerMode === true && target.controllerMode === true
+        controllerRecovery: event.purpose !== 'executor-message' && this.config.controllerMode === true && target.controllerMode === true
           && !observation && !workspaceContext && event.scheduleKind !== 'controller' && event.status === 'completed',
         onControllerState: state => this.store.controllerLifecycle.record(event.id, target.id, state),
         conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId, ...(source?.source ? { original: source.source } : {}) }, text: eventText, imagePaths: [], input: [{ type: 'text', text: eventText }],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
-        event: { kind: observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
-          toolName: observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.scheduleKind === 'controller' ? 'bridge_schedule_controller' : 'bridge_worker_result', text: eventText, introductionRequested },
+        event: { kind: event.purpose === 'executor-message' ? 'executor-message' : observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
+          toolName: event.purpose === 'executor-message' ? 'bridge_executor_message' : observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.scheduleKind === 'controller' ? 'bridge_schedule_controller' : 'bridge_worker_result', text: eventText, introductionRequested },
         onNativeId: workspaceContext ? nativeId => {
           if (!current() || !nativeId) return;
           if (boundNativeId && boundNativeId !== nativeId) throw new Error('工作区初始化返回了不同父会话');

@@ -46,6 +46,7 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
   };
   collect('dist/src');
   collect('harness');
+  collect('executor');
   // Include the dependencies reachable from the executor, not platform credentials or user files.
   const packages = new Set<string>();
   const include = (name: string): void => {
@@ -57,6 +58,7 @@ export function executorRelease(root = projectRoot): Promise<ExecutorRelease> {
   for (const name of ['smol-toml', 'ws', 'https-proxy-agent', 'undici']) include(name);
   for (const path of ['package.json', 'scripts/start-remote-agent.ps1', 'scripts/remote-update-helper.mjs', 'scripts/update-remote-agent.ps1', 'scripts/migrate-session-homes.mjs', 'scripts/migrate-native-sessions.mjs', 'scripts/install-native-session-runtime.ps1'])
     files.set(path, hash(readFileSync(join(root, path))));
+  files.set('scripts/message-controller.ps1', hash(readFileSync(join(root, 'scripts/message-controller.ps1'))));
   const entries = Object.fromEntries([...files].sort(([a], [b]) => a.localeCompare(b)));
   const id = hash(JSON.stringify(entries)), directory = join(root, '.local', 'executor-releases', id);
   const archive = join(directory, 'runtime.tgz'); mkdirSync(directory, { recursive: true });

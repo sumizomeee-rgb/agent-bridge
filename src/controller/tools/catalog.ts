@@ -64,6 +64,8 @@ export const controllerTools: { name: string; description: string; inputSchema: 
     limit: { type: 'integer', minimum: 1, maximum: 20, default: 10 }, offset: { type: 'integer', minimum: 0, default: 0 },
     view: { type: 'string', enum: ['all', 'active'], default: 'all' } }) },
   { name: 'bridge_send_user', description: harnessText('tools.bridge_send_user.description'), inputSchema: { ...object({ text: string(harnessText('tools.bridge_send_user.inputSchema.text.description')), targetId: string(harnessText('tools.bridge_send_user.inputSchema.targetId.description')), attachmentPaths: outgoingAttachmentPaths }), required: ['text'] } },
+  { name: 'bridge_reply_executor_message', description: harnessText('tools.bridge_reply_executor_message.description'),
+    inputSchema: { ...object({ messageId: string('Executor message ID'), text: string('Free-form reply to the originating assistant') }), required: ['messageId', 'text'] } },
 ];
 
 export function controllerToolsForCommunication(enabled?: boolean): typeof controllerTools {

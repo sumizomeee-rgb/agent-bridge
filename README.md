@@ -99,6 +99,8 @@ D:\Agent Workspace/
 
 ## 架构与目录
 
+执行助手通信入口见 [executor/README.md](executor/README.md)。远端发布时将该说明和 `scripts/message-controller.ps1` 同步到 AgentExecutor；自由文本消息、归属和回执保存在各机用户目录 `.agent-bridge/executors/`，不放任务 `tmp/` 或程序目录。用户接手的原生助手会话可按需向所属 Bot 的当前主控发消息并取回答复；通信不抢占 CLI，也不自动向聊天平台重复发消息。执行器离线保留本地队列；处理结果未知时保留状态，不自动重做。
+
 ```mermaid
 flowchart LR
   P[Discord / 飞书] --> H[Host：身份、群、权限与路由]

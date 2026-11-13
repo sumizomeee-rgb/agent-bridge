@@ -78,6 +78,24 @@ async function launch(runtime: ControllerRuntime, turn: AgentTurn, args: Record<
   return await runtime.invoke(turn, 'bridge_start_worker', { title: '温度调查', prompt: '检查温度', ...args }, callId) as Handle;
 }
 
+test('fixed worker duties and controller-message navigation are injected only for a new native session', async () => {
+  const f = fixture();
+  f.codex.run = async turn => {
+    f.codex.turns.push(turn); turn.onNativeId?.('same-native');
+    return { nativeId: 'same-native', text: '实际结果', processStopped: true };
+  };
+  try {
+    const first = await launch(f.runtime, f.turn, { model: 'gpt-6.1-sol' });
+    while (f.runtime.store.getJob(first.jobId)?.status !== 'completed') await flush();
+    await f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: first.workerId, prompt: '用户接手后又交回，继续原任务' });
+    while (f.codex.turns.length < 2) await flush();
+    assert.match(f.codex.turns[0]!.text, /按下面的任务及授权边界执行/);
+    assert.match(f.codex.turns[0]!.text, /本助手 ID：/);
+    assert.doesNotMatch(f.codex.turns[1]!.text, /按下面的任务及授权边界执行|本助手 ID：/);
+    assert.match(f.codex.turns[1]!.text, /用户接手后又交回/);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
 test('omitted and default models inherit confirmed actual parent model before any remote CLI default', async () => {
   const f = fixture(); f.turn.conversation.model = null; f.turn.conversation.actualModel = 'gpt-6.1-sol';
   f.codex.getModelInfo = async () => ({ defaultModel: 'gpt-6-astra', models: [

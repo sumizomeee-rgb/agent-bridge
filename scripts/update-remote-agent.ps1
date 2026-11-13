@@ -20,7 +20,7 @@ try {
  $candidate=Join-Path $data ('releases\'+$Release)
  # Only an immutable, checked release directory receives extracted program files.
  $entries=@(& tar -tzf $archive|ForEach-Object {$_ -replace '^\./',''});if($LASTEXITCODE -ne 0){throw 'Cannot list release archive'}
- if($entries | Where-Object {$_ -and ($_ -match '(^[/\\]|^[A-Za-z]:|(^|[/\\])\.\.([/\\]|$))' -or $_ -notmatch '^(dist/|harness/|node_modules/|scripts/|package.json$|release.json$)')}){throw 'Unsafe archive entries'}
+ if($entries | Where-Object {$_ -and ($_ -match '(^[/\\]|^[A-Za-z]:|(^|[/\\])\.\.([/\\]|$))' -or $_ -notmatch '^(dist/|harness/|executor/|node_modules/|scripts/|package.json$|release.json$)')}){throw 'Unsafe archive entries'}
  New-Item -ItemType Directory -Force -Path $candidate|Out-Null
  & tar -xzf $archive -C $candidate;if($LASTEXITCODE -ne 0){throw 'Release extraction failed'}
  & $NodePath $helper verify $resolvedRoot $ExpectedHostname $Release|Out-Null;if($LASTEXITCODE -ne 0){throw 'Release verification failed'}
@@ -77,7 +77,7 @@ try {
   Start-Sleep -Seconds 1
   if($attempt -eq 2){Recover-IdleLauncher}
   if((Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath).State -ne 'Running'){Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath}
-  $ready=Probe;if($ready.online -and $ready.release -eq $Release){@{state='ready';release=$Release}|ConvertTo-Json -Compress;return}
+  $ready=Probe;if($ready.online -and $ready.release -eq $Release){Copy-Item -LiteralPath (Join-Path $candidate 'executor/README.md') -Destination (Join-Path $resolvedRoot 'README.md') -Force; Copy-Item -LiteralPath (Join-Path $candidate 'scripts/message-controller.ps1') -Destination (Join-Path $resolvedRoot 'scripts/message-controller.ps1') -Force;@{state='ready';release=$Release}|ConvertTo-Json -Compress;return}
  }
  throw 'New executor did not become ready'
 } catch {

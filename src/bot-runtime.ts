@@ -117,6 +117,7 @@ export class BotRuntime {
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
       onCompletion: event => this.backgroundCompletion(event),
+      onExecutorMessage: (worker, message) => this.manager.acceptExecutorMessage(worker, message),
       onSupplementFailure: value => this.manager.workerInputFailed(value),
       onPolicyReport: value => this.manager.workerPolicyReport(value),
       onCountChanged: id => this.manager.refreshTaskCounts(id),

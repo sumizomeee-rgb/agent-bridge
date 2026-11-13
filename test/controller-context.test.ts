@@ -14,7 +14,7 @@ test('both CLI declarations expose only help/call; help expands the same enabled
   assert.deepEqual(codexDynamicTools(false).map(tool => tool.name), ['bridge_help', 'bridge_call']);
   assert.deepEqual(controllerEntryTools.map(tool => tool.name), ['bridge_help', 'bridge_call']);
   const index = controllerToolIndex(false);
-  assert.equal(index.length, 35); assert.equal(controllerToolIndex(true).length, 38);
+  assert.equal(index.length, 36); assert.equal(controllerToolIndex(true).length, 39);
   for (const command of controllerToolsForCommunication(false)) {
     assert.deepEqual(controllerToolHelp(command.name, false), command);
     assert.equal(index.find(tool => tool.name === command.name)?.description.includes('\n'), false);

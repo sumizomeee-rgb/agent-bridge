@@ -46,6 +46,11 @@ export class RemoteAgentAdapter implements AgentAdapter {
   async probeEntries(): Promise<{ cliEntries?: Record<string, 'ready' | 'unavailable'> }> {
     await this.validate(); return this.connection().request('hello', {});
   }
+  async executorMessages(method: string, args: Record<string, unknown>): Promise<unknown> {
+    // The normal handshake prepares idle executors after reconnect; never detach a busy worker's tunnel.
+    await this.validate(false, this.jobs.size === 0);
+    return this.connection().request(method, args);
+  }
   async listNativeSessions(userId: string, query: Omit<NativeSessionQuery, 'userId' | 'agent'>): Promise<NativeSessionPage> {
     await this.validate(); return this.connection().request('sessions/list', { userId, agent: this.binding.agent, query });
   }

@@ -23,6 +23,8 @@ import { workspaceDocuments } from './workspace-documents.js';
 import { workspaceOutputGuidance } from '../workspace-layout.js';
 import { harnessText } from '../harness.js';
 import { controllerWorkerReport, mentionsPolicyDenial } from './worker-report.js';
+import { ExecutorMessenger, type MessagePeer } from './executor-messenger.js';
+import { projectRoot } from '../config.js';
 import type { ExecutionTargetBinding } from '../remote/types.js';
 
 const workerInstruction = harnessText('worker.execution');
@@ -100,6 +102,9 @@ export class ControllerRuntime {
   private draining = false;
   private readonly numberedWorkers = new NumberedChoices<{ choice: WorkerChoice; label: string }>();
   private lastWorkCounts: string | undefined;
+  private readonly messenger: ExecutorMessenger;
+  private messagePoll?: Promise<void>;
+  private nextMessagePoll = 0;
   private isDraining(): boolean { return this.draining || this.callbacks.isDraining?.() === true; }
   beginDrain(): void { this.draining = true; }
   isIdle(): boolean { return this.messageDeliveries.size === 0 && this.active.size === 0 && this.preparations.size === 0 && this.dispatches.size === 0 && [...this.unconfirmedStops].every(id => this.recoveredLocalStops.has(id)) && !this.polling && !this.starting; }
@@ -107,6 +112,8 @@ export class ControllerRuntime {
   constructor(private readonly config: BridgeConfig, private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
     this.store = new ControllerStore(config.dataDir);
+    this.messenger = new ExecutorMessenger(this.store, registry, binding => this.callbacks.targetCatalog!.adapterFor(binding) as MessagePeer,
+      (worker, message) => this.callbacks.onExecutorMessage?.(worker, message) ?? false, userId => config.allowedUserIds.includes(userId));
   }
   async pauseConversation(conversationId: string): Promise<void> {
     if (this.closed || this.stopping) throw new Error('主控执行服务已关闭');
@@ -660,13 +667,17 @@ export class ControllerRuntime {
   }
   private async dispatch(turn: AgentTurn, name: string, input: unknown, callId?: string, workspaceInitialization = false): Promise<unknown> {
     if (this.closed || this.stopping) throw new Error('主控执行服务正在关闭');
-    if (!tools.has(name)) throw new Error('未知桥调度工具');
+    if (!tools.has(name) && name !== 'bridge_reply_executor_message') throw new Error('未知桥调度工具');
     if (this.isDraining() && ['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker', 'bridge_schedule_controller', 'bridge_schedule_message', 'bridge_update_schedule', 'bridge_adopt_native_session'].includes(name)) throw new Error('桥正在安全重启，已暂停新派发；请在恢复后继续。');
     const contextOrigin = this.origin(turn);
     await this.start();
     this.origin(turn);
     if (turn.signal.aborted || this.closed || this.stopping) throw new Error('主控会话已停止或执行服务正在关闭');
     const origin: TaskOrigin = workspaceInitialization ? { ...contextOrigin, purpose: 'workspace-context' } : contextOrigin;
+    if (name === 'bridge_reply_executor_message') {
+      const args = object(input, ['messageId', 'text']);
+      return this.messenger.reply(origin.userId, text(args.messageId, '消息 ID', 100), text(args.text, '答复正文', 64 * 1024));
+    }
     const key = workspaceInitialization || callId === undefined ? null : `${origin.conversationId}:${text(callId, '工具调用编号', 512)}`;
     const fingerprint = createHash('sha256').update(canonical({ name, input })).digest('hex');
     if (workspaceInitialization) {
@@ -1220,7 +1231,13 @@ export class ControllerRuntime {
         createdAt: worker.createdAt, updatedAt: this.timestamp() };
       const previous = this.store.jobs(worker.id).filter(value => value.id !== job.id && !['queued', 'cancelled'].includes(value.status)).at(-1);
       const recovery = previous?.interrupted ? harnessText('worker.interrupted_recovery') : '';
-      const turn: AgentTurn = { conversation, text: (job.origin.purpose === 'housekeeper' ? '' : job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : workerInstruction
+      if (this.callbacks.onExecutorMessage && !['workspace-context', 'housekeeper'].includes(job.origin.purpose ?? '')) {
+        try { await this.messenger.bind([worker]); } catch (error) { this.error(error); }
+      }
+      const communication = !worker.nativeId && !['workspace-context', 'housekeeper'].includes(job.origin.purpose ?? '')
+        ? harnessText('worker.controller_messages', { worker_id: worker.id,
+          readme: worker.target?.remoteRoot ? worker.target.remoteRoot + '/README.md' : projectRoot + '/executor/README.md' }) : '';
+      const turn: AgentTurn = { conversation, text: communication + (job.origin.purpose === 'housekeeper' ? '' : job.origin.purpose === 'workspace-context' ? workspaceWorkerInstruction : (!worker.nativeId ? workerInstruction : '')
           + (worker.target?.transport === 'ssh' ? (!worker.nativeId && worker.target.remoteRoot ? harnessText('worker.remote_output_guidance', { remote_root: worker.target.remoteRoot }) : '') : workspaceOutputGuidance(this.config.contextWorkspace ?? this.config.workspace))) + (!worker.nativeId && !['housekeeper', 'workspace-context'].includes(job.origin.purpose ?? '') ? harnessText('worker.concise_delivery') : '') + recovery + job.prompt, imagePaths: job.imagePaths,
         ...(worker.effort ? { effort: worker.effort } : {}), ...(job.origin.purpose === 'housekeeper' ? { readOnly: true } : {}), signal: state.abort.signal, onProgress: () => {}, acceptSupplements: true, dispatchId: job.id, recovering: state.recovering === true,
         onReady: () => { state.ready = true; this.pumpSupplements(workerId, state); },
@@ -1567,6 +1584,10 @@ export class ControllerRuntime {
     if (this.closed || this.stopping) return;
     await this.confirmUncertainStops();
     if (this.closed || this.stopping || this.isDraining()) return;
+    if (!this.messagePoll && this.callbacks.onExecutorMessage && this.now() >= this.nextMessagePoll) {
+      this.nextMessagePoll = this.now() + 10_000;
+      this.messagePoll = this.messenger.poll().catch(error => this.error(error)).finally(() => { this.messagePoll = undefined; });
+    }
     await this.observeStalls();
     for (const candidate of this.store.schedules()) {
       const plan = this.store.getSchedule(candidate.id)!;
@@ -1636,7 +1657,8 @@ export class ControllerRuntime {
     await this.polling;
     await Promise.allSettled([...this.messageDeliveries]);
     await Promise.allSettled([...this.feedbackPublications.values()]);
-    this.closed = true; this.store.close();
+    await this.messagePoll;
+    this.messenger.close(); this.closed = true; this.store.close();
     if (errors.length) throw new AggregateError(errors, '部分执行子 Agent 的进程停止尚未确认');
   }
 }
