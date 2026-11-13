@@ -269,11 +269,14 @@ for (const agent of ['codex', 'claude'] as const) test(`主控 ${agent} 复用�
     const profile = { ...f.profile, agent, id: 'controller-route' };
     writeFileSync(join(f.privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [profile] }));
     const binding = { id: 'local-route', targetId: 'local', ...await f.runtime.describe(profile.id, 1, agent, profile.model) };
-    const baseline = { OPENAI_API_KEY: 'ordinary-secret', ANTHROPIC_AUTH_TOKEN: 'ordinary-token', HTTPS_PROXY: 'http://unrelated-proxy', CODEX_HOME: 'ordinary-home' };
+    const baseline = { OPENAI_API_KEY: 'ordinary-secret', ANTHROPIC_AUTH_TOKEN: 'ordinary-token', HTTPS_PROXY: 'http://unrelated-proxy', CODEX_HOME: 'ordinary-home', NO_PROXY: '*', no_proxy: 'gateway.example' };
     const prepared = await f.runtime.prepareController(binding, 'controller-A', null, f.command, baseline);
     try {
       assert.equal(prepared.env.OPENAI_API_KEY, undefined); assert.equal(prepared.env.HTTPS_PROXY, undefined);
       assert.equal(prepared.env.ANTHROPIC_AUTH_TOKEN, undefined);
+      assert.deepEqual(prepared.env.NO_PROXY?.split(','), ['localhost', '127.0.0.1', '::1']);
+      assert.equal(prepared.env.no_proxy, prepared.env.NO_PROXY);
+      assert.equal(prepared.env.NO_PROXY?.includes('gateway.example'), false);
       assert.equal(prepared.command.args.includes('--mcp-config'), false, '主控自行装配自己的 MCP');
       const home = prepared.env[agent === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR']!;
       assert.equal(home, join(f.data, 'controller-homes', agent, 'controller-A', 'launch'));

@@ -11,6 +11,9 @@ export async function preparePresetLaunch(profile: LaunchProfile, binding: Prese
     const key = name.toUpperCase();
     if (/^(ANTHROPIC_|CLAUDE_CODE_|OPENAI_)/.test(key) || cleared.has(key)) env[name] = undefined;
   }
+  // Loopback services (including controller MCP) must never enter the gateway-only SSH proxy.
+  // Replace inherited bypasses so the gateway itself cannot accidentally bypass its route.
+  env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
   const command = { command: original.command, args: [...original.args] };
   let relay: Awaited<ReturnType<typeof startPresetConnect>> | undefined;
   try {
