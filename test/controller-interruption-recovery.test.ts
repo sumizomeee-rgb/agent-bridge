@@ -45,11 +45,11 @@ function fixture(t: TestContext) {
   };
 }
 
-test('20秒后发送短恢复事件而非重放用户内容，真实回复后原消息标记已答', async t => {
+test('20秒后恢复事件带上本次中断原话，不重新投递用户消息，回复后标记已答', async t => {
   const f=fixture(t); await f.send();
   const original=f.store.recoveries.active()[0]!; assert(original); assert.equal(original.attempts,0);
   await f.manager.pollControllerRecovery(original.dueAt-1); assert.equal(f.turns.length,1);
-  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert.equal(turn.text,harnessText('manager.controller_recovery')); assert(!turn.text.includes('original authorized goal')); await turn.onPublicMessage!('final answer');});
+  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.text.startsWith(harnessText('manager.controller_recovery'))); assert(turn.text.includes('来源：用户消息')); assert(turn.text.includes('original authorized goal')); await turn.onPublicMessage!('final answer');});
   await f.poll();
   assert.equal(f.turns.length,2); assert.equal(f.turns[1]!.conversation.nativeId,'native-main');
   assert.equal(f.store.recoveries.get(original.id)!.state,'done'); assert.equal(f.store.getMessage('original')!.replyState,'delivered');
@@ -77,9 +77,9 @@ test('新用户输入优先并取消旧恢复，stop和new也取消旧事件', a
   }
 });
 
-test('等待恢复跨桥重启保留，保持原native且不重放原用户消息', async t => {
+test('等待恢复跨桥重启保留原始输入，保持原native且不重新投递消息', async t => {
   const f=fixture(t); await f.send(); const id=f.store.recoveries.active()[0]!.id;
-  await f.restart(); assert.equal(f.store.recoveries.get(id)!.state,'pending');
+  await f.restart(); assert.equal(f.store.recoveries.get(id)!.state,'pending'); assert.deepEqual(f.store.recoveries.get(id)!.input,[{type:'text',text:'original authorized goal'}]);
   f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); await turn.onPublicMessage!('final answer');});
   await f.poll(); assert.equal(f.turns.length,2); assert.equal(f.store.recoveries.get(id)!.attempts,1);
 });
@@ -125,7 +125,7 @@ for (const failure of ['502 report stream interrupted','主控本轮协调调用
   f.setRun(async()=>{throw new Error(failure);});
   f.manager.completionAvailable(); await until(()=>f.manager.isIdle());
   const row=f.store.recoveries.active()[0]!; assert(row); assert.equal(row.origin.originMessageId,source.id);
-  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.bridgeFeedback?.records.some(r=>r.workerResultKnown===true)); await turn.onPublicMessage!('final answer');});
+  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.text.includes('already completed execution evidence')); assert(turn.text.includes('来源：助手结果汇总')); assert(turn.bridgeFeedback?.records.some(r=>r.workerResultKnown===true)); await turn.onPublicMessage!('final answer');});
   await f.poll(); assert.equal(f.store.recoveries.get(row.id)!.state,'done');
   assert.equal(f.registry.completionForTask(taskId)!.status,'completed');
 });
@@ -185,4 +185,17 @@ for (const succeeds of [true,false]) test(`定时唤醒中断进入同一恢复�
   if(!succeeds){assert(f.sent.at(-1)!.includes('第5/5次恢复失败'));assert(f.sent.at(-1)!.includes('来源：定时唤醒'));}
   assert.equal(f.registry.completionForTask(taskId)!.status,'completed');
   assert.equal(f.turns.filter(turn=>turn.event?.kind==='wake').length,1);
+});
+
+test('恢复携带中断原始图文，跨重启仍从相同路径传图', async t => {
+  const f=fixture(t), image=join(f.config.workspace,'original-image.png');
+  await f.manager.handle({id:'image-input',text:'按这张图直接做',userId:'owner',channelId:'dm',imagePaths:[image]});
+  await until(()=>f.manager.isIdle());
+  await f.restart();
+  f.setRun(async turn=>{
+    assert.equal(turn.event?.kind,'recovery'); assert(turn.text.includes('按这张图直接做'));
+    assert.deepEqual(turn.imagePaths,[image]); assert(turn.input?.some(part=>part.type==='localImage'&&part.path===image));
+    await turn.onPublicMessage!('final answer');
+  });
+  await f.poll(); assert.equal(f.turns.length,2);
 });

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import type { AgentInput } from '../types.js';
 import type { TaskOrigin } from '../tasks.js';
 
 export const recoveryDelayMs = 20_000;
@@ -8,7 +9,7 @@ export function recoveryBackoffMs(attempts: number): number { return Math.round(
 export interface ControllerRecovery {
   id: string; origin: TaskOrigin; triggerId: string; attempts: number; dueAt: number;
   state: 'pending' | 'queued' | 'running' | 'done' | 'cancelled' | 'exhausted';
-  taskId?: string; contextText?: string; sourceLabel?: string;
+  taskId?: string; input?: AgentInput[]; sourceLabel?: string;
 }
 export function recoveryTaskId(id: string, attempt: number): string {
   const hash = createHash('sha256').update(`controller-recovery:${id}:${attempt}`).digest('hex');
@@ -30,11 +31,11 @@ export class ControllerRecoveryJournal {
     return this.db.prepare("SELECT value_json FROM controller_recoveries WHERE json_extract(value_json,'$.state') IN ('pending','queued','running')").all()
       .map(row => JSON.parse(String(row.value_json)));
   }
-  schedule(origin: TaskOrigin, triggerId: string, now: number, contextText?: string, sourceLabel?: string): ControllerRecovery {
+  schedule(origin: TaskOrigin, triggerId: string, now: number, input?: AgentInput[], sourceLabel?: string): ControllerRecovery {
     const id = createHash('sha256').update(triggerId).digest('hex'), old = this.get(id);
     if (old) return old;
     this.cancelConversation(origin.conversationId);
-    const value: ControllerRecovery = { id, origin, triggerId, attempts: 0, dueAt: now + recoveryDelayMs, state: 'pending', ...(sourceLabel ? { sourceLabel } : {}), ...(contextText ? { contextText } : {}) };
+    const value: ControllerRecovery = { id, origin, triggerId, attempts: 0, dueAt: now + recoveryDelayMs, state: 'pending', ...(sourceLabel ? { sourceLabel } : {}), ...(input ? { input } : {}) };
     this.save(value); return value;
   }
   queue(id: string, now: number): ControllerRecovery | null {
