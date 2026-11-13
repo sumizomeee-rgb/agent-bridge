@@ -37,6 +37,7 @@ function conversation(row: Row): Conversation {
     nativeId: row.native_id === null ? null : String(row.native_id), title: String(row.title),
     model: row.model == null ? null : String(row.model), ...(row.model_policy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}), actualModel: row.actual_model == null ? null : String(row.actual_model),
     effort: row.effort == null ? null : String(row.effort),
+    ...(row.preset_json ? { preset: JSON.parse(String(row.preset_json)) } : {}),
     fastMode: row.fast_mode == null ? null : Number(row.fast_mode) === 1,
     actualEffort: row.actual_effort == null ? null : String(row.actual_effort),
     cwd: String(row.cwd), cwdExplicit: Number(row.cwd_explicit ?? 0) === 1, createdAt: String(row.created_at), updatedAt: String(row.updated_at),
@@ -144,6 +145,9 @@ export class SessionStore {
     if (!columns.has('controller_mode')) this.db.exec('ALTER TABLE conversations ADD COLUMN controller_mode INTEGER NOT NULL DEFAULT 0');
     if (!columns.has('context_seed')) this.db.exec('ALTER TABLE conversations ADD COLUMN context_seed TEXT');
     if (!columns.has('cwd_explicit')) this.db.exec('ALTER TABLE conversations ADD COLUMN cwd_explicit INTEGER NOT NULL DEFAULT 0');
+    if (!columns.has('preset_json')) this.db.exec('ALTER TABLE conversations ADD COLUMN preset_json TEXT');
+    const preferenceColumns = new Set(this.db.prepare('PRAGMA table_info(bot_preferences)').all().map(row => String(row.name)));
+    if (!preferenceColumns.has('preset_json')) this.db.exec('ALTER TABLE bot_preferences ADD COLUMN preset_json TEXT');
     const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
     if (!inboxColumns.has('group_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN group_json TEXT');
     if (!inboxColumns.has('source_json')) this.db.exec('ALTER TABLE inbox ADD COLUMN source_json TEXT');
@@ -446,13 +450,13 @@ export class SessionStore {
   }
 
   savePreferences(item: Conversation): void {
-    this.db.prepare(`INSERT INTO bot_preferences(agent,model,model_policy,effort) VALUES(?,?,?,?)
-      ON CONFLICT(agent) DO UPDATE SET model=excluded.model,model_policy=excluded.model_policy,effort=excluded.effort`)
-      .run(item.agent, item.model ?? null, item.modelPolicy ?? null, item.effort ?? null);
+    this.db.prepare(`INSERT INTO bot_preferences(agent,model,model_policy,effort,preset_json) VALUES(?,?,?,?,?)
+      ON CONFLICT(agent) DO UPDATE SET model=excluded.model,model_policy=excluded.model_policy,effort=excluded.effort,preset_json=excluded.preset_json`)
+      .run(item.agent, item.model ?? null, item.modelPolicy ?? null, item.effort ?? null, item.preset ? JSON.stringify(item.preset) : null);
   }
-  preferences(agent: AgentName): { model: string | null; modelPolicy?: 'cli-default'; effort: string | null } | null {
+  preferences(agent: AgentName): { model: string | null; modelPolicy?: 'cli-default'; effort: string | null; preset?: Conversation['preset'] } | null {
     const row = this.db.prepare('SELECT * FROM bot_preferences WHERE agent=?').get(agent);
-    return row ? { model: row.model == null ? null : String(row.model), effort: row.effort == null ? null : String(row.effort),
+    return row ? { ...(row.preset_json ? { preset: JSON.parse(String(row.preset_json)) } : {}), model: row.model == null ? null : String(row.model), effort: row.effort == null ? null : String(row.effort),
       ...(row.model_policy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}) } : null;
   }
   saveContextSeed(id: string, contextSeed: string): void {
@@ -463,6 +467,10 @@ export class SessionStore {
       .run(nativeId, new Date().toISOString(), id);
   }
 
+  setPreset(id: string, preset: Conversation['preset']): void {
+    this.db.prepare('UPDATE conversations SET preset_json=?,updated_at=? WHERE id=?')
+      .run(preset ? JSON.stringify(preset) : null, new Date().toISOString(), id);
+  }
   setModel(id: string, model: string | null): void {
     this.db.prepare('UPDATE conversations SET model = ?, model_policy = ?, updated_at = ? WHERE id = ?')
       .run(model, model === null ? 'cli-default' : null, new Date().toISOString(), id);

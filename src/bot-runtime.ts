@@ -8,7 +8,9 @@ import { ClaudeAdapter } from './agents/claude.js';
 import { SessionManager, type SessionManagerOptions } from './manager.js';
 import { prepareIncomingMessage } from './forwarded.js';
 import { PlatformTransport } from './platform.js';
-import { NativeControllerAdapter } from './controller/native.js';
+import { createControllerAdapter } from './controller/launch.js';
+import { PresetRuntime } from './presets/runtime.js';
+import { workspaceFile } from './workspace-layout.js';
 import { ControllerRuntime } from './controller/runtime.js';
 import { TaskRegistry, TaskService } from './tasks.js';
 import { DurableIngress } from './ingress.js';
@@ -152,12 +154,9 @@ export class BotRuntime {
         throw error;
       }
     };
-    const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke) ?? {
-      codex: new NativeControllerAdapter(config.commands.codex, env, { agent: 'codex', dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
-        internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.codex, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
-      claude: new NativeControllerAdapter(config.commands.claude, { ...env, CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' }, { agent: 'claude', dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
-        internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, metadataAdapter: this.execution.claude, defaultModels: config.defaultModels, identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool: invoke }),
-    } : this.execution;
+    const presetRuntime = new PresetRuntime(workspaceFile(config.contextWorkspace ?? config.workspace, 'agent-presets', 'private'), config.dataDir);
+    const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke)
+      ?? { codex: createControllerAdapter(config, env, 'codex', this.execution.codex, invoke), claude: createControllerAdapter(config, env, 'claude', this.execution.claude, invoke) } : this.execution;
     this.controllerAdapters = adapters;
     this.manager = new SessionManager(config, adapters, {
       sendText: (channel, text, options) => this.send(channel, text, options),
@@ -165,6 +164,16 @@ export class BotRuntime {
       setTaskCount: (message, count) => this.transport.setTaskCount(message, count),
     }, {
       ...hooks.manager, taskRegistry: this.tasks, botName: () => this.transport.botUser?.username,
+      resolveControllerPreset: async selector => {
+        const workspace = config.contextWorkspace ?? config.workspace;
+        const entries = (await this.targetCatalog.listPresets!(workspace, { targetId: 'local' })).filter(item => item.enabled);
+        const exact = entries.find(item => item.id.toLowerCase() === selector.toLowerCase());
+        const matches = exact ? [exact] : entries.filter(item => item.aliases.some(alias => alias.toLowerCase() === selector.toLowerCase()));
+        if (matches.length !== 1) throw new Error(matches.length ? '预设名称不唯一，请使用预设 ID。' : '没有找到已启用的桥电脑预设；/model preset 查看清单。');
+        const binding = (await this.targetCatalog.resolvePreset!(workspace, matches[0]!.id)).preset!;
+        await presetRuntime.validate(binding);
+        return binding;
+      },
       authorizeUser: user => hooks.authorize(user, ''),
       onListComputers: (_conversation, refresh) => this.targetCatalog.computerOverview(config.contextWorkspace ?? config.workspace, refresh),
       onDiagnostic: message => this.log(message),

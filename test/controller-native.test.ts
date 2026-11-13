@@ -1207,3 +1207,21 @@ test('Codex bridge_call file reads pass through compact presentation before nati
     await running;
   } finally { await s.cleanup(); }
 });
+
+test('预设主控 Native 层只读取预设配置源，不同步普通 OAuth；普通配置变化不重开进程', async () => {
+  const s = setup(), presetSource = join(s.dir, 'preset-source'); mkdirSync(presetSource);
+  writeFileSync(join(presetSource, 'config.toml'), 'model_provider="bridge_preset"\n[model_providers.bridge_preset]\nbase_url="https://preset.example"\nenv_key="BRIDGE_PRESET_API_KEY"\n');
+  writeFileSync(join(s.userHome, '.codex', 'auth.json'), '{"ordinary":"must-not-copy"}');
+  const internal = s.adapter as unknown as { options: { isolatedLaunch?: boolean }; env: NodeJS.ProcessEnv };
+  internal.options.isolatedLaunch = true; internal.env.CODEX_HOME = presetSource; internal.env.BRIDGE_PRESET_API_KEY = 'isolated-key';
+  try {
+    const first = await s.adapter.run(s.makeTurn());
+    const home = s.launches[0]!.env.CODEX_HOME!;
+    assert.equal(existsSync(join(home, 'auth.json')), false);
+    assert.match(readFileSync(join(home, 'config.toml'), 'utf8'), /preset\.example/);
+    writeFileSync(join(s.userHome, '.codex', 'config.toml'), 'model_provider="ordinary-changed"\n');
+    writeFileSync(join(s.userHome, '.codex', 'auth.json'), '{"ordinary":"changed"}');
+    await s.adapter.run({ ...s.makeTurn(), conversation: { ...s.makeTurn().conversation, nativeId: first.nativeId } });
+    assert.equal(s.transports.length, 1); assert.equal(s.launches[0]!.env.BRIDGE_PRESET_API_KEY, 'isolated-key');
+  } finally { await s.cleanup(); }
+});

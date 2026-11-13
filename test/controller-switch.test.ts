@@ -211,3 +211,19 @@ test('未触发的定时助手计为未停止，取消后没有CLI或排队任�
   await f.runtime.invoke(f.turn, 'bridge_cancel_schedule', { scheduleId: plan.scheduleId });
   assert.equal(f.runtime.isWorkerStopped(plan.workerId), true); assert.equal(f.codex.turns.length, 0);
 });
+
+test('同 Agent 切换预设时摘要也走指定预设，普通渠道不被调用', async t => {
+  const f = setup(t), selected = new SwitchAdapter(); selected.mode = 'summary';
+  const preset = { id: 'bridge-sol', profileId: 'route', revision: 1, fingerprint: 'a'.repeat(64), targetId: 'local', agent: 'codex' as const, model: 'target-model' };
+  const target = { ...f.target, agent: 'codex' as const, preset, model: preset.model };
+  const internal = f.runtime as unknown as { callbacks: { targetCatalog: unknown } };
+  internal.callbacks.targetCatalog = {
+    resolveTarget: async () => ({ id: 'local', label: '桥电脑', transport: 'local', agent: 'codex', agentCommand: f.config.commands.codex, cwd: f.source.cwd }),
+    adapterFor: (binding: { preset: unknown }) => { assert.deepEqual(binding.preset, preset); return selected; },
+  };
+  new SessionHandoffs(f.root).prepare(f.source, target, 'dm-original', [], [], 'agent-switch');
+  const result = await f.runtime.prepareAgentSwitch(f.source, target, 'dm-original', '切到预设', new AbortController().signal);
+  assert.match(result.contextSeed, /继续最新目标/); assert.equal(selected.turns.length, 1);
+  assert.equal(f.codex.turns.length, 0); assert.equal(f.claude.turns.length, 0);
+  assert.equal(selected.turns[0]!.conversation.model, preset.model);
+});

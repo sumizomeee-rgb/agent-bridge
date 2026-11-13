@@ -80,6 +80,7 @@ export interface SessionManagerOptions {
   onDiagnostic?: (message: string) => void;
   onListWorkers?: (conversation: Conversation, scope: 'current' | 'all') => Promise<WorkerOverview[]>;
   onRequestRestart?: (origin: RestartOrigin) => Promise<RestartReceipt>;
+  resolveControllerPreset?: (selector: string) => Promise<NonNullable<Conversation['preset']>>;
   onHostStatus?: () => Promise<HostSnapshot>;
 }
 
@@ -300,6 +301,7 @@ export class SessionManager {
     const target = this.store.createConversation(userId, agent, cwd, { controllerMode: this.config.controllerMode === true, cwdExplicit: previous?.cwdExplicit });
     const preference = this.store.preferences(agent);
     if (preference && (preference.model != null || preference.modelPolicy === 'cli-default')) this.store.setModel(target.id, preference.model);
+    if (preference?.preset) this.store.setPreset(target.id, preference.preset);
     if (preference?.effort != null) this.store.setEffort(target.id, preference.effort);
     return this.store.getConversation(target.id)!;
   }
@@ -770,13 +772,13 @@ export class SessionManager {
 
   private modelStatus(target: Conversation): string {
     const actual = target.actualModel ?? '尚未由 CLI 回报';
-    return `实际模型：${actual}\n会话选择：${target.model ?? 'CLI 默认'}\n强度选择：${target.effort ?? 'CLI 默认'}\n推理强度：${target.actualEffort ?? '尚未由 CLI 回报'}${target.agent === 'codex' && target.controllerMode ? '\n' + this.fastStatus(target) : ''}`;
+    return `实际模型：${actual}\n会话选择：${target.model ?? 'CLI 默认'}${target.preset ? `\n预设：${target.preset.id}（独立配置）` : ''}\n强度选择：${target.effort ?? 'CLI 默认'}\n推理强度：${target.actualEffort ?? '尚未由 CLI 回报'}${target.agent === 'codex' && target.controllerMode ? '\n' + this.fastStatus(target) : ''}`;
   }
 
   private async modelInfo(target: Conversation): Promise<AgentModelInfo> {
     let info: AgentModelInfo = { models: [], defaultModel: null };
     try {
-      info = await this.adapters[target.agent].getModelInfo?.(target.cwd) ?? info;
+      info = await this.adapters[target.agent].getModelInfo?.(target.cwd, target) ?? info;
     } catch (error) {
       if (target.agent !== 'claude') throw error;
       // Older Claude CLIs can still accept aliases/custom provider IDs without metadata support.
@@ -802,7 +804,7 @@ export class SessionManager {
         const entries = info.models.map((model, index) => `${index + 1}. ${model.id}${model.displayName !== model.id ? ` · ${model.displayName}` : ''}${model.isDefault ? '（目录推荐）' : ''}`);
         await reply(`${target.agent} 模型选项：\n${entries.length ? entries.join('\n') : 'CLI 尚未返回目录'}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/model 序号 或 模型名 切换；自定义网关模型可用 /model custom 模型名。${target.agent === 'claude' ? '\n别名及自定义模型的提供方可用性以下次调用为准。' : ''}`);
       } else {
-        await reply(`${agentDisplayName(target.agent)}\n实际模型：${target.actualModel ?? '尚未由 CLI 回报'}\n会话选择：${target.model ?? 'CLI 默认'}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/models 查看选项；/model 模型名 切换。`);
+        await reply(`${agentDisplayName(target.agent)}\n实际模型：${target.actualModel ?? '尚未由 CLI 回报'}\n会话选择：${target.model ?? 'CLI 默认'}${target.preset ? `\n预设：${target.preset.id}（独立配置）` : ''}\nCLI 当前新会话默认：${info.defaultModel ?? '尚未确认'}\n/models 查看选项；/model 模型名 切换。`);
       }
       return;
     }
@@ -810,6 +812,26 @@ export class SessionManager {
       || this.workers.has(target.id) || this.store.pendingCount(target.id) > 0;
     if (busy() || this.modelChanges.has(target.id)) {
       await reply('当前会话正在执行、排队或切换模型，请完成后再切换；也可 /stop 停止任务后重试。');
+      return;
+    }
+    if (argument === 'preset' || argument.startsWith('preset ')) {
+      if (!this.config.controllerMode || !this.options.resolveControllerPreset) { await reply('当前入口未启用主控预设。'); return; }
+      const selector = argument.slice(6).trim();
+      if (!selector || selector === 'list') {
+        const presets = (await listPresets(this.config.contextWorkspace ?? this.config.workspace, { targetId: 'local' })).filter(item => item.enabled);
+        await reply('桥电脑主控预设：\n' + (presets.map(item => `${item.id} · ${item.aliases.join(' / ')} · ${item.agent} · ${item.model}`).join('\n') || '尚未登记已启用预设')
+          + '\n/model preset 预设ID或别名 切换；/model default 返回普通配置。');
+        return;
+      }
+      this.modelChanges.add(target.id);
+      try {
+        const preset = await this.options.resolveControllerPreset(selector);
+        if (preset.targetId !== 'local') throw new Error('主控只支持桥电脑预设。');
+        if (busy() || this.store.getActive(message.userId)?.id !== target.id) throw new Error('准备期间会话或任务状态已改变，未切换。');
+        if (JSON.stringify(target.preset) === JSON.stringify(preset)) { await reply(`当前已使用预设 ${preset.id}。`); return; }
+        await this.switchAgent(target, preset.agent, message, { preset, model: preset.model });
+        await reply(`主控已切换到预设 ${preset.id} · ${agentDisplayName(preset.agent)} · ${preset.model}，已新建会话并续接上下文；助手和定时保留。不受 CC Switch 切换影响，无需再 /new。`);
+      } finally { this.modelChanges.delete(target.id); this.completionAvailable(); }
       return;
     }
     const custom = argument.startsWith('custom ');
@@ -829,7 +851,7 @@ export class SessionManager {
         selected = null;
         unverified = false;
       } else if (target.agent === 'codex' && !custom && !(this.config.modelOptions?.codex ?? []).includes(requested)) {
-        const info = await this.modelInfo(target);
+        const info = await this.modelInfo(target.preset ? { ...target, preset: undefined, nativeId: null, id: `ordinary-${target.id}` } : target);
         if (!info.models.some(model => model.id === requested)) {
           await reply(`CLI 目录没有 ${requested}，未修改会话。/model list 查看选项；确认网关支持此 ID 后，可用 /model custom ${requested}。`);
           return;
@@ -841,6 +863,11 @@ export class SessionManager {
       }
       if (busy()) {
         await reply('查询期间已有新任务排队，未修改模型。请任务结束后重试。'); return;
+      }
+      if (target.preset) {
+        await this.switchAgent(target, target.agent, message, { model: selected });
+        await reply(`已切回普通 ${agentDisplayName(target.agent)} 配置，模型 ${selected ?? 'CLI 默认'}；已新建会话并续接上下文，后续跟随普通 CLI / CC Switch 配置。`);
+        return;
       }
       if (target.effort) {
         await validateEffort(this.adapters[target.agent], { ...target, model: selected }, target.effort);
@@ -938,9 +965,15 @@ export class SessionManager {
       await this.options.onResumeSwitch?.(journal.source); await this.options.onResumeSwitch?.(journal.target);
     }
   }
-  private async switchAgent(source: Conversation, agent: AgentName, message: BridgeMessage): Promise<Conversation> {
+  private async switchAgent(source: Conversation, agent: AgentName, message: BridgeMessage, selection?: { preset?: Conversation['preset']; model: string | null }): Promise<Conversation> {
     if (this.switches.has(source.userId)) throw new Error('当前 Bot 已有 Agent 切换进行中。');
-    const target = this.selectedConversation(source.userId, agent, source.cwd, source);
+    let target = this.selectedConversation(source.userId, agent, source.cwd, source);
+    if (selection) {
+      this.store.setPreset(target.id, selection.preset); this.store.setModel(target.id, selection.model);
+      this.store.setEffort(target.id, source.agent === agent ? source.effort ?? null : null);
+      target = this.store.getConversation(target.id)!;
+      if (target.effort) await validateEffort(this.adapters[agent], target, target.effort);
+    }
     const journal: AgentSwitchJournal = { version: 1, source, target, channelId: message.channelId, phase: 'preparing', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     const controller = new AbortController(); this.switches.set(source.userId, { journal, controller }); this.saveSwitchJournal(journal);
     try {
@@ -1057,7 +1090,7 @@ export class SessionManager {
         const target = this.selectedConversation(message.userId, agent, this.newConversationCwd(current), current);
         if (request.continue) {
           // Freeze the confirmed parent selection before cancelling old work; a remote default cannot choose it.
-          const model = (current!.agent === agent ? current!.model ?? current!.actualModel : null)
+          const model = target.preset?.model ?? (current!.agent === agent ? current!.model ?? current!.actualModel : null)
             ?? this.config.defaultModels?.[agent] ?? (await this.adapters[agent].getModelInfo?.(target.cwd))?.defaultModel;
           if (!model || model === 'default' || !isModelId(model)) throw new Error('无法确认续接模型，原会话保持不变。');
           if (this.store.getActive(message.userId)?.id !== current!.id) throw new Error('准备交接时会话已切换。');
@@ -1087,6 +1120,7 @@ export class SessionManager {
         if (!statSync(cwd).isDirectory()) { await reply('指定路径不是目录。'); return; }
         const target = this.store.createConversation(message.userId, current?.agent ?? this.config.defaultAgent, cwd, { controllerMode: this.config.controllerMode === true, cwdExplicit: true });
         if (current?.model || current?.modelPolicy === 'cli-default') this.store.setModel(target.id, current.model ?? null);
+        if (current?.preset) this.store.setPreset(target.id, current.preset);
         if (current?.effort) this.store.setEffort(target.id, current.effort);
         await this.activate(message.userId, target);
         this.initializeWorkspace(this.store.getConversation(target.id)!, message);

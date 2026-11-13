@@ -16,8 +16,8 @@ export const COMMANDS: CommandDefinition[] = [
   { name: 'cwd', help: "/cwd 路径：在指定目录新建会话", description: '在指定工作目录新建会话', options: [
     { type: 'string', name: 'path', description: '工作目录路径', required: true, min_length: 1, max_length: 1000 },
   ] },
-  { name: 'model', help: "/model [序号|模型名|list|default]：查询、列出或切换模型，保留上下文；/model custom 模型名：网关自定义模型", description: '查看或切换模型，保留当前上下文', options: [
-    { type: 'string', name: 'name', description: '模型名；Claude 可填 haiku/sonnet/opus；list 列出，default 默认；留空查询', min_length: 1, max_length: 200 },
+  { name: 'model', help: "/model [序号|模型名|list|default|preset 预设ID或别名]：查询、列出或切换模型，保留上下文；/model custom 模型名：网关自定义模型", description: '查看或切换模型，保留当前上下文', options: [
+    { type: 'string', name: 'name', description: '模型名；preset 查看桥电脑预设，preset ID或别名 切换；default 普通默认；留空查询', min_length: 1, max_length: 200 },
     { type: 'boolean', name: 'custom', description: '网关自定义模型：跳过官方目录验证' },
   ] },
   { name: 'effort', help: "/effort [level|default]：查询或设置推理强度，保留上下文", description: '查看或设置当前会话推理强度，保留上下文', options: [

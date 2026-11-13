@@ -167,12 +167,12 @@ export class ControllerRuntime {
     if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或重启，不能准备 Agent 切换。');
     signal.throwIfAborted();
     if (source.id === target.id || source.userId !== target.userId || pathKey(source.cwd) !== pathKey(target.cwd)
-      || source.agent === target.agent || target.nativeId) throw new Error('Agent 切换准备的源或目标会话无效。');
+      || source.agent === target.agent && canonical([source.preset, source.model]) === canonical([target.preset, target.model]) || target.nativeId) throw new Error('Agent 切换准备的源或目标会话无效。');
     const handoffs = new SessionHandoffs(this.config.dataDir);
     const manifest = handoffs.get(target, channelId);
     if (!manifest || manifest.source.id !== source.id || manifest.source.agent !== source.agent || manifest.source.nativeId !== source.nativeId
       || manifest.mode !== 'agent-switch') throw new Error('缺少冻结的 Agent 切换证据，不能猜测源会话。');
-    const fingerprint = canonical({ source: { id: source.id, agent: source.agent, nativeId: source.nativeId }, target: { id: target.id, agent: target.agent, model: target.model ?? null, effort: target.effort ?? null }, channelId, snapshotHash: manifest.snapshotHash });
+    const fingerprint = canonical({ source: { id: source.id, agent: source.agent, nativeId: source.nativeId }, target: { id: target.id, agent: target.agent, model: target.model ?? null, effort: target.effort ?? null, preset: target.preset ?? null }, channelId, snapshotHash: manifest.snapshotHash });
     handoffs.prompt(target, channelId);
     const key = `agent-switch-context:${target.id}`;
     const cached = this.store.getCall(key, fingerprint) as { contextSeed: string } | undefined;
@@ -182,7 +182,10 @@ export class ControllerRuntime {
     if (this.preparations.has(target.id)) throw new Error('此 Agent 切换摘要已在准备中。');
     const abort = new AbortController();
     const linked = AbortSignal.any([signal, abort.signal]);
-    const workerId = randomUUID(), adapter = this.adapters[target.agent];
+    const workerId = randomUUID();
+    const adapter = target.preset ? this.callbacks.targetCatalog!.adapterFor({
+      ...await this.resolveTarget(target.cwd, 'local', target.agent), preset: target.preset, sessionVisibility: 'hidden',
+    }) : this.adapters[target.agent];
     const execute = async (): Promise<{ contextSeed: string }> => {
       let launched = false;
       const interrupt = () => { if (launched) void adapter.interrupt(workerId).catch(error => this.error(error)); };

@@ -68,6 +68,7 @@ export interface NativeControllerOptions {
   /** Test-only transport seam; production uses a real CLI process. */
   createTransport?: (command: AgentCommand, args: string[], cwd: string, env: NodeJS.ProcessEnv) => RpcTransport;
   userHome?: string;
+  isolatedLaunch?: boolean;
 }
 class TurnSealedError extends Error {
   constructor() { super('主控本轮已封闭，等待下一条真实输入。'); this.name = 'TurnSealedError'; }
@@ -165,6 +166,12 @@ export class NativeControllerAdapter implements AgentAdapter {
   }
   private sourceFiles(): string[] {
     const userHome = this.options.userHome ?? homedir();
+    if (this.options.isolatedLaunch) {
+      const home = this.options.agent === 'codex' ? this.env.CODEX_HOME : this.env.CLAUDE_CONFIG_DIR;
+      if (!home) throw new Error('预设启动配置目录缺失，拒绝回退普通配置。');
+      return this.options.agent === 'codex' ? [join(home, 'config.toml'), join(home, 'auth.json')]
+        : [join(home, 'settings.json'), join(home, '.credentials.json'), join(home, '.claude.json')];
+    }
     return this.options.agent === 'codex'
       ? [join(userHome, '.codex', 'config.toml'), join(userHome, '.codex', 'auth.json')]
       : [join(userHome, '.claude', 'settings.json'), join(userHome, '.claude', '.credentials.json'), join(userHome, '.claude.json')];
@@ -243,7 +250,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       const sourceConfig = userFiles[0]!;
       writeFileSync(join(home, 'config.toml'), isolatedCodexConfig(existsSync(sourceConfig) ? readFileSync(sourceConfig, 'utf8') : ''), 'utf8');
       this.copyCredential(userFiles[1]!, join(home, 'auth.json'));
-      refreshControllerCodexLogin(userFiles[1]!, join(home, 'auth.json'));
+      if (!this.options.isolatedLaunch) refreshControllerCodexLogin(userFiles[1]!, join(home, 'auth.json'));
     } else {
       for (const file of userFiles.slice(1)) this.copyCredential(file, join(home, file.endsWith('.credentials.json') ? '.credentials.json' : '.claude.json'));
     }
@@ -1049,6 +1056,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) throw new AggregateError(errors, '部分主控进程的停止尚未确认。');
+    if (this.options.isolatedLaunch) await this.options.metadataAdapter?.close();
   }
 }
 function imageMediaType(bytes: Buffer): string {

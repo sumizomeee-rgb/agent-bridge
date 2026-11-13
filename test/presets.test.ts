@@ -262,3 +262,32 @@ test('preset error conversion retains an already completed native report after c
     assert.equal(await adapter.confirmStopped('worker-A'), true); assert.equal(runs, 1);
   } finally { await adapter.close(); f.close(); }
 });
+
+for (const agent of ['codex', 'claude'] as const) test(`主控 ${agent} 复用预设线路但不继承普通登录、工具或助手历史目录`, async () => {
+  const f = fixture();
+  try {
+    const profile = { ...f.profile, agent, id: 'controller-route' };
+    writeFileSync(join(f.privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [profile] }));
+    const binding = { id: 'local-route', targetId: 'local', ...await f.runtime.describe(profile.id, 1, agent, profile.model) };
+    const baseline = { OPENAI_API_KEY: 'ordinary-secret', ANTHROPIC_AUTH_TOKEN: 'ordinary-token', HTTPS_PROXY: 'http://unrelated-proxy', CODEX_HOME: 'ordinary-home' };
+    const prepared = await f.runtime.prepareController(binding, 'controller-A', null, f.command, baseline);
+    try {
+      assert.equal(prepared.env.OPENAI_API_KEY, undefined); assert.equal(prepared.env.HTTPS_PROXY, undefined);
+      assert.equal(prepared.env.ANTHROPIC_AUTH_TOKEN, undefined);
+      assert.equal(prepared.command.args.includes('--mcp-config'), false, '主控自行装配自己的 MCP');
+      const home = prepared.env[agent === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR']!;
+      assert.equal(home, join(f.data, 'controller-homes', agent, 'controller-A', 'launch'));
+      assert.equal(JSON.stringify(prepared.command).includes('private-test-key'), false);
+      if (agent === 'codex') {
+        assert.equal(prepared.env.BRIDGE_PRESET_API_KEY, 'private-test-key');
+        assert.match(readFileSync(join(home, 'config.toml'), 'utf8'), /gateway\.example/);
+      } else assert.equal(prepared.env.ANTHROPIC_API_KEY, 'private-test-key');
+      writeFileSync(join(f.privateRoot, 'profiles.json'), JSON.stringify({ version: 1, profiles: [{ ...profile, baseUrl: 'https://changed.example', revision: 2 }] }));
+      const resumed = await f.runtime.prepareController(binding, 'controller-A', 'native-A', f.command, baseline);
+      try { assert.equal(resumed.env.ANTHROPIC_BASE_URL ?? 'https://gateway.example', 'https://gateway.example'); }
+      finally { await resumed.close(); }
+      await assert.rejects(f.runtime.prepareController(binding, 'controller-B', null, f.command, baseline), /已改变/);
+      await assert.rejects(f.runtime.prepareController({ ...binding, targetId: 'remote' }, 'controller-C', null, f.command, baseline), /桥电脑/);
+    } finally { await prepared.close(); }
+  } finally { f.close(); }
+});

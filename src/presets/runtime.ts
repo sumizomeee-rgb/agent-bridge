@@ -11,7 +11,7 @@ import type { Conversation, AgentAdapter, SessionVisibility, AgentCommand, Agent
 import { presetId, readPrivateJson } from './registry.js';
 import { readMaterials } from './materials.js';
 import { exposeCodexHistory, pinSessionLocation } from '../agents/worker-session.js';
-import { startPresetConnect } from './connect.js';
+import { preparePresetLaunch } from './launch.js';
 import { inheritCodexCapabilities, writeCodexPresetRouting } from './capabilities.js';
 import { sessionHome } from '../agents/session-home.js';
 import { nativeSessionEnvironment } from '../agents/native-session.js';
@@ -83,9 +83,9 @@ export class PresetRuntime {
     else { mkdirSync(home, { recursive: true }); writeFileSync(path, JSON.stringify({ binding, profile }), { flag: 'wx', mode: 0o600 }); }
     pinSessionLocation(home, binding.agent, visibility ?? 'hidden', null, {}, this.userHome);
   }
-  private async profile(binding: PresetBinding, workerId?: string, nativeId?: string | null, pin = false): Promise<LaunchProfile> {
+  private async profile(binding: PresetBinding, workerId?: string, nativeId?: string | null, pin = false, snapshotHome?: string): Promise<LaunchProfile> {
     assertPresetBinding(binding);
-    const home = workerId ? this.home(workerId, binding) : undefined, path = home ? join(home, 'preset-binding.json') : undefined;
+    const home = snapshotHome ?? (workerId ? this.home(workerId, binding) : undefined), path = home ? join(home, 'preset-binding.json') : undefined;
     if (path && existsSync(path)) {
       const saved = await readPrivateJson(path);
       if (!isObject(saved) || !isObject(saved.profile) || !isObject(saved.binding)
@@ -106,53 +106,36 @@ export class PresetRuntime {
   async prepare(binding: PresetBinding, workerId: string, nativeId: string | null, original: AgentCommand, baseEnv: NodeJS.ProcessEnv, visibility?: SessionVisibility): Promise<PreparedPreset> {
     const profile = await this.profile(binding, workerId, nativeId, true);
     const location = pinSessionLocation(this.home(workerId, binding), binding.agent, visibility ?? 'hidden', nativeId, {}, this.userHome)!;
-    const credential = await this.credential(profile);
-    const key = (binding.agent === 'codex' ? credential.apiKey : credential.authToken ?? credential.apiKey) as string;
-    const env = { ...process.env, ...baseEnv };
-    const cleared = new Set(['CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_API_KEY', 'CLAUDE_CONFIG_DIR', 'BRIDGE_PRESET_API_KEY', 'BRIDGE_PRESET_PROVIDER', 'NO_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
-    for (const name of Object.keys(env)) {
-      const key = name.toUpperCase();
-      if (/^(ANTHROPIC_|CLAUDE_CODE_|OPENAI_)/.test(key) || cleared.has(key)) env[name] = undefined;
-    }
-    // Configuration is shared by immutable preset identity, never copied per worker.
-    // Transcripts and SQLite indexes always belong to the ordinary native profile.
-    const home = join(this.userHome, binding.agent === 'codex' ? '.codex' : '.claude', 'bridge', 'profiles', profileFingerprint(profile));
-    mkdirSync(home, { recursive: true });
-    nativeSessionEnvironment(env, visibility ?? 'hidden');
-    const command = { command: original.command, args: [...original.args] };
-    let relay: Awaited<ReturnType<typeof startPresetConnect>> | undefined;
+    const prepared = await preparePresetLaunch(profile, binding, await this.credential(profile), original, baseEnv);
     try {
-      if (profile.transport.kind === 'ssh-connect') {
-        const url = new URL(profile.baseUrl); relay = await startPresetConnect(profile.transport, `${url.hostname}:${url.port || '443'}`);
-        for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) env[name] = relay.proxyUrl;
-      }
+      const home = join(this.userHome, binding.agent === 'codex' ? '.codex' : '.claude', 'bridge', 'profiles', profileFingerprint(profile));
+      mkdirSync(home, { recursive: true });
+      nativeSessionEnvironment(prepared.env, visibility ?? 'hidden');
       if (binding.agent === 'codex') {
-        inheritCodexCapabilities(home, location?.profileHome ?? join(this.userHome, '.codex'));
-        env.CODEX_HOME = home; env.CODEX_SQLITE_HOME = location.sqliteHome; env.BRIDGE_PRESET_API_KEY = key;
+        inheritCodexCapabilities(home, location.profileHome);
+        prepared.env.CODEX_HOME = home; prepared.env.CODEX_SQLITE_HOME = location.sqliteHome;
         exposeCodexHistory(home, location);
         writeCodexPresetRouting(home, binding.model, profile.baseUrl, location.profileHome);
-        const provider = 'bridge_preset';
-        env.BRIDGE_PRESET_PROVIDER = provider;
-        const values: Record<string, unknown> = { model_provider: provider, model: binding.model,
-          [`model_providers.${provider}.name`]: 'Explicit bridge preset', [`model_providers.${provider}.base_url`]: profile.baseUrl,
-          [`model_providers.${provider}.env_key`]: 'BRIDGE_PRESET_API_KEY', [`model_providers.${provider}.requires_openai_auth`]: false,
-          [`model_providers.${provider}.wire_api`]: 'responses', check_for_update_on_startup: false };
-        for (const [name, value] of Object.entries(values)) command.args.push('-c', `${name}=${JSON.stringify(value)}`);
       } else {
-        env.CLAUDE_CONFIG_DIR = location.profileHome; env.ANTHROPIC_BASE_URL = profile.baseUrl;
+        prepared.env.CLAUDE_CONFIG_DIR = location.profileHome;
         mkdirSync(location.profileHome, { recursive: true });
-        env[credential.authToken ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY'] = key;
-        env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
-        env.DISABLE_AUTOUPDATER = '1';
-        env.ANTHROPIC_MODEL = binding.model;
-        // Main selection alone does not pin background work or family aliases.
-        for (const family of ['HAIKU', 'SONNET', 'OPUS', 'FABLE']) env[`ANTHROPIC_DEFAULT_${family}_MODEL`] = binding.model;
-        env.CLAUDE_CODE_SUBAGENT_MODEL = binding.model;
-        env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
-        command.args.push('--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}');
+        prepared.command.args.push('--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}');
       }
-      return { command, env, close: async () => { await relay?.close(); } };
-    } catch (error) { await relay?.close(); throw error; }
+      return prepared;
+    } catch (error) { await prepared.close(); throw error; }
+  }
+  async prepareController(binding: PresetBinding, conversationId: string, nativeId: string | null, command: AgentCommand, env: NodeJS.ProcessEnv): Promise<PreparedPreset> {
+    if (binding.targetId !== 'local') throw new Error('主控只支持桥电脑预设。');
+    const home = join(this.dataRoot, 'controller-homes', binding.agent, presetId(conversationId), 'launch');
+    const profile = await this.profile(binding, undefined, nativeId, true, home);
+    const prepared = await preparePresetLaunch(profile, binding, await this.credential(profile), command, env);
+    try {
+      if (binding.agent === 'codex') {
+        writeCodexPresetRouting(home, binding.model, profile.baseUrl);
+        prepared.env.CODEX_HOME = home;
+      } else prepared.env.CLAUDE_CONFIG_DIR = home;
+      return prepared;
+    } catch (error) { await prepared.close(); throw error; }
   }
   private async credential(profile: LaunchProfile): Promise<Record<string, unknown>> {
     const managed = (await readMaterials(this.privateRoot, parseLaunchProfiles)).map(source => source.credentials[profile.credentialId]).filter(value => value !== undefined);

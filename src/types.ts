@@ -13,6 +13,8 @@ export interface Conversation {
   model?: string | null;
   /** Explicit default follows current CLI settings even when resuming; absent preserves legacy native behavior. */
   modelPolicy?: 'cli-default';
+  /** Immutable registered launch route; absent means ordinary user configuration. */
+  preset?: import('./presets/types.js').PresetBinding;
   /** Most recently reported effective model, separate from aliases/selections. */
   actualModel?: string | null;
   /** Most recently reported reasoning effort; null means the CLI did not confirm it. */
@@ -201,7 +203,7 @@ export interface AgentAdapter {
   confirmStopped?(conversationId: string, dispatchId?: string): Promise<boolean>;
   close(): Promise<void>;
   /** Metadata only: never sends a user prompt or starts a generated turn. */
-  getModelInfo?(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'>): Promise<AgentModelInfo>;
+  getModelInfo?(cwd: string, context?: Pick<Conversation, 'id' | 'nativeId'> & Partial<Pick<Conversation, 'preset'>>): Promise<AgentModelInfo>;
   /** Persist the target-owned preset snapshot before scheduling or starting work. */
   preparePreset?(workerId: string, nativeId: string | null): Promise<void>;
 }
