@@ -171,7 +171,7 @@ for (const succeeds of [true,false]) test(`定时唤醒中断进入同一恢复�
   f.manager.completionAvailable(); await until(()=>f.manager.isIdle());
   const pending=f.store.recoveries.active()[0]!; assert(pending);
   assert.equal(f.sent.length,before+1); assert(f.sent.at(-1)!.includes('第1/5次'));
-  assert(f.sent.at(-1)!.includes('定时自唤醒'));
+  assert(f.sent.at(-1)!.includes('定时自唤醒')); assert(f.sent.at(-1)!.includes('来源：定时唤醒'));
   await f.restart();
   f.setRun(async turn=>{
     assert.equal(turn.event?.kind,'recovery'); assert(turn.text.includes('检查已交付版本并继续验收'));
@@ -182,7 +182,7 @@ for (const succeeds of [true,false]) test(`定时唤醒中断进入同一恢复�
     assert.equal(f.sent.length,before+1+(succeeds||attempt===5?1:0));
   }
   assert.equal(f.store.recoveries.get(pending.id)!.state,succeeds?'done':'exhausted');
-  if(!succeeds)assert(f.sent.at(-1)!.includes('第5/5次恢复失败'));
+  if(!succeeds){assert(f.sent.at(-1)!.includes('第5/5次恢复失败'));assert(f.sent.at(-1)!.includes('来源：定时唤醒'));}
   assert.equal(f.registry.completionForTask(taskId)!.status,'completed');
   assert.equal(f.turns.filter(turn=>turn.event?.kind==='wake').length,1);
 });

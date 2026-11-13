@@ -33,11 +33,12 @@ export const BRIDGE_NOTICE_COPY = {
 } as const satisfies Record<string, { title: string; tone: BridgePresentation['tone']; text: string }>;
 
 export type BridgeNoticeCode = keyof typeof BRIDGE_NOTICE_COPY;
-export interface BridgeNoticeParams { taskTitle?: string; recoveryAttempts?: number }
+export interface BridgeNoticeParams { taskTitle?: string; recoveryAttempts?: number; sourceLabel?: string }
 
 export function bridgeNotice(code: BridgeNoticeCode, params: BridgeNoticeParams = {}): BridgePresentation {
   const copy = BRIDGE_NOTICE_COPY[code];
+  const sourceLabel = (params.sourceLabel ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim().slice(0, 40);
   const taskTitle = [...(params.taskTitle ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim()].slice(0, 80).join('');
   return { title: BRIDGE_NOTICE_PREFIX + copy.title, tone: copy.tone, purpose: 'status',
-    blocks: [{ kind: 'text', text: (code === 'controllerRecoveryExhausted' && params.recoveryAttempts !== undefined ? `第${params.recoveryAttempts}/5次恢复失败。` : '') + copy.text }], ...(taskTitle ? { footer: '任务：' + taskTitle } : {}) };
+    blocks: [{ kind: 'text', text: (code === 'controllerRecoveryExhausted' && params.recoveryAttempts !== undefined ? `第${params.recoveryAttempts}/5次恢复失败。` : '') + copy.text }], ...(taskTitle || sourceLabel ? { footer: [sourceLabel ? '来源：' + sourceLabel : '', taskTitle ? '任务：' + taskTitle : ''].filter(Boolean).join('\n') } : {}) };
 }

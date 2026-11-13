@@ -12,7 +12,7 @@ import { agentDisplayName, replyHeader } from './reply.js';
 import { computerOverview, workerOverview, isActiveWorker, type ComputerOverview, type WorkerOverview } from './overview.js';
 import { commandHelp, parseCommand as command, parseNewArguments } from './commands.js';
 import { presentationText, type BridgePresentation } from './presentation.js';
-import { bridgeNotice, type BridgeNoticeCode } from './notices.js';
+import { bridgeNotice, type BridgeNoticeCode, type BridgeNoticeParams } from './notices.js';
 import { DeliveryPreparationError, executionErrorEvidence as errorEvidence } from './delivery-errors.js';
 import { completedResultFromError, isObject, stopEvidenceFromError } from './agents/process.js';
 import { MetadataProbeError } from './agents/metadata.js';
@@ -192,7 +192,7 @@ export class SessionManager {
       || this.store.getActive(target.userId)?.id !== target.id || this.store.pendingCount(target.id) > 0 || !retryableControllerFailure(error)) return false;
     this.store.recoveries.schedule({ conversationId: target.id, userId: target.userId, channelId: source.channelId, originMessageId: input.id,
       nativeId: stored.nativeId, agent: stored.agent, cwd: stored.cwd, ...(scheduledEvent?.reboundFrom ? { reboundFrom: scheduledEvent.reboundFrom } : {}) }, triggerId, Date.now(),
-      scheduled ? `原定时任务：${scheduledEvent.title}\n${scheduledEvent.text}` : undefined);
+      scheduled ? `原定时任务：${scheduledEvent.title}\n${scheduledEvent.text}` : undefined, scheduled ? '定时唤醒' : triggerId === source.id ? '用户消息' : '助手结果汇总');
     this.armControllerRecovery(); return true;
   }
   private assertDispatchFailureTurn(turn:AgentTurn):Conversation {
@@ -1477,7 +1477,7 @@ export class SessionManager {
       confirm: () => { if (current()) this.store.feedback.deliveredToController(scope, [...offered]); } };
   }
   private failureFeedback(target: Conversation, route: { id: string; userId: string; channelId: string; groupContext?: GroupTurnContext },
-    code: BridgeNoticeCode, error: unknown, details: Partial<Pick<BridgeFeedback, 'stage' | 'taskTitle' | 'taskId' | 'workerId' | 'jobId' | 'supplementId' | 'workerResultKnown' | 'deliveryState' | 'processStopped' | 'nativeId' | 'recoveryAttempts'>> = {}, notifyUser = true): BridgeFeedback {
+    code: BridgeNoticeCode, error: unknown, details: Partial<Pick<BridgeFeedback, 'stage' | 'taskTitle' | 'taskId' | 'workerId' | 'jobId' | 'supplementId' | 'workerResultKnown' | 'deliveryState' | 'processStopped' | 'nativeId' | 'recoveryAttempts' | 'sourceLabel'>> = {}, notifyUser = true): BridgeFeedback {
     const known = this.store.turnResult(route.id);
     const uncertain = this.running.get(route.userId)?.publicationUncertain || isObject(error) && error.deliveryUncertain === true;
     return this.store.feedback.record({ ...this.feedbackScope(target, route), sourceId: route.id, code,
@@ -1492,7 +1492,7 @@ export class SessionManager {
     if (this.closed || !this.config.allowedUserIds.includes(item.userId) || this.options.authorizeUser?.(item.userId) === false) return Promise.resolve(false);
     if (!this.store.feedback.claimNotice(item.id)) return Promise.resolve(item.userState === 'delivered');
     const controller = new AbortController();
-    const promise = Promise.resolve().then(() => deliver ? deliver() : this.sendBridgeNotice(item.channelId, item.code, item.taskTitle, 'feedback:' + item.id, controller.signal, item.recoveryAttempts))
+    const promise = Promise.resolve().then(() => deliver ? deliver() : this.sendBridgeNotice(item.channelId, item.code, item.taskTitle, 'feedback:' + item.id, controller.signal, { recoveryAttempts: item.recoveryAttempts, sourceLabel: item.sourceLabel }))
       .then(() => { this.store.feedback.finishNotice(item.id, 'delivered'); return true; }, () => { this.store.feedback.finishNotice(item.id, 'uncertain'); return false; })
       .finally(() => this.feedbackSends.delete(item.id));
     this.feedbackSends.set(item.id, { controller, promise }); return promise;
@@ -1533,8 +1533,8 @@ export class SessionManager {
     return true;
   }
 
-  private sendBridgeNotice(channelId: string, code: BridgeNoticeCode, taskTitle?: string, deliveryKey?: string, signal?: AbortSignal, recoveryAttempts?: number): Promise<void> {
-    const view = bridgeNotice(code, { taskTitle, recoveryAttempts });
+  private sendBridgeNotice(channelId: string, code: BridgeNoticeCode, taskTitle?: string, deliveryKey?: string, signal?: AbortSignal, details: Omit<BridgeNoticeParams, 'taskTitle'> = {}): Promise<void> {
+    const view = bridgeNotice(code, { taskTitle, ...details });
     return this.sink.sendText(channelId, presentationText(view), { presentation: view, ...(deliveryKey ? { deliveryKey } : {}), ...(signal ? { signal } : {}) });
   }
 
@@ -1810,7 +1810,7 @@ export class SessionManager {
             : lifecycle?.submission === 'accepted' ? 'controllerExecutionInterrupted' : 'controllerFailed';
           if (target.controllerMode) {
             const scheduled = !handled && !retained && !turn.publicationUncertain && this.scheduleControllerRecovery(target, item, item.id, error);
-            const feedback = this.failureFeedback(target, item, scheduled ? 'controllerRecoveryScheduled' : noticeCode, error, {}, !handled);
+            const feedback = this.failureFeedback(target, item, scheduled ? 'controllerRecoveryScheduled' : noticeCode, error, { sourceLabel: '用户消息' }, !handled);
             if (!handled) await this.sendFeedbackNotice(feedback);
           } else if (!handled) await this.sendBridgeNotice(item.channelId, noticeCode, undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
         }
@@ -2187,6 +2187,7 @@ export class SessionManager {
         ? this.scheduleControllerRecovery(target, originalInput, event.id, error, scheduledWake ? event : undefined) : false;
       const recoveryExhausted = event.purpose === 'controller-recovery' && this.store.recoveries.get(event.controllerRecoveryId!)?.state === 'exhausted';
       const failure = this.failureFeedback(target, event, recoveryExhausted ? 'controllerRecoveryExhausted' : scheduledRecovery ? 'controllerRecoveryScheduled' : noticeCode, error, { stage: failureStage, taskTitle: event.title, taskId: event.taskId, workerResultKnown: event.status === 'completed',
+        sourceLabel: event.purpose === 'controller-recovery' ? this.store.recoveries.get(event.controllerRecoveryId!)?.sourceLabel : scheduledWake ? '定时唤醒' : event.purpose === undefined ? '助手结果汇总' : undefined,
         ...(recoveryExhausted ? { recoveryAttempts: this.store.recoveries.get(event.controllerRecoveryId!)!.attempts } : {}),
         ...(controller.signal.aborted ? { stage: 'interrupted' } : {}), ...(deliveryStarted ? { deliveryState: 'uncertain' } : {}) }, event.purpose !== 'housekeeper' && !workspaceContext && !observation && !this.closed && (event.purpose !== 'controller-recovery' || recoveryExhausted));
       if (workspaceContext) {

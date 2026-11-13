@@ -9,7 +9,7 @@ export interface FeedbackScope {
 }
 export interface BridgeFeedback extends FeedbackScope {
   id: string; sourceId: string; code: BridgeNoticeCode; stage: string; reason: string;
-  recoveryAttempts?: number;
+  recoveryAttempts?: number; sourceLabel?: string;
   taskTitle?: string; taskId?: string; workerId?: string; jobId?: string; supplementId?: string;
   resultKnown: boolean; workerResultKnown?: boolean; processStopped: boolean | null;
   deliveryState: 'not-attempted' | 'not-delivered' | 'confirmed' | 'uncertain' | 'unknown';
