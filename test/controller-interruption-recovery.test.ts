@@ -159,3 +159,30 @@ test('助手的413失败结果只作为汇报证据，不触发主控自动恢�
   assert.equal(f.store.recoveries.active().length,0);
   await f.manager.pollControllerRecovery(Date.now()+1e9); assert.equal(f.turns.length,2);
 });
+
+for (const succeeds of [true,false]) test(`定时唤醒中断进入同一恢复链，保留任务且中间静默：${succeeds}`, async t => {
+  const f=fixture(t); f.setRun(async turn=>{await turn.onPublicMessage!('original reply');}); await f.send();
+  const source=f.store.getMessage('original')!, parent=f.store.getConversation(source.conversationId!)!;
+  const context=f.registry.createContext({conversationId:parent.id,userId:'owner',channelId:'dm',originMessageId:source.id,nativeId:parent.nativeId,agent:parent.agent,cwd:parent.cwd,purpose:'schedule',scheduleKind:'controller'});
+  const {taskId}=f.registry.register(JSON.parse((await import('node:fs')).readFileSync(context.contextPath,'utf8')),'定时自唤醒 · 检查交付');
+  f.registry.acceptObservedResult(taskId,'completed','检查已交付版本并继续验收'); f.registry.closeContext(context.contextId);
+  f.setRun(async()=>{throw new Error('Claude 主控失败：error_during_execution');});
+  const before=f.sent.length;
+  f.manager.completionAvailable(); await until(()=>f.manager.isIdle());
+  const pending=f.store.recoveries.active()[0]!; assert(pending);
+  assert.equal(f.sent.length,before+1); assert(f.sent.at(-1)!.includes('第1/5次'));
+  assert(f.sent.at(-1)!.includes('定时自唤醒'));
+  await f.restart();
+  f.setRun(async turn=>{
+    assert.equal(turn.event?.kind,'recovery'); assert(turn.text.includes('检查已交付版本并继续验收'));
+    if(succeeds) await turn.onPublicMessage!('final answer'); else throw new Error('502 upstream');
+  });
+  for(let attempt=1;attempt<=(succeeds?1:5);attempt++){
+    await f.poll();
+    assert.equal(f.sent.length,before+1+(succeeds||attempt===5?1:0));
+  }
+  assert.equal(f.store.recoveries.get(pending.id)!.state,succeeds?'done':'exhausted');
+  if(!succeeds)assert(f.sent.at(-1)!.includes('第5/5次恢复失败'));
+  assert.equal(f.registry.completionForTask(taskId)!.status,'completed');
+  assert.equal(f.turns.filter(turn=>turn.event?.kind==='wake').length,1);
+});

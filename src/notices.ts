@@ -10,12 +10,12 @@ export const BRIDGE_NOTICE_COPY = {
   resultPreparationFailed: { title: '汇报准备失败', tone: 'error', text: '结果已保存。' },
   resultDeliveryUncertain: { title: '汇报发送待核对', tone: 'error', text: '结果已保存。' },
   summaryFailed: { title: '汇总失败', tone: 'error', text: '助手结果已保存。' },
-  wakeFailed: { title: '唤醒失败', tone: 'error', text: '本次唤醒未完成，请核对状态。' },
-  wakePreparationFailed: { title: '唤醒失败', tone: 'error', text: '本次未提交给主控。' },
-  wakeStopped: { title: '唤醒已停止', tone: 'warning', text: '本次唤醒已停止。' },
+  wakeFailed: { title: '本轮中断，未安排恢复', tone: 'error', text: '主控本轮执行未完成；不满足自动恢复条件，请核对状态。' },
+  wakePreparationFailed: { title: '主控准备失败', tone: 'error', text: '本次未提交给主控。' },
+  wakeStopped: { title: '主控执行已停止', tone: 'warning', text: '本轮执行已停止。' },
   controllerDeliveryUncertain: { title: '回复投递待核对', tone: 'error', text: '回复可能已送达，但尚未取得确认；未自动重发。' },
   controllerSubmissionUnknown: { title: '主控接收待核对', tone: 'error', text: '消息已尝试提交，但未能确认接收或结果；未自动重发。' },
-  controllerRecoveryScheduled: { title: '本轮中断，已安排恢复', tone: 'warning', text: '若无新消息，待主控空闲且旧进程确认结束后尝试恢复；初次约20秒，后续冷却按1.5倍递增，最多5次。' },
+  controllerRecoveryScheduled: { title: '本轮中断，已安排恢复', tone: 'warning', text: '若无新消息，待主控空闲且旧进程确认结束后尝试恢复；首次恢复为第1/5次，约20秒后尝试；后续冷却按1.5倍递增。' },
   controllerRecoveryExhausted: { title: '自动恢复未完成', tone: 'error', text: '自动恢复已停止，会话和执行结果保留；可以继续发消息。' },
   controllerExecutionInterrupted: { title: '本轮中断，会话可继续', tone: 'error', text: '主控已接收原消息，但本轮未完成回复。异常已记录，主控下一轮会收到并核对已有操作；你可以直接发消息继续，无需重启。本次未安排自动恢复。' },
   controllerPreparationFailed: { title: '主控准备失败', tone: 'error', text: '本轮未提交给主控。' },
@@ -33,11 +33,11 @@ export const BRIDGE_NOTICE_COPY = {
 } as const satisfies Record<string, { title: string; tone: BridgePresentation['tone']; text: string }>;
 
 export type BridgeNoticeCode = keyof typeof BRIDGE_NOTICE_COPY;
-export interface BridgeNoticeParams { taskTitle?: string }
+export interface BridgeNoticeParams { taskTitle?: string; recoveryAttempts?: number }
 
 export function bridgeNotice(code: BridgeNoticeCode, params: BridgeNoticeParams = {}): BridgePresentation {
   const copy = BRIDGE_NOTICE_COPY[code];
   const taskTitle = [...(params.taskTitle ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim()].slice(0, 80).join('');
   return { title: BRIDGE_NOTICE_PREFIX + copy.title, tone: copy.tone, purpose: 'status',
-    blocks: [{ kind: 'text', text: copy.text }], ...(taskTitle ? { footer: '任务：' + taskTitle } : {}) };
+    blocks: [{ kind: 'text', text: (code === 'controllerRecoveryExhausted' && params.recoveryAttempts !== undefined ? `第${params.recoveryAttempts}/5次恢复失败。` : '') + copy.text }], ...(taskTitle ? { footer: '任务：' + taskTitle } : {}) };
 }
