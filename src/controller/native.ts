@@ -764,7 +764,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     } else if (message.type === 'result') {
       this.acknowledgeSubmission(active);
       if (message.is_error === true || message.subtype !== 'success') {
-        const details = [typeof message.result === 'string' ? message.result : '', ...(Array.isArray(message.errors) ? message.errors.filter((value): value is string => typeof value === 'string').slice(0, 3) : [])].filter(Boolean).join('\n');
+        const details = [String(message.subtype), typeof message.result === 'string' ? message.result : '', ...(Array.isArray(message.errors) ? message.errors.filter((value): value is string => typeof value === 'string').slice(0, 3) : [])].filter(Boolean).join('\n');
         active.completed.reject(new NativeTurnFailure(`Claude 主控失败：${safeError(details || String(message.subtype), String(message.subtype))}`));
       }
       else if (!session.nativeId) active.completed.reject(new Error('Claude 主控没有返回会话标识。'));

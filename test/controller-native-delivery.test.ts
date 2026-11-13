@@ -2,6 +2,7 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, fetch } from 'undici';
 import { DeliveryPreparationError } from '../src/delivery-errors.js';
+import { retryableControllerFailure } from '../src/controller/recovery.js';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -294,6 +295,14 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控直接获
 test('Claude 错误数组保留状态码供恢复分类且凭据脱敏', async t => {
   const f=fixture(t,'claude'), running=f.adapter.run(f.turn); await until(()=>f.protocol.started);
   f.protocol.emit({type:'result',subtype:'error_during_execution',is_error:true,session_id:'continued-native',errors:['401 unauthorized Bearer private-test-token']});
-  await assert.rejects(running,error=>{assert(error instanceof Error);assert.match(error.message,/401 unauthorized/);assert(!error.message.includes('private-test-token'));return true;});
+  await assert.rejects(running,error=>{assert(error instanceof Error);assert.match(error.message,/401 unauthorized/);assert.equal(retryableControllerFailure(error),false);assert(!error.message.includes('private-test-token'));return true;});
   assert.equal(f.sends.length,0);
+});
+
+test('Claude 空回复诊断保留执行错误类别并触发中断恢复分类', async t => {
+  const f=fixture(t,'claude'), running=f.adapter.run(f.turn); await until(()=>f.protocol.started);
+  const diagnostic='[ede_diagnostic] result_type=assistant last_content_type=none stop_reason=end_turn';
+  f.protocol.emit({type:'result',subtype:'error_during_execution',is_error:true,session_id:'continued-native',errors:[diagnostic]});
+  await assert.rejects(running,error=>{assert(error instanceof Error);assert.match(error.message,/error_during_execution/);assert.match(error.message,/last_content_type=none/);assert.equal(retryableControllerFailure(error),true);return true;});
+  assert.equal(retryableControllerFailure(new Error('Claude 主控失败：'+diagnostic)),true);
 });

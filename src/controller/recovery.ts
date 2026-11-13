@@ -72,5 +72,5 @@ export function retryableControllerFailure(error: unknown): boolean {
   if (error.name === 'AbortError' || flags.deliveryUncertain || flags.publicationFailed || flags.processStillRunning) return false;
   const message = error.message;
   if (/\b(400|401|403|404)\b|鉴权|凭据|权限|credential|unauthorized|invalid.{0,20}(model|schema|argument)/i.test(message)) return false;
-  return /error_during_execution|\b(408|429|500|502|503|504)\b|ECONN|ETIMEDOUT|fetch failed|network|socket|timeout|超时|empty.{0,20}(response|content)|没有通过公开通道回复|尚未完成.*回复/i.test(message);
+  return /error_during_execution|last_content_type=none|\b(408|429|500|502|503|504)\b|ECONN|ETIMEDOUT|fetch failed|network|socket|timeout|超时|empty.{0,20}(response|content)|没有通过公开通道回复|尚未完成.*回复/i.test(message);
 }
