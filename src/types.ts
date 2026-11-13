@@ -177,7 +177,7 @@ export interface AgentTurn {
   /** Disposable evidence-only execution: restricted filesystem tools, no inherited MCP/plugins. */
   readOnly?: boolean;
   /** Standalone background input, never a human authorization. */
-  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context' | 'group-event' | 'executor-message'; toolName?: string; text: string; introductionRequested?: boolean };
+  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context' | 'group-event' | 'executor-message' | 'recovery'; toolName?: string; text: string; introductionRequested?: boolean };
   /** Optional explicit worker effort inherited from the coordinating turn. */
   effort?: string;
   onModel?: (model: string) => void;

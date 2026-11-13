@@ -660,7 +660,7 @@ export class NativeControllerAdapter implements AgentAdapter {
       }
       if (active.publicationPreparationError && !active.silent) throw active.publicationPreparationError;
       const privateFinalRequired = !!active.turn.onPrivateInputCheck && !active.turn.groupContext && !active.turn.event;
-      if ((!active.turn.event || active.replyRecovery) && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired)) throw Object.assign(new Error('主控没有通过公开通道回复，本轮未标记为成功。'), { finalReplyMissing: true });
+      if ((!active.turn.event || active.turn.event.kind === 'recovery' || active.replyRecovery) && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired)) throw Object.assign(new Error('主控没有通过公开通道回复，本轮未标记为成功。'), { finalReplyMissing: true });
       if (!session.nativeId) throw new Error('主控没有返回会话标识。');
       active.completed.resolve({ nativeId: session.nativeId, text: '', controlledOutput: true });
     };
@@ -763,7 +763,10 @@ export class NativeControllerAdapter implements AgentAdapter {
       if (Array.isArray(message.message.content)) for (const item of message.message.content) if (isObject(item)) this.recordClaudeTool(active, item);
     } else if (message.type === 'result') {
       this.acknowledgeSubmission(active);
-      if (message.is_error === true || message.subtype !== 'success') active.completed.reject(new NativeTurnFailure(`Claude 主控失败：${safeError(message.result, String(message.subtype))}`));
+      if (message.is_error === true || message.subtype !== 'success') {
+        const details = [typeof message.result === 'string' ? message.result : '', ...(Array.isArray(message.errors) ? message.errors.filter((value): value is string => typeof value === 'string').slice(0, 3) : [])].filter(Boolean).join('\n');
+        active.completed.reject(new NativeTurnFailure(`Claude 主控失败：${safeError(details || String(message.subtype), String(message.subtype))}`));
+      }
       else if (!session.nativeId) active.completed.reject(new Error('Claude 主控没有返回会话标识。'));
       else this.finish(session, active);
     }

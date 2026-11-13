@@ -2147,3 +2147,24 @@ test('model preset 提交被旧宿主规则拒绝后，恢复日志直接完成�
   assert.equal(f.host.store.getController(A)!.generation, original.generation + 1);
   assert.equal(summaries, 1); assert.equal(f.calls.length, turns);
 });
+
+test('中断恢复经真实宿主私聊投递，不新增主控代次，不重放原消息', async t => {
+  const f=fixture(t), manager=f.managers.get(A)!, config=f.configs[0]!, registry=new TaskRegistry(config.dataDir);
+  try {
+  (manager as unknown as {options:SessionManagerOptions}).options.taskRegistry=registry;
+  f.run(async (_botId,turn)=>{
+    if (!turn.event) throw new Error('502 upstream stream interrupted');
+    assert.equal(turn.event.kind,'recovery'); assert(!turn.text.includes('original owner goal'));
+    await turn.onPublicMessage!('recovered final reply');
+  });
+  const source=f.host.store.getController(A)!;
+  await manager.handle({id:'host-recovery-source',userId:config.ownerUserId!,channelId:A+'|owner-dm',text:'original owner goal',imagePaths:[]});
+  await eventual(()=>manager.isIdle(),'failed private turn');
+  const pending=f.sessions.get(A)!.recoveries.active()[0]!; assert(pending);
+  await manager.pollControllerRecovery(pending.dueAt+1); await f.drain();
+  assert.equal(f.host.store.getController(A)!.generation,source.generation);
+  assert.equal(f.host.store.getController(A)!.conversationId,source.conversationId);
+  assert(f.replies.some(reply=>reply.channel===A+'|owner-dm'&&reply.text.includes('recovered final reply')));
+  assert.equal(f.sessions.get(A)!.recoveries.get(pending.id)!.state,'done');
+  } finally { await manager.close(); registry.close(); }
+});

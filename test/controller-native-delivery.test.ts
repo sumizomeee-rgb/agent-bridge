@@ -290,3 +290,10 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控直接获
   assert.ok(!instructions.includes('WRONG_CONVERSATION_DIRECTORY_MEMORY'));
   f.protocol.complete(); await running;
 });
+
+test('Claude 错误数组保留状态码供恢复分类且凭据脱敏', async t => {
+  const f=fixture(t,'claude'), running=f.adapter.run(f.turn); await until(()=>f.protocol.started);
+  f.protocol.emit({type:'result',subtype:'error_during_execution',is_error:true,session_id:'continued-native',errors:['401 unauthorized Bearer private-test-token']});
+  await assert.rejects(running,error=>{assert(error instanceof Error);assert.match(error.message,/401 unauthorized/);assert(!error.message.includes('private-test-token'));return true;});
+  assert.equal(f.sends.length,0);
+});

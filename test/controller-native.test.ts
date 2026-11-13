@@ -1225,3 +1225,13 @@ test('预设主控 Native 层只读取预设配置源，不同步普通 OAuth；
     assert.equal(s.transports.length, 1); assert.equal(s.launches[0]!.env.BRIDGE_PRESET_API_KEY, 'isolated-key');
   } finally { await s.cleanup(); }
 });
+
+test('中断恢复事件必须真正回复用户，不能按普通后台事件静默结束', async () => {
+  const s=setup(); s.setMode('silent');
+  try {
+    const turn={...s.makeTurn(), event:{kind:'recovery' as const,toolName:'bridge_controller_recovery',text:'上轮中断，请继续并完成回复。'}};
+    await assert.rejects(s.adapter.run(turn),/没有通过公开通道回复/);
+    assert.equal(s.transports.length,1); assert.equal(s.published.length,0);
+    s.setMode('public'); await s.adapter.run(turn); assert.equal(s.published.length,1);
+  } finally { await s.cleanup(); }
+});

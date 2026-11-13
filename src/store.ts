@@ -7,6 +7,7 @@ import { validMessageId } from './routing.js';
 import { parseCommand } from './commands.js';
 import { ControllerFeedbackJournal } from './controller-feedback.js';
 import { ControllerLifecycleJournal } from './controller-lifecycle.js';
+import { ControllerRecoveryJournal } from './controller/recovery.js';
 import { ControllerKnowledgeJournal } from './controller-knowledge.js';
 import { DispatchFailureJournal } from './dispatch-failures.js';
 
@@ -65,6 +66,7 @@ export class SessionStore {
   private readonly db: DatabaseSync;
   readonly feedback: ControllerFeedbackJournal;
   readonly controllerLifecycle: ControllerLifecycleJournal;
+  readonly recoveries: ControllerRecoveryJournal;
   readonly knowledge: ControllerKnowledgeJournal;
   readonly dispatchFailures: DispatchFailureJournal;
 
@@ -157,6 +159,7 @@ export class SessionStore {
     if (!publicColumns.has('error')) this.db.exec('ALTER TABLE controller_public_messages ADD COLUMN error TEXT');
     this.feedback = new ControllerFeedbackJournal(this.db);
     this.controllerLifecycle = new ControllerLifecycleJournal(this.db);
+    this.recoveries = new ControllerRecoveryJournal(this.db);
     this.knowledge = new ControllerKnowledgeJournal(this.db);
     this.dispatchFailures = new DispatchFailureJournal(this.db);
   }
