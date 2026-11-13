@@ -2105,3 +2105,45 @@ test('scheduled messages reject stale destinations and retain uncertain transpor
     await assert.rejects(hooks.sendScheduledMessage!(plan),/未知|拒绝/);assert.equal(f.calls.length,turns);
   } finally {await runtime.close();registry.close();}
 });
+test('model preset 命令经真实宿主绑定提交同引擎预设切换，完成回执且可切回普通配置', async t => {
+  const f = fixture(t), manager = f.managers.get(A)!, config = f.configs[0]!;
+  const preset = { id: 'local-preset', profileId: 'route', revision: 1, fingerprint: 'a'.repeat(64), targetId: 'local', agent: 'codex' as const, model: 'model-preset' };
+  const internal = manager as unknown as { options: SessionManagerOptions };
+  internal.options.resolveControllerPreset = async () => preset;
+  internal.options.onPrepareSwitch = async () => ({ contextSeed: '原始目标和必要背景' });
+  internal.options.onRebindSwitch = async () => {};
+  f.run(async (_id, turn) => { if (!turn.preparing) await turn.onPublicMessage?.('fixture reply'); });
+  const original = f.host.store.getController(A)!;
+  await manager.handle({ id: 'host-model-preset', userId: config.ownerUserId!, channelId: A + '|private', text: '/model preset local-preset', imagePaths: [] });
+  const selected = f.host.store.getController(A)!;
+  assert.equal(selected.generation, original.generation + 1); assert.equal(selected.agent, original.agent);
+  assert.equal(selected.preset?.id, preset.id); assert.notEqual(selected.conversationId, original.conversationId);
+  assert.equal(f.sessions.get(A)!.getMessage('host-model-preset')!.state, 'completed');
+  assert(f.replies.some(reply => reply.text.includes('主控已切换到预设')));
+  await manager.handle({ id: 'host-model-default', userId: config.ownerUserId!, channelId: A + '|private', text: '/model default', imagePaths: [] });
+  assert.equal(f.host.store.getController(A)!.generation, selected.generation + 1);
+  assert.equal(f.host.store.getController(A)!.preset, undefined);
+  assert.equal(f.sessions.get(A)!.getMessage('host-model-default')!.state, 'completed');
+});
+
+test('model preset 提交被旧宿主规则拒绝后，恢复日志直接完成绑定而不重做模型准备', async t => {
+  const f = fixture(t), manager = f.managers.get(A)!, config = f.configs[0]!;
+  const preset = { id: 'recover-preset', profileId: 'route', revision: 1, fingerprint: 'b'.repeat(64), targetId: 'local', agent: 'codex' as const, model: 'preset-model' };
+  const internal = manager as unknown as { options: SessionManagerOptions };
+  let summaries = 0;
+  internal.options.resolveControllerPreset = async () => preset;
+  internal.options.onPrepareSwitch = async () => { summaries++; return { contextSeed: '已准备的上下文' }; };
+  internal.options.onRebindSwitch = async () => {};
+  f.run(async (_id, turn) => { if (!turn.preparing) await turn.onPublicMessage?.('fixture reply'); });
+  const original = f.host.store.getController(A)!;
+  const commit = f.host.store.replaceControllerForAgentSwitch.bind(f.host.store);
+  f.host.store.replaceControllerForAgentSwitch = () => { throw new Error('Selecting the current backend must preserve the native session'); };
+  await manager.handle({ id: 'interrupted-preset', userId: config.ownerUserId!, channelId: A + '|private', text: '/model preset recover-preset', imagePaths: [] });
+  assert.equal(f.host.store.getController(A)!.conversationId, original.conversationId);
+  const turns = f.calls.length; assert.equal(summaries, 1);
+  f.host.store.replaceControllerForAgentSwitch = commit;
+  await manager.recover();
+  assert.equal(f.host.store.getController(A)!.preset?.id, preset.id);
+  assert.equal(f.host.store.getController(A)!.generation, original.generation + 1);
+  assert.equal(summaries, 1); assert.equal(f.calls.length, turns);
+});

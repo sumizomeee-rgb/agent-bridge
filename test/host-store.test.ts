@@ -650,3 +650,18 @@ test('a proposed handoff prevents new workers from invalidating a trusted execut
   assert.throws(() => store.markTaskExecutionActive('stop-proof', A), /pending handoff/);
   assert.equal(store.acceptHandoff('stop-proof-handoff', B).ownerBotId, B);
 });
+
+test('同引擎仅在预设线路改变时允许交接，保留队列并支持提交恢复', async t => {
+  const path = await directory(t), store = open(t, path); seed(store); root(store); enqueue(store, 'pending-preset-input');
+  const preset = { id: 'local-gemini', profileId: 'gateway-gemini', revision: 1, fingerprint: 'a'.repeat(64), targetId: 'local', agent: 'codex' as const, model: 'gateway-model' };
+  const target: HostController = { ...controller(A, 2), preset };
+  store.replaceControllerForAgentSwitch(A, P, target, 1, 'ordinary-to-preset');
+  store.replaceControllerForAgentSwitch(A, P, target, 1, 'ordinary-to-preset');
+  assert.equal(store.getController(A)!.preset?.id, preset.id); assert.equal(store.getEvent('pending-preset-input')!.generation, 2);
+  assert.throws(() => store.replaceControllerForAgentSwitch(A, P, { ...controller(A, 3), preset }, 2), /current backend/);
+  const changed = { ...controller(A, 3), preset: { ...preset, id: 'local-other', fingerprint: 'b'.repeat(64) } };
+  store.replaceControllerForAgentSwitch(A, P, changed, 2, 'preset-to-preset');
+  assert.equal(store.getEvent('pending-preset-input')!.generation, 3);
+  store.replaceControllerForAgentSwitch(A, P, controller(A, 4), 3, 'preset-to-ordinary');
+  assert.equal(store.getController(A)!.preset, undefined); assert.equal(store.getEvent('pending-preset-input')!.generation, 4);
+});

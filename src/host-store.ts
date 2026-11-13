@@ -20,6 +20,7 @@ export class HostStateError extends Error {
 export interface HostController {
   conversationId: string; generation: number; agent: AgentName; nativeId: string | null;
   model?: string | null; effort?: string | null;
+  preset?: import('./presets/types.js').PresetBinding;
 }
 export interface HostBot {
   botId: string; platform: BridgePlatform; applicationId: string; ownerPrincipalId: string | null;
@@ -456,7 +457,8 @@ export class HostStore {
       }
       const previous = this.mustBot(botId);
       if (previous.ownerPrincipalId !== principalId || !previous.controller) throw new HostStateError('forbidden', 'Agent switch requires the owned current controller');
-      if (previous.controller.agent === controller.agent) throw new HostStateError('conflict', 'Selecting the current backend must preserve the native session');
+      if (previous.controller.agent === controller.agent && same(previous.controller.preset ?? null, controller.preset ?? null))
+        throw new HostStateError('conflict', 'Selecting the current backend must preserve the native session unless the preset route changes');
       this.assertControllerChange(botId, controller, expectedGeneration);
       this.run('INSERT INTO host_controller_switches(id,bot_id,from_json,to_json) VALUES (?,?,?,?)', operationId, botId,
         JSON.stringify(previous.controller), JSON.stringify(controller));

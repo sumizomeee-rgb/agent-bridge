@@ -79,7 +79,7 @@ export class HostRuntime {
           const c = sessions.getConversation(migrated.activeConversationId);
           if (!c || c.userId !== migrated.ownerUserId) throw new Error('迁移后的当前主控与激活账号不一致。');
           this.store.setController(bot.botId!, migrated.ownerPrincipalId!, { conversationId: c.id, generation: 1, agent: c.agent,
-            nativeId: c.nativeId, model: c.model, effort: c.effort }, 0);
+            nativeId: c.nativeId, model: c.model, effort: c.effort, ...(c.preset ? { preset: c.preset } : {}) }, 0);
         } finally { sessions.close(); }
       }
     }
@@ -144,7 +144,7 @@ export class HostRuntime {
             const target = sessions?.conversationById(id);
             if (!target) throw new Error('目标主控记录不存在。');
             const controller: HostController = { conversationId: id, generation: (current?.generation ?? 0) + 1,
-              agent: target.agent, nativeId: target.nativeId, model: target.model, effort: target.effort };
+              agent: target.agent, nativeId: target.nativeId, model: target.model, effort: target.effort, ...(target.preset ? { preset: target.preset } : {}) };
             const owner = this.store.getBot(botId)!.ownerPrincipalId!;
             if (reason === 'agent-switch') this.store.replaceControllerForAgentSwitch(botId, owner, controller, current?.generation ?? 0);
             else this.store.setController(botId, owner, controller, current?.generation ?? 0, bot.controllerMode !== true);
@@ -623,7 +623,7 @@ export class HostRuntime {
           const target = await bot.manager.prepareReset(bot.config.ownerUserId);
           prepared.push({ bot, target }); this.store.recordBatchCancellation(id, botId, { confirmed: true, detail: '受管旧定时及其执行已确认结束' });
           this.store.prepareBatchController(id, botId, { conversationId: target.id, agent: target.agent, nativeId: target.nativeId,
-            generation: (previous?.generation ?? 0) + 1, model: target.model, effort: target.effort });
+            generation: (previous?.generation ?? 0) + 1, model: target.model, effort: target.effort, ...(target.preset ? { preset: target.preset } : {}) });
         } catch (error) { this.store.recordBatchCancellation(id, botId, { confirmed: false, detail: String(error) }); throw error; }
       }
       this.store.commitBatchReset(id);
