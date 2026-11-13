@@ -58,6 +58,57 @@ test('registration-only crash resumes the durable message and keeps a full long 
   } finally { registry.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('recipient selection follows a dynamic active directory, explicit names and stable IDs without changing ownership', t => {
+  const f = setup(), store = new ExecutorMessages(f.executor, f.userHome);
+  t.after(() => { store.close(); rmSync(f.root, { recursive: true, force: true }); });
+  const directoryId = 'd'.repeat(64);
+  const alpha = { scope: f.binding.scope, botId: 'feishu:dynamic-a', userId: f.binding.userId, principalId: 'same-owner', aliases: ['Alpha'] };
+  const beta = { scope: executorScope('bot-B|owner'), botId: 'discord:dynamic-b', userId: 'bot-B|owner', principalId: 'same-owner', aliases: ['Beta'] };
+  store.registerDirectory(directoryId, [alpha, beta]); store.bind(f.binding);
+  const cross = store.send(f.binding.workerId, '转交另一主控讨论', 'cross', 'beta');
+  assert.equal(cross.recipient!.botId, beta.botId); assert.equal(cross.sender!.workerId, f.binding.workerId);
+  assert.equal(store.binding(f.binding.workerId)!.scope, alpha.scope);
+  assert.equal(store.pending(alpha.scope).length, 0); assert.equal(store.pending(beta.scope).length, 1);
+  assert.throws(() => store.update(alpha.scope, cross.id, 'handled', '来源主控不能截获答复'));
+  store.update(beta.scope, cross.id, 'handled', '目标主控答复');
+  assert.equal(store.get(cross.id)!.reply, '目标主控答复');
+  assert.equal(store.send(f.binding.workerId, '默认仍找原主控', 'default').recipient!.scope, alpha.scope);
+  const bare = store.send(null, '普通CLI自由消息', 'bare', beta.botId);
+  assert.equal(bare.workerId, null); assert.equal(bare.recipient!.scope, beta.scope);
+  assert.throws(() => store.send(null, bare.text, bare.id, alpha.botId));
+  store.registerDirectory(directoryId, [alpha, { ...beta, aliases: ['Renamed'] }]);
+  assert.throws(() => store.send(null, '旧名不再有效', 'old-name', 'Beta'));
+  assert.equal(store.send(null, '改名无需改代码', 'new-name', 'RENAMED').recipient!.scope, beta.scope);
+  store.registerDirectory(directoryId, [alpha]);
+  assert.equal(store.recipients().length, 1); assert.throws(() => store.send(null, '停用后不可新投递', 'inactive', beta.botId));
+  store.registerDirectory(directoryId, [alpha, { ...beta, aliases: ['Alpha'] }]);
+  assert.throws(() => store.send(null, '跨平台同名不猜选', 'ambiguous', 'Alpha'), /不唯一/);
+  assert.equal(store.send(null, '用稳定ID消歧', 'qualified', beta.botId).recipient!.botId, beta.botId);
+  store.registerDirectory(directoryId, [alpha, { ...beta, principalId: 'different-owner' }]);
+  assert.throws(() => store.send(f.binding.workerId, '不能冒用其他负责人', 'other-owner', beta.botId));
+});
+
+test('an active controller with no previous workers receives and answers an ordinary CLI message', async () => {
+  const f = setup(), controller = new ControllerStore(join(f.root, 'bridge')), registry = new TaskRegistry(join(f.root, 'tasks'));
+  const daemon = new RemoteDaemon(f.executor, { version: 1, expectedHostname: hostname(), engines: { codex: { agentCommand: { command: process.execPath, args: [] }, defaultCwd: f.root } } }, { nativeSessionOptions: { userHome: f.userHome } });
+  const sender = new ExecutorMessages(f.executor, f.userHome), userId = 'bot-no-workers|owner';
+  const recipient = { scope: executorScope(userId), botId: 'feishu:newly-activated', userId, principalId: 'owner', aliases: ['Newly Activated'] };
+  const target = { id: 'station', label: '工位', transport: 'ssh' as const, remoteRoot: f.executor, agent: 'codex' as const, agentCommand: { command: process.execPath, args: [] }, cwd: f.root };
+  const messenger = new ExecutorMessenger(controller, registry, () => ({ executorMessages: (method, args) => daemon.handle(method, args) }), (worker, message, owner) => {
+    assert.equal(worker, null); assert.equal(owner, userId);
+    registry.enqueueExecutorMessage({ conversationId: 'new-current-parent', nativeId: 'current-native', userId, channelId: 'dm', originMessageId: 'owner-source', agent: 'codex', cwd: f.root, purpose: 'executor-message', executorMessageId: message.id }, message.id, message.text);
+    return true;
+  }, owner => owner === userId, async () => ({ directoryId: 'f'.repeat(64), userId, recipients: [recipient], targets: [target] }));
+  try {
+    await messenger.poll(); assert.equal(sender.recipients()[0]!.botId, recipient.botId);
+    sender.send(null, '没有被桥派出过，也能点名联系', 'ordinary', 'Newly Activated');
+    await messenger.poll(); assert.equal(sender.get('ordinary')!.state, 'accepted');
+    await messenger.reply(userId, 'ordinary', '已收到普通CLI的讨论');
+    assert.equal(sender.get('ordinary')!.reply, '已收到普通CLI的讨论');
+    await assert.rejects(messenger.reply('different-owner', 'ordinary', '截获'));
+  } finally { messenger.close(); sender.close(); controller.close(); registry.close(); await daemon.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('manager routes an already queued message to the new controller and permits a silent decision', async () => {
   const f = setup(), dataDir = join(f.root, 'bot');
   const registry = new TaskRegistry(join(f.root, 'tasks')), sessions = new SessionStore(dataDir);
@@ -85,6 +136,14 @@ test('manager routes an already queued message to the new controller and permits
     assert.equal(calls[0]!.event?.kind, 'executor-message'); assert.match(calls[0]!.text, /请判断这次对齐/);
     assert.equal(calls[0]!.controllerRecovery, false); assert.equal(publicMessages.length, 0);
     assert.deepEqual(interruptions, []);
+    const context = JSON.parse(readFileSync(calls[0]!.taskContextPath!, 'utf8'));
+    const origin = registry.getContextOrigin(context, { allowClosed: true });
+    assert.equal(sessions.getMessage(origin.originMessageId)!.conversationId, current.id, 'follow-up work must bind to the new controller');
+    assert.equal(sessions.getMessage(origin.originMessageId)!.replyState, 'cancelled', 'internal relay must not create an unanswered platform message');
+    assert(manager.acceptExecutorMessage(null, { id: 'ordinary-cli', workerId: null, text: '用户自己开的CLI也来讨论', recipient: { scope: executorScope(f.binding.userId), userId: f.binding.userId, botId: 'bot-current', principalId: 'owner', aliases: ['Current'] }, state: 'queued', reply: null, createdAt: '' }, f.binding.userId));
+    manager.completionAvailable(); const bare = registry.completionForTask(executorTaskId('ordinary-cli'))!;
+    while (registry.eventState(bare.id) !== 'delivered') { assert(Date.now() < deadline); await new Promise(done => setTimeout(done, 5)); }
+    assert.equal(calls.length, 2); assert.equal(publicMessages.length, 0);
   } finally { await manager.close(); sessions.close(); registry.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -108,6 +167,7 @@ test('real executor RPC, bridge journal restart and /new cancellation retain a m
     return requestRemoteHttp<T>(endpoint.port, endpoint.token, method, args);
   }, async close() {} }) });
   const make = () => new ExecutorMessenger(controller, registry, () => peer, (w, m) => {
+    assert(w);
     wakes++; registry.enqueueExecutorMessage({ ...w.origin, conversationId: activeParent, nativeId: 'current-native', purpose: 'executor-message', executorMessageId: m.id, executorWorkerId: w.id }, m.id, m.text); return true;
   }, userId => userId === f.binding.userId);
   let messenger = make();

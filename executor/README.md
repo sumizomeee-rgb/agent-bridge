@@ -8,8 +8,13 @@
 
 ```powershell
 & ./scripts/message-controller.ps1 list
+& ./scripts/message-controller.ps1 controllers
 $messageId = [guid]::NewGuid().ToString()
 & ./scripts/message-controller.ps1 send --worker '<助手 ID>' --id $messageId --text '把刚刚对齐的结论交给主控，请判断下一步……'
+# 明确点名其他主控：--to 使用 controllers 返回的名称、别名或 botId，不写死具体 Bot。
+& ./scripts/message-controller.ps1 send --worker '<助手 ID>' --to '<主控名称或 botId>' --id ([guid]::NewGuid().ToString()) --text '请这位主控判断……'
+# 用户自己新开的普通 CLI 也可直接指定主控，无须先成为桥助手。
+& ./scripts/message-controller.ps1 send --to '<主控名称或 botId>' --id ([guid]::NewGuid().ToString()) --text '我们刚刚的对齐是……'
 # 长正文也可用 --file '<UTF-8 文本绝对路径>'，与 --text 二选一。
 & ./scripts/message-controller.ps1 get --id $messageId
 ```
@@ -17,3 +22,5 @@ $messageId = [guid]::NewGuid().ToString()
 `queued` 表示已本地落盘、等待桥接收，不代表主控已看见。`accepted` 表示桥已接收、等待主控处理。`handled` 表示已处理，`reply` 是主控给原助手的答复，可能为空；`uncertain` 表示处理结果未知，先核对，不自动重发。桥或网络离线时队列保留。使用原消息 ID 查询或重试，不为同一条消息新建 ID。
 
 消息跟随所属 Bot 的当前主控，跨 `/new`、重启保留。主控可以回复助手、派工或按需通知用户；内部答复不会自动重复发到聊天软件。命令不会抢占或自动续接用户正在操作的 CLI 会话，助手按需执行 `get` 取回答复。
+
+不填 `--to` 时默认找已登记助手的所属主控；明确点名时从当前桥动态同步的已激活主控目录解析，投递给该 Bot 的当前会话，不改变原助手归属。同名主控或跨平台重名须使用目录里的完整 botId，不自动选第一个；目录是最近同步的快照，不保证此刻在线。目标改名、激活或停用后随目录刷新。跨主控仅限同一负责人的登记；普通 CLI 直接点名时仍需使用本机已登记的主控，不自行拼接网络地址。

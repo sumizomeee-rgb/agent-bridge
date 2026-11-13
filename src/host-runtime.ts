@@ -18,6 +18,7 @@ import type { ControllerSchedule } from './controller/runtime-types.js';
 import type { TaskCompletionEvent } from './tasks.js';
 import { historyOptions, type ConversationHistoryOptions } from './group-history.js';
 import { GroupMentionResolutionError, groupMessagePayloadHash } from './group-mentions.js';
+import { executorScope } from './executor-messages.js';
 
 type Context = NonNullable<AgentTurn['groupContext']>;
 const key = (...v: string[]): string => createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -98,6 +99,13 @@ export class HostRuntime {
       authorize: (user, text) => this.authorize(botId, user, text),
       receiveGroup: message => this.receive(botId, message),
       requestRestart: origin => this.requestRestart(origin), isDraining: () => this.draining,
+      executorDirectory: () => ({ id: key('executor-directory', this.config.rootDataDir), recipients: [...this.bots.values()].flatMap(member => {
+        const config = member.config, userId = config.ownerUserId;
+        const owner = this.store.getBot(config.botId!)?.ownerPrincipalId;
+        if (!member.isReady() || !userId || !owner || !member.manager.currentConversation(userId)?.nativeId) return [];
+        return [{ scope: executorScope(userId), botId: config.botId!, userId, principalId: owner,
+          aliases: [...new Set([...(config.aliases ?? []), ...(member.transport.botUser?.username ? [member.transport.botUser.username] : [])])] }];
+      }) }),
       isGroupChannel: channel => {
         if (!channel.startsWith(bot.scopePrefix!)) return false;
         const raw = channel.slice(bot.scopePrefix!.length);

@@ -293,7 +293,7 @@ export class TaskRegistry {
   enqueueExecutorMessage(origin: TaskOrigin, messageId: string, text: string): TaskCompletionEvent {
     const taskId = executorTaskId(messageId);
     const previous = this.completionForTask(taskId); if (previous) return previous;
-    if (origin.purpose !== 'executor-message' || origin.executorMessageId !== messageId || !origin.executorWorkerId) throw new Error('执行器消息来源无效。');
+    if (origin.purpose !== 'executor-message' || origin.executorMessageId !== messageId) throw new Error('执行器消息来源无效。');
     const registered = this.db.prepare('SELECT origin_json FROM tasks WHERE id=?').get(taskId);
     if (registered) {
       const saved = JSON.parse(String(registered.origin_json)) as TaskOrigin;

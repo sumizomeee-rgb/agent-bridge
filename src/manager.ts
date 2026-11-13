@@ -1811,20 +1811,27 @@ export class SessionManager {
     }
     return { state, processed: known?.result.controlledOutput === true || state === 'delivered' && known !== null, ...(safeToRetry ? { safeToRetry: true as const } : {}) };
   }
-  acceptExecutorMessage(worker: import('./controller/runtime-types.js').ControllerWorker, message: import('./executor-messages.js').ExecutorMessage): boolean {
-    const target = this.currentConversation(worker.origin.userId);
-    const source = this.store.getMessage(worker.origin.originMessageId);
-    if (!target?.nativeId || !target.controllerMode || !source || source.userId !== target.userId || worker.id !== message.workerId
-      || !this.options.taskRegistry) return false;
-    const privateSource = this.store.latestMessage(target.id);
-    if (worker.origin.groupContext && !privateSource) return false;
-    const origin: TaskOrigin = { userId: target.userId, channelId: privateSource?.channelId ?? worker.origin.channelId,
-      originMessageId: privateSource?.id ?? worker.origin.originMessageId,
+  acceptExecutorMessage(worker: import('./controller/runtime-types.js').ControllerWorker | null, message: import('./executor-messages.js').ExecutorMessage, userId = worker?.origin.userId): boolean {
+    if (!userId || !this.config.allowedUserIds.includes(userId)) return false;
+    const target = this.currentConversation(userId);
+    if (!target?.nativeId || !target.controllerMode || !this.options.taskRegistry
+      || message.recipient && message.recipient.userId !== userId) return false;
+    const notice = this.store.workspaceNotice(target.id);
+    const source = this.store.latestMessage(target.id) ?? (notice ? this.store.getMessage(notice.sourceMessageId) : null)
+      ?? (worker ? this.store.getMessage(worker.origin.originMessageId) : null);
+    if (!source || source.userId !== userId || worker?.origin.groupContext && source.channelId === worker.origin.channelId) return false;
+    const relayId = `executor-message:${message.id}:${target.id}`;
+    const sender = message.sender;
+    this.store.addMessage({ id: relayId, userId, channelId: source.channelId, text: message.text, imagePaths: [],
+      source: { messageId: relayId, userId, channelId: source.channelId, authorType: 'bot', authorName: sender?.title ?? '用户电脑 CLI' } }, target.id, 'completed');
+    this.store.setReplyState([relayId], 'cancelled'); // Internal relay: no platform reply is owed merely for receipt.
+    const origin: TaskOrigin = { userId: target.userId, channelId: source.channelId,
+      originMessageId: relayId,
       conversationId: target.id, nativeId: target.nativeId, agent: target.agent, cwd: target.cwd,
-      purpose: 'executor-message', executorMessageId: message.id, executorWorkerId: worker.id };
+      purpose: 'executor-message', executorMessageId: message.id, executorWorkerId: message.workerId ?? undefined };
     this.options.taskRegistry.enqueueExecutorMessage(origin, message.id,
-      harnessText('manager.executor_message', { message_id: message.id, worker_id: worker.id, agent: worker.agent,
-        native_id: worker.nativeId ?? '尚未绑定', computer: worker.target?.label ?? '桥电脑', body: message.text }));
+      harnessText('manager.executor_message', { message_id: message.id, worker_id: message.workerId ?? '普通 CLI（未绑定助手）', agent: sender?.agent ?? worker?.agent ?? '未声明',
+        native_id: sender?.nativeId ?? worker?.nativeId ?? '未声明', computer: worker?.target?.label ?? '登记执行器', body: message.text }));
     return true;
   }
   private completionTarget(event: TaskCompletionEvent): Conversation | null {
@@ -1833,7 +1840,7 @@ export class SessionManager {
     if (event.purpose === 'executor-message') {
       return target?.controllerMode && origin?.userId === event.userId && target.userId === event.userId
         && origin.channelId === event.channelId && target.agent === event.agent && target.cwd === event.cwd
-        && event.taskId === executorTaskId(event.executorMessageId ?? '') && !!event.executorWorkerId
+        && event.taskId === executorTaskId(event.executorMessageId ?? '')
         && this.config.allowedUserIds.includes(event.userId) && this.options.authorizeUser?.(event.userId) !== false ? target : null;
     }
     // Even a corrupt completion journal cannot select another person's DM or session.
@@ -1852,6 +1859,13 @@ export class SessionManager {
     if (event.purpose === 'executor-message') {
       const active = this.currentConversation(event.userId);
       if (!active?.nativeId || !active.controllerMode) return;
+      const source = this.store.getMessage(event.originMessageId);
+      if (source?.userId === active.userId) {
+        const relayId = `executor-message:${event.executorMessageId}:${active.id}`;
+        this.store.addMessage({ id: relayId, userId: active.userId, channelId: event.channelId, text: source.text, imagePaths: [],
+          source: { messageId: relayId, userId: active.userId, channelId: event.channelId, authorType: 'bot', authorName: source.source?.authorName ?? '执行器通信' } }, active.id, 'completed');
+        this.store.setReplyState([relayId], 'cancelled'); event = { ...event, originMessageId: relayId };
+      }
       // The Bot owns this message, not a retired controller session. Never adopt the sender's CLI.
       event = { ...event, conversationId: active.id, nativeId: active.nativeId, agent: active.agent, cwd: active.cwd };
     }

@@ -113,7 +113,20 @@ export class ControllerRuntime {
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
     this.store = new ControllerStore(config.dataDir);
     this.messenger = new ExecutorMessenger(this.store, registry, binding => this.callbacks.targetCatalog!.adapterFor(binding) as MessagePeer,
-      (worker, message) => this.callbacks.onExecutorMessage?.(worker, message) ?? false, userId => config.allowedUserIds.includes(userId));
+      (worker, message, userId) => this.callbacks.onExecutorMessage?.(worker, message, userId) ?? false, userId => config.allowedUserIds.includes(userId),
+      async () => {
+        const directory = this.callbacks.executorDirectory?.(), userId = config.ownerUserId;
+        if (!directory || !userId || !this.callbacks.targetCatalog) return null;
+        const catalog = this.callbacks.targetCatalog, workspace = config.contextWorkspace ?? config.workspace;
+        const targets: ExecutionTargetBinding[] = [];
+        for (const target of await catalog.listTargets(workspace)) {
+          try {
+            await catalog.authorizeNativeAccess?.(workspace, userId, target.id);
+            const agent = target.engines[0]; if (agent) targets.push(await catalog.resolveTarget(workspace, target.id, agent));
+          } catch { /* Only targets available to this owner enter their local directory. */ }
+        }
+        return { directoryId: directory.id, recipients: directory.recipients, userId, targets };
+      });
   }
   async pauseConversation(conversationId: string): Promise<void> {
     if (this.closed || this.stopping) throw new Error('主控执行服务已关闭');

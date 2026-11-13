@@ -1,5 +1,5 @@
 import { projectRoot } from '../config.js';
-import { ExecutorMessages, executorMessageRequest, executorScope, executorTaskId, type ExecutorBinding, type ExecutorMessage } from '../executor-messages.js';
+import { ExecutorMessages, executorMessageRequest, executorScope, executorTaskId, type ExecutorBinding, type ExecutorMessage, type ExecutorRecipient } from '../executor-messages.js';
 import type { ControllerWorker } from './runtime-types.js';
 import type { ControllerStore } from './store.js';
 import type { TaskRegistry } from '../tasks.js';
@@ -9,18 +9,23 @@ export interface MessagePeer { executorMessages?(method: string, args: Record<st
 export class ExecutorMessenger {
   private local?: ExecutorMessages;
   private readonly registered = new Map<string, string>();
+  private readonly directories = new Map<string, string>();
   constructor(private readonly store: ControllerStore, private readonly registry: TaskRegistry,
     private readonly peer: (binding: ExecutionTargetBinding) => MessagePeer,
-    private readonly accept: (worker: ControllerWorker, message: ExecutorMessage) => boolean,
-    private readonly allowed: (userId: string) => boolean) {}
-  private async request(worker: ControllerWorker, method: string, args: Record<string, unknown>): Promise<unknown> {
-    if (worker.target?.transport === 'ssh') {
-      const peer = this.peer(worker.target);
+    private readonly accept: (worker: ControllerWorker | null, message: ExecutorMessage, userId: string) => boolean,
+    private readonly allowed: (userId: string) => boolean,
+    private readonly directory?: () => Promise<{ directoryId: string; userId: string; recipients: ExecutorRecipient[]; targets: ExecutionTargetBinding[] } | null>) {}
+  private async requestTarget(binding: ExecutionTargetBinding | undefined, method: string, args: Record<string, unknown>): Promise<unknown> {
+    if (binding?.transport === 'ssh') {
+      const peer = this.peer(binding);
       if (!peer.executorMessages) throw new Error('目标执行器尚未支持通信。');
       return peer.executorMessages(method, args);
     }
     this.local ??= new ExecutorMessages(projectRoot);
     return executorMessageRequest(this.local, method, args);
+  }
+  private async request(worker: ControllerWorker, method: string, args: Record<string, unknown>): Promise<unknown> {
+    return this.requestTarget(worker.target, method, args);
   }
   async bind(workers: ControllerWorker[]): Promise<void> {
     const changed = workers.filter(w => this.allowed(w.origin.userId) && !['workspace-context', 'housekeeper'].includes(w.origin.purpose ?? '')
@@ -34,28 +39,43 @@ export class ExecutorMessenger {
     }
   }
   async poll(): Promise<void> {
-    const groups = new Map<string, ControllerWorker[]>();
+    const groups = new Map<string, { workers: ControllerWorker[]; target?: ExecutionTargetBinding; userId: string; directory?: { directoryId: string; recipients: ExecutorRecipient[] } }>();
+    const groupKey = (target: ExecutionTargetBinding | undefined, userId: string) => JSON.stringify([target?.transport ?? 'local', target?.id ?? 'local', target?.remoteRoot, userId]);
     for (const w of this.store.workers()) {
       if (!this.allowed(w.origin.userId) || ['workspace-context', 'housekeeper'].includes(w.origin.purpose ?? '')) continue;
-      const key = JSON.stringify([w.target?.transport, w.target?.id, w.target?.remoteRoot, w.origin.userId]);
-      const group = groups.get(key) ?? []; group.push(w); groups.set(key, group);
+      const key = groupKey(w.target, w.origin.userId);
+      const group = groups.get(key) ?? { workers: [], target: w.target, userId: w.origin.userId };
+      group.workers.push(w); groups.set(key, group);
     }
-    const results = await Promise.allSettled([...groups.values()].map(async workers => {
+    const directory = await this.directory?.();
+    if (directory && this.allowed(directory.userId)) for (const target of directory.targets) {
+      const key = groupKey(target, directory.userId);
+      const group = groups.get(key) ?? { workers: [], target, userId: directory.userId };
+      group.directory = { directoryId: directory.directoryId, recipients: directory.recipients }; groups.set(key, group);
+    }
+    const results = await Promise.allSettled([...groups.entries()].map(async ([groupId, group]) => {
+      const { workers, target, userId } = group;
+      if (group.directory) {
+        const value = JSON.stringify(group.directory);
+        if (this.directories.get(groupId) !== value) {
+          await this.requestTarget(target, 'messages/directory', group.directory); this.directories.set(groupId, value);
+        }
+      }
       await this.bind(workers);
-      const representative = workers[0]!, scope = executorScope(representative.origin.userId);
-      const messages = await this.request(representative, 'messages/pending', { scope }) as ExecutorMessage[];
+      const scope = executorScope(userId);
+      const messages = await this.requestTarget(target, 'messages/pending', { scope }) as ExecutorMessage[];
       for (const message of messages) {
-        const worker = workers.find(w => w.id === message.workerId);
-        if (!worker) continue;
+        const worker = workers.find(w => w.id === message.workerId) ?? null;
+        if (message.recipient ? message.recipient.scope !== scope : !worker) continue;
         const key = `executor-message:${message.id}`, previous = this.store.readCallReceipt(key);
-        if (!previous) this.store.saveCall(key, 'executor-message', { workerId: worker.id, text: message.text });
-        else if ((previous as {workerId: string; text: string}).workerId !== worker.id || (previous as {text: string}).text !== message.text) throw new Error('消息 ID 冲突。');
+        if (!previous) this.store.saveCall(key, 'executor-message', { workerId: message.workerId, userId, target, text: message.text });
+        else if ((previous as {workerId: string | null; text: string}).workerId !== message.workerId || (previous as {text: string}).text !== message.text) throw new Error('消息 ID 冲突。');
         const event = this.registry.completionForTask(executorTaskId(message.id));
         const state = event ? this.registry.eventState(event.id) : null;
         if (state === 'delivered' || state === 'uncertain') {
-          await this.request(worker, 'messages/update', { scope, id: message.id, state: state === 'delivered' ? 'handled' : 'uncertain' });
-        } else if (event || this.accept(worker, message)) {
-          await this.request(worker, 'messages/update', { scope, id: message.id, state: 'accepted' });
+          await this.requestTarget(target, 'messages/update', { scope, id: message.id, state: state === 'delivered' ? 'handled' : 'uncertain' });
+        } else if (event || this.accept(worker, message, userId)) {
+          await this.requestTarget(target, 'messages/update', { scope, id: message.id, state: 'accepted' });
         }
       }
     }));
@@ -63,10 +83,10 @@ export class ExecutorMessenger {
     if (errors.length) throw new AggregateError(errors.map(value => value.reason), '部分执行器通信暂不可用，消息保持原状态。');
   }
   async reply(userId: string, messageId: string, text: string): Promise<unknown> {
-    const receipt = this.store.readCallReceipt(`executor-message:${messageId}`) as { workerId?: string } | undefined;
+    const receipt = this.store.readCallReceipt(`executor-message:${messageId}`) as { workerId?: string; userId?: string; target?: ExecutionTargetBinding } | undefined;
     const worker = receipt?.workerId ? this.store.getWorker(receipt.workerId) : null;
-    if (!worker || worker.origin.userId !== userId || !this.allowed(userId)) throw new Error('消息不属于本主控。');
-    return this.request(worker, 'messages/update', { scope: executorScope(userId), id: messageId, state: 'handled', reply: text });
+    if (!receipt || (receipt.userId ?? worker?.origin.userId) !== userId || !this.allowed(userId)) throw new Error('消息不属于本主控。');
+    return this.requestTarget(receipt.target ?? worker?.target, 'messages/update', { scope: executorScope(userId), id: messageId, state: 'handled', reply: text });
   }
   close(): void { this.local?.close(); }
 }

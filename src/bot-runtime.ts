@@ -28,6 +28,7 @@ import type { TaskCompletionEvent, TaskContextFile } from './tasks.js';
 import { randomUUID } from 'node:crypto';
 
 export interface BotRuntimeHooks {
+  executorDirectory?: () => { id: string; recipients: import('./executor-messages.js').ExecutorRecipient[] };
   authorize(userId: string, text: string): boolean;
   receiveGroup(message: IncomingDM): Promise<void>;
   manager: Pick<SessionManagerOptions, 'binding' | 'onGroupTurnStart' | 'onSceneCheck' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'> & { binding: NonNullable<SessionManagerOptions['binding']> };
@@ -117,7 +118,8 @@ export class BotRuntime {
       onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
       onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
       onCompletion: event => this.backgroundCompletion(event),
-      onExecutorMessage: (worker, message) => this.manager.acceptExecutorMessage(worker, message),
+      onExecutorMessage: (worker, message, userId) => this.manager.acceptExecutorMessage(worker, message, userId),
+      executorDirectory: hooks.executorDirectory,
       onSupplementFailure: value => this.manager.workerInputFailed(value),
       onPolicyReport: value => this.manager.workerPolicyReport(value),
       onCountChanged: id => this.manager.refreshTaskCounts(id),
