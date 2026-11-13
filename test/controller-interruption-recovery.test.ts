@@ -115,14 +115,14 @@ test('进程崩溃时正在执行的恢复结果未知，不重放；仅pending�
   } finally { db.close(); }
 });
 
-test('助手结果汇报中断也可恢复，但不重新执行已完成的助手任务', async t => {
+for (const failure of ['502 report stream interrupted','主控本轮协调调用过多，已停止继续派发。']) test(`助手结果汇报中断可恢复且不重跑助手：${failure}`, async t => {
   const f=fixture(t);
   f.setRun(async turn=>{await turn.onPublicMessage!('original reply');}); await f.send();
   const source=f.store.getMessage('original')!, parent=f.store.getConversation(source.conversationId!)!;
   const context=f.registry.createContext({conversationId:parent.id,userId:'owner',channelId:'dm',originMessageId:source.id,nativeId:parent.nativeId,agent:parent.agent,cwd:parent.cwd});
   const {taskId}=f.registry.register(JSON.parse((await import('node:fs')).readFileSync(context.contextPath,'utf8')),'finished worker');
   f.registry.acceptObservedResult(taskId,'completed','already completed execution evidence'); f.registry.closeContext(context.contextId);
-  f.setRun(async()=>{throw new Error('502 report stream interrupted');});
+  f.setRun(async()=>{throw new Error(failure);});
   f.manager.completionAvailable(); await until(()=>f.manager.isIdle());
   const row=f.store.recoveries.active()[0]!; assert(row); assert.equal(row.origin.originMessageId,source.id);
   f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.bridgeFeedback?.records.some(r=>r.workerResultKnown===true)); await turn.onPublicMessage!('final answer');});
