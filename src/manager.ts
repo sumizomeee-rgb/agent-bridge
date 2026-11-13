@@ -186,6 +186,15 @@ export class SessionManager {
       this.completionAvailable();
     }
   }
+  private async completeControllerRecovery(event: TaskCompletionEvent): Promise<void> {
+    const recovery = this.store.recoveries.get(event.controllerRecoveryId!);
+    this.store.recoveries.finish(event.controllerRecoveryId!, event.taskId, true, false, Date.now());
+    this.store.setReplyState([event.originMessageId], 'delivered');
+    // The completed reply stays completed even if this extra user-only notice cannot be delivered.
+    await this.sendBridgeNotice(event.channelId, 'controllerRecoverySucceeded', undefined, `recovery-success:${event.controllerRecoveryId}`, undefined,
+      { recoveryAttempts: recovery?.attempts, sourceLabel: recovery?.sourceLabel })
+      .catch(error => this.options.onDiagnostic?.('CONTROLLER_RECOVERY_SUCCESS_NOTICE ' + String(error)));
+  }
   private scheduleControllerRecovery(target: Conversation, source: BridgeMessage, triggerId: string, error: unknown, originalEvent?: TaskCompletionEvent, messages: BridgeMessage[] = [source]): boolean {
     const stored = this.store.getConversation(target.id), input = this.store.getMessage(source.id);
     const scheduled = originalEvent?.purpose === 'schedule' && originalEvent.scheduleKind === 'controller'
@@ -2145,8 +2154,7 @@ export class SessionManager {
       if (result.controlledOutput || observation) {
         registry.markDelivered(event.id);
         if (event.purpose === 'controller-recovery') {
-          this.store.recoveries.finish(event.controllerRecoveryId!, event.taskId, true, false, Date.now());
-          this.store.setReplyState([event.originMessageId], 'delivered');
+          await this.completeControllerRecovery(event);
         }
         return;
       }
@@ -2165,8 +2173,7 @@ export class SessionManager {
       this.store.saveDelivery(event.userId, event.channelId, identity);
       registry.markDelivered(event.id);
       if (event.purpose === 'controller-recovery') {
-        this.store.recoveries.finish(event.controllerRecoveryId!, event.taskId, true, false, Date.now());
-        this.store.setReplyState([event.originMessageId], 'delivered');
+        await this.completeControllerRecovery(event);
       }
     } catch (error) {
       const retained = completedResultFromError(error);

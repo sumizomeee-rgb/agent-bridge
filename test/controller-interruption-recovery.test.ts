@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { bridgeNotice } from '../src/notices.js';
+import { feishuPresentationCards, discordPresentationPages } from '../src/presentation.js';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import { TaskRegistry } from '../src/tasks.js';
@@ -23,7 +25,7 @@ function fixture(t: TestContext) {
   const store = new SessionStore(config.dataDir), registry = new TaskRegistry(config.dataDir), turns: AgentTurn[] = [], sent: string[] = [];
   const conversation = store.createConversation('owner','codex',root,{controllerMode:true});
   store.saveNativeId(conversation.id,'native-main'); store.setActive('owner',conversation.id);
-  let stopped = true, failDelivery = false;
+  let stopped = true, failDelivery = false, failRecoveryNotice = false;
   let run: (turn: AgentTurn) => Promise<void> = async () => { throw new Error('502 upstream stream ended'); };
   const create = () => {
     const adapter: AgentAdapter = {
@@ -31,6 +33,7 @@ function fixture(t: TestContext) {
       async interrupt() {}, async confirmStopped() { return stopped; }, async close() {},
     };
     return new SessionManager(config,{codex:adapter,claude:adapter},{async sendText(_channel,text) {
+      if (failRecoveryNotice && text.includes('本轮已恢复')) throw new Error('notice delivery failed');
       if (failDelivery && text.includes('final answer')) throw new Error('network delivery failure'); sent.push(text);
     }},{taskRegistry:registry,mergeDelayMs:0});
   };
@@ -38,7 +41,7 @@ function fixture(t: TestContext) {
   t.after(async () => { await manager.close(); registry.close(); store.close(); rmSync(root,{recursive:true,force:true}); });
   return { store, registry, turns, sent, config, conversation,
     get manager() { return manager; },
-    setRun(value: typeof run) { run=value; }, setStopped(value:boolean) { stopped=value; }, setFailDelivery(value:boolean) { failDelivery=value; },
+    setRun(value: typeof run) { run=value; }, setStopped(value:boolean) { stopped=value; }, setFailDelivery(value:boolean) { failDelivery=value; }, setFailRecoveryNotice() { failRecoveryNotice=true; },
     async send(id='original',text='original authorized goal') { await manager.handle({id,text,userId:'owner',channelId:'dm',imagePaths:[]}); await until(()=>manager.isIdle()); },
     async restart() { await manager.close(); manager=create(); await manager.recover(); },
     async poll() { const row=store.recoveries.active()[0]; assert(row); await manager.pollControllerRecovery(row.dueAt+1); await until(()=>manager.isIdle()); },
@@ -54,6 +57,8 @@ test('20秒后恢复事件带上本次中断原话，不重新投递用户消息
   assert.equal(f.turns.length,2); assert.equal(f.turns[1]!.conversation.nativeId,'native-main');
   assert.equal(f.store.recoveries.get(original.id)!.state,'done'); assert.equal(f.store.getMessage('original')!.replyState,'delivered');
   assert.equal(f.sent.filter(text=>text.includes('final answer')).length,1);
+  assert.equal(f.sent.filter(text=>text.includes('本轮已恢复')).length,1); assert(f.sent.at(-1)!.includes('第1/5次恢复成功'));
+  assert(f.sent.at(-1)!.includes('来源：用户消息'));
 });
 
 test('确认旧进程退出前不消耗次数，连续失败最多自动恢复五次', async t => {
@@ -179,7 +184,7 @@ for (const succeeds of [true,false]) test(`定时唤醒中断进入同一恢复�
   });
   for(let attempt=1;attempt<=(succeeds?1:5);attempt++){
     await f.poll();
-    assert.equal(f.sent.length,before+1+(succeeds||attempt===5?1:0));
+    assert.equal(f.sent.length,before+1+(succeeds?2:attempt===5?1:0));
   }
   assert.equal(f.store.recoveries.get(pending.id)!.state,succeeds?'done':'exhausted');
   if(!succeeds){assert(f.sent.at(-1)!.includes('第5/5次恢复失败'));assert(f.sent.at(-1)!.includes('来源：定时唤醒'));}
@@ -198,4 +203,20 @@ test('恢复携带中断原始图文，跨重启仍从相同路径传图', async
     await turn.onPublicMessage!('final answer');
   });
   await f.poll(); assert.equal(f.turns.length,2);
+});
+
+test('恢复成功通知使用飞书绿卡和Discord绿色标题', () => {
+  const view=bridgeNotice('controllerRecoverySucceeded',{recoveryAttempts:2,sourceLabel:'定时唤醒'});
+  assert.equal((feishuPresentationCards(view)[0]!.header as {template:string}).template,'green');
+  assert(discordPresentationPages(view)[0]!.includes('\u001b[32m'));
+  assert(view.blocks[0]!.text.includes('第2/5次恢复成功'));
+});
+
+test('额外成功通知发送失败，不把已完成的回复变成失败或再次执行', async t => {
+  const f=fixture(t); await f.send(); const id=f.store.recoveries.active()[0]!.id;
+  f.setFailRecoveryNotice(); f.setRun(async turn=>{await turn.onPublicMessage!('final answer');});
+  await f.poll(); assert.equal(f.store.recoveries.get(id)!.state,'done');
+  assert.equal(f.store.getMessage('original')!.replyState,'delivered');
+  await f.manager.pollControllerRecovery(Date.now()+1e9); assert.equal(f.turns.length,2);
+  assert.equal(f.sent.filter(text=>text.includes('自动恢复未完成')).length,0);
 });
