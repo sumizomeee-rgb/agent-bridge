@@ -52,7 +52,7 @@ test('20秒后恢复事件带上本次中断原话，不重新投递用户消息
   const f=fixture(t); await f.send();
   const original=f.store.recoveries.active()[0]!; assert(original); assert.equal(original.attempts,0);
   await f.manager.pollControllerRecovery(original.dueAt-1); assert.equal(f.turns.length,1);
-  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.text.startsWith(harnessText('manager.controller_recovery'))); assert(turn.text.includes('来源：用户消息')); assert(turn.text.includes('original authorized goal')); await turn.onPublicMessage!('final answer');});
+  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.text.startsWith(harnessText('manager.controller_recovery'))); assert(turn.text.includes('用户：original authorized goal')); assert(turn.text.includes('original authorized goal')); await turn.onPublicMessage!('final answer');});
   await f.poll();
   assert.equal(f.turns.length,2); assert.equal(f.turns[1]!.conversation.nativeId,'native-main');
   assert.equal(f.store.recoveries.get(original.id)!.state,'done'); assert.equal(f.store.getMessage('original')!.replyState,'delivered');
@@ -130,7 +130,7 @@ for (const failure of ['502 report stream interrupted','主控本轮协调调用
   f.setRun(async()=>{throw new Error(failure);});
   f.manager.completionAvailable(); await until(()=>f.manager.isIdle());
   const row=f.store.recoveries.active()[0]!; assert(row); assert.equal(row.origin.originMessageId,source.id);
-  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.text.includes('already completed execution evidence')); assert(turn.text.includes('来源：助手结果汇总')); assert(turn.bridgeFeedback?.records.some(r=>r.workerResultKnown===true)); await turn.onPublicMessage!('final answer');});
+  f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.text.includes('already completed execution evidence')); assert(turn.text.includes('助手：already completed execution evidence')); assert(turn.bridgeFeedback?.records.some(r=>r.workerResultKnown===true)); await turn.onPublicMessage!('final answer');});
   await f.poll(); assert.equal(f.store.recoveries.get(row.id)!.state,'done');
   assert.equal(f.registry.completionForTask(taskId)!.status,'completed');
 });
@@ -219,4 +219,52 @@ test('额外成功通知发送失败，不把已完成的回复变成失败或�
   assert.equal(f.store.getMessage('original')!.replyState,'delivered');
   await f.manager.pollControllerRecovery(Date.now()+1e9); assert.equal(f.turns.length,2);
   assert.equal(f.sent.filter(text=>text.includes('自动恢复未完成')).length,0);
+});
+
+async function workerEvent(f: ReturnType<typeof fixture>, title: string, text: string) {
+  const source=f.store.getMessage('original')!,parent=f.store.getConversation(source.conversationId!)!;
+  const context=f.registry.createContext({conversationId:parent.id,userId:'owner',channelId:'dm',originMessageId:source.id,nativeId:parent.nativeId,agent:parent.agent,cwd:parent.cwd});
+  const {taskId}=f.registry.register(JSON.parse((await import('node:fs')).readFileSync(context.contextPath,'utf8')),title);
+  f.registry.acceptObservedResult(taskId,'completed',text);f.registry.closeContext(context.contextId);
+  f.manager.completionAvailable();await until(()=>f.manager.isIdle());return taskId;
+}
+
+test('用户恢复耗尽后助手结果介入，按时间合并原话与结果，成功后不再注入',async t=>{
+  const f=fixture(t);await f.send('original','直接做方向一');
+  for(let i=0;i<5;i++)await f.poll();
+  const scope={conversationId:f.conversation.id,userId:'owner',channelId:'dm'};
+  assert.equal(f.store.pendingInputs.read(scope).length,1);
+  f.setRun(async turn=>{
+    assert(turn.text.indexOf('用户：直接做方向一')<turn.text.indexOf('助手：成片已经生成'));
+    assert.equal(turn.text.split(harnessText('manager.controller_recovery')).length,2);
+    assert(!turn.text.includes('后台任务的自动结果'));await turn.onPublicMessage!('final answer');
+  });
+  await workerEvent(f,'成片制作','成片已经生成，待验收');
+  assert.equal(f.store.pendingInputs.read(scope).length,0);
+  f.setRun(async turn=>{assert(!turn.text.includes('成片已经生成'));assert(!turn.text.includes('直接做方向一'));await turn.onPublicMessage!('final answer');});
+  await f.send('after','接下来讨论别的');
+});
+
+test('助手汇总恢复耗尽后新用户消息介入，先旧结果再新原话',async t=>{
+  const f=fixture(t);f.setRun(async turn=>{await turn.onPublicMessage!('original reply');});await f.send();
+  f.setRun(async()=>{throw new Error('502 summary failed');});
+  await workerEvent(f,'已完成制作','成片完成，路径 video.mp4');for(let i=0;i<5;i++)await f.poll();
+  await f.restart();
+  f.setRun(async turn=>{
+    assert(turn.text.indexOf('助手：成片完成，路径 video.mp4')<turn.text.indexOf('用户：进展如何，继续做'));
+    assert.equal(turn.text.split('助手：').length,2);await turn.onPublicMessage!('final answer');
+  });await f.send('follow-up','进展如何，继续做');
+  assert.equal(f.store.pendingInputs.read({conversationId:f.conversation.id,userId:'owner',channelId:'dm'}).length,0);
+});
+
+test('三次失败积压只拼一份有序原文，重启保留，明确停止清空',async t=>{
+  const f=fixture(t);await f.send('original','第一条');await f.send('second','第二条');await f.send('third','第三条');await f.restart();
+  const scope={conversationId:f.conversation.id,userId:'owner',channelId:'dm'};assert.equal(f.store.pendingInputs.read(scope).length,3);
+  f.setRun(async turn=>{
+    const labels=['用户：第一条','用户：第二条','用户：第三条','用户：第四条'];
+    for(let i=0;i<labels.length;i++){assert.equal(turn.text.split(labels[i]!).length,2);if(i)assert(turn.text.indexOf(labels[i-1]!)<turn.text.indexOf(labels[i]!));}
+    assert.equal(turn.text.split(harnessText('manager.controller_recovery')).length,2);await turn.onPublicMessage!('final answer');
+  });await f.send('fourth','第四条');assert.equal(f.store.pendingInputs.read(scope).length,0);
+  f.setRun(async()=>{throw new Error('502 upstream');});await f.send('stop-case','不要复活的旧事');
+  await f.send('stop-command','/stop');assert.equal(f.store.pendingInputs.read(scope).length,0);
 });

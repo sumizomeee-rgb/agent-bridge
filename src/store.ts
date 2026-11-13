@@ -7,6 +7,7 @@ import { validMessageId } from './routing.js';
 import { parseCommand } from './commands.js';
 import { ControllerFeedbackJournal } from './controller-feedback.js';
 import { ControllerLifecycleJournal } from './controller-lifecycle.js';
+import { PendingControllerInputs } from './controller/pending-inputs.js';
 import { ControllerRecoveryJournal } from './controller/recovery.js';
 import { ControllerKnowledgeJournal } from './controller-knowledge.js';
 import { DispatchFailureJournal } from './dispatch-failures.js';
@@ -67,6 +68,7 @@ export class SessionStore {
   readonly feedback: ControllerFeedbackJournal;
   readonly controllerLifecycle: ControllerLifecycleJournal;
   readonly recoveries: ControllerRecoveryJournal;
+  readonly pendingInputs: PendingControllerInputs;
   readonly knowledge: ControllerKnowledgeJournal;
   readonly dispatchFailures: DispatchFailureJournal;
 
@@ -160,6 +162,7 @@ export class SessionStore {
     this.feedback = new ControllerFeedbackJournal(this.db);
     this.controllerLifecycle = new ControllerLifecycleJournal(this.db);
     this.recoveries = new ControllerRecoveryJournal(this.db);
+    this.pendingInputs = new PendingControllerInputs(this.db);
     this.knowledge = new ControllerKnowledgeJournal(this.db);
     this.dispatchFailures = new DispatchFailureJournal(this.db);
   }
@@ -539,6 +542,9 @@ export class SessionStore {
     for (const id of ids) update.run(state, new Date().toISOString(), id);
   }
 
+  messageCreatedAt(id: string): string {
+    return String(this.db.prepare('SELECT created_at FROM inbox WHERE id=?').get(id)?.created_at ?? new Date().toISOString());
+  }
   getMessage(id: string): InboxItem | null {
     const row = this.db.prepare('SELECT * FROM inbox WHERE id = ?').get(id);
     return row ? inbox(row) : null;

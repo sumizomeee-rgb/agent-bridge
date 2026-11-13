@@ -330,6 +330,10 @@ export class TaskRegistry {
       ??this.db.prepare("SELECT o.*,t.title,t.wake_allowed,'worker-progress' kind FROM task_observations o JOIN tasks t ON t.id=o.task_id WHERE o.id=?").get(id);
     return row?this.event(row):null;
   }
+  completionContent(id: string): { text: string; createdAt: string } | null {
+    const row=this.db.prepare('SELECT text,created_at FROM task_events WHERE id=?').get(id);
+    return row ? {text:String(row.text),createdAt:String(row.created_at)} : null;
+  }
   private finish(taskId: string, status: TaskTerminalStatus, text: string, displayText = text): boolean {
     this.db.exec('BEGIN IMMEDIATE');
     try {

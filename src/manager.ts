@@ -30,6 +30,7 @@ import { harnessText } from './harness.js';
 import type { AgentAdapter, AgentModelInfo, AgentName, AgentTurn, EffortMetadata, BridgeConfig, BridgeMessage, Conversation, ReplySink, ReplyOptions } from './types.js';
 
 import { SessionHandoffs } from './controller/handoff.js';
+import { pendingInputMessages, type PendingControllerInput } from './controller/pending-inputs.js';
 import { recoveryDelayMs, retryableControllerFailure, type ControllerRecovery } from './controller/recovery.js';
 import { shouldShowMessageReceipts } from './receipt-policy.js';
 import type { RestartOrigin, RestartReceipt } from './restart.js';
@@ -180,11 +181,28 @@ export class SessionManager {
       }
       if (!this.store.recoveries.valid(item.id, item.taskId!)) continue;
       const originalEvent = registry.completionById(item.triggerId), originalMessage = this.store.getMessage(item.origin.originMessageId);
-      const originalInput = item.input ?? (originalEvent ? [{ type: 'text' as const, text: originalEvent.text }] : originalMessage ? this.input([originalMessage]) : []);
-      const recoveryText = `${harnessText('manager.controller_recovery')}\n来源：${item.sourceLabel ?? (originalEvent ? '后台事件' : '用户消息')}\n内容：\n${originalInput.filter(part => part.type === 'text').map(part => part.text).join('\n\n')}`;
+      const scope=this.pendingInputScope(target,item.origin);
+      this.store.pendingInputs.remember(scope, originalEvent ? [this.eventInput(originalEvent)] : originalMessage ? this.userInputs([originalMessage]) : []);
+      const recoveryText = pendingInputMessages(this.store.pendingInputs.read(scope)).filter(part=>part.type==='text').map(part=>part.text).join('\n\n');
       registry.enqueueControllerRecovery({ ...item.origin, purpose: 'controller-recovery', controllerRecoveryId: item.id }, item.taskId!, recoveryText);
       this.completionAvailable();
     }
+  }
+  private pendingInputScope(target: Conversation, route: {userId:string;channelId:string}) {
+    return {conversationId:target.id,userId:route.userId,channelId:route.channelId};
+  }
+  private userInputs(messages: InboxItem[]): PendingControllerInput[] {
+    return messages.map(message=>({id:message.id,speaker:'用户',occurredAt:this.store.messageCreatedAt(message.id),input:this.input([message])}));
+  }
+  private eventInput(event: TaskCompletionEvent): PendingControllerInput {
+    const content=this.options.taskRegistry?.completionContent(event.id);
+    return {id:event.id,speaker:event.scheduleKind==='controller'?'定时':'助手',occurredAt:content?.createdAt ?? new Date().toISOString(),
+      input:[{type:'text',text:content?.text ?? event.text}]};
+  }
+  private acknowledgePendingInputs(target: Conversation, route: {userId:string;channelId:string}, ids: string[]): void {
+    this.store.pendingInputs.acknowledge(this.pendingInputScope(target,route),ids);
+    this.store.recoveries.completeInputs(target.id,ids);
+    this.store.setReplyState(ids,'delivered');
   }
   private async completeControllerRecovery(event: TaskCompletionEvent): Promise<void> {
     const recovery = this.store.recoveries.get(event.controllerRecoveryId!);
@@ -805,6 +823,7 @@ export class SessionManager {
 
   private cancel(conversation: Conversation, detach = true): number {
     this.store.dispatchFailures.deactivate(conversation.id);
+    this.store.pendingInputs.clear(conversation.id);
     this.store.recoveries.cancelConversation(conversation.id);
     for (const item of this.switches.values()) if (item.journal.source.id === conversation.id && item.journal.phase !== 'committing') item.controller.abort();
     this.noticeSends.get(conversation.id)?.controller.abort();
@@ -1659,6 +1678,7 @@ export class SessionManager {
       let privateReplyDelivered = false;
       let privateFinalStarted = false;
       const privateControllerInput = this.config.controllerMode === true && !groupContext;
+      let pendingInputIds: string[] = [];
       try {
         if (privateControllerInput) this.store.startPrivateBatch(item.id);
         if (groupContext && this.options.onGroupTurnStart) groupContext = { ...groupContext, scene: await this.options.onGroupTurnStart(groupContext) };
@@ -1677,6 +1697,9 @@ export class SessionManager {
           groupOutcome='silent';this.store.setState(item.id,'cancelled','失败记录已处理或复核来源失效');
           await this.options.onGroupSilent?.(groupContext!);continue;
         }
+        const pendingInputs=privateControllerInput?this.store.pendingInputs.read(this.pendingInputScope(target,item)):[];
+        pendingInputIds=pendingInputs.map(message=>message.id);
+        const continuedInput=pendingInputs.length?pendingInputMessages([...pendingInputs,...this.userInputs(batch)]):null;
         const dispatchReviewText=dispatchReview?harnessText('manager.dispatch_failure_review',{failure_list:JSON.stringify(this.store.dispatchFailures.pendingReview(dispatchReview).map(r=>({id:r.id,tool:r.tool,title:r.title,reason:r.reason})))}):undefined;
         if(dispatchReview)this.store.dispatchFailures.reminded(dispatchReview,Date.now());
         const result = await this.adapters[target.agent].run({
@@ -1705,9 +1728,9 @@ export class SessionManager {
           } } : {}),
           ...(groupContext ? { groupContext, onSilent: async () => { if (!current()) throw new Error('群轮次已经停止'); await this.options.onGroupSilent?.(groupContext!); silent = true; } } : {}),
           ...(groupContext?.eventKind ? { event: { kind: groupContext.eventKind, text: dispatchReviewText??item.text } } : {}),
-          conversation: target, source: this.turnSource(item), text: dispatchReviewText??`${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
-          imagePaths: batch.flatMap(value => value.imagePaths), input: [
-            ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...(dispatchReviewText?[{type:'text' as const,text:dispatchReviewText}]:this.input(batch)),
+          conversation: target, source: this.turnSource(item), text: continuedInput ? continuedInput.filter(part=>part.type==='text').map(part=>part.text).join('\n\n') : dispatchReviewText??`${!target.nativeId && target.contextSeed ? target.contextSeed + '\n\n当前用户消息：\n' : ''}${batch.map(value => value.text).filter(Boolean).join('\n\n')}`,
+          imagePaths: continuedInput ? continuedInput.filter(part=>part.type==='localImage').map(part=>part.path) : batch.flatMap(value => value.imagePaths), input: [
+            ...(!target.nativeId && target.contextSeed ? [{ type: 'text' as const, text: target.contextSeed + '\n\n当前用户消息：' }] : []), ...(continuedInput ?? (dispatchReviewText?[{type:'text' as const,text:dispatchReviewText}]:this.input(batch))),
           ],
           onReady: () => { turn.ready = true; this.pumpSupplements(target, turn); },
           signal: controller.signal,
@@ -1821,7 +1844,10 @@ export class SessionManager {
             : lifecycle?.submission === 'unknown' ? 'controllerSubmissionUnknown'
             : lifecycle?.submission === 'accepted' ? 'controllerExecutionInterrupted' : 'controllerFailed';
           if (target.controllerMode) {
-            const scheduled = !handled && !retained && !turn.publicationUncertain && this.scheduleControllerRecovery(target, item, item.id, error, undefined, turn.messageIds.map(id => this.store.getMessage(id)).filter((message): message is InboxItem => message !== null));
+            if(privateControllerInput && !privateReplyDelivered && !retained && !turn.publicationUncertain && retryableControllerFailure(error))
+              this.store.pendingInputs.remember(this.pendingInputScope(target,item),this.userInputs(turn.messageIds.map(id=>this.store.getMessage(id)).filter((message):message is InboxItem=>message!==null)));
+            if(privateReplyDelivered || turn.publicationUncertain || retained || isObject(error) && error.processStillRunning===true)this.store.pendingInputs.hold(this.pendingInputScope(target,item),pendingInputIds);
+            const scheduled = !handled && !privateReplyDelivered && !retained && !turn.publicationUncertain && this.scheduleControllerRecovery(target, item, item.id, error, undefined, turn.messageIds.map(id => this.store.getMessage(id)).filter((message): message is InboxItem => message !== null));
             const feedback = this.failureFeedback(target, item, scheduled ? 'controllerRecoveryScheduled' : noticeCode, error, { sourceLabel: '用户消息' }, !handled);
             if (!handled) await this.sendFeedbackNotice(feedback);
           } else if (!handled) await this.sendBridgeNotice(item.channelId, noticeCode, undefined, `error:${target.id}:${item.id}`).catch(() => undefined);
@@ -1835,6 +1861,7 @@ export class SessionManager {
           }
         }
         if (contextId) this.options.taskRegistry?.closeContext(contextId);
+        if(privateControllerInput && groupOutcome==='completed')this.acknowledgePendingInputs(target,item,pendingInputIds);
         if (groupContext) await this.options.onGroupTurnFinished?.(groupContext, groupOutcome).catch(() => undefined);
         if (this.running.get(item.userId) === turn) this.running.delete(item.userId);
         this.refreshTaskCounts(conversationId);
@@ -2074,6 +2101,7 @@ export class SessionManager {
     let recoveryReplyDelivered = false;
     let replyPreparationStarted = false;
     let deliveryStarted = false;
+    let pendingInputIds: string[] = [];
     try {
       const source = workspaceContext ? this.store.latestMessage(target.id) : null;
       const hasHumanSource = !introductionRequested && source?.conversationId === target.id && source.userId === event.userId
@@ -2087,7 +2115,13 @@ export class SessionManager {
         ? `${harnessText('manager.legacy_summary')}${target.contextSeed}\n\n${event.text}` : event.text;
       const feedback = this.feedbackInput(target, event, current);
       if(event.purpose==='dispatch-failure')this.store.dispatchFailures.reminded(event.taskId,Date.now());
-      const recoveryImages = event.purpose === 'controller-recovery' ? this.store.recoveries.get(event.controllerRecoveryId!)?.input?.filter(part => part.type === 'localImage') ?? [] : [];
+      const continuationAllowed = !event.groupContext && !observation && !workspaceContext && target.controllerMode
+        && (event.purpose===undefined || event.purpose==='schedule' && event.scheduleKind==='controller' || event.purpose==='controller-recovery');
+      const pendingInputs=continuationAllowed?this.store.pendingInputs.read(this.pendingInputScope(target,event)):[];
+      pendingInputIds=pendingInputs.map(message=>message.id);
+      const continuedInput=pendingInputs.length?pendingInputMessages([...pendingInputs,...(event.purpose==='controller-recovery'?[]:[this.eventInput(event)])]):null;
+      if(continuedInput)eventText=continuedInput.filter(part=>part.type==='text').map(part=>part.text).join('\n\n');
+      const recoveryImages=continuedInput?.filter(part=>part.type==='localImage') ?? [];
       const result = await this.adapters[target.agent].run({
         ...(this.config.controllerMode ? { taskChecklist: this.store.knowledge.summary(this.knowledgeScope(event.userId, event.channelId)) } : {}),
         bridgeFeedback: feedback.bridgeFeedback, onReadBridgeFeedback: feedback.onReadBridgeFeedback,
@@ -2097,7 +2131,7 @@ export class SessionManager {
         onControllerState: state => this.store.controllerLifecycle.record(event.id, target.id, state),
         conversation: target, source: { messageId: event.id, userId: event.userId, channelId: event.channelId, ...(source?.source ? { original: source.source } : {}) }, text: eventText,
         imagePaths: recoveryImages.map(part => part.path),
-        input: [{ type: 'text', text: eventText }, ...recoveryImages],
+        input: continuedInput ?? [{ type: 'text', text: eventText }, ...recoveryImages],
         taskContextPath: context?.contextPath, signal: controller.signal, onProgress: () => {},
         event: { kind: event.purpose === 'controller-recovery' ? 'recovery' : event.purpose === 'executor-message' ? 'executor-message' : observation ? 'worker-progress' : workspaceContext ? 'workspace-context' : event.scheduleKind === 'controller' ? 'wake' : 'worker-result',
           toolName: event.purpose === 'controller-recovery' ? 'bridge_controller_recovery' : event.purpose === 'executor-message' ? 'bridge_executor_message' : observation ? 'bridge_worker_progress' : workspaceContext ? 'bridge_workspace_context' : event.scheduleKind === 'controller' ? 'bridge_schedule_controller' : 'bridge_worker_result', text: eventText, introductionRequested },
@@ -2153,6 +2187,7 @@ export class SessionManager {
       }
       if (result.controlledOutput || observation) {
         registry.markDelivered(event.id);
+        this.acknowledgePendingInputs(target,event,pendingInputIds);
         if (event.purpose === 'controller-recovery') {
           await this.completeControllerRecovery(event);
         }
@@ -2172,6 +2207,7 @@ export class SessionManager {
       if (!current()) throw new Error('汇总投递期间父会话已停止或切换');
       this.store.saveDelivery(event.userId, event.channelId, identity);
       registry.markDelivered(event.id);
+      this.acknowledgePendingInputs(target,event,pendingInputIds);
       if (event.purpose === 'controller-recovery') {
         await this.completeControllerRecovery(event);
       }
@@ -2196,6 +2232,9 @@ export class SessionManager {
       }
       const scheduledWake = event.purpose === 'schedule' && event.scheduleKind === 'controller';
       const originalInput = (event.purpose === undefined || scheduledWake) && !event.groupContext ? this.store.getMessage(event.originMessageId) : null;
+      if(originalInput && !controller.signal.aborted && !this.closed && !retained && !publicationFailed && !deliveryStarted && retryableControllerFailure(error))
+        this.store.pendingInputs.remember(this.pendingInputScope(target,event),[this.eventInput(event)]);
+      if(publicationFailed || deliveryStarted || retained || isObject(error) && error.processStillRunning===true)this.store.pendingInputs.hold(this.pendingInputScope(target,event),pendingInputIds);
       const scheduledRecovery = !controller.signal.aborted && !this.closed && !retained && !publicationFailed && !deliveryStarted && originalInput
         ? this.scheduleControllerRecovery(target, originalInput, event.id, error, event) : false;
       const recoveryExhausted = event.purpose === 'controller-recovery' && this.store.recoveries.get(event.controllerRecoveryId!)?.state === 'exhausted';

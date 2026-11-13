@@ -59,6 +59,9 @@ export class ControllerRecoveryJournal {
   completeSource(conversationId: string, sourceId: string): void {
     for (const value of this.active()) if (value.origin.conversationId === conversationId && value.origin.originMessageId === sourceId) { value.state = 'done'; this.save(value); }
   }
+  completeInputs(conversationId: string, ids: string[]): void {
+    for(const value of this.active()) if(value.origin.conversationId===conversationId && ids.includes(value.triggerId)) { value.state='done'; this.save(value); }
+  }
   cancelConversation(conversationId: string): void {
     for (const value of this.active()) if (value.origin.conversationId === conversationId) { value.state = 'cancelled'; this.save(value); }
   }
