@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { TaskOrigin } from '../tasks.js';
 
-export const recoveryDelayMs = 30_000;
-export const recoveryLimit = 2;
+export const recoveryDelayMs = 20_000;
+export const recoveryLimit = 5;
+export function recoveryBackoffMs(attempts: number): number { return Math.round(recoveryDelayMs * 1.5 ** attempts); }
 export interface ControllerRecovery {
   id: string; origin: TaskOrigin; triggerId: string; attempts: number; dueAt: number;
   state: 'pending' | 'queued' | 'running' | 'done' | 'cancelled' | 'exhausted';
@@ -52,7 +53,7 @@ export class ControllerRecoveryJournal {
   finish(id: string, taskId: string, success: boolean, retryable: boolean, now: number): void {
     const value = this.valid(id, taskId); if (!value) return;
     value.state = success ? 'done' : retryable && value.attempts < recoveryLimit ? 'pending' : 'exhausted';
-    value.dueAt = now + recoveryDelayMs; this.save(value);
+    value.dueAt = now + recoveryBackoffMs(value.attempts); this.save(value);
   }
   completeSource(conversationId: string, sourceId: string): void {
     for (const value of this.active()) if (value.origin.conversationId === conversationId && value.origin.originMessageId === sourceId) { value.state = 'done'; this.save(value); }
@@ -71,6 +72,6 @@ export function retryableControllerFailure(error: unknown): boolean {
   const flags = error as Error & { deliveryUncertain?: boolean; publicationFailed?: boolean; processStillRunning?: boolean };
   if (error.name === 'AbortError' || flags.deliveryUncertain || flags.publicationFailed || flags.processStillRunning) return false;
   const message = error.message;
-  if (/\b(400|401|403|404)\b|鉴权|凭据|权限|credential|unauthorized|invalid.{0,20}(model|schema|argument)/i.test(message)) return false;
+  if (/\b(400|401|403|404|413)\b|鉴权|凭据|权限|credential|unauthorized|invalid.{0,20}(model|schema|argument)/i.test(message)) return false;
   return /error_during_execution|last_content_type=none|\b(408|429|500|502|503|504)\b|ECONN|ETIMEDOUT|fetch failed|network|socket|timeout|超时|empty.{0,20}(response|content)|没有通过公开通道回复|尚未完成.*回复/i.test(message);
 }

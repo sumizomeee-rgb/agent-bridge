@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { SessionManager } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import { TaskRegistry } from '../src/tasks.js';
-import { ControllerRecoveryJournal, retryableControllerFailure } from '../src/controller/recovery.js';
+import { ControllerRecoveryJournal, retryableControllerFailure, recoveryBackoffMs } from '../src/controller/recovery.js';
 import { harnessText } from '../src/harness.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig } from '../src/types.js';
 
@@ -45,7 +45,7 @@ function fixture(t: TestContext) {
   };
 }
 
-test('30秒后发送短恢复事件而非重放用户内容，真实回复后原消息标记已答', async t => {
+test('20秒后发送短恢复事件而非重放用户内容，真实回复后原消息标记已答', async t => {
   const f=fixture(t); await f.send();
   const original=f.store.recoveries.active()[0]!; assert(original); assert.equal(original.attempts,0);
   await f.manager.pollControllerRecovery(original.dueAt-1); assert.equal(f.turns.length,1);
@@ -56,12 +56,13 @@ test('30秒后发送短恢复事件而非重放用户内容，真实回复后原
   assert.equal(f.sent.filter(text=>text.includes('final answer')).length,1);
 });
 
-test('确认旧进程退出前不消耗次数，连续失败最多自动恢复两次', async t => {
+test('确认旧进程退出前不消耗次数，连续失败最多自动恢复五次', async t => {
   const f=fixture(t); await f.send(); const id=f.store.recoveries.active()[0]!.id;
   f.setStopped(false); await f.poll(); assert.equal(f.turns.length,1); assert.equal(f.store.recoveries.get(id)!.attempts,0);
-  f.setStopped(true); await f.poll(); assert.equal(f.turns.length,2); assert.equal(f.store.recoveries.get(id)!.attempts,1);
-  await f.poll(); assert.equal(f.turns.length,3); assert.equal(f.store.recoveries.get(id)!.state,'exhausted');
-  await f.manager.pollControllerRecovery(Date.now()+1e9); assert.equal(f.turns.length,3);
+  f.setStopped(true);
+  for (let attempt=1; attempt<=5; attempt++) { await f.poll(); assert.equal(f.turns.length,attempt+1); assert.equal(f.store.recoveries.get(id)!.attempts,attempt); }
+  assert.equal(f.store.recoveries.get(id)!.state,'exhausted');
+  await f.manager.pollControllerRecovery(Date.now()+1e9); assert.equal(f.turns.length,6);
   assert.equal(f.sent.filter(text=>text.includes('自动恢复已停止')).length,1);
 });
 
@@ -109,7 +110,7 @@ test('进程崩溃时正在执行的恢复结果未知，不重放；仅pending�
     const row=journal.schedule(origin,'failure',0), queued=journal.queue(row.id,30000)!;
     journal.start(row.id,queued.taskId!); journal.recover(40000);
     assert.equal(journal.get(row.id)!.state,'exhausted');
-    for(const message of ['401 unauthorized','403 forbidden','invalid model','credential missing']) assert.equal(retryableControllerFailure(new Error(message)),false);
+    for(const message of ['401 unauthorized','403 forbidden','413 Payload Too Large','invalid model','credential missing']) assert.equal(retryableControllerFailure(new Error(message)),false);
     for(const message of ['502 upstream','Claude 主控失败：error_during_execution','ETIMEDOUT']) assert.equal(retryableControllerFailure(new Error(message)),true);
   } finally { db.close(); }
 });
@@ -127,4 +128,34 @@ test('助手结果汇报中断也可恢复，但不重新执行已完成的助�
   f.setRun(async turn=>{assert.equal(turn.event?.kind,'recovery'); assert(turn.bridgeFeedback?.records.some(r=>r.workerResultKnown===true)); await turn.onPublicMessage!('final answer');});
   await f.poll(); assert.equal(f.store.recoveries.get(row.id)!.state,'done');
   assert.equal(f.registry.completionForTask(taskId)!.status,'completed');
+});
+
+test('五次冷却严格从20秒起按1.5倍递增，未到期不启动', () => {
+  const db=new DatabaseSync(':memory:'), journal=new ControllerRecoveryJournal(db);
+  try {
+    assert.deepEqual([0,1,2,3,4].map(recoveryBackoffMs),[20000,30000,45000,67500,101250]);
+    const origin={conversationId:'main',userId:'owner',channelId:'dm',originMessageId:'original',nativeId:'native',agent:'codex' as const,cwd:process.cwd()};
+    const first=journal.schedule(origin,'backoff-failure',0); assert.equal(first.dueAt,20000);
+    for(let attempt=1;attempt<=5;attempt++){
+      const pending=journal.get(first.id)!;
+      assert.equal(journal.queue(first.id,pending.dueAt-1),null);
+      const queued=journal.queue(first.id,pending.dueAt)!; assert.equal(queued.attempts,attempt);
+      journal.start(first.id,queued.taskId!); journal.finish(first.id,queued.taskId!,false,true,pending.dueAt+100);
+      const next=journal.get(first.id)!;
+      assert.equal(next.state,attempt<5?'pending':'exhausted');
+      if(attempt<5)assert.equal(next.dueAt,pending.dueAt+100+recoveryBackoffMs(attempt));
+    }
+  } finally { db.close(); }
+});
+
+test('助手的413失败结果只作为汇报证据，不触发主控自动恢复', async t => {
+  const f=fixture(t); f.setRun(async turn=>{await turn.onPublicMessage!('final answer');}); await f.send();
+  const source=f.store.getMessage('original')!, parent=f.store.getConversation(source.conversationId!)!;
+  const context=f.registry.createContext({conversationId:parent.id,userId:'owner',channelId:'dm',originMessageId:source.id,nativeId:parent.nativeId,agent:parent.agent,cwd:parent.cwd});
+  const {taskId}=f.registry.register(JSON.parse((await import('node:fs')).readFileSync(context.contextPath,'utf8')),'worker image check');
+  f.registry.acceptObservedResult(taskId,'failed','413 Payload Too Large while imageView'); f.registry.closeContext(context.contextId);
+  f.manager.completionAvailable(); await until(()=>f.manager.isIdle());
+  assert.equal(f.turns.length,2); assert.equal(f.turns[1]!.event?.kind,'worker-result');
+  assert.equal(f.store.recoveries.active().length,0);
+  await f.manager.pollControllerRecovery(Date.now()+1e9); assert.equal(f.turns.length,2);
 });
