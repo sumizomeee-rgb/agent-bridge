@@ -1,6 +1,6 @@
 # 主控上下文与按需工具
 
-固定初始化从专用工作区的 `README.md` 开始。程序只展开其中登记的引用，不在末尾另加另一份桥协议、Agent 规则或 MEMORY。工程工作目录仍由 `workingCwd`、`/cwd` 决定，与上下文入口分开。
+原生主控的固定初始化从专用工作区的 `README.md` 开始。程序只展开其中登记的引用，不在末尾另加另一份桥协议、Agent 规则或 MEMORY。工程工作目录仍由 `workingCwd`、`/cwd` 决定，与上下文入口分开。
 
 1. README 保存通用行为规则和引用导航。
 2. `workspace/MEMORY.md` 载入用户原文，不由初始化助手摘要替代。
@@ -8,6 +8,14 @@
 4. 每轮附带消息来源、受众、投递位置、时间、模型、事件与有界状态；任务清单、反馈和群现场沿原有触发条件提供。
 
 README 与骨架保留 `{{bridge_root}}`、`{{workspace_root}}` 和 `{{include:...}}`，实际路径在初始化时解析。同版本模板在不同电脑保持相同；不解释 MEMORY 中的模板样式文本，不支持任意路径或递归引用。必要引用缺失、重复、未知引用、文件编码或大小异常会标记不完整，不能靠隐式拼接掩盖。
+
+## 外部主控与共享查询
+
+外部客户端维护自己的行为 README。桥只提供 `controller.external_protocol` 技术协议、同一份短工具目录和本轮运行事实；`fixedContext.kind` 为 `client-protocol`，不读取共享工作区 README、MEMORY。固定技术文案集中登记在 `harness/prompts.toml`，由 `controller/documents.ts` 统一装配。
+
+聊天查询由 `ControllerHistoryService` 统一处理目标解析、负责人授权和查询路由，最终复用已有聊天日志查询。原生与 external 入口使用相同的 `bridge_list_controllers`、`bridge_search_chat_history`、`bridge_read_chat_history`，没有外部客户端专用查询实现。原生调用保留平台范围；无渠道主控可查询同一负责人已授权主控的私聊记录，省略目标仍表示自己的记录。
+
+2026-11-15 实机验收（代码 `5edb6ca`）：44 项相关测试通过，部署后外部固定文案 1797 字符、files 为空；此前为 8402 字符及两个工作区文件。Dot 实际派出笔记本 Luna（`6b7f32a8-6e71-41c5-a5a0-8528c96bba22`）与工位 Haiku（`482e11dc-7589-4e1d-bfbb-d1fec19f0e71`），两者均完成只读电脑状态采样；外部调用 Teto 聊天搜索与单条展开成功。CPU 采样缺项由主控继续安排同一助手补充，不将失败的零值视为有效证据。这验证本轮工具链，不代表云端客户端具备持续自动唤醒保证。
 
 ## 工具调用
 
