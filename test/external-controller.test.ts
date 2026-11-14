@@ -27,6 +27,10 @@ function decision(adapter:ExternalControllerAdapter,lease:string):string {
 test('external waiting persists calls across restart and never impersonates a native CLI session',async t=>{
   const f=fixture(t),first=f.adapter(),binding=first.connect('instance','actual-external-session');
   const waiting=first.run(f.turn());const suspended=assert.rejects(waiting,{name:'ExternalControllerSuspended'});
+  const exported=first.events(binding.lease).find((value:any)=>value.kind==='decision') as any;
+  assert.equal(exported.input.fixedContext.kind,'client-protocol');
+  assert.doesNotMatch(exported.input.fixedContext.text,/owner context/);
+  assert.match(exported.input.fixedContext.text,/bridge_help/);
   const id=decision(first,binding.lease);first.accept(binding.lease,id);
   assert.equal(first.isWaiting('conversation'),true);
   assert.deepEqual(await first.call(binding.lease,id,'dispatch','bridge_start_worker',{prompt:'goal'}),{accepted:true});

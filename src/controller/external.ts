@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { AgentAdapter, AgentResult, AgentTurn, BridgeConfig } from '../types.js';
 import { ControllerCoordinator, createControllerCoordinationState, canonicalControllerJSON, type ControllerCoordinationState, type ControllerDecisionPort } from './coordinator.js';
 import { ControllerContextRenderer } from './context.js';
-import { workspaceDocuments } from './workspace-documents.js';
+import { controllerDocuments } from './documents.js';
 
 export class ExternalControllerSuspended extends Error {
   constructor() { super('External controller waiting persisted'); this.name='ExternalControllerSuspended'; }
@@ -228,8 +228,8 @@ export class ExternalControllerAdapter implements AgentAdapter {
       state.turn={...state.turn,...facts};
     }
     const live:LiveDecision={decision,state,busy:0,port:null!};
-    const exportInput=(input=state.turn.input??[{type:'text',text:state.turn.text}])=>({input,context:this.context.runtime(state.turn,{model:undefined,effort:undefined},true),
-      fixedContext:workspaceDocuments(this.config.contextWorkspace??this.config.workspace,{agent:'external',internalBotCommunicationEnabled:this.config.internalBotCommunicationEnabled}),source:state.turn.source});
+    const exportInput=(input=state.turn.input??[{type:'text',text:state.turn.text}])=>({input,context:this.context.runtime(state.turn,{model:undefined,effort:undefined}),
+      fixedContext:controllerDocuments(this.config.contextWorkspace??this.config.workspace,{agent:'external',internalBotCommunicationEnabled:this.config.internalBotCommunicationEnabled}),source:state.turn.source});
     const continueDecision=(input:unknown)=>{
       this.transaction(()=>{
         live.decision.status='superseded';this.save(live.decision);

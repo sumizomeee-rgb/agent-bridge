@@ -1334,3 +1334,20 @@ test('external controller never launches native agent-switch summaries', async (
     assert.equal(f.codex.turns.length + f.claude.turns.length, 0);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
+
+
+test('external initialization supplies protocol without reading workspace README or MEMORY', async () => {
+  const f = fixture(); f.turn.conversation.agent = 'external';
+  const context = f.registry.createContext({ conversationId: 'parent-A', userId: 'user-A', channelId: 'dm-A',
+    originMessageId: 'message-A', nativeId: 'native-parent', agent: 'external', cwd: f.dir });
+  f.turn.taskContextPath = context.contextPath;
+  writeFileSync(join(f.dir, 'README.md'), Buffer.from([0xff]));
+  writeFileSync(join(f.dir, 'MEMORY.md'), Buffer.from([0xff]));
+  try {
+    const result = await f.runtime.initializeWorkspace(f.turn) as { status: string };
+    assert.equal(result.status, 'completed'); assert.equal(f.runtime.store.workers().length, 0);
+    assert.equal(f.events.length, 1); assert.match(f.events[0]!.text, /外部主控协议和工具目录/);
+    assert.doesNotMatch(f.events[0]!.text, /直接载入|MEMORY|Required owner/);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.runtime.close(); f.registry.close(); }
+});

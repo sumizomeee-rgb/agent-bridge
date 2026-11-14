@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { workspaceDocuments } from '../src/controller/workspace-documents.js';
+import { controllerDocuments } from '../src/controller/documents.js';
 
 test('workspace rules are complete UTF-8 originals, including the last rule after the old summary budget', () => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-rules-'));
@@ -26,5 +27,25 @@ test('missing or oversized files are reported explicitly without partial text or
     const result = workspaceDocuments(root);
     assert.equal(result.errors.length, 1); assert.equal(result.files.length, 0);
     assert.ok(result.text.includes('未完整载入')); assert.ok(!result.text.includes('unrelated'));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('external clients receive protocol and tools without loading shared workspace behavior or owner memory', () => {
+  const root = mkdtempSync(join(tmpdir(), 'client-rules-'));
+  try {
+    writeFileSync(join(root, 'README.md'), 'BUTLER_BEHAVIOR_ONLY');
+    writeFileSync(join(root, 'MEMORY.md'), 'OWNER_MEMORY_ONLY');
+    const result = controllerDocuments(root, { agent: 'external' });
+    assert.equal(result.kind, 'client-protocol');
+    assert.deepEqual(result.errors, []); assert.deepEqual(result.files, []);
+    assert.match(result.text, /accept、call、finish/);
+    assert.match(result.text, /bridge_help/); assert.match(result.text, /bridge_search_chat_history/);
+    assert.doesNotMatch(result.text, /BUTLER_BEHAVIOR_ONLY|OWNER_MEMORY_ONLY|DONE|优先回复/);
+    assert.deepEqual(controllerDocuments(join(root, 'missing'), { agent: 'external' }), result);
+    writeFileSync(join(root, 'README.md'), '{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}');
+    const native = controllerDocuments(root, { agent: 'claude' });
+    assert.equal(native.kind, 'workspace'); assert.match(native.text, /OWNER_MEMORY_ONLY/);
+    assert.equal(native.text, workspaceDocuments(root, { agent: 'claude' }).text);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

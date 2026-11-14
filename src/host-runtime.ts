@@ -18,6 +18,7 @@ import type { TaskCompletionEvent } from './tasks.js';
 import { historyOptions, type ConversationHistoryOptions } from './group-history.js';
 import { GroupMentionResolutionError, groupMessagePayloadHash } from './group-mentions.js';
 import { executorScope } from './executor-messages.js';
+import { ControllerHistoryService, chatHistoryTools, type HistoryCaller, type HistoryEndpoint } from './controller/history.js';
 
 type Context = NonNullable<AgentTurn['groupContext']>;
 const key = (...v: string[]): string => createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -46,6 +47,7 @@ export class HostRuntime {
   private readonly preparations = new Map<string, Promise<void>>();
   private readonly budgetNotices = new Set<Promise<void>>();
   private readonly publicationTails = new Map<string, Promise<void>>();
+  private readonly history = new ControllerHistoryService(id => this.historyEndpoint(id));
   private closed = false;
   private draining = false;
   private recovering = false;
@@ -215,7 +217,9 @@ export class HostRuntime {
       authorize, executorDirectory: () => this.executorDirectory(), requestRestart: origin => this.requestRestart(origin), isDraining: () => this.draining,
       pauseGroup: () => {}, resumeGroup: () => {},
       log: message => this.report('CONTROLLER ' + id + ' ' + message),
-      invoke: async (_turn, name, args, _callId, delegate) => {
+      invoke: async (turn, name, args, _callId, delegate) => {
+        if (chatHistoryTools.has(name) || name === 'bridge_list_controllers')
+          return this.invokeDirectory(config, turn, name, args, delegate);
         if (['bridge_delivery_targets', 'bridge_read_group_history', 'bridge_group_context', 'bridge_start_collaboration', 'bridge_send_bot', 'bridge_broadcast'].includes(name))
           throw new Error('This controller has no chat channel.');
         return delegate(args);
@@ -775,11 +779,11 @@ export class HostRuntime {
       defaultTargetId: this.defaultDeliveryTarget(source), targets: visibleTargets, unavailable,
       rule: 'When defaultTargetId is null the input is internal: answer via bridge_send_bot, or explicitly choose an authorized external destination only if appropriate. Otherwise omitting targetId replies to the original input. Explicit delivery never changes task ownership or future delivery. bridge_send_message finishes by default; finish:false is supplementary. Cross-group sends do not create new human inputs or automatic Bot participation.' };
   }
-  private listControllers(botId: string, turn: AgentTurn, args: Record<string, unknown>): unknown {
-    const source = this.deliverySource(botId, turn), limit = args.limit ?? 20, offset = args.offset ?? 0;
+  private listControllers(principalId: string, args: Record<string, unknown>): unknown {
+    const limit = args.limit ?? 20, offset = args.offset ?? 0;
     if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 50 || !Number.isInteger(offset) || (offset as number) < 0) throw new Error('主控查询分页参数无效。');
     if (args.botId !== undefined) bounded(args.botId, 'botId', 200);
-    const owned = this.store.listBots().filter(bot => bot.ownerPrincipalId === source.principalId && this.principalAllowed(bot.botId, source.principalId)
+    const owned = this.store.listBots().filter(bot => bot.ownerPrincipalId === principalId && this.principalAllowed(bot.botId, principalId)
       && (args.botId === undefined || bot.botId === args.botId));
     const controllers = owned.slice(offset as number, (offset as number) + (limit as number)).map(stored => {
       const bot = this.bots.get(stored.botId), current = stored.controller;
@@ -794,7 +798,7 @@ export class HostRuntime {
           : !stored.ready ? 'initialization-incomplete' : !bot?.isReady() ? 'connection-unavailable' : activity?.stopped ? 'stopped'
           : activity?.running ? 'processing' : activity?.initializing ? 'initializing' : 'idle',
         queuedInputs: { manager: activity?.pending ?? null, host: pendingEvents }, activeWorkers: children,
-        groups: this.store.listGroups(stored.botId).filter(group => group.enabled && group.principalId === source.principalId)
+        groups: this.store.listGroups(stored.botId).filter(group => group.enabled && group.principalId === principalId)
           .map(group => ({ targetId: this.targetId(group), spaceId: group.spaceId })),
         gatewayAvailability: 'not probed', ...(current ? { agent: current.agent } : {}) };
     });
@@ -802,20 +806,45 @@ export class HostRuntime {
       rule: 'Host snapshot, not proof of model gateway availability or acceptance. Busy controllers queue collaboration; start revalidates ownership, readiness and membership.' };
   }
 
-  private queryOtherChatHistory(botId: string, turn: AgentTurn, name: string, args: Record<string, unknown>): unknown {
-    const source = this.deliverySource(botId, turn), targetId = bounded(args.targetBotId, 'targetBotId', 200);
-    if (source.spaceId) throw new Error('其他主控的私聊历史只能在负责人私聊中查询。');
-    const target = this.bots.get(targetId), stored = this.store.getBot(targetId);
-    if (!target || !stored || target.config.platform !== this.configurations.get(botId)!.platform
-      || stored.ownerPrincipalId !== source.principalId || !this.principalAllowed(targetId, source.principalId))
-      throw new Error('目标须为同平台、同一负责人名下的已登记主控。');
-    const userId = target.config.controllerUserId!;
-    const route = target.manager.knownDMChannels().filter(value => value.userId === userId
-      && !this.hooks(target.config).isGroupChannel?.(value.channelId)).at(-1);
-    if (!route) throw new Error('目标主控尚无该负责人的已保存私聊记录。');
-    const { targetBotId: _target, ...input } = args;
-    const result = target.manager.queryChatHistory({ userId, channelId: route.channelId, historyBotId: targetId }, name, input);
-    return { targetBotId: targetId, ...(result as Record<string, unknown>) };
+  private historyCaller(config: BridgeConfig, turn: AgentTurn): HistoryCaller {
+    if (config.botId) {
+      const source = this.deliverySource(config.botId, turn);
+      return { controllerId: config.controllerId!, botId: config.botId, principalId: source.principalId,
+        platform: config.platform, ...(source.spaceId ? { spaceId: source.spaceId } : {}) };
+    }
+    const source = turn.source, current = this.store.getController(config.controllerId!);
+    if (this.closed || this.draining || turn.preparing || turn.signal.aborted || !source
+      || !config.ownerPrincipalId || !this.config.principals.some(value => value.id === config.ownerPrincipalId)
+      || config.controllerUserId !== 'principal:' + config.ownerPrincipalId
+      || source.userId !== config.controllerUserId || source.userId !== turn.conversation.userId
+      || current?.conversationId !== turn.conversation.id)
+      throw new Error('清单或历史查询轮次已失效。');
+    return { controllerId: config.controllerId!, principalId: config.ownerPrincipalId,
+      ...(turn.groupContext ? { spaceId: turn.groupContext.spaceId } : {}) };
+  }
+
+  private historyEndpoint(targetId: string): HistoryEndpoint | undefined {
+    const stored = this.store.getBot(targetId);
+    const core = this.controllers.get(stored?.controllerId ?? targetId);
+    if (!core?.config.ownerPrincipalId || !core.config.controllerUserId) return undefined;
+    const config = core.config, principalId = config.ownerPrincipalId!, userId = config.controllerUserId!;
+    const authorized = config.botId
+      ? this.store.getBot(config.botId)?.ownerPrincipalId === principalId && this.principalAllowed(config.botId, principalId)
+      : this.config.principals.some(value => value.id === principalId) && config.allowedUserIds.includes(userId);
+    return { controllerId: config.controllerId!, principalId, platform: config.platform, userId, authorized,
+      routes: core.manager.knownDMChannels().map(route => ({ ...route,
+        private: config.botId ? !this.hooks(config).isGroupChannel?.(route.channelId) : route.channelId === 'controller:' + config.controllerId })),
+      query: (scope, name, input) => core.manager.queryChatHistory(scope, name, input) };
+  }
+
+  private invokeDirectory(config: BridgeConfig, turn: AgentTurn, name: string, args: Record<string, unknown>,
+    delegate?: (input: Record<string, unknown>) => Promise<unknown>): unknown {
+    const caller = this.historyCaller(config, turn);
+    if (name === 'bridge_list_controllers') return this.listControllers(caller.principalId, args);
+    return this.history.query(caller, name, args, input => {
+      if (!delegate) throw new Error('执行工具未配置。');
+      return delegate(input);
+    });
   }
 
   private async startCollaboration(botId: string, turn: AgentTurn, args: Record<string, unknown>, callId?: string): Promise<unknown> {
@@ -1321,12 +1350,9 @@ export class HostRuntime {
     delegate?: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown> {
     if (this.draining || this.closed) throw new Error('桥正在等待现有轮次结束，暂停新增管理调用。');
     assertBotCommunicationAllowed(this.config.internalBotCommunicationEnabled, name, args);
+    if (chatHistoryTools.has(name) || name === 'bridge_list_controllers')
+      return this.invokeDirectory(this.configurations.get(botId)!, turn, name, args, delegate);
     if (!turn.groupContext) this.deliverySource(botId, turn);
-    if (['bridge_search_chat_history', 'bridge_read_chat_history'].includes(name) && args.targetBotId !== undefined) {
-      if (args.targetBotId !== botId) return this.queryOtherChatHistory(botId, turn, name, args);
-      const { targetBotId: _target, ...input } = args; args = input;
-    }
-    if (name === 'bridge_list_controllers') return this.listControllers(botId, turn, args);
     if (name === 'bridge_start_collaboration') return this.startCollaboration(botId, turn, args, callId);
     if (name === 'bridge_delivery_targets') return this.deliveryTargets(botId, turn);
     if (name === 'bridge_read_group_history') return this.readGroupHistory(botId, turn, args);

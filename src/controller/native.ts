@@ -2,7 +2,7 @@ import { harnessText } from '../harness.js';
 import { ControllerCoordinator, createControllerCoordinationState, TurnSealedError, canonicalControllerJSON as canonicalJSON, type ControllerCoordinationState } from './coordinator.js';
 import { ControllerContextRenderer, controllerClock as bridgeClock, controllerImagePaths, currentImageManifest as imageManifest } from './context.js';
 import { claudeModelSettings, createEffortReporter, effortCapabilityForModel, isEffortLevel, normalizeEffortCapability, observedClaudeEffort, resolveDefaultModel, selectedEffort, validateEffort } from '../effort.js';
-import { workspaceDocuments } from './workspace-documents.js';
+import { controllerDocuments } from './documents.js';
 import { refreshControllerCodexLogin } from './codex-credentials.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, lstatSync, statSync, appendFileSync } from 'node:fs';
@@ -157,7 +157,7 @@ export class NativeControllerAdapter implements AgentAdapter {
     hash.update(cwd); return hash.digest('hex');
   }
   private instructions(): string {
-    return workspaceDocuments(this.options.contextWorkspace, { agent: this.options.agent, internalBotCommunicationEnabled: this.options.internalBotCommunicationEnabled }).text;
+    return controllerDocuments(this.options.contextWorkspace, { agent: this.options.agent, internalBotCommunicationEnabled: this.options.internalBotCommunicationEnabled }).text;
   }
   private signature(turn: AgentTurn): string {
     return createHash('sha256').update(this.metadataSource(turn.conversation.cwd))

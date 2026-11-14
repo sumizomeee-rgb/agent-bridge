@@ -6,6 +6,7 @@ import { setImmediate as nextImmediate } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { DeliveryPreparationError } from '../src/delivery-errors.js';
 import { HostRuntime } from '../src/host-runtime.js';
+import type { ControllerCore } from '../src/controller/core.js';
 import { HostStore } from '../src/host-store.js';
 import { ControllerStore } from '../src/controller/store.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
@@ -2191,4 +2192,43 @@ test('executor directory isolates controllers sharing one canonical owner and ex
   assert.notEqual(first!.scope, second!.scope);
   assert.deepEqual(new Set(directory.recipients.map(value => value.controllerId)), new Set([A, B]));
   assert.deepEqual(new Set(directory.recipients.map(value => value.botId)), new Set([A, B]));
+});
+
+
+test('channel-free controller uses the shared history service and roster without waking chat controllers', async t => {
+  const f = fixture(t), target = f.ids[1]!;
+  const dm = { id: target + '|1792180000001|om_external_history', userId: f.configs[1]!.ownerUserId!,
+    channelId: target + '|oc_owner_history', text: '公共历史服务的真实保存记录', imagePaths: [] };
+  await f.managers.get(target)!.handle(dm); await f.drain();
+  assert(f.managers.get(target)!.knownDMChannels().length > 0, 'Fixture must admit the saved private message');
+  const before = f.calls.length, original = f.host.store.controllerForBot(target);
+  const id = 'external-client', userId = 'principal:' + P;
+  const config: BridgeConfig = { ...f.config.controllerConfigs[0]!, controllerId: id, controllerUserId: userId,
+    controllerBackend: { kind: 'external', endpointId: 'client' }, botId: undefined, platform: undefined,
+    scopePrefix: undefined, ownerUserId: userId, allowedUserIds: [userId], dataDir: join(f.path, 'client') };
+  f.config.controllerConfigs.push(config); f.host.store.registerController(id, P);
+  const conversation = { ...f.managers.get(target)!.currentConversation(userId)!, id: 'client-conversation', userId, agent: 'external' as const };
+  f.host.store.setIndependentController(id, P, { conversationId: conversation.id, generation: 1,
+    agent: 'external', nativeId: 'actual-room' }, 0);
+  f.host.attachCore({ config, async close() {}, beginDrain() {}, isIdle() { return true; } } as unknown as ControllerCore);
+  const hooks = f.host.controllerHooks(config);
+  const turn: AgentTurn = { conversation, source: { messageId: 'client-query', userId, channelId: 'controller:' + id },
+    text: '查询已保存记录', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
+  const unused = async () => { throw new Error('Cross history must not invoke the caller manager'); };
+  const invoke = (name: string, args: Record<string, unknown>) => hooks.invoke(turn, name, args, 'query-call', unused);
+  const roster = await invoke('bridge_list_controllers', {}) as any;
+  assert(roster.controllers.some((value:any) => value.botId === target));
+  const page = await invoke('bridge_search_chat_history', { targetBotId: target, query: '公共历史服务' }) as any;
+  assert.equal(page.targetBotId, target); assert.equal(page.messages.length, 1);
+  const around = await invoke('bridge_read_chat_history', { targetBotId: target, messageId: page.messages[0].messageId }) as any;
+  assert(around.messages.some((value:any) => value.text.includes('真实保存记录')));
+  await assert.rejects(invoke('bridge_search_chat_history', { targetBotId: target, channelId: 'forged' }), /参数/);
+  const allowed = f.configs[1]!.allowedUserIds.splice(0);
+  await assert.rejects(invoke('bridge_search_chat_history', { targetBotId: target }), /目标须/);
+  f.configs[1]!.allowedUserIds.push(...allowed);
+  const group = { ...turn, groupContext: { spaceId: G1 } } as AgentTurn;
+  await assert.rejects(hooks.invoke(group, 'bridge_search_chat_history', { targetBotId: target }, 'group', unused), /负责人私聊/);
+  const stale = { ...turn, conversation: { ...conversation, id: 'old-conversation' } };
+  await assert.rejects(hooks.invoke(stale, 'bridge_search_chat_history', { targetBotId: target }, 'stale', unused), /轮次已失效/);
+  assert.equal(f.calls.length, before); assert.deepEqual(f.host.store.controllerForBot(target), original);
 });

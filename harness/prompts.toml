@@ -1170,7 +1170,7 @@ injection = "历史工具参数描述"
 activation = "工具目录刷新后；Codex 已有会话需 /new c"
 source = "src/controller/knowledge-tools.ts"
 text = '''
-Omit for this Bot/current chat. Another exact botId from bridge_list_controllers selects that controller’s saved private chat with the same owner on the same platform, across /new. Keep this value for pagination and reading hits. Does not wake that controller.
+Omit for this controller/current chat. An exact botId from bridge_list_controllers selects the same owner’s saved private chat across /new. Chat-channel callers also require the same platform; channel-free callers use their registered owner scope. Keep this target for pagination and reading hits. Does not wake that controller.
 '''
 
 [prompts."tools.bridge_read_chat_history.inputSchema.messageId.description"]
@@ -2262,3 +2262,14 @@ injection = "持久中断恢复事件"
 activation = "上轮未完成回复且满足恢复条件时"
 source = "src/manager.ts"
 text = "请接续处理以下未完成消息，核对已有操作，避免重复执行。"
+
+[prompts."controller.external_protocol"]
+purpose = "外部客户端使用桥能力的技术协议，不承载工作区角色与行为约定"
+audience = "外部主控客户端"
+injection = "外部决策的fixedContext"
+activation = "外部主控创建或恢复决策时提供；客户端行为指引由其自身项目维护"
+source = "src/controller/documents.ts:controllerDocuments"
+text = '''通过当前决策的 accept、call、finish 接口使用桥工具；身份和范围由桥校验。
+bridge_help 不传 command 返回短目录，传 command 展开完整参数。按工具说明调用，渠道能力以当前绑定和回执为准。
+接单回执不代表助手完成；通过后续事件或工具查询结果。处理完当前决策后正常 finish。
+同一逻辑调用保留原调用标识与参数；结果未知时核对原回执，恢复时先续接已有状态。'''

@@ -19,7 +19,7 @@ import { sessionVisibility } from '../agents/worker-session.js';
 import { stoppedExecutionFailure as hasStoppedExecutionFailure } from '../agents/interrupted-execution.js';
 import type { ControllerJob, ControllerRuntimeCallbacks, ControllerSchedule, ControllerSupplement, ControllerWorker } from './runtime-types.js';
 import { HandoffResultError, SessionHandoffs } from './handoff.js';
-import { workspaceDocuments } from './workspace-documents.js';
+import { controllerDocuments } from './documents.js';
 import { workspaceOutputGuidance } from '../workspace-layout.js';
 import { harnessText } from '../harness.js';
 import { controllerWorkerReport, mentionsPolicyDenial } from './worker-report.js';
@@ -647,10 +647,11 @@ export class ControllerRuntime {
       const context = JSON.parse(readFileSync(created.contextPath, 'utf8')) as TaskContextFile;
       const hex = createHash('sha256').update('workspace-documents:' + origin.conversationId).digest('hex');
       const id = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join('-');
-      const task = this.registry.register(context, '工作区文件载入', id);
-      const documents = workspaceDocuments(this.config.contextWorkspace ?? this.config.workspace, { agent: turn.conversation.agent });
+      const documents = controllerDocuments(this.config.contextWorkspace ?? this.config.workspace, { agent: turn.conversation.agent });
+      const task = this.registry.register(context, documents.kind === 'workspace' ? '工作区文件载入' : '主控协议载入', id);
       const result = documents.errors.length ? '工作区文件未完整载入：\n' + documents.errors.join('\n')
-        : '桥已直接载入 README.md 和 MEMORY.md 完整原文，无需初始化助手。\n' + documents.files.join('\n');
+        : documents.kind === 'workspace' ? '桥已直接载入 README.md 和 MEMORY.md 完整原文，无需初始化助手。\n' + documents.files.join('\n')
+        : '桥已提供外部主控协议和工具目录；客户端使用自己的 README。';
       const receipt = { kind: 'workspace-documents', taskId: task.taskId, status: documents.errors.length ? 'failed' : 'completed' };
       this.store.saveWorkspaceInitialization(origin.conversationId, receipt);
       this.registry.acceptObservedResult(task.taskId, documents.errors.length ? 'failed' : 'completed', result);
