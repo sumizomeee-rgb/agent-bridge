@@ -6,18 +6,36 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
+export function baselineTestSelection({ agent, controllerModel, controllerEffort = 'low', targets }) {
+  assert(['codex', 'claude'].includes(agent), 'Baseline requires a native Agent');
+  const models = agent === 'codex' ? ['gpt-6-luna'] : ['haiku', 'claude-haiku-5.5'];
+  const model = controllerModel ?? models[0];
+  assert(models.includes(model), 'Baseline model must be the authorized Luna/Haiku model');
+  assert.equal(controllerEffort, 'low', 'Baseline effort must be low');
+  assert(!targets?.some(id => id !== 'local'), 'Baseline executes only one local worker');
+  return { model, effort: 'low', targets: ['local'] };
+}
+
 /** The production catalog, deployment service and SSH adapter are never replaced here. */
-export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort = 'xhigh', sourceConfigRoot, contextWorkspace, exerciseNew = false, exerciseMessages = false }) {
+export async function runConfigured({ root, runDir, configPath, agent, evidence, save, targets, controllerModel, controllerEffort, baselineOnly = false, sourceConfigRoot, contextWorkspace, exerciseNew = false, exerciseMessages = false, controllerPreset }) {
+  controllerEffort ??= baselineOnly ? 'low' : 'xhigh';
+  let authorizedModel = agent === 'codex' ? 'gpt-6-luna' : 'haiku';
+  if (baselineOnly) {
+    const selection = baselineTestSelection({ agent, controllerModel, controllerEffort, targets });
+    authorizedModel = selection.model; targets = selection.targets;
+  }
   const load = file => import(pathToFileURL(join(root, 'dist/src', file)));
   const { loadHostConfig, agentEnvironment } = sourceConfigRoot
     ? await import(pathToFileURL(join(sourceConfigRoot, 'dist/src/config.js'))) : await load('config.js');
+  const { workspaceDocuments } = await load('controller/workspace-documents.js');
   const { workspaceFile } = await load('workspace-layout.js');
   const { HostRuntime } = await load('host-runtime.js');
   const { BotRuntime } = await load('bot-runtime.js');
+  const { ExecutorMessages, executorMessageHome } = await load('executor-messages.js');
   const { TargetCatalogService } = await load('remote/catalog.js');
   const { RemoteDeploymentService } = await load('remote/deployment.js');
   const { setRemoteDeploymentHook } = await load('remote/client.js');
-  const { NativeControllerAdapter } = await load('controller/native.js');
+  const { createControllerAdapter } = await load('controller/launch.js');
   const { CodexAdapter } = await load('agents/codex.js');
   const { ClaudeAdapter } = await load('agents/claude.js');
   const { SessionStore } = await load('store.js');
@@ -29,17 +47,18 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(workspace, 'README.md'), '隔离主控测试。只执行明确的只读测试任务，不开展业务工作。\n');
   const context = contextWorkspace ?? source.contextWorkspace ?? source.workspace;
-  const model = controllerModel ?? (agent === 'codex' ? 'gpt-6-luna' : 'haiku');
+  const model = controllerModel ?? authorizedModel;
   // Preserve real registration/routing; only conversations, task journals and output are isolated.
   const labApplicationId = source.platform === 'feishu' ? 'cli_lab' + process.pid : String(700000000000000000n + BigInt(process.pid));
   const labPrefix = source.platform + ':' + labApplicationId + '|';
-  const config = { ...source, applicationId: labApplicationId, botId: source.platform + ':' + labApplicationId,
+  const config = { ...source, controllerId: 'lab-' + agent, channelDataDir: join(directory, 'channel'), applicationId: labApplicationId, botId: source.platform + ':' + labApplicationId,
     scopePrefix: labPrefix, allowedUserIds: source.allowedUserIds.map(id => labPrefix + id.slice(source.scopePrefix.length)),
     workspace, contextWorkspace: context, workingCwd: workspace, dataDir: join(directory, 'data'),
     logsDir: join(directory, 'logs'), attachmentsDir: join(directory, 'images'), controllerMode: true, token: '', appSecret: undefined,
     defaultModels: { ...source.defaultModels, [agent]: model } };
   const receipt = { agent, controllerModel: model, controllerEffort, sourceBotId: source.botId, labBotId: config.botId,
-    contextWorkspace: context, actualRemoteExecution: true,
+    contextWorkspace: context, baselineOnly, actualRemoteExecution: !baselineOnly,
+    isolatedExecutorMessages: executorMessageHome(root, join(directory, 'isolated-user-home')),
     platform: 'isolated receipt sink', deployments: [], tools: [], deliveries: [], workers: [], cases: [], defaults: [] };
   evidence.configured ??= []; evidence.configured.push(receipt); save();
   const check = async (name, work) => {
@@ -74,10 +93,9 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
     setRemoteDeploymentHook((target, cwd) => deployments.ensure(target, cwd));
     const principalId = source.ownerPrincipalId ?? 'lab-owner';
     const rawOwner = source.allowedUserIds[0].slice(source.scopePrefix.length);
-    config.ownerPrincipalId = principalId; config.ownerUserId = config.allowedUserIds[0];
-    host = new HostRuntime({ ...sourceHost, rootDataDir: join(directory, 'host'), configs: [config], spaces: [],
+    config.ownerPrincipalId = principalId; config.ownerUserId = config.controllerUserId = 'principal:' + principalId; config.channelOwnerUserId = config.allowedUserIds[0];
+    host = new HostRuntime({ ...sourceHost, rootDataDir: join(directory, 'host'), configs: [config], controllerConfigs: [config], spaces: [],
       principals: [{ id: principalId, accounts: { [config.botId]: rawOwner } }] },
-      { version: 3, status: 'complete', migrationId: 'configured-lab', migratedAt: new Date().toISOString(), bots: [] },
       async () => { throw new Error('Test does not restart the production bridge'); }, text => { receipt.hostLog ??= []; receipt.hostLog.push(text); save(); });
     // Read the same host-owned active-controller binding as the actual manager.
     store = new SessionStore(config.dataDir, host.hooks(config).manager.binding);
@@ -86,6 +104,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       receipt.deliveries.push({ at: new Date().toISOString(), text }); save();
     } };
     bot = new BotRuntime(config, host.hooks(config), {
+      createExecutorMessages: () => new ExecutorMessages(root, join(directory, 'isolated-user-home')),
       createExecutionAdapters: () => execution,
       createTransport: (_config, input, events) => {
         receive = input; const history = { messages: [], hasMore: false, oldestId: null, newestId: null };
@@ -98,10 +117,7 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       },
       createControllerAdapters: (_config, _env, _execution, invoke) => {
         const adapters = {};
-        for (const selectedAgent of ['codex', 'claude']) adapters[selectedAgent] = new NativeControllerAdapter(source.commands[selectedAgent], env, {
-          agent: selectedAgent, dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace, metadataAdapter: execution[selectedAgent], defaultModels: config.defaultModels,
-          internalBotCommunicationEnabled: sourceHost.internalBotCommunicationEnabled,
-          invokeTool: (turn, name, args, id) => invokeTracked(invoke, turn, name, args, id) });
+        for (const selectedAgent of ['codex', 'claude']) adapters[selectedAgent] = createControllerAdapter(config, env, selectedAgent, execution[selectedAgent], (turn, name, args, id) => invokeTracked(invoke, turn, name, args, id));
         for (const adapter of Object.values(adapters)) {
           const run = adapter.run.bind(adapter);
           adapter.run = async turn => { receipt.controllerRuns = (receipt.controllerRuns ?? 0) + 1; save(); return run(turn); };
@@ -121,7 +137,14 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
           }
       } finally { db.close(); }
     }
-    conversation = store.createConversation(config.allowedUserIds[0], agent, workspace, { controllerMode: true });
+    if (baselineOnly) {
+      const previous = runtime.store.workerDefault('local');
+      const choice = { kind: 'ordinary', agent, model: authorizedModel, effort: 'low' };
+      runtime.store.setWorkerDefault('local', choice);
+      receipt.defaults.push({ targetId: 'local', choice, previous, isolatedTestOverride: true }); save();
+    }
+    conversation = store.createConversation(config.controllerUserId, agent, workspace, { controllerMode: true });
+    if (controllerPreset) { const selected = await catalog.resolvePreset(context, controllerPreset); assert.equal(selected.preset.agent, agent); assert.equal(selected.preset.model, model, 'Controller test preset must use the authorized test model'); store.setPreset(conversation.id, selected.preset); conversation = store.getConversation(conversation.id); }
     store.setActive(conversation.userId, conversation.id); store.setModel(conversation.id, model); store.setEffort(conversation.id, controllerEffort);
 
     async function invokeTracked(invoke, turn, name, args, id) {
@@ -151,9 +174,9 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       const deliveryCount = receipt.deliveries.length;
       const id = config.scopePrefix + (source.platform === 'feishu' ? Date.now() + '|om_lab_' + label : String(BigInt(Date.now()) * 1000000n));
       assert(validMessageId(id) && validChannelId(channelId), 'Invalid isolated platform envelope');
-      assert(host.authorize(config.botId, conversation.userId, text), 'Isolated owner authorization failed');
-      await receive({ id, text, userId: conversation.userId, channelId, attachments: [],
-        source: { messageId: id, userId: conversation.userId, channelId, authorType: 'user' } });
+      assert(host.authorize(config.botId, config.channelOwnerUserId, text), 'Isolated owner authorization failed');
+      await receive({ id, text, userId: config.channelOwnerUserId, channelId, attachments: [],
+        source: { messageId: id, userId: config.channelOwnerUserId, channelId, authorType: 'user' } });
       assert(bot.ingress.getMessage(id), 'Ingress rejected test envelope');
       await wait(() => ['completed', 'failed', 'cancelled', 'command'].includes(store.getMessage(id)?.state) && manager.isIdle(), label);
       if (text.startsWith('/')) assert(['command', 'completed'].includes(store.getMessage(id).state));
@@ -165,11 +188,22 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
       await deployments.check();
       for (const { target, cwd } of bindings) assert.equal((await deployments.ensure(target, cwd)).state, 'ready', target.id + ' executor not ready');
     });
-    if (exerciseNew) {
+    if (baselineOnly) {
+      const entry = await check('README-only fixed workspace entry', async () => {
+        const documents = workspaceDocuments(context, { agent, internalBotCommunicationEnabled: config.internalBotCommunicationEnabled });
+        assert.deepEqual(documents.errors, []);
+        assert.equal(documents.files.filter(file => resolve(file) === resolve(context, 'README.md')).length, 1);
+        assert.equal(documents.files.filter(file => resolve(file) === resolve(context, 'MEMORY.md')).length, 1);
+        assert(!documents.text.includes('{{include:'), 'Workspace includes were not expanded');
+        receipt.workspaceEntry = { files: documents.files, fixedEntry: join(context, 'README.md'), expandedCharacters: documents.text.length };
+      });
+      if (entry.status !== 'passed') return;
+    }
+    if (exerciseNew || baselineOnly) {
       const intro = await check('ordinary /new introduces once without an initialization worker', async () => {
         const previous = conversation.id, workers = runtime.store.workers().length;
         await send('context-new', '/new');
-        conversation = store.getActive(config.allowedUserIds[0]);
+        conversation = store.getActive(config.controllerUserId);
         assert(conversation && conversation.id !== previous, 'New controller was not created');
         await wait(() => store.workspaceNotice(conversation.id)?.state === 'delivered' && manager.isIdle(), 'new introduction');
         assert.equal(store.workspaceNotice(conversation.id).outcome, 'ready');
@@ -231,9 +265,39 @@ export async function runConfigured({ root, runDir, configPath, agent, evidence,
         assert.equal(job.status, 'completed'); assert.equal(job.processStopped, true); assert.match(job.result, new RegExp(marker));
         if (target.expectedHostname) assert(job.result.toLowerCase().includes(target.expectedHostname.toLowerCase()), 'Wrong executing computer');
         assert(receipt.deliveries.slice(start).some(d => d.text.includes('LAB_CONFIGURED_RESULT') && (!target.expectedHostname || d.text.toLowerCase().includes(target.expectedHostname.toLowerCase()))), 'Result did not return to controller');
-        await send('configured-workers-' + target.id, '/workers'); await send('configured-history-' + target.id, '/workers history');
-        const last = receipt.deliveries.slice(-2); assert(last[0].text.includes('运行0个')); assert(!last[0].text.includes(marker)); assert(last[1].text.includes('历史'));
+        if (!baselineOnly) {
+          await send('configured-workers-' + target.id, '/workers'); await send('configured-history-' + target.id, '/workers history');
+          const last = receipt.deliveries.slice(-2); assert(last[0].text.includes('运行0个')); assert(!last[0].text.includes(marker)); assert(last[1].text.includes('历史'));
+        }
       });
+    }
+    if (baselineOnly) {
+      if (receipt.cases.some(item => item.status === 'failed')) return;
+      await check('new continue uses one authorized initializer and delivers a native continuation', async () => {
+        const previous = conversation.id, before = runtime.store.workers().map(worker => worker.id);
+        await send('baseline-continue', '/new continue');
+        conversation = store.getActive(config.controllerUserId);
+        assert(conversation && conversation.id !== previous, 'Continuation did not create a new logical controller');
+        await wait(() => store.workspaceNotice(conversation.id)?.state === 'delivered' && manager.isIdle() && runtime.isIdle(), 'continuation initialization');
+        assert.equal(store.workspaceNotice(conversation.id).outcome, 'ready');
+        const initializers = runtime.store.workers().filter(worker => !before.includes(worker.id));
+        assert.equal(initializers.length, 1, 'Continuation must use exactly one actual initialization worker');
+        const initializer = initializers[0], job = runtime.store.jobs(initializer.id)[0];
+        assert.equal(initializer.origin.purpose, 'workspace-context');
+        assert.equal(initializer.agent, agent); assert.equal(initializer.model, authorizedModel);
+        assert.equal(initializer.effort, 'low'); assert.equal(initializer.target.id, 'local');
+        assert.equal(job.status, 'completed'); assert.equal(job.processStopped, true);
+        const deliveryStart = receipt.deliveries.length;
+        await send('baseline-after-continue', '隔离续接已完成。仅简短回复 LAB_BASELINE_CONTINUED，不调用工具、不派工。');
+        conversation = store.getConversation(conversation.id);
+        assert(conversation.nativeId, 'Continuation has no real native identity');
+        assert(receipt.deliveries.slice(deliveryStart).some(delivery => delivery.text.includes('LAB_BASELINE_CONTINUED')), 'Continuation reply was not delivered');
+        assert.equal(runtime.store.workers().filter(worker => !before.includes(worker.id)).length, 1, 'Continuation dispatched extra work');
+        receipt.continuation = { conversationId: conversation.id, nativeId: conversation.nativeId, initializerId: initializer.id,
+          initializerNativeId: runtime.store.getWorker(initializer.id).nativeId, model: initializer.model, status: job.status,
+          notice: store.workspaceNotice(conversation.id), replyDelivered: true };
+      });
+      return;
     }
     // Every actual computer also gets an ordinary CLI path; remote defaults can legitimately be unset.
     for (const target of selected.filter(t => t.transport === 'ssh' && t.engines.includes(agent))) await check(target.id + ' ordinary real ' + agent + ' path', async () => {

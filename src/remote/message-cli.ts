@@ -13,7 +13,7 @@ export function messageCommand(argv: string[]): unknown {
   const allowed = operation === 'send' ? ['--root', '--worker', '--to', '--text', '--file', '--id']
     : operation === 'get' ? ['--root', '--id'] : operation === 'list' ? ['--root', '--cwd'] : operation === 'controllers' ? ['--root'] : [];
   if (!allowed.length || !options['--root'] || Object.keys(options).some(key => !allowed.includes(key)))
-    throw new Error('用法：controllers | list [--cwd DIR] | send [--worker ID] [--to 主控名称或botId] --id MESSAGE_ID --text TEXT（或 --file FILE）| get --id MESSAGE_ID；均需 --root EXECUTOR_ROOT。');
+    throw new Error('用法：controllers | list [--cwd DIR] | send [--worker ID] [--to 主控名称或controllerId] --id MESSAGE_ID --text TEXT（或 --file FILE）| get --id MESSAGE_ID；均需 --root EXECUTOR_ROOT。');
   const store = new ExecutorMessages(resolve(options['--root']));
   try {
     if (operation === 'list') return store.list(options['--cwd']);

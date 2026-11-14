@@ -46,15 +46,15 @@ for (const platform of ['feishu', 'discord'] as const) test(platform + ': isolat
   const app = platform === 'feishu' ? 'cli_lab_' + process.pid : String(700000000000000000n + BigInt(process.pid)), botId = platform + ':' + app, prefix = botId + '|';
   const owner = '333333333333333333', group = '555555555555555555';
   mkdirSync(join(root, '.codex')); writeFileSync(join(root, '.codex/config.toml'), 'model_provider="fixture"\n');
-  const c: BridgeConfig = { botId, applicationId: app, platform, profile: 'isolated-group', scopePrefix: prefix,
-    ownerPrincipalId: 'owner', ownerUserId: prefix + owner, allowedUserIds: [prefix + owner], token: '', defaultAgent: 'codex',
+  const c: BridgeConfig = { botId, controllerId: 'lab', controllerUserId: 'principal:owner', channelOwnerUserId: prefix + owner, channelDataDir: join(root, 'channel'), applicationId: app, platform, profile: 'isolated-group', scopePrefix: prefix,
+    ownerPrincipalId: 'owner', ownerUserId: 'principal:owner', allowedUserIds: [prefix + owner], token: '', defaultAgent: 'codex',
     defaultModels: { codex: 'fixture-model' }, controllerMode: true, groupMode: true,
     workspace: join(root, 'workspace'), contextWorkspace: join(root, 'workspace'), workingCwd: join(root, 'workspace'),
     dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'), proxyUrl: null, maxImageBytes: 1024,
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } } };
-  const config: HostConfig = { version: 3, rootDataDir: join(root, 'host'), configs: [c],
+  const config: HostConfig = { version: 4, workspaceRoot: root, registry: { version: 4, workspaceRoot: root, registryRoot: join(root, 'registry'), hostDataDir: join(root, 'host'), startupControllers: [], controllers: [], channels: [], principals: [], spaces: [] }, rootDataDir: join(root, 'host'), configs: [c], controllerConfigs: [c],
     principals: [{ id: 'owner', accounts: { [botId]: owner } }], spaces: [{ id: 'group', accounts: { [botId]: group } }] };
-  const host = new HostRuntime(config, { version: 3, status: 'complete', migrationId: 'lab', migratedAt: 'now', bots: [] }, async () => ({ accepted: true }), () => {});
+  const host = new HostRuntime(config, async () => ({ accepted: true }), () => {});
   const sent: Array<{ channel: string; text: string; options?: ReplyOptions }> = [], processes: Protocol[] = [], executions: AgentTurn[] = [];
   const originals = new Map<string, IncomingDM>();
   let finishWorker!: () => void;
@@ -95,7 +95,7 @@ for (const platform of ['feishu', 'discord'] as const) test(platform + ': isolat
   const input = (text: string): IncomingDM => {
     ++sequence;
     const id = platform === 'feishu' ? `${1792980000000 + sequence}|om_lab_${sequence}` : String(1800000000000000000n + BigInt(sequence));
-    const m: IncomingDM = { id: prefix + id, userId: c.ownerUserId!, channelId: prefix + group, text, attachments: [], space: { kind: 'group', spaceId: group, mentionedUserIds: [app] } };
+    const m: IncomingDM = { id: prefix + id, userId: c.channelOwnerUserId!, channelId: prefix + group, text, attachments: [], space: { kind: 'group', spaceId: group, mentionedUserIds: [app] } };
     originals.set(id, m); return m;
   };
   await host.receive(botId, input('/group start'));
@@ -147,8 +147,8 @@ for (const platform of ['feishu', 'discord'] as const) test(platform + ': isolat
   await until(() => processes[1]?.turns === 1);
   await publish(processes[1]!, 'recovered same group', 104);
   await until(() => host.isIdle());
-  assert.equal(host.store.getController(botId)!.conversationId, conversation.id);
-  assert.equal(host.store.getController(botId)!.nativeId, 'group-native');
+  assert.equal(host.store.getController('lab')!.conversationId, conversation.id);
+  assert.equal(host.store.getController('lab')!.nativeId, 'group-native');
   assert.equal(executions.length, 1, 'neither the failure nor recovery may replay the worker');
   assert.equal(sent.filter(s => s.text.includes('recovered same group')).length, 1);
 });

@@ -29,18 +29,18 @@ const source = sourceHost.configs.find(c => c.defaultAgent === 'codex');
 assert(source?.ownerUserId && source.scopePrefix, 'Configured Codex owner missing');
 const appId = source.platform === 'feishu' ? 'cli_labfailure' + process.pid : String(700000000000000000n + BigInt(process.pid));
 const prefix = source.platform + ':' + appId + '|';
-const rawOwner = source.ownerUserId.slice(source.scopePrefix.length), owner = prefix + rawOwner;
+const rawOwner = (source.channelOwnerUserId ?? source.allowedUserIds[0]).slice(source.scopePrefix.length), owner = prefix + rawOwner;
 const workspace = path.join(runDir, 'workspace'); fs.mkdirSync(workspace, { recursive: true });
 fs.writeFileSync(path.join(workspace, 'README.md'), '隔离主控故障测试，只执行指定测试步骤，不开展业务工作。\n');
 fs.writeFileSync(path.join(workspace, 'MEMORY.md'), '# 隔离测试，无业务任务\n');
 const model = 'gpt-6-luna', effort = 'xhigh';
-const config = { ...source, applicationId: appId, botId: source.platform + ':' + appId, scopePrefix: prefix,
+const config = { ...source, controllerId: 'lab-dispatch', channelDataDir: path.join(runDir, 'channel'), applicationId: appId, botId: source.platform + ':' + appId, scopePrefix: prefix,
   ownerUserId: owner, allowedUserIds: [owner], externalAllowedUserIds: [rawOwner],
   workspace, workingCwd: workspace, contextWorkspace: source.contextWorkspace ?? source.workspace,
   dataDir: path.join(runDir, 'data'), logsDir: path.join(runDir, 'logs'), attachmentsDir: path.join(runDir, 'images'),
   token: '', appSecret: undefined, controllerMode: true, defaultAgent: 'codex',
   defaultModels: { ...source.defaultModels, codex: model } };
-const principalId = source.ownerPrincipalId ?? 'lab-owner'; config.ownerPrincipalId = principalId;
+const principalId = source.ownerPrincipalId ?? 'lab-owner'; config.ownerPrincipalId = principalId; config.ownerUserId = config.controllerUserId = 'principal:' + principalId; config.channelOwnerUserId = owner;
 const channel = prefix + (source.platform === 'feishu' ? 'oc_lab_failure_' + process.pid : String(800000000000000000n + BigInt(process.pid)));
 assert(validChannelId(channel));
 const report = { status: 'running', model, effort, tools: [], deliveries: [], cases: [], logs: [] };
@@ -74,9 +74,8 @@ const wait = async (condition, label, timeout = 240000) => {
 };
 const env = agentEnvironment(source);
 const execution = { codex: new CodexAdapter(source.commands.codex, env), claude: new ClaudeAdapter(source.commands.claude, env) };
-const host = new HostRuntime({ ...sourceHost, rootDataDir: path.join(runDir, 'host'), configs: [config], spaces: [],
+const host = new HostRuntime({ ...sourceHost, rootDataDir: path.join(runDir, 'host'), configs: [config], controllerConfigs: [config], spaces: [],
   principals: [{ id: principalId, accounts: { [config.botId]: rawOwner } }] },
-  { version: 3, status: 'complete', migrationId: 'dispatch-failure-lab', migratedAt: new Date().toISOString(), bots: [] },
   async () => { throw new Error('Lab cannot restart bridge'); }, message => { report.logs.push(String(message).slice(0, 600)); save(); });
 let receive, expected, bot, store;
 try {
@@ -115,8 +114,8 @@ try {
         } })])),
   });
   host.attach(bot); store = new SessionStore(config.dataDir);
-  const conversation = store.createConversation(owner, 'codex', workspace, { controllerMode: true });
-  store.setActive(owner, conversation.id); store.setModel(conversation.id, model); store.setEffort(conversation.id, effort);
+  const conversation = store.createConversation(config.controllerUserId, 'codex', workspace, { controllerMode: true });
+  store.setActive(config.controllerUserId, conversation.id); store.setModel(conversation.id, model); store.setEffort(conversation.id, effort);
   host.store.setController(config.botId, principalId, { conversationId: conversation.id, generation: 1, agent: 'codex', nativeId: null, model, effort }, 0);
   const targets = await bot.targetCatalog.listTargets(config.contextWorkspace, true);
   const target = targets.find(t => t.id === 'workstation'); assert(target, 'Real workstation registration missing');

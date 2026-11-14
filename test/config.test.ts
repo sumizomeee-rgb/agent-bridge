@@ -5,6 +5,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentEnvironment, loadHostConfig, redactText, safeError } from '../src/config.js';
 
+function fixtureConfig(root: string) {
+  const workspaceRoot = join(root, 'workspaces'), registry = join(workspaceRoot, 'bridge-registry');
+  const applicationId = '123456789012345678', channelId = 'discord:' + applicationId;
+  const channel = join(registry, 'channels', 'discord', 'bots', applicationId), controller = join(registry, 'controllers', 'default');
+  mkdirSync(channel, { recursive: true }); mkdirSync(controller, { recursive: true });
+  writeFileSync(join(registry, 'config.json'), JSON.stringify({ version: 4, controllers: ['default'], startupControllers: ['default'], channels: [channelId], principals: [{ id: 'owner', accounts: { [channelId]: applicationId } }], spaces: [] }));
+  writeFileSync(join(channel, 'config.json'), JSON.stringify({ version: 1, id: channelId, platform: 'discord', applicationId, allowedUserIds: [applicationId] }));
+  writeFileSync(join(channel, 'credentials.json'), JSON.stringify({ version: 1, token: 'private-test-value' }));
+  writeFileSync(join(controller, 'config.json'), JSON.stringify({ version: 1, id: 'default', ownerPrincipalId: 'owner', backend: { kind: 'native', agent: 'codex' }, channelId }));
+  const path = join(root, 'config.json'), base = { version: 4, workspaceRoot,
+    commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } };
+  writeFileSync(path, JSON.stringify(base)); return { path, base };
+}
+
 test('explicit proxy port reaches all agent proxy variables and preserves local bypass', () => {
   const env = agentEnvironment({ proxyUrl: 'http://127.0.0.1:7898' } as Parameters<typeof agentEnvironment>[0]);
   assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7898');
@@ -17,10 +31,7 @@ test('explicit proxy port reaches all agent proxy variables and preserves local 
 test('port override and invalid ports are validated without printing token', () => {
   const root = mkdtempSync(join(tmpdir(), 'bridge-config-'));
   try {
-    const path = join(root, 'config.json');
-    mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
-    writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
-    writeFileSync(path, JSON.stringify({ version: 3, startupProfiles: ['discord/default'], workspaceRoot: join(root, 'workspaces'), dataDir: join(root, 'data'), commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } }));
+    const { path } = fixtureConfig(root);
     assert.equal(loadHostConfig(['--config', path, '--proxy-port', '7899']).configs[0]!.proxyUrl, 'http://127.0.0.1:7899');
     assert.throws(() => loadHostConfig(['--config', path, '--proxy-port', '0']).configs[0]!, /1–65535/);
     assert.throws(() => loadHostConfig(['--config', path, '--proxy-port', 'bad']).configs[0]!, /1–65535/);
@@ -37,13 +48,7 @@ test('redaction preserves long replies while limiting diagnostic errors', () => 
 test('ordinary file limit defaults to 20 MiB and validates configuration before startup', () => {
   const root = mkdtempSync(join(tmpdir(), 'bridge-config-'));
   try {
-    const path = join(root, 'config.json');
-    mkdirSync(join(root, 'bots', 'discord'), { recursive: true });
-    writeFileSync(join(root, 'bots', 'discord', 'default.json'), JSON.stringify({ applicationId: '123456789012345678', token: 'private-test-value', allowedUserIds: ['123456789012345678'] }));
-    const base = { version: 3, startupProfiles: ['discord/default'], workspaceRoot: join(root, 'workspaces'),
-      dataDir: join(root, 'data'),
-      commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } };
-    writeFileSync(path, JSON.stringify(base));
+    const { path, base } = fixtureConfig(root);
     assert.equal(loadHostConfig(['--config', path]).configs[0]!.maxFileBytes, 20 * 1024 * 1024);
     for (const limit of [1, 1024, 24 * 1024 * 1024]) {
       writeFileSync(path, JSON.stringify({ ...base, maxFileBytes: limit }));

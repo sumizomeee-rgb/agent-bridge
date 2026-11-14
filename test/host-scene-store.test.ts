@@ -14,7 +14,8 @@ async function setup(t: TestContext) {
   t.after(async () => { for (const value of stores) value.close(); await rm(path, { recursive: true, force: true }); });
   const store = open();
   for (const id of [A, B, C]) {
-    store.registerBot({ botId: id, platform: 'feishu', applicationId: id.slice(7) });
+    const controllerId = 'controller-' + id.slice(7); store.registerController(controllerId);
+    store.registerBot({ controllerId, botId: id, platform: 'feishu', applicationId: id.slice(7) });
     store.mapPrincipal({ botId: id, principalId: P, platformUserId: 'user-' + id, proof: 'verified owner' });
     store.mapSpace({ botId: id, platformSpaceId: 'native-' + id, spaceId: SPACE, proof: 'verified group' });
     store.claimOwner(id, P); store.setController(id, P, controller(id), 0);
@@ -254,7 +255,7 @@ test('only ACKed outboxes add public scene changes and a late old-epoch ACK stay
 test('an explicitly routed public result exposes only the published text, not its private source envelope', async t => {
   const { store } = await setup(t), group = store.getGroup(SPACE)!;
   const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1,
-    messageId: 'private-secret-source', userId: A + '|user-' + A, channelId: A + '|private-owner' };
+    messageId: 'private-secret-source', userId: 'principal:' + P, channelId: A + '|private-owner' };
   const target = { id: 'group-target', kind: 'group' as const, botId: A, principalId: P, channelId: A + '|native-' + A,
     spaceId: SPACE, epoch: group.epoch, revision: group.revision };
   store.registerRoutedDelivery({ id: 'routed', source, target, payload: { text: 'Authorized group result', paths: [] } });

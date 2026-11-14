@@ -34,11 +34,14 @@ test('maintenance script refuses a legacy host before changing its flags and nev
     assert.equal(dirname(resolve(root)), resolve(tmpdir())); assert(basename(root).startsWith('bridge-maintenance-script-'));
     rmSync(root, { recursive: true, force: true });
   });
-  mkdirSync(join(root, 'scripts')); mkdirSync(join(root, '.local', 'data'), { recursive: true });
+  const workspace = join(root, 'workspace'), data = join(workspace, 'bridge-local', 'host');
+  mkdirSync(join(root, 'scripts')); mkdirSync(join(root, '.local')); mkdirSync(data, { recursive: true });
+  mkdirSync(join(workspace, 'bridge-registry'), { recursive: true });
   copyFileSync(resolve('stop.ps1'), join(root, 'stop.ps1'));
   copyFileSync(resolve('scripts/paths.ps1'), join(root, 'scripts/paths.ps1'));
-  writeFileSync(join(root, '.local/config.json'), JSON.stringify({ version: 3 }));
-  const data = join(root, '.local/data'), proof = join(data, 'bridge.pid.json');
+  writeFileSync(join(root, '.local/config.json'), JSON.stringify({ version: 4, workspaceRoot: workspace }));
+  writeFileSync(join(workspace, 'bridge-registry', 'config.json'), JSON.stringify({ version: 4, startupControllers: [] }));
+  const proof = join(data, 'bridge.pid.json');
   writeFileSync(proof, JSON.stringify({ pid: 123 }));
   const legacy = spawnSync('pwsh', ['-NoProfile', '-File', join(root, 'stop.ps1'), '-Drain', '-WaitSeconds', '1'], { encoding: 'utf8', windowsHide: true });
   assert.equal(legacy.error, undefined); assert.notEqual(legacy.status, 0);

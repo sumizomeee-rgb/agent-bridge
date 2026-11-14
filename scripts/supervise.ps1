@@ -7,7 +7,7 @@ $runtime = Join-Path $projectRoot '.local\runtime\win-x64\node.exe'
 $entry = Join-Path $projectRoot 'dist\src\main.js'
 $restartEntry = Join-Path $projectRoot 'dist\src\restart.js'
 
-$logDir = Join-Path $projectRoot '.local\logs'
+$logDir = Join-Path $dataDir 'logs'
 New-Item -ItemType Directory -Path $dataDir,$logDir -Force | Out-Null
 $identityBytes = [Text.Encoding]::UTF8.GetBytes($projectRoot.ToLowerInvariant())
 $identityHash = [Security.Cryptography.SHA256]::Create()

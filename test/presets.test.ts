@@ -36,8 +36,8 @@ function turn(root: string, model: string, nativeId: string | null = null): Agen
 test('预设按需发现、不探测网络；口语别名只用于查询，派发使用稳定ID', async () => {
   const f = fixture();
   try {
-    mkdirSync(join(f.root, 'agent-presets'));
-    writeFileSync(join(f.root, 'agent-presets/registry.json'), JSON.stringify({ version: 1, presets: [f.entry, { ...f.entry, id: 'offline', aliases: ['台式 sol'], targetId: 'home', enabled: false }] }));
+    mkdirSync(join(f.root, 'bridge-agent-presets'));
+    writeFileSync(join(f.root, 'bridge-agent-presets/registry.json'), JSON.stringify({ version: 1, presets: [f.entry, { ...f.entry, id: 'offline', aliases: ['台式 sol'], targetId: 'home', enabled: false }] }));
     assert.equal((await listPresets(f.root)).length, 2);
     assert.deepEqual((await listPresets(f.root, { query: '工位' })).map(x => x.id), ['office-sol']);
     assert.equal((await listPresets(f.root, { targetId: 'home' }))[0]!.enabled, false);
@@ -50,16 +50,16 @@ test('预设按需发现、不探测网络；口语别名只用于查询，派�
 test('目录缺失保留普通派发；损坏的预设目录明确报错，禁用项不回退', async () => {
   const f = fixture();
   const local: AgentAdapter = { run: async () => ({ nativeId: 'normal', text: 'ok' }), interrupt: async () => {}, close: async () => {} };
-  const config: BridgeConfig = { token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: f.root, proxyUrl: null,
+  const config: BridgeConfig = { controllerId: 'fixture-controller', token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: f.root, proxyUrl: null,
     commands: { codex: f.command, claude: f.command }, dataDir: f.data, logsDir: f.root, attachmentsDir: f.root, maxImageBytes: 1 };
   const catalog = new TargetCatalogService(config, { codex: local, claude: local });
   try {
     assert.deepEqual(await catalog.listPresets(f.root), []);
     assert.equal((await catalog.listTargets(f.root))[0]!.id, 'local');
-    mkdirSync(join(f.root, 'agent-presets'));
-    writeFileSync(join(f.root, 'agent-presets/registry.json'), JSON.stringify({ version: 1, presets: [{ ...f.entry, enabled: false }] }));
+    mkdirSync(join(f.root, 'bridge-agent-presets'));
+    writeFileSync(join(f.root, 'bridge-agent-presets/registry.json'), JSON.stringify({ version: 1, presets: [{ ...f.entry, enabled: false }] }));
     await assert.rejects(catalog.resolvePreset(f.root, f.entry.id), /未回退/);
-    writeFileSync(join(f.root, 'agent-presets/registry.json'), '{');
+    writeFileSync(join(f.root, 'bridge-agent-presets/registry.json'), '{');
     await assert.rejects(catalog.listPresets(f.root));
   } finally { await catalog.close(); f.close(); }
 });

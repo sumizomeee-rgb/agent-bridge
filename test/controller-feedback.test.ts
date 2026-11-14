@@ -52,7 +52,7 @@ test('已接收后中断通知说明会话可继续，反馈待下一轮接收�
   assert.match(f.sent[0]!, /本轮中断，会话可继续/);
   assert.match(f.sent[0]!, /主控下一轮会收到/);
   assert.match(f.sent[0]!, /无需重启/);
-  assert.match(f.sent[0]!, /本次未自动重试/);
+  assert.match(f.sent[0]!, /本次未安排自动恢复/);
   assert.equal(f.store.feedback.read(f.scope()).records[0]!.controllerState, 'pending');
   assert.equal(f.turns.length, 1);
   await f.send('continue');

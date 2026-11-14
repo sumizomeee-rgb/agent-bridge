@@ -156,13 +156,13 @@ test('主动 /cwd 选择工程目录后，/new 与 /new c 都保留它，规则�
   assert.equal(f.inspect.getActive('owner')!.cwd, project); assert.equal(f.children.turns[0]!.conversation.cwd, f.shared);
   f.children.finish(0); await until(() => f.manager.isIdle());
 });
-for (const command of ['/new', '/new c']) for (const explicit of [false, true]) test(`统一工作区后旧默认目录迁移，明确 /cwd 的旧路径保留：${command} explicit=${explicit}`, async t => {
-  const f = fixture(t), legacy = join(f.root, 'legacy'); mkdirSync(legacy); f.config.legacyWorkspace = legacy;
+for (const command of ['/new', '/new c']) for (const explicit of [false, true]) test(`运行时不推测迁移已保存的工作目录：${command} explicit=${explicit}`, async t => {
+  const f = fixture(t), legacy = join(f.root, 'legacy'); mkdirSync(legacy);
   const old = f.inspect.createConversation('owner', 'codex', legacy, { controllerMode: true, cwdExplicit: explicit }); f.inspect.setActive('owner', old.id); f.inspect.setModel(old.id, 'gpt-6.1-sol');
   await f.send('new', command);
   if (command === '/new c') { await until(() => f.children.turns.length === 1); f.children.finish(0); }
   await f.ready();
-  assert.equal(f.inspect.getActive('owner')!.cwd, explicit ? legacy : f.shared);
+  assert.equal(f.inspect.getActive('owner')!.cwd, legacy);
   assert.equal(f.inspect.getConversation(old.id)!.cwd, legacy, 'historical session remains unchanged');
 });
 test('未登记用户不能读取共享规则或启动历史续接', async t => {
@@ -184,8 +184,8 @@ for (const command of ['/new', '/new c', '/cwd']) test(`${command} 取消旧定�
   await until(() => f.manager.isIdle()); f.advance(120000); await f.runtime.poll();
   assert.equal(f.runtime.store.schedules()[0]!.status, 'cancelled'); assert.equal(f.children.turns.length, command === '/new c' ? 1 : 0);
 });
-test('新旧目录重启后保留 cwdExplicit，不因配置迁移覆盖用户指定工程', async t => {
-  const f = fixture(t), legacy = join(f.root, 'legacy'); mkdirSync(legacy); f.config.legacyWorkspace = legacy;
+test('重启后保留 cwdExplicit，不覆盖用户指定工程', async t => {
+  const f = fixture(t), legacy = join(f.root, 'legacy'); mkdirSync(legacy);
   await f.send('cwd', '/cwd ' + legacy); await f.ready(); await f.restart(); await f.send('new', '/new'); await until(() => f.manager.isIdle());
   assert.equal(f.inspect.getActive('owner')!.cwd, legacy); assert.equal(f.inspect.getActive('owner')!.cwdExplicit, true);
 });

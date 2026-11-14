@@ -4,89 +4,38 @@
 
 ## 部署
 
-正式配置为 `version: 3`，`startupProfiles` 启动同平台 Bot 的完整集合。一个 Bot 只服务一个激活账号，其私聊和已激活工作群共用当前主控；不同 Bot 独立保存主控会话和运行数据；用户文档目录可以共用。`-Profile` 仅校验集合成员，不能用它单独启动一个 Bot。账号和跨应用群地址须明确登记，见[Profile、Bot 与宿主迁移](profiles.md)。
+正式 bootstrap 为 `version:4`，只保存明确的 `workspaceRoot`、CLI 命令和公共运行选项。主控、启动集合、操作者及可选渠道登记均放在工作区，完整配置见 [主控与渠道登记](controller-registry.md)。运行时不读取旧 `.local/bots/`，不按平台派生新工作区，也不回退旧数据路径。
 
-主控模式的 `/agent` 真实切换自动提炼本 Bot 当前最新上下文，目标主控准备成功后提交并重绑助手、排队工作和计划；失败保持原主控，同后端无操作，来回切也不恢复旧后端分支。`/new` 是重置；`/new continue` 仅提炼当前 Bot，不转移普通助手归属；待触发计划跨 `/new`、continue 和 `/cwd` 保留，新主控就绪后处理，已启动定时助手仍按原停止边界核实。群命令只保留安全子集，详见[使用说明](usage.md)。不提供历史主控重新绑定入口；`/chats` 只读。
+1. 准备同平台 Node `>=24.12.0`、`node_modules/`、构建后的 `dist/`、`harness/`、脚本与工作区骨架。CLI 使用目标用户自己的认证、网关和 skills。
+2. 运行 `.\init-workspace.ps1 -Path 'D:\Agent Workspace'`。生成器只补缺失文件，保留已有 README、MEMORY 与私有登记；不自动改 bootstrap。
+3. 复制 `config.example.json` 为项目 `.local/config.json`，填写 CLI 与工作区路径，在工作区完成主控和渠道登记。真实配置、凭据和运行数据不进 Git。
+4. 已有部署先正常排空并停止旧桥，再执行 [v4 离线迁移](controller-registry.md#旧部署的一次性迁移)。不能用新脚本控制仍在旧目录运行的进程。
+5. 运行 `.\start.ps1 -Check`，再运行 `.\start.ps1`。检查只证明静态配置和本机路径，不验证平台、网关或模型当前可用。
+6. 需要登录后隐藏启动时，以管理员运行 `.\install-startup.ps1 -StartNow`。
 
-模型选择按会话保存，重启后保留。同一 Agent 的 `/new`、`/cwd` 沿用显式模型选择；跨后端交接按目标后端的选择和默认配置校验，不复制源后端不兼容的模型或强度。执行或排队期间先完成任务或 `/stop`，再切模型。CLI 回报的实际模型和目录推荐默认分别显示，避免误认。自定义网关模型是否可用由下一次提供方调用验证。
+`-Profile` 接受启动主控 ID 或其已绑定渠道的 profile 名，只校验集合成员，不单独启动该成员；`-Platform` 核对已配置渠道，不更改启动集合。无渠道主控可使用不带平台的启动方式。
 
-Codex 每轮读取当前工作目录的生效配置，按当前供应商直接使用原生 ID 续接，并核对返回供应商及会话 ID。续接时使用 `excludeTurns: true` 省略返回的历史正文，Codex 仍恢复完整上下文，避免图片和工具历史累积导致桥的单条输出超限。CC Switch 切换后无需手动恢复命令。若无法确认安全续接，保留旧会话并明确报错，本轮任务尚未提交；不会自动另开空会话或重做工具操作。供应商与认证仍由用户的 CLI / CC Switch 配置管理。
+主控与聊天渠道各自的 `network.proxyPort` 独立生效；`-ProxyPort` 是明确的临时覆盖。配置不修改飞连、系统代理或隧道自启。`internalBotCommunicationEnabled` 控制跨 Bot 后台协作，不取消在执行的直属助手或改变平台发送授权。
 
-已验证平台为 Windows x64。目标机器需已登录 Codex CLI，并安装 Claude Code CLI（Claude 使用自己的登录或网关设置）。两者沿用目标用户的全局配置和 skills。
+## 工作区、停止与重启
 
-1. 获取代码、编译后的 `dist/` 与 `harness/` 运行资产，携带脚本和工作区骨架，复制同平台 `node_modules/` 与 `.local/runtime/`。
-2. 将 `config.example.json` 复制到 `.local/config.json`，填写 CLI、`startupProfiles`、`workspaceRoot`、`principals`；各 Bot 凭据、白名单和网络填写到 `.local/bots/<平台>/<名称>.json`。群模式还需显式 `groupMode: true`，飞书逐应用核对 `spaces` 地址。
-3. 生成用户上下文工作区，并在各 Profile 指定共享或独立的目录。现有 v2 数据先完成下述离线迁移；全新空部署直接使用 v3。运行 `./start.ps1 -Check`，只检查本机配置、运行时、CLI 路径等静态前提，不连接平台、网关或 Agent，不证明代理端口在线。
-4. 运行 `./start.ps1` 启动完整集合。代理写在各 Profile 的 `network.proxyPort`，或显式用 `./start.ps1 -ProxyPort 7898` 临时覆盖。
-5. 需要登录后隐藏启动：以管理员运行 `./install-startup.ps1 -StartNow`。
+工作区 `README.md` 是固定初始化上下文的唯一入口；MEMORY 由其中显式引用载入。部署说明、外部 API 和登记细节按需阅读，不额外灌入主控。
 
-`./stop.ps1` 会停止桥，并让后台监督任务停止重启。手动执行 `./start.ps1` 时重新启用运行。保持只有一处部署处理同一个机器人；程序也使用机器人身份对应的本机单实例锁。
+- `bridge-local/host/`：宿主库、收件与重启状态、PID、停止请求、`host.log`、`logs/startup-errors.log` 和外部 API 私有登记。
+- `bridge-registry/controllers/<id>/data/`：主控会话、助手、任务、定时、恢复、上下文票据及原生主控运行资料。
+- `bridge-registry/channels/lark|discord/bots/<appId>/data/`：渠道 ingress、outbox、生命周期和附件。渠道凭据在同级 `credentials.json`。
+- `bridge-local/browser/`：桥的浏览器运行资料；`bridge-computers/` 保存电脑与 SSH 登记。
+- `tmp/<任务名>/`：临时产物；以上持久目录不视为可清理 tmp。
 
-`internalBotCommunicationEnabled` 在公共配置中独立控制跨 Bot 后台通信：省略为 `true` 保持旧部署，示例显式 `false`，先体验群公开协作。关闭会拒绝后台递话、内部协作发起和依赖内部通知的任务交接，停止派送尚未送入主控的内部定向事件，并取消未接受的 `proposed` 交接提议以免阻挡原负责人派工；不会取消任务或在执行的直属助手，原负责人和资源归属保持，再次开启不复活旧提议。内部结果及助手／唤醒失败的错误正文仍不改投群公开区域。群广播、公开协作、群静默不回复、本人私聊与直属助手继续可用，完整边界见 [Profile 的可选功能](profiles.md#网络与可选功能)。
+`.\stop.ps1` 写入宿主 `disabled` 和停止请求，让监督任务停止重启。`.\stop.ps1 -Drain` 暂停接新工作并等待已有执行安全结束；未确认进程停止时不强杀。手动 `.\start.ps1` 重新启用，监督和安全重启沿用同一个宿主目录及日志目录。
 
-修改此开关后先确认任务状态并安全重启桥，续接原生会话即可生效，不要求 `/new`。新提供的工具声明去除内部入口，Codex 旧会话可能仍显示缓存的接口，但桥端硬性拒绝关闭的操作；不能把“旧清单仍可见”误判成开关失效。当前轮已收到的内容不能撤回；不得为刷新清单擅自重置用户上下文。启动检查成功或接口被拒绝只证明相应阶段，真实群公开协作需另做现场验收。
+普通重启保留主控原生会话、任务和定时；外部 Agent 的等待决策持久化，重新连接后使用当前 lease 继续。期限按原 deadline 计算，不因重启重新计时；执行中结果未知不会自动重放副作用。`/new` 是新建主控会话，与重启不同；待触发计划沿用既有的持久生命周期规则。
 
-群派工自动登记与有界现场刷新的升级边界见[唯一群聊设计](group-controller-design.md#主控可见现场与慢响应刷新)：主控不再执行显式认领／完成协议，桥仍保存任务、助手、原授权、资源和终态。安全重启不能把正在执行或结果未知的任务伪造成已结束，不取消无关助手，不清空原生历史。旧会话缓存的认领工具不能替代新派工入口的程序登记；新动态工具的可见性与调用兼容须按实际后端分别验收，不为更新清单擅自 `/new`。部署检查应另覆盖慢返回遇到新派工／结束、同响应多工具共同暂停、每个原始主人请求、每个 Bot 的一次持久刷新预算（派生根共享，重启不补满）及用完后继续排队，以及关闭后台互通时内部正文不外泄。文档列出目标与验收边界，不代替本轮构建、自动化或真机证据。
-
-平台代理由各 Profile 的 `network.proxyPort` 独立决定，Discord REST、Gateway、图片链路使用相应配置；缺省平台直连，Agent 未指定代理时沿用已有 CLI 环境。显式覆盖保留本地与工位网关的 `NO_PROXY`。这些设置不更改飞连、系统代理、监听隧道或它们的自启。
-
-宿主只有一个项目锁、监督进程与安全重启登记；各 Bot 验证真实应用身份并持独立身份锁。成员启动或鉴权失败会保留错误并关闭该成员资源，其他健康成员继续；涉及失败成员的群操作保持可核对的失败／未就绪状态。
-
-部署验收分别记录实际代码版本、平台、网关及测试范围；既有现场记录见唯一群聊设计，不能沿用早期网关离线状态或旧验收结果推断当前健康。`-Check`、编译、自动化和只读群 API 成功不能替代真实模型调用、公开回复、重连及本轮新增边界的现场验证。
-
-## 生成 Agent 工作区
-
-在桥仓库运行下列脚本，`-Path` 必须是目标工作区的完整绝对路径。省略参数时会询问路径；不依赖当前目录、Node 或联网。
-
-```powershell
-.\init-workspace.ps1 -Path 'D:\Agent Workspace'
-```
-
-生成 `MEMORY.md`、`README.md`、`bridge-remote-agents/registry.json`、`bridge-capabilities/registry.json` 和各目录的 `example.json`，以及 `bridge-chat-platforms/lark.md`、`bridge-chat-platforms/discord.md`；预建根目录 `tmp/`，重复运行保留目录内已有内容。只创建缺失文件，已有文件原样保留，重复运行可以补齐模板；不会改 `.local/config.json`、复制技能或迁移认证。脚本报错时返回非零退出码。
-
-1. 保留生成的 `README.md` 作为桥通用规则，在 `MEMORY.md` 的“用户偏好”“本地工作约定”“环境与入口”中填写本地内容；长工作指南只保存权威入口，不复制到通用 README。
-2. `bridge-remote-agents/registry.json` 初始为有效的空注册表，本机 `local` 由桥内置。参考 `bridge-remote-agents/example.json` 填写真实远端登记，替换示例的电脑名称、SSH 配置、别名、引擎和路径；示例不会自动激活。SSH 凭据仍留在 SSH 配置库，供应商和认证留在对应电脑的 CLI。
-3. `bridge-capabilities/registry.json` 初始为空；按 `bridge-capabilities/example.json` 填写真正使用的浏览器 profile 和能力入口。验收记录注明范围，当前状态由桥按需查询，示例不会启用；见[能力登记与就绪检查](capabilities.md)。
-4. 将该路径放在对应 Profile 的 `workspace`；或者按公共 `workspaceRoot` 下的 `<平台>/<应用ID>` 默认路径生成。多个 Bot 可以指向同一目录；这不会合并各自的账号、主控或任务数据。`workingCwd` 是默认工程目录；私聊 `/cwd 完整绝对路径` 会在工程目录新建主控，初始化仍读固定上下文工作区。已运行桥需安全重启加载配置。
-
-工作区文件属于用户资料，需要单独迁移；保留旧工作区就直接复制它，不必重新生成或覆盖。修改模板不会覆盖现有工作区。旧工作区的 AGENTS.md 如需收敛，应先把通用规则与本地内容分别归入 README、MEMORY，再备份并回收旧文件；生成器不会自动合并或删除用户已有文件，也不会重新生成 AGENTS.md。重复运行生成器会补齐缺失的平台文档，但已有 README 的初始化入口需要用户按模板定点更新；没有声明读取范围时，桥不会自行扫描或加载额外资料。
-
-### 旧版根目录登记迁移
-
-升级读取路径前先安全停桥并核对用户工作区。将根目录 `agents.json`、`agents.example.json` 移到 `bridge-remote-agents/registry.json`、`bridge-remote-agents/example.json`；将 `capabilities.json`、`capabilities.example.json` 移到 `bridge-capabilities/registry.json`、`bridge-capabilities/example.json`。保持 JSON 原字节，目标已有文件时先核对合并，不直接覆盖。更新已有 README、MEMORY 和平台指南中的路径引用后，重新运行生成器核对，再重启桥。生成器检测到旧根目录登记会提前报错，不自动迁移用户文件或创建空表代替真实登记。
-
-职责与新增职能的模板、固定清单和读取逻辑约定见 [项目 README](../README.md#工作区职责与生成原理)。
-
-## 工作目录与数据
-
-桥代码与 Agent 默认工作目录独立。工作区 `README.md` 是固定初始化的唯一入口，保存通用行为规则并显式引用桥交付协议、工具导航和 MEMORY 原文；项目 README 只作部署与工程导航；用户语言、交流与执行偏好、本地工作约定、机器与项目导航保存在实际工作区的 `MEMORY.md`。业务详细习惯按工作区导航在相关任务中读取，不复制到桥。仓库 `workspace-template/` 仅是可手动采用的通用模板，运行时不会自动复制或覆盖用户文件。
-
-技能名称、描述和路径由 CLI 根据自身系统、用户及启用的插件技能生成，不由桥扫描或拼装，也不是工作区初始化摘要。控制器使用隔离 home 保留用户供应商和模型路由，限制电脑工具与用户 MCP；隔离并不保证没有 CLI 技能元数据。桥不为上下文分层关闭或删除用户技能、不改全局设置。执行端原生指令由 CLI 自身加载；工作区不生成供应商专用正文，需要配置共享入口时放在相应 CLI 的用户级上下文。普通初始化直接装配工作区 README 的登记引用并载入 MEMORY.md 原文，只有历史续接需要只读助手。
-
-`/new` 默认不注入旧聊天；`/new continue` 只提炼本 Bot 当前主控，`/agent` 真实切换内置连续交接并保留任务和计划。正常重启续接原生历史。交接摘要是一次性的上下文输入，偏好与长期记忆维护在配置的用户工作区 README、MEMORY；共享目录的 Bot 读取同一份用户资料，工程 cwd 不改变资料入口。
-
-`.local/`、`node_modules/`、`dist/` 不进入 Git：
-
-- `.local/config.json`：version:3 宿主设置，CLI、同平台启动集合、上下文根目录、操作者及群映射。
-- `.local/bots/<平台>/<名称>.json`：对应 bot 的凭据、应用身份、白名单及启动功能。
-
-旧部署升级须先按 [宿主语义迁移](profiles.md#现有部署迁移到-v3) 执行 dry-run → 正常停桥／核实任务静止 → apply，再更新部署目录和登录任务。迁移输出 `blockers` 时不得删除记录、改状态或伪造停止标记强清；应先核实本机与远端进程和未知执行结果。新运行版本不自动解释旧配置、旧归属或半完成迁移。
-
-- `.local/runtime/win-x64/node.exe`：Node 24.13.0 便携运行时。
-- `.local/data/host.sqlite`、`host-inbox.sqlite`：宿主当前主控、账号、工作群、协作事件、交接与群游标；`restart.sqlite` 保存宿主重启阶段。
-- `.local/data/bots/<平台>/<应用ID>/`：该 Bot 的 `bridge.sqlite`、`ingress.sqlite`、`controller.sqlite`、`tasks.sqlite`、原生租约与 `controller-homes/`，共同保存会话、助手、计划、队列和原生历史，应一起备份。
-- 各 Bot 数据目录的 `contexts/`、`tickets/`：父轮次凭据和签名回执票据，只供授权子任务使用。
-- 各 Bot 数据目录的 `attachments/`、`outgoing/`：已用图片及回传文件；正在使用的资料不应删除，也不自动扫描上传。
-- `.local/logs/<平台>/<应用ID>/`：各 Bot 日志，不主动保存凭据。
-- 各 Bot 数据目录的 `capability-health/`：能力轻检查缓存，不保存网站认证。
-- `.local/data/host-semantic-version.json`：宿主语义提交标记；旧库存在或标记不完整时拒绝启动，不能手改它跳过迁移。
-
-迁移到同平台新电脑时正常停桥，备份并复制代码、构建、`.local`、配置引用的用户工作区；共用目录只复制一份，按目标位置更新各 Profile 和 CLI 路径，各 Bot 运行数据库分别保留。只有目标用户本身已具有 CLI 认证才可使用，不迁移 CLI 登录 Token。
-
+迁往同平台新电脑时，先正常停桥，搬迁代码、发行资产、bootstrap 和唯一工作区，再更新 CLI 路径及明确的工作区入口。跨机器 CLI 登录仍由目标用户准备；不要只搬其中某个数据库或遗失渠道凭据、签名票据。
 
 ## 跨电脑直属 Agent
 
-在实际工作区维护 `bridge-remote-agents/registry.json`（`version: 1`），格式见 `workspace-template/bridge-remote-agents/example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
+在实际工作区维护 `bridge-computers/registry.json`（`version: 1`），格式见 `workspace-template/bridge-computers/example.json`。每项记录稳定的目标 id、电脑名称、桥电脑上的 SSH 配置和别名、目标运行目录、Node 路径，以及该电脑已安装引擎的命令和默认工作目录。只存导航和非秘密登记；登录、供应商及模型别名保留在目标用户自己的 CLI 配置中。本机使用保留目标 `local`，无需重复登记。
 
 主控按需使用 `bridge_list_targets` 查询，再在 `bridge_start_worker` 指定 `targetId`。登记不等于实时在线，派发时核对目标电脑、引擎和远端目录；不会因目标失败而悄悄改在本机执行。远端执行器在自己的 `.local/remote` 保存任务登记与回执；助手历史由原生 CLI 保存在对应用户的 `.codex/sessions`、`.claude/projects` 及原生索引，`.codex/bridge/`、`.claude/bridge/` 只保留绑定、共享预设配置与运行时。显隐通过原生来源筛选实现，详见[预设与原生历史](presets.md#原生历史可见性)。管理接口仅监听目标机 127.0.0.1，通过 SSH 本地转发和私有认证连接。断线重连和桥恢复查询同一派发编号，不重复提交原任务。续接、工作中补充、停止、读图与文件回传沿用既有协议。
 

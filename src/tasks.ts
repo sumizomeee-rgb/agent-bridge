@@ -5,15 +5,15 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { executorTaskId } from './executor-messages.js';
-import type { AgentName, AgentTurn, Conversation } from './types.js';
+import type { ControllerAgentName, AgentTurn, Conversation } from './types.js';
 
 export interface TaskOrigin {
   conversationId: string; userId: string; channelId: string; originMessageId: string;
-  nativeId: string | null; agent: AgentName; cwd: string;
+  nativeId: string | null; agent: ControllerAgentName; cwd: string;
   helperPath?: string; nodePath?: string;
   groupContext?: AgentTurn['groupContext'];
   /** Immutable original parent identities survive successive backend switches. */
-  reboundFrom?: Array<{ conversationId: string; agent: AgentName; nativeId: string | null }>;
+  reboundFrom?: Array<{ conversationId: string; agent: ControllerAgentName; nativeId: string | null }>;
   /** Program-created internal workspace initialization, never a user/tool parameter. */
   purpose?: 'workspace-context' | 'schedule' | 'host-event' | 'housekeeper' | 'dispatch-failure' | 'executor-message' | 'controller-recovery';
   controllerRecoveryId?: string;
@@ -146,7 +146,7 @@ export class TaskRegistry {
   close(): void { this.db.close(); }
   createContext(origin: TaskOrigin): { contextId: string; contextPath: string } {
     if (!origin.conversationId || !origin.userId || !origin.channelId || !origin.originMessageId || !origin.cwd
-      || !['codex', 'claude'].includes(origin.agent)) throw new Error('任务父会话信息不完整');
+      || !['codex', 'claude', 'external'].includes(origin.agent)) throw new Error('任务父会话信息不完整');
     const contextId = randomUUID(); const token = randomBytes(32).toString('hex');
     this.db.prepare('INSERT INTO task_contexts (id,token,origin_json,created_at) VALUES (?,?,?,?)')
       .run(contextId, token, JSON.stringify(origin), timestamp());
@@ -483,6 +483,21 @@ export class TaskRegistry {
   }
   markUncertain(id: string, reason = '任务汇报过程中断，结果未知；不自动重做'): void {
     for (const table of ['task_events', 'task_observations']) this.db.prepare(`UPDATE ${table} SET state='uncertain',reason=?,updated_at=? WHERE id=? AND state IN ('queued','processing')`).run(reason, timestamp(), id);
+  }
+  suspendEvent(id: string): boolean {
+    let changed = false;
+    for (const table of ['task_events', 'task_observations']) changed = Number(this.db.prepare(`UPDATE ${table} SET state='queued',updated_at=? WHERE id=? AND state='processing'`).run(timestamp(), id).changes) > 0 || changed;
+    return changed;
+  }
+  requeueExternalProcessing(users?: string[]): number {
+    let count = 0;
+    for (const table of ['task_events', 'task_observations']) {
+      for (const row of this.db.prepare(`SELECT id,origin_json FROM ${table} WHERE state='processing'`).all()) {
+        const origin = JSON.parse(String(row.origin_json)) as TaskOrigin;
+        if (origin.agent === 'external' && (!users || users.includes(origin.userId)) && this.suspendEvent(String(row.id))) count++;
+      }
+    }
+    return count;
   }
   recoverProcessing(users?: string[]): number {
     let count = 0;

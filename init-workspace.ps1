@@ -37,21 +37,21 @@ try {
     }
 
     $templateRoot = Join-Path $PSScriptRoot 'workspace-template'
-    $files = @('MEMORY.md', 'README.md', 'bridge-prompts.json', 'bridge-remote-agents/registry.json', 'bridge-remote-agents/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-chat-platforms\lark.md', 'bridge-chat-platforms\discord.md')
+    $files = @('MEMORY.md', 'README.md', 'bridge-prompts.json', 'bridge-computers/registry.json', 'bridge-computers/example.json', 'bridge-agent-presets/registry.json', 'bridge-agent-presets/example.json', 'bridge-agent-presets/private/profiles.json', 'bridge-agent-presets/private/credentials.json', 'bridge-capabilities/registry.json', 'bridge-capabilities/example.json', 'bridge-registry/config.json', 'bridge-registry/controllers/README.md', 'bridge-registry/controllers/config.example.json', 'bridge-registry/channels/lark/README.md', 'bridge-registry/channels/lark/bots/README.md', 'bridge-registry/channels/discord/README.md', 'bridge-registry/channels/discord/bots/README.md', 'bridge-local/README.md')
     # 不在旧登记仍位于根目录时生成空表，以免真实配置被静默忽略。
     foreach ($legacy in @('agents.json', 'agents.example.json', 'capabilities.json', 'capabilities.example.json')) {
         if (Test-Path -LiteralPath (Join-Path $workspace $legacy)) {
-            throw "检测到旧版根目录登记 $legacy；请按部署说明先迁移至 bridge-remote-agents/ 或 bridge-capabilities/，再生成骨架。"
+            throw "检测到旧版根目录登记 $legacy；请按部署说明先迁移至 bridge-computers/ 或 bridge-capabilities/，再生成骨架。"
         }
     }
     # 旧职能目录必须先迁移，不能新建空登记表遮住用户原配置。
-    foreach ($legacyDirectory in @('remote-agents', 'capabilities', 'agent-presets', 'chat-platforms')) {
-        if ((Test-Path -LiteralPath (Join-Path $workspace $legacyDirectory)) -and !(Test-Path -LiteralPath (Join-Path $workspace ('bridge-' + $legacyDirectory)))) {
+    foreach ($legacyDirectory in @('remote-agents', 'capabilities', 'agent-presets', 'chat-platforms', 'bridge-remote-agents', 'bridge-chat-platforms', '.local/browser')) {
+        if (Test-Path -LiteralPath (Join-Path $workspace $legacyDirectory)) {
             throw "检测到旧职能目录 $legacyDirectory；请先迁移，生成器不会覆盖或另建空表。"
         }
     }
     # 先检查父目录及完整清单，避免碰撞时只生成一部分模板。
-    $directories = @('bridge-chat-platforms', 'bridge-remote-agents', 'bridge-agent-presets', 'bridge-agent-presets\private', 'bridge-capabilities', 'tmp')
+    $directories = @('bridge-registry', 'bridge-registry\controllers', 'bridge-registry\channels\lark\bots', 'bridge-registry\channels\discord\bots', 'bridge-local', 'bridge-local\host', 'bridge-local\browser', 'bridge-computers', 'bridge-agent-presets', 'bridge-agent-presets\private', 'bridge-capabilities', 'tmp')
     foreach ($name in $directories) {
         $directory = Join-Path $workspace $name
         if ([IO.File]::Exists($directory)) {
@@ -118,7 +118,7 @@ try {
     }
     Write-Host "工作区：$workspace"
     Write-Host "完成：生成 $created 个文件，保留 $preserved 个已存在文件。"
-    Write-Host '填写工作区说明、电脑登记及所需预设配置，再将桥配置的 workspace 指向此目录。'
+    Write-Host '填写工作区说明、电脑登记及所需预设配置，再将桥配置的 workspaceRoot 指向此目录。'
     Write-Host '预设启动配置和凭据只在本工作区维护；桥启动后自动准备各电脑所需文件，无需逐台复制。'
     exit 0
 } catch {

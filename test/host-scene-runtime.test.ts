@@ -14,17 +14,16 @@ import type { AgentTurn, BridgeConfig } from '../src/types.js';
 const A = 'feishu:scene-runtime-a', B = 'feishu:scene-runtime-b', P = 'owner', SPACE = 'group';
 async function fixture(t: TestContext) {
   const path = await mkdtemp(join(tmpdir(), 'bridge-scene-runtime-test-'));
-  const configs = [A, B].map((id, index): BridgeConfig => ({ botId: id, platform: 'feishu', applicationId: id.slice(7),
-    scopePrefix: id + '|', ownerPrincipalId: P, ownerUserId: id + '|owner-' + index, token: '', allowedUserIds: [id + '|owner-' + index],
+  const configs = [A, B].map((id, index): BridgeConfig => ({ botId: id, controllerId: id, controllerUserId: 'principal:' + P, channelOwnerUserId: id + '|owner-' + index, platform: 'feishu', applicationId: id.slice(7),
+    scopePrefix: id + '|', ownerPrincipalId: P, ownerUserId: 'principal:' + P, token: '', allowedUserIds: [id + '|owner-' + index],
     defaultAgent: 'codex', workspace: path, dataDir: join(path, 'bot-' + index), attachmentsDir: join(path, 'images-' + index),
     logsDir: join(path, 'logs-' + index), proxyUrl: null, maxImageBytes: 1024, maxFileBytes: 1024,
     controllerMode: true, groupMode: true, internalBotCommunicationEnabled: false,
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } } }));
-  const config: HostConfig = { version: 3, rootDataDir: join(path, 'host'), configs, internalBotCommunicationEnabled: false,
+  const config: HostConfig = { version: 4, workspaceRoot: path, registry: { version: 4, workspaceRoot: path, registryRoot: join(path, 'registry'), hostDataDir: join(path, 'host'), startupControllers: [], controllers: [], channels: [], principals: [], spaces: [] }, rootDataDir: join(path, 'host'), configs, controllerConfigs: configs, internalBotCommunicationEnabled: false,
     principals: [{ id: P, accounts: { [A]: 'owner-0', [B]: 'owner-1' } }],
     spaces: [{ id: SPACE, accounts: { [A]: 'group-a', [B]: 'group-b' } }] };
   const reports: string[] = [], host = new HostRuntime(config,
-    { version: 3, status: 'complete', migrationId: 'test', migratedAt: '2026-10-18T00:00:00.000Z', bots: [] },
     async () => ({ accepted: true }), line => reports.push(line));
   const hooks = new Map(configs.map(c => [c.botId!, host.hooks(c)]));
   const stores = new Map<string, ControllerStore>();
@@ -38,6 +37,7 @@ async function fixture(t: TestContext) {
       && !store.jobs(workerId).some(job => ['queued', 'running', 'uncertain'].includes(job.status))
       && !store.schedules().some(plan => plan.worker?.id === workerId && ['pending', 'dispatching', 'running', 'uncertain'].includes(plan.status)) };
     host.attach({ config: c, controller, manager: { isIdle: () => true },
+      core: { config: c, controller, manager: { isIdle: () => true }, beginDrain() {}, isIdle: () => true, async close() {} },
       transport: { async getGroupInfo() { return { botIsMember: true }; }, async getGroupMember() { return { id: 'owner' }; } },
       isReady: () => true, isIdle: () => true, async close() { store.close(); },
     } as unknown as BotRuntime);

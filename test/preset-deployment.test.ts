@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { presetMaterials } from '../src/presets/deployment.js';
 import { installMaterials, readMaterials, materialsHash } from '../src/presets/materials.js';
-import { parseLaunchProfiles, PresetRuntime } from '../src/presets/runtime.js';
+import { parseLaunchProfiles, PresetRuntime, PresetAgentAdapter } from '../src/presets/runtime.js';
 import { RemoteDeploymentService, type ExecutorRelease } from '../src/remote/deployment.js';
 import { SshRemoteClient, setRemoteDeploymentHook, requestRemoteHttp } from '../src/remote/client.js';
 import { RemoteDaemon } from '../src/remote/daemon.js';
@@ -15,17 +15,21 @@ import { ControllerRuntime } from '../src/controller/runtime.js';
 import { TaskRegistry } from '../src/tasks.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig } from '../src/types.js';
 import type { ExecutionTargetBinding } from '../src/remote/types.js';
+import { CodexAdapter } from '../src/agents/codex.js';
+import { JsonLineProcess } from '../src/agents/process.js';
+import { ExecutorMessages } from '../src/executor-messages.js';
+import { projectRoot } from '../src/config.js';
 import { ownTemporaryDirectory } from './temp-directory.js';
 
 function fixture() {
   const root = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'preset-deploy-')), 'preset-deploy-');
   const workspace = join(root, 'workspace'), privateRoot = join(root, 'executor', '.local', 'agent-presets');
-  const central = join(workspace, 'agent-presets', 'private'); mkdirSync(central, { recursive: true });
+  const central = join(workspace, 'bridge-agent-presets', 'private'); mkdirSync(central, { recursive: true });
   const profile = { id: 'gateway-sol', revision: 1, agent: 'codex', model: 'gpt-6.1-sol', credentialId: 'codex-key', baseUrl: 'https://gateway.example', transport: { kind: 'direct' } };
   const entry = { id: 'home-sol', aliases: ['家用 sol'], targetId: 'home', agent: 'codex', model: profile.model, profileId: profile.id, revision: 1, enabled: true };
   const target: ExecutionTargetBinding = { id: 'home', label: 'home', transport: 'ssh', expectedHostname: hostname(), sshConfig: 'ssh-config', alias: 'test', remoteRoot: join(root, 'executor'), nodePath: process.execPath, agent: 'codex', agentCommand: { command: process.execPath, args: [] }, cwd: root };
   function source(profiles: unknown[] = [profile], presets: unknown[] = [entry], credentials: unknown = { 'codex-key': { apiKey: 'isolated-test-key' }, unused: { apiKey: 'never-transfer-this' } }) {
-    writeFileSync(join(workspace, 'agent-presets', 'registry.json'), JSON.stringify({ version: 1, presets }));
+    writeFileSync(join(workspace, 'bridge-agent-presets', 'registry.json'), JSON.stringify({ version: 1, presets }));
     writeFileSync(join(central, 'profiles.json'), JSON.stringify({ version: 1, profiles }));
     writeFileSync(join(central, 'credentials.json'), JSON.stringify({ version: 1, credentials }));
   }
@@ -176,6 +180,8 @@ const readline=require('node:readline');const send=x=>process.stdout.write(JSON.
 const input=readline.createInterface({input:process.stdin});input.on('line',line=>{const m=JSON.parse(line);
 if(m.method==='initialize')send({id:m.id,result:{}});
 if(m.method==='config/read')send({id:m.id,result:{config:{model_provider:'bridge_preset'}}});
+if(m.method==='model/list')send({id:m.id,result:{data:[{id:'gpt-6.1-sol',model:'gpt-6.1-sol',displayName:'fixture sol',isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'medium'},{reasoningEffort:'high'},{reasoningEffort:'xhigh'}]}]}});
+if(m.method==='thread/read')send({id:m.id,result:{thread:{id:thread,reasoningEffort:'xhigh'}}});
 if(m.method==='thread/start'||m.method==='thread/resume'){thread=m.params.threadId||thread;send({id:m.id,result:{thread:{id:thread},modelProvider:m.params.modelProvider}});}
 if(m.method==='turn/start'){send({id:m.id,result:{turn:{id:'turn'}}});setTimeout(()=>{
 send({method:'item/completed',params:{threadId:thread,turnId:'turn',item:{type:'agentMessage',phase:'final_answer',id:'final',text:process.env.BRIDGE_PRESET_API_KEY==='isolated-test-key'?'AUTO_PRESET_OK':'BAD_ENV'}}});
@@ -183,13 +189,24 @@ send({method:'turn/completed',params:{threadId:thread,turn:{id:'turn',status:'co
 });input.on('close',()=>process.exit(0));`);
   const command = { command: process.execPath, args: [script] }, remoteRoot = f.target.remoteRoot!;
   const daemonConfig = { version: 1 as const, expectedHostname: hostname(), engines: { codex: { agentCommand: command, defaultCwd: remoteRoot } } };
-  const daemon = new RemoteDaemon(remoteRoot, daemonConfig); await daemon.listen();
+  const isolatedHome = join(f.root, 'isolated-user-home');
+  const presetRuntime = new PresetRuntime(f.privateRoot, join(remoteRoot, '.local', 'remote'), isolatedHome);
+  const daemon = new RemoteDaemon(remoteRoot, daemonConfig, { nativeSessionOptions: { userHome: isolatedHome },
+    adapterFactory: (agent, request, track) => {
+      assert.equal(agent, 'codex'); assert(request.preset); assert.equal(request.sessionVisibility, 'hidden');
+      const env = { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, CODEX_HOME: undefined, CODEX_SQLITE_HOME: undefined, CLAUDE_CONFIG_DIR: undefined };
+      return new PresetAgentAdapter(presetRuntime, request.preset, request.agentCommand, env, (configured, preparedEnv) =>
+        new CodexAdapter(configured, { ...preparedEnv, BRIDGE_CODEX_APP_SERVER: process.execPath }, (_nativeCommand, args, cwd, launchEnv) => {
+          // Keep production preset/source preparation; the final child is a deterministic fake CLI, never the installed model runtime.
+          const child = new JsonLineProcess(configured, args, cwd, launchEnv); track(child); return child;
+        }), request.sessionVisibility);
+    } }); await daemon.listen();
   const endpoint = JSON.parse(readFileSync(join(daemon.dataDirectory, 'endpoint.json'), 'utf8')) as { port: number; token: string };
-  mkdirSync(join(f.workspace, 'remote-agents'));
-  writeFileSync(join(f.workspace, 'remote-agents', 'registry.json'), JSON.stringify({ version: 1, targets: [{ id: 'home', label: '隔离电脑', expectedHostname: hostname(),
+  mkdirSync(join(f.workspace, 'bridge-computers'));
+  writeFileSync(join(f.workspace, 'bridge-computers', 'registry.json'), JSON.stringify({ version: 1, targets: [{ id: 'home', label: '隔离电脑', expectedHostname: hostname(),
     sshConfig: resolve(f.root, 'ssh-config'), alias: 'fixture', remoteRoot, nodePath: process.execPath, engines: daemonConfig.engines }] }));
   const engineering = join(f.root, 'engineering'); mkdirSync(engineering);
-  const config: BridgeConfig = { token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: engineering, contextWorkspace: f.workspace,
+  const config: BridgeConfig = { controllerId: 'fixture-controller', token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', workspace: engineering, contextWorkspace: f.workspace,
     proxyUrl: null, commands: { codex: command, claude: command }, dataDir: join(f.root, 'controller-data'), attachmentsDir: f.root, logsDir: f.root, maxImageBytes: 1024 };
   const local: AgentAdapter = { run: async () => { throw Error('不能回退本机执行'); }, interrupt: async () => {}, close: async () => {} };
   const service = new RemoteDeploymentService(async () => [{ target: f.target, cwd: f.workspace }], () => {}, async () => ({ state: 'ready' }), async () => ({} as ExecutorRelease), Date.now,
@@ -197,7 +214,7 @@ send({method:'turn/completed',params:{threadId:thread,turn:{id:'turn',status:'co
   const catalog = new TargetCatalogService(config, { codex: local, claude: local }, { pollMs: 2,
     clientFactory: () => ({ request: <T>(method: string, args: unknown) => requestRemoteHttp<T>(endpoint.port, endpoint.token, method, args), close: async () => {} }) });
   const registry = new TaskRegistry(config.dataDir), runtime = new ControllerRuntime(config, { codex: local, claude: local }, registry,
-    { targetCatalog: catalog, onCompletion: () => {}, onCountChanged: () => {}, onStall: () => {}, onError: () => {}, pollIntervalMs: 25 });
+    { targetCatalog: catalog, createExecutorMessages: () => new ExecutorMessages(projectRoot, isolatedHome), onCompletion: () => {}, onCountChanged: () => {}, onStall: () => {}, onError: () => {}, pollIntervalMs: 25 });
   try {
     service.start(); assert.equal((await service.ensure(f.target, f.workspace)).state, 'ready'); await runtime.start();
     const context = registry.createContext({ conversationId: 'parent', userId: 'owner', channelId: 'local-sink', originMessageId: 'test-message', nativeId: 'controller', agent: 'codex', cwd: engineering });
@@ -218,6 +235,6 @@ send({method:'turn/completed',params:{threadId:thread,turn:{id:'turn',status:'co
     await completed(continuation.jobId);
     assert.equal(runtime.store.jobs().length, 2); assert.equal(runtime.store.getWorker(first.workerId)!.nativeId, 'isolated-native');
     assert.ok(!JSON.stringify(runtime.store.getWorker(first.workerId)).includes('isolated-test-key'));
-    assert.equal(existsSync(join(remoteRoot, 'agent-presets', 'registry.json')), false);
+    assert.equal(existsSync(join(remoteRoot, 'bridge-agent-presets', 'registry.json')), false);
   } finally { await runtime.close(); await catalog.close(); await service.close(); registry.close(); await daemon.close(); }
 });

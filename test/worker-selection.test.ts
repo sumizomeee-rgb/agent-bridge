@@ -13,6 +13,8 @@ import { TargetCatalogService } from '../src/remote/catalog.js';
 import { slashText, GROUP_SLASH_COMMANDS } from '../src/slash.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig } from '../src/types.js';
 import type { ControllerTargetCatalog } from '../src/controller/runtime-types.js';
+import { ExecutorMessages } from '../src/executor-messages.js';
+import { projectRoot } from '../src/config.js';
 import { ownTemporaryDirectory } from './temp-directory.js';
 
 function fixture() {
@@ -23,11 +25,11 @@ function fixture() {
     async getModelInfo() { return { defaultModel: 'gpt-6.1-sol', models: ['gpt-6.1-sol', 'gpt-6-luna', 'haiku'].map(id => ({ id, displayName: id, supportedEfforts: ['low', 'medium', 'xhigh'] })) }; },
     async interrupt() {}, async close() {}, async preparePreset() { return {} as never; },
   };
-  const config: BridgeConfig = { token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', controllerMode: true, workspace: dir,
+  const config: BridgeConfig = { controllerId: 'fixture-controller', token: '', allowedUserIds: ['owner'], defaultAgent: 'codex', controllerMode: true, workspace: dir,
     proxyUrl: null, commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } },
     dataDir: join(dir, 'data'), attachmentsDir: dir, logsDir: dir, maxImageBytes: 100 };
-  mkdirSync(join(dir, 'remote-agents')); mkdirSync(join(dir, 'agent-presets'));
-  writeFileSync(join(dir, 'remote-agents/registry.json'), JSON.stringify({ version: 1, targets: ['home', 'claude-only'].map(id => ({
+  mkdirSync(join(dir, 'bridge-computers')); mkdirSync(join(dir, 'bridge-agent-presets'));
+  writeFileSync(join(dir, 'bridge-computers/registry.json'), JSON.stringify({ version: 1, targets: ['home', 'claude-only'].map(id => ({
     id, label: id, expectedHostname: 'fixture', sshConfig: join(dir, 'ssh-config'), alias: 'fixture', remoteRoot: dir, nodePath: process.execPath,
     engines: Object.fromEntries((id === 'home' ? ['codex', 'claude'] : ['claude']).map(agent => [agent, { agentCommand: config.commands.codex, defaultCwd: dir }])),
   })) }));
@@ -37,7 +39,7 @@ function fixture() {
     ...(localPreset ? [{ id: 'local-sol', aliases: ['本机 SOL'], targetId: 'local', agent: 'codex' as const, model: 'gpt-6.1-sol', profileId: 'sol', revision: 1, enabled }] : []),
     { id: 'disabled-local', aliases: ['停用'], targetId: 'local', agent: 'codex' as const, model: 'gpt-6-luna', profileId: 'luna', revision: 1, enabled: false },
   ];
-  writeFileSync(join(dir, 'agent-presets/registry.json'), JSON.stringify({ version: 1, presets: presets() }));
+  writeFileSync(join(dir, 'bridge-agent-presets/registry.json'), JSON.stringify({ version: 1, presets: presets() }));
   const catalog = new TargetCatalogService(config, { codex: adapter, claude: adapter });
   const targetCatalog: ControllerTargetCatalog = {
     listTargets: (...args) => catalog.listTargets(...args), resolveTarget: (...args) => catalog.resolveTarget(...args),
@@ -51,7 +53,7 @@ function fixture() {
     adapterFor: () => adapter, handoff: async () => { throw new Error('not authorized'); },
   };
   const registry = new TaskRegistry(config.dataDir);
-  const runtime = new ControllerRuntime(config, { codex: adapter, claude: adapter }, registry, { targetCatalog, pollIntervalMs: 60000 });
+  const runtime = new ControllerRuntime(config, { codex: adapter, claude: adapter }, registry, { targetCatalog, createExecutorMessages: () => new ExecutorMessages(projectRoot, join(dir, 'isolated-user-home')), pollIntervalMs: 60000 });
   const origin = { conversationId: 'parent', userId: 'owner', channelId: 'local-sink', originMessageId: 'input', agent: 'codex' as const, nativeId: 'parent-native', cwd: dir };
   const context = registry.createContext(origin);
   const turn: AgentTurn = { conversation: { id: 'parent', userId: 'owner', agent: 'codex', model: 'gpt-6.1-sol', effort: 'medium', nativeId: 'parent-native',

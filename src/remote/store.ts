@@ -24,7 +24,75 @@ export class RemoteStore {
       CREATE TABLE IF NOT EXISTS processes(job TEXT NOT NULL,pid INTEGER NOT NULL,identity TEXT,closed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job,pid));`);
     const columns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map(row => String(row.name)));
     if (!columns.has('user_id')) this.db.exec('ALTER TABLE sessions ADD COLUMN user_id TEXT');
+    this.db.exec('CREATE TABLE IF NOT EXISTS controller_owner_migrations(old_user_id TEXT PRIMARY KEY,user_id TEXT NOT NULL)');
     this.nativeLeases = new NativeSessionLeaseStore(join(directory, 'controller.sqlite'), this.db);
+  }
+  /** Explicit host-owned identity migration; execution choices and handback state are unchanged. */
+  migrateControllerOwners(mapping: Record<string, string>): { migrated: number; retiredAdoptions: number } {
+    const entries = Object.entries(mapping);
+    if (!entries.length) return { migrated: 0, retiredAdoptions: 0 };
+    for (const [oldUser, user] of entries) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,199}\|[A-Za-z0-9][A-Za-z0-9_.:\-]{0,199}$/.test(oldUser)
+        || !/^principal:[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(user)) throw new Error('主控归属迁移映射无效。');
+    }
+    const user = (value: unknown): unknown => typeof value === 'string' && Object.hasOwn(mapping, value) ? mapping[value] : value;
+    const adoptionHash = (value: Record<string, unknown>) => createHash('sha256').update(JSON.stringify({ userId: value.userId,
+      ref: value.ref, workerId: value.workerId, adoptionId: value.adoptionId, expectedRevision: value.revision })).digest('hex');
+    let migrated = 0, retiredAdoptions = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [oldUser, next] of entries) {
+        const previous = this.db.prepare('SELECT user_id FROM controller_owner_migrations WHERE old_user_id=?').get(oldUser);
+        if (previous && previous.user_id !== next) throw new Error('已确认的主控归属迁移映射冲突，未改变数据。');
+      }
+      const requests = this.db.prepare('SELECT id,worker,fingerprint,request,data FROM jobs').all().map(row => ({ row, request: JSON.parse(String(row.request)) as RemoteDispatch }));
+      for (const { row, request } of requests) {
+        if (user(request.userId) === request.userId) continue;
+        if (fingerprint(request) !== row.fingerprint) throw new Error('旧派工指纹与保存请求不一致，未迁移。');
+        const job = JSON.parse(String(row.data)) as RemoteJob;
+        if (job.status === 'running' || job.stopped === false || job.result && job.stopped !== true)
+          throw new Error('原用户仍有未确认退出的远端执行，不能在线迁移归属。');
+      }
+      for (const row of this.db.prepare('SELECT id,worker,user_id FROM sessions').all()) {
+        const workerRequests = requests.filter(value => value.row.worker === row.worker);
+        if (!(typeof row.user_id === 'string' && Object.hasOwn(mapping, row.user_id))
+          && !(row.user_id == null && workerRequests.some(value => user(value.request.userId) !== value.request.userId))) continue;
+        const owners = new Set(workerRequests.map(value => user(value.request.userId)));
+        const next = row.user_id == null && owners.size === 1 ? [...owners][0] : user(row.user_id);
+        if (next == null || typeof next !== 'string' || !next.startsWith('principal:')) continue;
+        if (owners.size && (owners.size !== 1 || !owners.has(next))) throw new Error('旧会话与派工用户归属冲突，未迁移。');
+        this.db.prepare('UPDATE sessions SET user_id=? WHERE id=?').run(next, row.id!);
+      }
+      for (const { row, request } of requests) {
+        const next = user(request.userId); if (next === request.userId) continue;
+        request.userId = String(next);
+        this.db.prepare('UPDATE jobs SET request=?,fingerprint=? WHERE id=?').run(JSON.stringify(request), fingerprint(request), row.id!);
+        migrated++;
+      }
+      for (const [oldUser, next] of entries) this.db.prepare('UPDATE native_session_leases SET user_id=? WHERE user_id=?').run(next, oldUser);
+      for (const row of this.db.prepare('SELECT id,fingerprint,result_json FROM native_session_adoptions').all()) {
+        const result = JSON.parse(String(row.result_json)) as Record<string, unknown>, next = user(result.userId);
+        if (next === result.userId) continue;
+        const proven = row.id === result.adoptionId && typeof result.workerId === 'string' && typeof result.revision === 'string'
+          && !!result.ref && typeof result.ref === 'object' && adoptionHash(result) === row.fingerprint;
+        result.userId = next;
+        if (result.ownership && typeof result.ownership === 'object' && !Array.isArray(result.ownership)) {
+          const ownership = result.ownership as Record<string, unknown>;
+          if (user(ownership.userId) !== next) throw new Error('旧接管回执的用户归属冲突，未迁移。');
+          ownership.userId = next;
+        }
+        let hash: string;
+        if (proven) hash = adoptionHash(result);
+        else {
+          hash = 'owner-migration-unreplayable:' + String(row.fingerprint);
+          result.ownerMigration = { version: 1, status: 'unreplayable', reason: 'Original adoption arguments cannot be proven from the saved receipt.' };
+          retiredAdoptions++;
+        }
+        this.db.prepare('UPDATE native_session_adoptions SET fingerprint=?,result_json=? WHERE id=?').run(hash, JSON.stringify(result), row.id!);
+      }
+      for (const [oldUser, next] of entries) this.db.prepare('INSERT OR IGNORE INTO controller_owner_migrations VALUES (?,?)').run(oldUser, next);
+      this.db.exec('COMMIT'); return { migrated, retiredAdoptions };
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   jobs(): RemoteJob[] { return (this.db.prepare('SELECT data FROM jobs').all() as { data: string }[]).map(row => JSON.parse(row.data) as RemoteJob); }
   job(id: string): RemoteJob | null { const row = this.db.prepare('SELECT data FROM jobs WHERE id=?').get(id) as { data: string } | undefined; return row ? JSON.parse(row.data) as RemoteJob : null; }

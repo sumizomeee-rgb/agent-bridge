@@ -14,7 +14,6 @@ import type { ControllerWorker, ControllerJobStatus } from '../src/controller/ru
 import { SessionManager, type SessionManagerOptions } from '../src/manager.js';
 import { SessionStore } from '../src/store.js';
 import type { BotRuntime } from '../src/bot-runtime.js';
-import type { HostSemanticMarker } from '../src/host-migration.js';
 import type { HostConfig } from '../src/config.js';
 import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from '../src/types.js';
 import type { DMHistoryOptions, DMHistoryPage } from '../src/ingress.js';
@@ -114,24 +113,23 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
   const ownerId = (index: number) => platform === 'feishu' ? `owner-${index}` : '333333333333333333';
   const otherId = (index: number) => platform === 'feishu' ? `other-${index}` : '444444444444444444';
   const configs = ids.map((botId, index): BridgeConfig => ({
-    botId, platform, applicationId: botId.slice(platform.length + 1), scopePrefix: `${botId}|`,
-    ...(options.unowned?.includes(botId) ? {} : { ownerPrincipalId: P }), ownerUserId: `${botId}|${ownerId(index)}`, profile: `test-${index}`,
+    botId, controllerId: botId, controllerUserId: 'principal:' + P, channelOwnerUserId: `${botId}|${ownerId(index)}`, platform, applicationId: botId.slice(platform.length + 1), scopePrefix: `${botId}|`,
+    ...(options.unowned?.includes(botId) ? {} : { ownerPrincipalId: P }), ownerUserId: 'principal:' + P, profile: `test-${index}`,
     token: '', allowedUserIds: [`${botId}|${ownerId(index)}`, `${botId}|${otherId(index)}`], defaultAgent: 'codex',
     workspace: join(path, `workspace-${index}`), dataDir: join(path, `data-${index}`),
     attachmentsDir: join(path, `images-${index}`), logsDir: join(path, `logs-${index}`), proxyUrl: null,
     maxImageBytes: 1024, maxFileBytes: 4096, controllerMode: true, groupMode: true, internalBotCommunicationEnabled: options.internalBotCommunicationEnabled,
     commands: { codex: { command: 'fake', args: [] }, claude: { command: 'fake', args: [] } },
   }));
-  const config: HostConfig = { version: 3, rootDataDir: join(path, 'host'), configs, internalBotCommunicationEnabled: options.internalBotCommunicationEnabled,
+  const config: HostConfig = { version: 4, workspaceRoot: path, registry: { version: 4, workspaceRoot: path, registryRoot: join(path, 'registry'), hostDataDir: join(path, 'host'), startupControllers: [], controllers: [], channels: [], principals: [], spaces: [] }, rootDataDir: join(path, 'host'), configs, controllerConfigs: configs.map(c => ({ ...c, ownerPrincipalId: c.ownerPrincipalId ?? P })), internalBotCommunicationEnabled: options.internalBotCommunicationEnabled,
     principals: [{ id: P, accounts: Object.fromEntries(ids.map((id, index) => [id, ownerId(index)])) },
       { id: Q, accounts: Object.fromEntries(ids.map((id, index) => [id, otherId(index)])) }],
     spaces: [{ id: G1, accounts: Object.fromEntries(ids.map((id, index) => [id, platform === 'feishu' ? `oc_${index ? 'b' : 'a'}_group_1` : '555555555555555555'])) },
       { id: G2, accounts: Object.fromEntries(ids.map((id, index) => [id, platform === 'feishu' ? `oc_${index ? 'b' : 'a'}_group_2` : '666666666666666666'])) }],
   };
-  const marker: HostSemanticMarker = { version: 3, status: 'complete', migrationId: 'test-only', migratedAt: '2026-10-17T00:00:00.000Z', bots: [] };
   const reports: string[] = [], replies: Array<{ botId: string; channel: string; text: string; options?: ReplyOptions }> = [];
   const calls: Array<{ botId: string; turn: AgentTurn }> = [];
-  const host = new HostRuntime(config, marker, async () => ({ accepted: true }), line => reports.push(line));
+  const host = new HostRuntime(config, async () => ({ accepted: true }), line => reports.push(line));
   const managers = new Map<string, SessionManager>(), sessions = new Map<string, SessionStore>();
   const controllerStores = new Map<string, ControllerStore>();
   const hooks = new Map(configs.map(c => [c.botId!, host.hooks(c)]));
@@ -163,7 +161,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
         return { nativeId: turn.conversation.nativeId ?? `native-${botId}`, text: '', controlledOutput: true };
       }, async interrupt() {}, async close() {}, async confirmStopped() { return true; },
     };
-    const manager = new SessionManager(c, { codex: adapter, claude: adapter }, {
+    const manager = new SessionManager({ ...c, allowedUserIds: [c.controllerUserId!] }, { codex: adapter, claude: adapter }, {
       async sendText(channel, text, replyOptions) { replies.push({ botId, channel, text, options: replyOptions }); },
     }, { ...hook.manager, authorizeUser: user => hook.authorize(user, ''), mergeDelayMs: 0,
       onListWorkers: async (conversation, scope) => {
@@ -185,7 +183,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
         if (mentionViews.has(botId)) return mentionViews.get(botId)!(raw, id);
         const original = originals.get(id); if (!original) throw new Error('test original missing');
         return { messageId: id.split('|')[1]!, createTime: id.split('|')[0]!, spaceId: raw,
-          senderId: c.ownerUserId!.slice(c.scopePrefix!.length), payloadHash: groupMessagePayloadHash(original),
+          senderId: c.channelOwnerUserId!.slice(c.scopePrefix!.length), payloadHash: groupMessagePayloadHash(original),
           mentions: original.space!.mentionedUserIds.map((id, index) => ({ key: `@_user_${index + 1}`, id })) };
       },
       async sendText(channel: string, text: string, replyOptions?: ReplyOptions) { replies.push({ botId, channel, text, options: replyOptions }); },
@@ -208,6 +206,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
         await transport.sendText(channel, text, replyOptions);
       }, async close() { await manager.close(); },
     } as unknown as BotRuntime;
+    Object.assign(bot, { core: { config: c, manager, controller: bot.controller, isReady: () => bot.isReady(), beginDrain: () => bot.beginDrain(), isIdle: () => bot.isIdle(), close: () => bot.close() } });
     host.attach(bot);
     if ((options.initialized ?? ids).includes(botId)) {
       const conversation = inspect.createConversation(c.ownerUserId!, 'codex', c.workspace, { controllerMode: true });
@@ -228,7 +227,7 @@ function fixture(t: TestContext, options: { initialized?: string[]; unowned?: st
     const c = configs.find(item => item.botId === botId)!, raw = config.spaces.find(s => s.id === spaceId)!.accounts[botId]!;
     if (!sourceIds.has(externalId)) sourceIds.set(externalId, platform === 'feishu'
       ? `${1792180000000 + sourceIds.size}|om_${externalId.replace(/[^A-Za-z0-9_-]/g, '_')}` : String(1792180000000000000n + BigInt(sourceIds.size)));
-    const result = { id: `${c.scopePrefix}${sourceIds.get(externalId)!}`, userId: c.ownerUserId!, channelId: `${c.scopePrefix}${raw}`, text,
+    const result = { id: `${c.scopePrefix}${sourceIds.get(externalId)!}`, userId: c.channelOwnerUserId!, channelId: `${c.scopePrefix}${raw}`, text,
       attachments: [], space: { kind: 'group', spaceId: raw, mentionedUserIds: mentions.map(id => `platform-${id}`) } };
     originals.set(sourceIds.get(externalId)!, result as IncomingDM);
     return result as IncomingDM;
@@ -495,7 +494,7 @@ function scopedView(f: ReturnType<typeof fixture>, botId: string, source: Incomi
   const rawId = source.id.slice(sourceConfig.scopePrefix!.length), c = f.configs.find(c => c.botId === botId)!;
   const space = f.config.spaces.find(s => s.accounts[sourceConfig.botId!] === source.space!.spaceId)!;
   return { messageId: rawId.split('|')[1]!, createTime: rawId.split('|')[0]!, spaceId: space.accounts[botId]!,
-    senderId: c.ownerUserId!.slice(c.scopePrefix!.length), payloadHash: groupMessagePayloadHash(source), mentions };
+    senderId: c.channelOwnerUserId!.slice(c.scopePrefix!.length), payloadHash: groupMessagePayloadHash(source), mentions };
 }
 function crossAppMention(f: ReturnType<typeof fixture>, source: IncomingDM, repeat = false): void {
   source.space!.mentionedUserIds = ['ou_b_in_receiver_namespace'];
@@ -1238,7 +1237,7 @@ test('removing the configured principal immediately stops new turns and old grou
 test('removing one loaded Bot account from its whitelist pauses the shared group but keeps all owners and native pointers', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate();
   const before = [A, B].map(id => f.host.store.getController(id));
-  f.configs[1]!.allowedUserIds = f.configs[1]!.allowedUserIds.filter(user => user !== f.configs[1]!.ownerUserId);
+  f.configs[1]!.allowedUserIds = f.configs[1]!.allowedUserIds.filter(user => user !== f.configs[1]!.channelOwnerUserId);
   assert.equal(f.host.allowDelivery(A, `${A}|oc_a_group_1`), false);
   assert.equal(f.host.store.getGroup(G1)?.enabled, false);
   assert.deepEqual([A, B].map(id => f.host.store.getController(id)), before);
@@ -1248,8 +1247,7 @@ test('removing one loaded Bot account from its whitelist pauses the shared group
 test('restarting against a persisted group pauses revoked configuration before attaching or starting any Bot', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); await f.close();
   const config: HostConfig = { ...f.config, configs: f.config.configs.map(value => ({ ...value, allowedUserIds: [] })) };
-  const marker: HostSemanticMarker = { version: 3, status: 'complete', migrationId: 'restart-test', migratedAt: '', bots: [] };
-  const reopened = new HostRuntime(config, marker, async () => ({}), () => {});
+  const reopened = new HostRuntime(config, async () => ({}), () => {});
   try {
     assert.equal(reopened.store.getGroup(G1)?.enabled, false);
     assert.equal(reopened.store.getBot(A)?.ownerPrincipalId, P);
@@ -1441,7 +1439,7 @@ test('disabled completion wake retains the result after stop without reviving it
 test('turning group mode off pauses persisted bindings before Bot startup and does not transfer ownership', { timeout: 10000 }, async t => {
   const f = fixture(t); await f.activate(); const owner = f.host.store.getBot(A)!.ownerPrincipalId;
   await f.close(); f.configs[0]!.groupMode = false;
-  const restored = new HostRuntime(f.config, { version: 3, status: 'complete', migrationId: 'already-v3', migratedAt: new Date().toISOString(), bots: [] }, async () => ({}), () => {});
+  const restored = new HostRuntime(f.config, async () => ({}), () => {});
   try { assert.equal(restored.store.getGroup(G1)?.enabled, false); assert.equal(restored.store.getBot(A)?.ownerPrincipalId, owner); }
   finally { await restored.close(); }
 });
@@ -2028,7 +2026,7 @@ test('scheduled delivery uses real host authorization, transport and history wit
     const primary = f.ids[0]!, c = f.configs[0]!, hooks = f.hooks.get(primary)!;
     const registry = new TaskRegistry(c.dataDir); let now = Date.now();
     const unused: AgentAdapter = { run: async () => { throw Error('No execution agent permitted'); }, interrupt: async () => {}, close: async () => {} };
-    const runtime = new ControllerRuntime(c, { codex: unused, claude: unused }, registry, {
+    const runtime = new ControllerRuntime({ ...c, allowedUserIds: [c.controllerUserId!] }, { codex: unused, claude: unused }, registry, {
       now: () => now, pollIntervalMs: 3600000, prepareScheduledMessage: hooks.prepareScheduledMessage,
       sendScheduledMessage: hooks.sendScheduledMessage, scheduledMessageDelivered: hooks.scheduledMessageDelivered,
       canSendScheduledMessage: hooks.canSendScheduledMessage,
@@ -2080,7 +2078,7 @@ test('scheduled messages reject stale destinations and retain uncertain transpor
   const f=fixture(t);await f.activate();
   const c=f.configs[0]!,hooks=f.hooks.get(A)!,registry=new TaskRegistry(c.dataDir);let now=Date.now();
   const unused:AgentAdapter={run:async()=>{throw Error('no model');},interrupt:async()=>{},close:async()=>{}};
-  const runtime=new ControllerRuntime(c,{codex:unused,claude:unused},registry,{now:()=>now,pollIntervalMs:3600000,prepareScheduledMessage:hooks.prepareScheduledMessage,sendScheduledMessage:hooks.sendScheduledMessage,canSendScheduledMessage:hooks.canSendScheduledMessage});
+  const runtime=new ControllerRuntime({...c,allowedUserIds:[c.controllerUserId!]},{codex:unused,claude:unused},registry,{now:()=>now,pollIntervalMs:3600000,prepareScheduledMessage:hooks.prepareScheduledMessage,sendScheduledMessage:hooks.sendScheduledMessage,canSendScheduledMessage:hooks.canSendScheduledMessage});
   let receipt!: {scheduleId:string};let held!:AgentTurn;
   f.run(async(botId,turn)=>{
     if(botId!==A||turn.event){await turn.onSilent?.();return;}
@@ -2154,7 +2152,7 @@ test('中断恢复经真实宿主私聊投递，不新增主控代次，不重�
   (manager as unknown as {options:SessionManagerOptions}).options.taskRegistry=registry;
   f.run(async (_botId,turn)=>{
     if (!turn.event) throw new Error('502 upstream stream interrupted');
-    assert.equal(turn.event.kind,'recovery'); assert(!turn.text.includes('original owner goal'));
+    assert.equal(turn.event.kind,'recovery'); assert(turn.text.includes('original owner goal'));
     await turn.onPublicMessage!('recovered final reply');
   });
   const source=f.host.store.getController(A)!;
@@ -2167,4 +2165,30 @@ test('中断恢复经真实宿主私聊投递，不新增主控代次，不重�
   assert(f.replies.some(reply=>reply.channel===A+'|owner-dm'&&reply.text.includes('recovered final reply')));
   assert.equal(f.sessions.get(A)!.recoveries.get(pending.id)!.state,'done');
   } finally { await manager.close(); registry.close(); }
+});
+
+test('bound external session identity is persisted through the current authorized controller binding', async t => {
+  const f = fixture(t), manager = f.managers.get(A)!;
+  const sessions = (manager as unknown as { store: SessionStore }).store;
+  const current = f.host.store.controllerForBot(A)!;
+  const target = sessions.createConversation(f.configs[0]!.controllerUserId!, 'external', f.configs[0]!.workspace, { controllerMode: true });
+  sessions.setActive(target.userId, target.id);
+  sessions.saveNativeId(target.id, 'external-bound-session');
+  assert.equal(f.host.store.getController(f.configs[0]!.controllerId!)!.nativeId, 'external-bound-session');
+  sessions.saveNativeId(current.conversationId, 'late-obsolete-session');
+  assert.equal(f.host.store.controllerForBot(A)!.conversationId, target.id);
+  assert.equal(f.host.store.controllerForBot(A)!.nativeId, 'external-bound-session');
+  const unauthorized = sessions.createConversation('principal:other-person', 'external', target.cwd);
+  sessions.saveNativeId(unauthorized.id, 'unauthorized-session');
+  assert.equal(f.host.store.controllerForBot(A)!.nativeId, 'external-bound-session');
+});
+
+test('executor directory isolates controllers sharing one canonical owner and exposes stable controller identities', t => {
+  const f = fixture(t), directory = f.host.hooks(f.configs[0]!).executorDirectory!();
+  assert.equal(directory.recipients.length, 2);
+  const [first, second] = directory.recipients;
+  assert.equal(first!.userId, second!.userId);
+  assert.notEqual(first!.scope, second!.scope);
+  assert.deepEqual(new Set(directory.recipients.map(value => value.controllerId)), new Set([A, B]));
+  assert.deepEqual(new Set(directory.recipients.map(value => value.botId)), new Set([A, B]));
 });

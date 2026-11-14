@@ -1,11 +1,11 @@
 import { harnessCatalog, harnessCatalogPath } from '../harness.js';
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { AgentName } from '../types.js';
+import type { ControllerAgentName } from '../types.js';
 import { renderHarnessPrompt } from '../harness.js';
 import { controllerToolIndexText } from './tools/entry.js';
 
-export interface WorkspaceDocumentOptions { agent?: AgentName; internalBotCommunicationEnabled?: boolean }
+export interface WorkspaceDocumentOptions { agent?: ControllerAgentName; internalBotCommunicationEnabled?: boolean }
 export const bridgeProjectRoot = () => resolve(dirname(harnessCatalogPath()), '..');
 
 /** README is the only fixed-context entry. Included owner data is never re-templated. */

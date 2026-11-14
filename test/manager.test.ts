@@ -121,7 +121,7 @@ test('部分投递后失败的模型回复不标完成', async t => {
     async markReplyDelivered() { completions++; },
   }, { mergeDelayMs: 0 });
   await f.manager.handle(message('partial-reply', 'work'));
-  await waitFor(() => f.sink.replies.some(item => item.text.includes('later chunk failed')));
+  await waitFor(() => f.sink.replies.some(item => item.text.includes('回复发送失败')));
   const inspect = new SessionStore(f.config.dataDir);
   try {
     assert.equal(inspect.getMessage('partial-reply')?.state, 'completed');
@@ -478,7 +478,7 @@ test('已失败的模型任务不重放，用户可以手动继续', async t => 
   await f.manager.handle(message('fails', 'fails'));
   await waitFor(() => f.codex.calls.length === 1);
   f.codex.pending[0]!.reject(new Error('fake failure'));
-  await waitFor(() => f.sink.replies.some(item => item.text.includes('fake failure')));
+  await waitFor(() => f.sink.replies.some(item => item.text.includes('主控执行失败')));
   await f.manager.handle(message('fails', 'duplicate'));
   await f.manager.handle(message('retry-explicit', 'user explicitly continues'));
   await waitFor(() => f.codex.calls.length === 2);
@@ -619,7 +619,7 @@ test('忙中切换 Agent 等待当前轮安全结束，排队输入交给最新�
   assert.equal(f.codex.calls.length, 1);
 });
 
-test('merged and steered inputs retain each real source instead of relabeling the batch as its last sender', async t => {
+test('private merged input stays concise while each real source remains stored and steering keeps its own source', async t => {
   const f = fixture(t, false); await f.manager.close();
   const steered: Parameters<NonNullable<AgentAdapter['steer']>>[1][] = [];
   const adapter: AgentAdapter = { run: turn => { const pending = f.codex.run(turn); turn.onReady?.(); return pending; },
@@ -632,11 +632,13 @@ test('merged and steered inputs retain each real source instead of relabeling th
   const main = f.codex.calls[0]!;
   assert.equal(main.source?.userId, 'u1'); assert.deepEqual(main.source?.original, first.source);
   const blocks = main.input!.filter(item => item.type === 'text').map(item => item.text);
-  assert.match(blocks[0]!, /actual-a/); assert.equal(blocks[1], '第一个输入'); assert.match(blocks[2]!, /actual-b/); assert.equal(blocks[3], '第二个输入');
+  assert.deepEqual(blocks, ['第一个输入', '第二个输入']);
+  const inspect = new SessionStore(f.config.dataDir);
+  try { assert.deepEqual(inspect.getMessage(first.id)!.source, first.source); assert.deepEqual(inspect.getMessage(second.id)!.source, second.source); } finally { inspect.close(); }
   const third = { ...message('label-c', '补充'), source: { messageId: 'real-c', userId: 'actual-c', channelId: 'origin-c', authorType: 'user' as const } };
   await f.manager.handle(third); await waitFor(() => steered.length === 1);
   assert.deepEqual(steered[0]!.source?.original, third.source); assert.equal(steered[0]!.source?.channelId, 'dm-u1');
-  assert.match(JSON.stringify(steered[0]!.input), /actual-c/); assert.doesNotMatch(JSON.stringify(steered[0]!.input), /actual-a|actual-b/);
+  assert.deepEqual(steered[0]!.input, [{ type: 'text', text: '补充' }]);
   f.codex.finish(0); await waitFor(() => f.sink.replies.some(item => item.text.startsWith('[Codex')));
 });
 

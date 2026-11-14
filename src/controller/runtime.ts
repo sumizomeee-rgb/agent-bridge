@@ -112,7 +112,7 @@ export class ControllerRuntime {
   constructor(private readonly config: BridgeConfig, private readonly adapters: Record<AgentName, AgentAdapter>,
     private readonly registry: TaskRegistry, private readonly callbacks: ControllerRuntimeCallbacks = {}) {
     this.store = new ControllerStore(config.dataDir);
-    this.messenger = new ExecutorMessenger(this.store, registry, binding => this.callbacks.targetCatalog!.adapterFor(binding) as MessagePeer,
+    this.messenger = new ExecutorMessenger(config.controllerId!, this.store, registry, binding => this.callbacks.targetCatalog!.adapterFor(binding) as MessagePeer,
       (worker, message, userId) => this.callbacks.onExecutorMessage?.(worker, message, userId) ?? false, userId => config.allowedUserIds.includes(userId),
       async () => {
         const directory = this.callbacks.executorDirectory?.(), userId = config.ownerUserId;
@@ -126,7 +126,7 @@ export class ControllerRuntime {
           } catch { /* Only targets available to this owner enter their local directory. */ }
         }
         return { directoryId: directory.id, recipients: directory.recipients, userId, targets };
-      });
+      }, callbacks.createExecutorMessages);
   }
   async pauseConversation(conversationId: string): Promise<void> {
     if (this.closed || this.stopping) throw new Error('主控执行服务已关闭');
@@ -166,6 +166,8 @@ export class ControllerRuntime {
   async prepareAgentSwitch(source: Conversation, target: Conversation, channelId: string, prompt: string, signal: AbortSignal): Promise<{ contextSeed: string }> {
     if (this.closed || this.stopping || this.isDraining()) throw new Error('桥正在关闭或重启，不能准备 Agent 切换。');
     signal.throwIfAborted();
+    if (source.agent === 'external' || target.agent === 'external') throw new Error('外部主控不支持原生 Agent 切换摘要。');
+    const targetAgent = target.agent;
     if (source.id === target.id || source.userId !== target.userId || pathKey(source.cwd) !== pathKey(target.cwd)
       || source.agent === target.agent && canonical([source.preset, source.model]) === canonical([target.preset, target.model]) || target.nativeId) throw new Error('Agent 切换准备的源或目标会话无效。');
     const handoffs = new SessionHandoffs(this.config.dataDir);
@@ -184,15 +186,15 @@ export class ControllerRuntime {
     const linked = AbortSignal.any([signal, abort.signal]);
     const workerId = randomUUID();
     const adapter = target.preset ? this.callbacks.targetCatalog!.adapterFor({
-      ...await this.resolveTarget(target.cwd, 'local', target.agent), preset: target.preset, sessionVisibility: 'hidden',
-    }) : this.adapters[target.agent];
+      ...await this.resolveTarget(target.cwd, 'local', targetAgent), preset: target.preset, sessionVisibility: 'hidden',
+    }) : this.adapters[targetAgent];
     const execute = async (): Promise<{ contextSeed: string }> => {
       let launched = false;
       const interrupt = () => { if (launched) void adapter.interrupt(workerId).catch(error => this.error(error)); };
       linked.addEventListener('abort', interrupt, { once: true });
       try {
         const cwd = this.config.contextWorkspace ?? this.config.workspace;
-        const model = target.model ?? this.config.defaultModels?.[target.agent] ?? (await adapter.getModelInfo?.(cwd))?.defaultModel;
+        const model = target.model ?? this.config.defaultModels?.[targetAgent] ?? (await adapter.getModelInfo?.(cwd))?.defaultModel;
         if (!model || model === 'default' || !isModelId(model)) throw new Error('无法确定目标 Agent 的摘要模型；未借用源 Agent 模型。');
         const conversation: Conversation = { ...target, id: workerId, nativeId: null, model, actualModel: null, actualEffort: null,
           cwd, title: 'Agent 切换上下文摘要' };
@@ -215,7 +217,7 @@ export class ControllerRuntime {
       } finally { linked.removeEventListener('abort', interrupt); }
     };
     const done = Promise.resolve().then(execute);
-    this.preparations.set(target.id, { agent: target.agent, abort, done });
+    this.preparations.set(target.id, { agent: targetAgent, abort, done });
     try { return await done; } finally { this.preparations.delete(target.id); }
   }
   private adapter(worker: ControllerWorker): AgentAdapter {
@@ -1003,6 +1005,8 @@ export class ControllerRuntime {
       })();
       if (presetTarget && (!presetTarget.preset || (args.targetId !== undefined && args.targetId !== presetTarget.id)
         || (args.agent !== undefined && args.agent !== presetTarget.agent) || (args.model !== undefined && args.model !== presetTarget.preset.model))) throw new Error('预设与显式电脑、后端或模型参数冲突，未派发。');
+      if (!presetTarget && args.agent === undefined && turn.conversation.agent === 'external')
+        throw new Error('外部主控不能作为执行助手；请将该电脑默认助手登记为 ordinary 或 preset，或明确选择助手。');
       const agent = presetTarget?.agent ?? (args.agent === undefined ? turn.conversation.agent : args.agent);
       if (agent !== 'codex' && agent !== 'claude') throw new Error('agent 必须是 codex 或 claude');
       target = presetTarget ?? await this.resolveTarget(turn.conversation.cwd, args.targetId === undefined ? 'local' : text(args.targetId, '执行目标', 256), agent,

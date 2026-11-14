@@ -24,7 +24,7 @@ import { executionErrorEvidence } from '../delivery-errors.js';
 import { completedRetirementFailure } from '../agents/retirement.js';
 import { NativeSessionService, type NativeSessionRef, type NativeSessionAdoptArgs, type NativeSessionServiceOptions } from '../native-sessions.js';
 import { userHandoffCommand } from '../agents/user-handoff.js';
-import { ExecutorMessages, executorMessageRequest } from '../executor-messages.js';
+import { ExecutorMessages, executorMessageRequest, type ControllerOwnerMigration } from '../executor-messages.js';
 
 function blocksWorkerContinuation(job: RemoteJob): boolean {
   return job.status === 'running' || job.status === 'uncertain' && !stoppedExecutionFailure({
@@ -214,9 +214,17 @@ export class RemoteDaemon {
   async handle(method: string, raw: unknown): Promise<unknown> {
     if (this.initializing) throw new Error('执行器正在准备原生会话目录，尚未就绪。');
     if (!isObject(raw)) throw new Error('远端请求参数无效。');
+    if (method === 'owners/migrate') {
+      if (raw.version !== 1 || !Array.isArray(raw.owners) || Object.keys(raw).some(key => !['version', 'owners'].includes(key))) throw new Error('主控归属迁移协议无效。');
+      this.messageStore ??= new ExecutorMessages(this.root, this.options.nativeSessionOptions?.userHome);
+      this.messageStore.registerOwnerMigrationMappings(raw.owners as ControllerOwnerMigration[]);
+      return { version: 1, ...this.store.migrateControllerOwners(this.messageStore.ownerMappings()) };
+    }
     if (method.startsWith('messages/')) {
       this.messageStore ??= new ExecutorMessages(this.root, this.options.nativeSessionOptions?.userHome);
-      return executorMessageRequest(this.messageStore, method, raw);
+      const result = executorMessageRequest(this.messageStore, method, raw);
+      if (method === 'messages/directory') this.store.migrateControllerOwners(this.messageStore.ownerMappings());
+      return result;
     }
     if (method === 'hello') return { hostname: hostname(), platform: process.platform, engines: Object.keys(this.config.engines), version: 1, presetDispatch: 1, sessionVisibility: 1,
       deployment: { release: this.options.release ?? process.env.BRIDGE_EXECUTOR_RELEASE ?? null, maintenance: 1 },

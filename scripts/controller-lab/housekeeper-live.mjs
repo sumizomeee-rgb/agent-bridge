@@ -79,12 +79,12 @@ export async function runHousekeeperLive(options) {
     writeFileSync(join(workspace, 'README.md'), labRule + '\n');
     const applicationId = source.platform === 'feishu' ? 'cli_labhousekeeper' + process.pid : String(710000000000000000n + BigInt(process.pid));
     const prefix = source.platform + ':' + applicationId + '|';
-    const rawOwner = (source.ownerUserId ?? source.allowedUserIds[0]).slice(source.scopePrefix.length);
+    const rawOwner = (source.channelOwnerUserId ?? source.allowedUserIds[0]).slice(source.scopePrefix.length);
     const userId = prefix + rawOwner, principalId = source.ownerPrincipalId ?? 'lab-owner';
     const channelId = prefix + (source.platform === 'feishu' ? 'oc_lab_housekeeper_' + process.pid : String(810000000000000000n + BigInt(process.pid)));
     assert(validChannelId(channelId), 'Invalid isolated channel');
-    config = { ...source, applicationId, botId: source.platform + ':' + applicationId, scopePrefix: prefix,
-      allowedUserIds: [userId], ownerUserId: userId, ownerPrincipalId: principalId,
+    config = { ...source, controllerId: 'lab-housekeeper', channelDataDir: join(directory, 'channel'), controllerUserId: 'principal:' + principalId, channelOwnerUserId: userId, applicationId, botId: source.platform + ':' + applicationId, scopePrefix: prefix,
+      allowedUserIds: [userId], ownerUserId: 'principal:' + principalId, ownerPrincipalId: principalId,
       workspace, contextWorkspace: context, workingCwd: workspace, legacyWorkspace: workspace,
       dataDir: join(directory, 'data'), logsDir: join(directory, 'logs'), attachmentsDir: join(directory, 'images'),
       token: '', appSecret: undefined, controllerMode: true, groupMode: false,
@@ -104,9 +104,8 @@ export async function runHousekeeperLive(options) {
 
     const build = (seed) => {
       execution = { codex: new CodexAdapter(source.commands.codex, env), claude: new ClaudeAdapter(source.commands.claude, env) };
-      host = new HostRuntime({ ...sourceHost, rootDataDir: join(directory, 'host'), configs: [config], spaces: [],
+      host = new HostRuntime({ ...sourceHost, rootDataDir: join(directory, 'host'), configs: [config], controllerConfigs: [config], spaces: [],
         principals: [{ id: principalId, accounts: { [config.botId]: rawOwner } }] },
-      { version: 3, status: 'complete', migrationId: 'housekeeper-lab', migratedAt: stamp(), bots: [] },
       async () => { throw new Error('Lab forbids bridge restart'); }, () => {});
       bot = new BotRuntime(config, host.hooks(config), {
         createExecutionAdapters: () => execution,
@@ -236,8 +235,8 @@ export async function runHousekeeperLive(options) {
       sessions = new SessionStore(config.dataDir);
       if (seed) {
         for (const item of originalSettings) runtime.store.setWorkerDefault(item.targetId, item.choice);
-        const conversation = sessions.createConversation(userId, 'codex', workspace, { controllerMode: true });
-        sessions.setActive(userId, conversation.id); sessions.setModel(conversation.id, controllerModel); sessions.setEffort(conversation.id, controllerEffort);
+        const conversation = sessions.createConversation(config.controllerUserId, 'codex', workspace, { controllerMode: true });
+        sessions.setActive(config.controllerUserId, conversation.id); sessions.setModel(conversation.id, controllerModel); sessions.setEffort(conversation.id, controllerEffort);
         host.store.setController(config.botId, principalId, { conversationId: conversation.id, generation: 1, agent: 'codex', nativeId: null,
           model: controllerModel, effort: controllerEffort }, 0); report.controller.conversationId = conversation.id;
       }
@@ -272,9 +271,9 @@ export async function runHousekeeperLive(options) {
     await delay(200);
     await wait(() => bot.manager.isIdle() && bot.tasks.queuedEvents().length === 0, 'initial workspace context delivery');
     assert(report.controllerTurns.every(turn => turn.kind === 'user' || turn.kind === 'workspace-context'), 'Unexpected worker result before housekeeping was enabled');
-    assert(sessions.getActive(userId)?.nativeId, 'Real controller CLI session was not established');
-    report.controller.actualModel = sessions.getActive(userId).actualModel;
-    report.controller.actualEffort = sessions.getActive(userId).actualEffort;
+    assert(sessions.getActive(config.controllerUserId)?.nativeId, 'Real controller CLI session was not established');
+    report.controller.actualModel = sessions.getActive(config.controllerUserId).actualModel;
+    report.controller.actualEffort = sessions.getActive(config.controllerUserId).actualEffort;
     assert.equal(report.controller.actualModel, controllerModel);
     const turnsBeforeOn = report.controllerTurns.length;
     await send('/housekeeper on');

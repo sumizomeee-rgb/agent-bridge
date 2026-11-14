@@ -187,7 +187,7 @@ test('workers uses the saved preset ID, resolves aliases on demand and keeps pre
   const items = [worker({ workerId: 'ordinary', queued: 0 }), worker({ workerId: 'preset', queued: 0, presetId: 'saved-sol' }),
     worker({ workerId: 'retired', presetId: 'retired-sol', running: false, queued: 0, status: 'completed' })];
   const f = fixture(t, { onListWorkers: async () => items });
-  const root = join(f.config.workspace, 'agent-presets'); mkdirSync(root);
+  const root = join(f.config.workspace, 'bridge-agent-presets'); mkdirSync(root);
   const path = join(root, 'registry.json');
   writeFileSync(path, JSON.stringify({ version: 1, presets: [{ id: 'saved-sol', aliases: ['工位 sol'], targetId: 'workstation',
     agent: 'codex', model: 'gpt-6.1-sol', profileId: 'gateway-sol', revision: 1, enabled: false }] }));

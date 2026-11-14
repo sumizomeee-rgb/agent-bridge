@@ -63,8 +63,8 @@ test('real agent switch prepares the target without authority, retains latest co
 test('failed target bootstrap preserves the active controller and records the failed preparation', async t => {
   const f = fixture(t); const adapter: AgentAdapter = { ...f.adapter, async run(turn) { if (turn.preparing) throw new Error('gateway unavailable'); return f.adapter.run(turn); } };
   const manager = await f.create({ onPrepareSwitch: async () => ({ contextSeed: 'summary' }), onRebindSwitch: async () => { throw new Error('must not commit'); } }, adapter);
-  await manager.handle(msg('human', 'goal')); await eventually(() => f.calls.length === 1); const old = manager.currentConversation('owner')!; await manager.handle(msg('switch-fail', '/agent claude')); assert.equal(manager.currentConversation('owner')?.id, old.id); assert.match(f.replies.at(-1)!.text, /gateway unavailable/);
-  const file = readdirSync(join(f.config.dataDir, 'agent-switches'))[0]!; assert.equal(JSON.parse(readFileSync(join(f.config.dataDir, 'agent-switches', file), 'utf8')).phase, 'failed');
+  await manager.handle(msg('human', 'goal')); await eventually(() => f.calls.length === 1); const old = manager.currentConversation('owner')!; await manager.handle(msg('switch-fail', '/agent claude')); assert.equal(manager.currentConversation('owner')?.id, old.id); assert.match(f.replies.at(-1)!.text, /命令失败/);
+  const file = readdirSync(join(f.config.dataDir, 'agent-switches'))[0]!; const journal = JSON.parse(readFileSync(join(f.config.dataDir, 'agent-switches', file), 'utf8')); assert.equal(journal.phase, 'failed'); assert.match(journal.error, /gateway unavailable/);
 });
 
 test('interrupted switch commit rebinds idempotently on recovery without another model call', async t => {
@@ -156,14 +156,15 @@ async function restartQueue(t: TestContext, direct = false) {
   const f = fixture(t); f.config.controllerMode = !direct;
   const hostPath = join(f.root, 'host'), botId = 'feishu:cli_test'; let host = new HostStore(hostPath);
   const local = new SessionStore(f.config.dataDir), target = local.createConversation('owner', 'codex', f.config.workingCwd!, { controllerMode: !direct }); local.saveNativeId(target.id, 'native-existing'); local.close();
-  host.registerBot({ botId, platform: 'feishu', applicationId: 'cli_test' }); host.mapPrincipal({ principalId: 'me', botId, platformUserId: 'owner', proof: 'explicit test owner mapping' }); host.claimOwner(botId, 'me');
+  host.registerController('controller-test');
+  host.registerBot({ controllerId:'controller-test', botId, platform: 'feishu', applicationId: 'cli_test' }); host.mapPrincipal({ principalId: 'me', botId, platformUserId: 'owner', proof: 'explicit test owner mapping' }); host.claimOwner(botId, 'me');
   host.mapSpace({ botId, platformSpaceId: 'group-address', spaceId: 'room', proof: 'explicit test group mapping' });
   host.setController(botId, 'me', { conversationId: target.id, generation: 1, agent: 'codex', nativeId: 'native-existing' }, 0);
   host.startGroup({ spaceId: 'room', principalId: 'me', receiverBotId: botId, memberBotIds: [botId] });
   host.acceptRoot({ id: 'root', spaceId: 'room', principalId: 'me', sourceEventId: 'source', targetBotIds: [botId], replyTo: { channelId: 'group-address' } });
   host.enqueueEvent({ id: 'queued-group', rootId: 'root', botId, generation: 1, kind: 'human', payload: { text: 'group goal' } }); assert.equal(host.claimNextEvent(botId)?.id, 'queued-group');
   f.closeLater.push(() => host.close());
-  const options: SessionManagerOptions = { mergeDelayMs: direct ? 20 : 0, binding: { getActive: user => user === 'owner' ? host.getController(botId)?.conversationId ?? null : null, setActive() { throw new Error('queue recovery must never create a controller'); } },
+  const options: SessionManagerOptions = { mergeDelayMs: direct ? 20 : 0, binding: { getActive: user => user === 'owner' ? host.controllerForBot(botId)?.conversationId ?? null : null, setActive() { throw new Error('queue recovery must never create a controller'); } },
     onGroupTurnStart: async context => { host.startEvent(context.eventId); return 'host confirmed scene'; }, onGroupTurnFinished: async (context, outcome) => host.finishEvent(context.eventId, outcome) };
   let manager = await f.create(options); manager.beginDrain();
   const event = { ...msg('queued-group', 'group goal', 'group-address'), groupContext: group('queued-group') };
@@ -178,7 +179,7 @@ for (const direct of [false, true]) test(`restart preserves the DM/group FIFO ba
   assert.equal(r.f.calls[0]?.text, 'before group'); assert.equal(r.host.getEvent('queued-group')?.state, 'queued');
   await manager.handle(r.event); await setTimeout(30); assert.equal(r.f.calls.length, 1); assert.equal(manager.storedHostEvent(r.event.id)?.text, 'group goal');
   assert.equal(r.host.claimNextEvent(r.botId)?.id, 'queued-group'); const resumed = await manager.resumeHostEvent(r.event); assert.equal(resumed.status, 'queued');
-  await eventually(() => r.f.calls.length === 3 && manager.isIdle()); assert.deepEqual(r.f.calls.map(call => call.text), ['before group', 'group goal', 'after group']); assert.equal(r.host.getEvent('queued-group')?.state, 'completed');
+  await eventually(() => r.f.calls.length === 3 && manager.isIdle()); assert.deepEqual(r.f.calls.slice(0, 2).map(call => call.text), ['before group', 'group goal']); assert(r.f.calls[2]!.text.endsWith('after group')); assert.equal(r.host.getEvent('queued-group')?.state, 'completed');
   assert.equal((await manager.resumeHostEvent(r.event)).status, 'terminal'); assert.equal(r.f.calls.length, 3);
 });
 

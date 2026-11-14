@@ -54,7 +54,9 @@ test('explicit cancellation archives a legacy uncertain worker only after read-o
   await assert.rejects(f.runtime.invoke(f.turn, 'bridge_continue_worker', { workerId: worker.id, prompt: 'do not replay' }), /报告已保存/);
   assert.equal(f.runtime.queryWorkerOverview(f.turn.conversation)[0]!.archivedAt, receipt.archivedAt);
   const list = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: Array<{ archivedAt?: string; archiveReason?: string }> };
-  assert.equal(list.workers[0]!.archivedAt, receipt.archivedAt); assert.equal(list.workers[0]!.archiveReason, worker.archiveReason);
+  assert.equal(list.workers[0]!.archivedAt, receipt.archivedAt); assert.equal(list.workers[0]!.archiveReason, undefined);
+  const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: worker.id }) as { workers: Array<{ archiveReason?: string }> };
+  assert.equal(details.workers[0]!.archiveReason, worker.archiveReason);
   const reopened = new ControllerStore(f.dir);
   try { assert.deepEqual(reopened.getWorker(worker.id), worker); assert.deepEqual(reopened.getJob(job.id)!.nativeResult, f.report); }
   finally { reopened.close(); }

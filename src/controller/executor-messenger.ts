@@ -10,18 +10,19 @@ export class ExecutorMessenger {
   private local?: ExecutorMessages;
   private readonly registered = new Map<string, string>();
   private readonly directories = new Map<string, string>();
-  constructor(private readonly store: ControllerStore, private readonly registry: TaskRegistry,
+  constructor(private readonly controllerId: string, private readonly store: ControllerStore, private readonly registry: TaskRegistry,
     private readonly peer: (binding: ExecutionTargetBinding) => MessagePeer,
     private readonly accept: (worker: ControllerWorker | null, message: ExecutorMessage, userId: string) => boolean,
     private readonly allowed: (userId: string) => boolean,
-    private readonly directory?: () => Promise<{ directoryId: string; userId: string; recipients: ExecutorRecipient[]; targets: ExecutionTargetBinding[] } | null>) {}
+    private readonly directory?: () => Promise<{ directoryId: string; userId: string; recipients: ExecutorRecipient[]; targets: ExecutionTargetBinding[] } | null>,
+    private readonly createLocal: () => ExecutorMessages = () => new ExecutorMessages(projectRoot)) {}
   private async requestTarget(binding: ExecutionTargetBinding | undefined, method: string, args: Record<string, unknown>): Promise<unknown> {
     if (binding?.transport === 'ssh') {
       const peer = this.peer(binding);
       if (!peer.executorMessages) throw new Error('目标执行器尚未支持通信。');
       return peer.executorMessages(method, args);
     }
-    this.local ??= new ExecutorMessages(projectRoot);
+    this.local ??= this.createLocal();
     return executorMessageRequest(this.local, method, args);
   }
   private async request(worker: ControllerWorker, method: string, args: Record<string, unknown>): Promise<unknown> {
@@ -32,7 +33,7 @@ export class ExecutorMessenger {
       && this.registered.get(w.id) !== JSON.stringify([w.nativeId, w.title, w.cwd]));
     for (let i = 0; i < changed.length; i += 100) {
       const batch = changed.slice(i, i + 100);
-      const bindings: ExecutorBinding[] = batch.map(w => ({ workerId: w.id, scope: executorScope(w.origin.userId), userId: w.origin.userId,
+      const bindings: ExecutorBinding[] = batch.map(w => ({ workerId: w.id, controllerId: this.controllerId, scope: executorScope(this.controllerId,w.origin.userId), userId: w.origin.userId,
         agent: w.agent, nativeId: w.nativeId, title: w.title, cwd: w.cwd }));
       await this.request(batch[0]!, 'messages/bind', { bindings });
       for (const w of batch) this.registered.set(w.id, JSON.stringify([w.nativeId, w.title, w.cwd]));
@@ -62,7 +63,7 @@ export class ExecutorMessenger {
         }
       }
       await this.bind(workers);
-      const scope = executorScope(userId);
+      const scope = executorScope(this.controllerId,userId);
       const messages = await this.requestTarget(target, 'messages/pending', { scope }) as ExecutorMessage[];
       for (const message of messages) {
         const worker = workers.find(w => w.id === message.workerId) ?? null;
@@ -86,7 +87,7 @@ export class ExecutorMessenger {
     const receipt = this.store.readCallReceipt(`executor-message:${messageId}`) as { workerId?: string; userId?: string; target?: ExecutionTargetBinding } | undefined;
     const worker = receipt?.workerId ? this.store.getWorker(receipt.workerId) : null;
     if (!receipt || (receipt.userId ?? worker?.origin.userId) !== userId || !this.allowed(userId)) throw new Error('消息不属于本主控。');
-    return this.requestTarget(receipt.target ?? worker?.target, 'messages/update', { scope: executorScope(userId), id: messageId, state: 'handled', reply: text });
+    return this.requestTarget(receipt.target ?? worker?.target, 'messages/update', { scope: executorScope(this.controllerId,userId), id: messageId, state: 'handled', reply: text });
   }
   close(): void { this.local?.close(); }
 }

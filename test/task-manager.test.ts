@@ -104,7 +104,7 @@ for (const failure of ['preparation', 'stop', 'execution'] as const) test(`contr
     : failure === 'stop' ? new AgentProcessStopError(25) : new Error('native generation failed'));
   await waitFor(() => f.sink.replies.some(r => r.options?.presentation?.tone === 'error'));
   const notice = f.sink.replies.at(-1)!;
-  assert.equal(notice.options?.presentation?.title, failure === 'stop' ? '【桥】退出待确认' : '【桥】唤醒失败');
+  assert.equal(notice.options?.presentation?.title, failure === 'stop' ? '【桥】退出待确认' : failure === 'preparation' ? '【桥】主控准备失败' : '【桥】本轮中断，未安排恢复');
   assert(!notice.text.includes('助手结果已保存')); assert(!notice.text.includes('报告已保存'));
   if (failure === 'preparation') assert(notice.text.includes('未提交给主控'));
   assert.equal(f.registry.eventState(event.id), 'uncertain'); assert.equal(f.registry.getNextEvent(), null); assert.equal(f.codex.calls.length, 2);

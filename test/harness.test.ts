@@ -17,7 +17,7 @@ test('context contraction preserves reviewed command schemas and essential turn 
   assert.match(controllerInstructions, /finish=false/);
   assert.match(controllerInstructions, /DONE/);
   assert.match(controllerInstructions, /performed=false/);
-  assert.equal(sha(JSON.stringify(controllerToolsForCommunication(false).filter(tool => tool.name !== 'bridge_schedule_message').map(tool => ({name:tool.name,inputSchema:tool.inputSchema}))).replace(/\\r\\n/g, '\\n')), '5b56c7dafad224c137c496e2178167e554af26bb098691aab4737a25d55e40a0');
+  assert.equal(sha(JSON.stringify(controllerToolsForCommunication(false).filter(tool => tool.name !== 'bridge_schedule_message').map(tool => ({name:tool.name,inputSchema:tool.inputSchema}))).replace(/\\r\\n/g, '\\n')), 'db3f74a73d0ad5356674e8d065edd0114b7af8547a0d8194f2d989ce42232de6');
   assert.equal(controllerInstructionsForCommunication(true), controllerInstructions);
 });
 
@@ -72,7 +72,9 @@ test('one summary-worker prompt serves every window and generated README uses th
 test('initialization introduction rules have one declared README source', () => {
   const text=workspaceDocuments().text;
   assert.match(text,/introductionRequested=true/);
-  assert.match(text,/职责与能力、主要偏好/);
+  assert.match(text,/1\. \*\*职责与能力\*\*/);
+  assert.match(text,/2\. \*\*用户偏好\*\*/);
+  assert.match(text,/3\. \*\*续接内容\*\*/);
   assert.equal(harnessCatalog().prompts['manager.introduction_new'],undefined);
   assert.equal(harnessCatalog().prompts['manager.introduction_continue'],undefined);
   assert.equal(harnessText('worker.initialization_repair_failed',{error:'原始 {{diagnostic}}'}),'上一轮只读初始化已经正常返回，但回执校验失败：原始 {{diagnostic}}');

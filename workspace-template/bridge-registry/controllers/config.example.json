@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "id": "controller-name",
+  "aliases": ["显示名"],
+  "ownerPrincipalId": "owner",
+  "backend": {"kind": "native", "agent": "codex"},
+  "wait": {"responseMs": null},
+  "network": {"proxyPort": null}
+}

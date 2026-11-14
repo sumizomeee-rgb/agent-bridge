@@ -125,3 +125,15 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} explicit model 
     defaultModel = ''; await assert.rejects(resolveDefaultModel(adapter, turn), /无法确认/);
   } finally { await adapter.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('external controller never queries or adopts native CLI model and effort metadata', async () => {
+  const conversation = { id: 'external', userId: 'owner', agent: 'external' as const, nativeId: 'session', title: '', cwd: process.cwd(), createdAt: '', updatedAt: '' };
+  let queries = 0;
+  const adapter = { run: async () => ({ nativeId: 'session', text: '' }), interrupt: async () => {}, close: async () => {}, getModelInfo: async () => { queries++; throw new Error('must not query CLI'); } };
+  assert.throws(() => modelEffortCapability({ defaultModel: null, models: [] }, conversation));
+  await assert.rejects(validateEffort(adapter, conversation, 'high'));
+  const turn: AgentTurn = { conversation, text: '', imagePaths: [], signal: new AbortController().signal, onProgress() {} };
+  assert.equal(await resolveDefaultModel(adapter, turn), turn);
+  await assert.rejects(resolveDefaultModel(adapter, { ...turn, conversation: { ...conversation, modelPolicy: 'cli-default' } }));
+  assert.equal(queries, 0);
+});

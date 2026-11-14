@@ -249,10 +249,11 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} 主控真实输
   assert.match(JSON.stringify(f.protocol.written), /Bridge feedback; program evidence/);
   assert.match(JSON.stringify(f.protocol.written), /前次汇总失败，助手结果仍在/);
   assert.equal((await f.protocol.call('bridge_read_feedback', { id: 'bad-id' })).ok, false); assert.equal(queried, 0);
-  assert.equal((await f.protocol.call('bridge_read_feedback', { id: 'a'.repeat(64) })).ok, true); assert.equal(queried, 1);
+  const feedback=await f.protocol.call('bridge_read_feedback', { id: 'a'.repeat(64) });
+  assert.equal(feedback.ok, true); assert.match(JSON.stringify(feedback.value), /前次汇总失败，助手结果仍在/); assert.equal(queried, 1);
   assert.deepEqual(f.invoked, []);
   const legacy = await f.protocol.call('bridge_list_workers', { details: true });
-  assert.equal(legacy.ok, true); assert.match(JSON.stringify(legacy.value), /bridgeFeedback/); assert.equal(queried, 2);
+  assert.equal(legacy.ok, true); assert.doesNotMatch(JSON.stringify(legacy.value), /bridgeFeedback/); assert.equal(queried, 1);
   assert.equal((await f.protocol.call('bridge_send_user', { text: '已核对已有结果' })).ok, true);
   f.protocol.complete(); assert.equal((await running).controlledOutput, true);
 });

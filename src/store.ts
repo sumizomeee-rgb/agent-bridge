@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import type { AgentName, AgentResult, BridgeMessage, Conversation } from './types.js';
+import type { ControllerAgentName, AgentResult, BridgeMessage, Conversation } from './types.js';
 import { validMessageId } from './routing.js';
 import { parseCommand } from './commands.js';
 import { ControllerFeedbackJournal } from './controller-feedback.js';
@@ -16,7 +16,7 @@ export type InboxState = 'command' | 'queued' | 'steering' | 'uncertain' | 'runn
 export interface InboxItem extends BridgeMessage {
   conversationId: string | null;
   state: InboxState;
-  replyState: 'pending' | 'delivered' | 'failed' | 'cancelled' | null;
+  replyState: 'pending' | 'delivered' | 'not-required' | 'failed' | 'cancelled' | null;
 }
 export interface PrivateInputBatch {
   rootId: string; conversationId: string; userId: string; channelId: string;
@@ -24,7 +24,7 @@ export interface PrivateInputBatch {
 }
 export interface DeliveredReply {
   conversationId: string;
-  agent: AgentName;
+  agent: ControllerAgentName;
   nativeId: string;
 }
 
@@ -35,7 +35,7 @@ export interface WorkspaceNotice { conversationId: string; userId: string; chann
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
 function conversation(row: Row): Conversation {
   return {
-    id: String(row.id), userId: String(row.user_id), agent: String(row.agent) as AgentName,
+    id: String(row.id), userId: String(row.user_id), agent: String(row.agent) as ControllerAgentName,
     nativeId: row.native_id === null ? null : String(row.native_id), title: String(row.title),
     model: row.model == null ? null : String(row.model), ...(row.model_policy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}), actualModel: row.actual_model == null ? null : String(row.actual_model),
     effort: row.effort == null ? null : String(row.effort),
@@ -61,6 +61,7 @@ function inbox(row: Row): InboxItem {
 export interface ControllerBinding {
   getActive(userId: string): string | null;
   setActive(userId: string, conversationId: string, reason?: 'reset' | 'agent-switch'): void;
+  saveNativeId?(conversationId: string, nativeId: string): void;
 }
 export class SessionStore {
   readonly path: string;
@@ -413,7 +414,7 @@ export class SessionStore {
     this.db.prepare("UPDATE inbox SET conversation_id=?,updated_at=? WHERE conversation_id=? AND state='queued'")
       .run(newId, new Date().toISOString(), oldId);
   }
-  createConversation(userId: string, agent: AgentName, cwd: string, options: { controllerMode?: boolean; contextSeed?: string; cwdExplicit?: boolean } = {}): Conversation {
+  createConversation(userId: string, agent: ControllerAgentName, cwd: string, options: { controllerMode?: boolean; contextSeed?: string; cwdExplicit?: boolean } = {}): Conversation {
     const now = new Date().toISOString();
     const item: Conversation = {
       id: randomUUID(), userId, agent, nativeId: null, model: null, actualModel: null, actualEffort: null,
@@ -460,7 +461,7 @@ export class SessionStore {
       ON CONFLICT(agent) DO UPDATE SET model=excluded.model,model_policy=excluded.model_policy,effort=excluded.effort,preset_json=excluded.preset_json`)
       .run(item.agent, item.model ?? null, item.modelPolicy ?? null, item.effort ?? null, item.preset ? JSON.stringify(item.preset) : null);
   }
-  preferences(agent: AgentName): { model: string | null; modelPolicy?: 'cli-default'; effort: string | null; preset?: Conversation['preset'] } | null {
+  preferences(agent: ControllerAgentName): { model: string | null; modelPolicy?: 'cli-default'; effort: string | null; preset?: Conversation['preset'] } | null {
     const row = this.db.prepare('SELECT * FROM bot_preferences WHERE agent=?').get(agent);
     return row ? { ...(row.preset_json ? { preset: JSON.parse(String(row.preset_json)) } : {}), model: row.model == null ? null : String(row.model), effort: row.effort == null ? null : String(row.effort),
       ...(row.model_policy === 'cli-default' ? { modelPolicy: 'cli-default' as const } : {}) } : null;
@@ -471,6 +472,10 @@ export class SessionStore {
   saveNativeId(id: string, nativeId: string): void {
     this.db.prepare('UPDATE conversations SET native_id = ?, updated_at = ? WHERE id = ?')
       .run(nativeId, new Date().toISOString(), id);
+    if (this.binding?.saveNativeId) {
+      const target = this.getConversation(id);
+      if (target && this.binding.getActive(target.userId) === id) this.binding.saveNativeId(id, nativeId);
+    }
   }
 
   setPreset(id: string, preset: Conversation['preset']): void {
@@ -504,7 +509,7 @@ export class SessionStore {
   getLastDelivery(userId: string, channelId: string): DeliveredReply | null {
     const row = this.db.prepare('SELECT conversation_id, agent, native_id FROM delivered_replies WHERE user_id = ? AND channel_id = ?')
       .get(userId, channelId);
-    return row ? { conversationId: String(row.conversation_id), agent: String(row.agent) as AgentName, nativeId: String(row.native_id) } : null;
+    return row ? { conversationId: String(row.conversation_id), agent: String(row.agent) as ControllerAgentName, nativeId: String(row.native_id) } : null;
   }
 
   saveDelivery(userId: string, channelId: string, reply: DeliveredReply): void {
@@ -572,6 +577,14 @@ export class SessionStore {
       .all().map(inbox).filter(item => !users || users.includes(item.userId));
     for (const item of items) this.setReplyState([item.id], 'failed');
     return items;
+  }
+
+  /** External decisions survive a bridge stop; native processes retain their interruption semantics. */
+  requeueExternalRunning(users?: string[]): number {
+    const items = this.db.prepare("SELECT i.* FROM inbox i JOIN conversations c ON c.id=i.conversation_id WHERE c.agent='external' AND i.state IN ('running','steering') ORDER BY i.sequence")
+      .all().map(inbox).filter(item => !users || users.includes(item.userId));
+    for (const item of items) this.setState(item.id, 'queued');
+    return items.length;
   }
 
   interruptRunning(users?: string[]): InboxItem[] {

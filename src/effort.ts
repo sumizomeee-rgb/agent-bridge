@@ -18,6 +18,7 @@ export function normalizeEffortCapability(agent: AgentName, levels: unknown, evi
 }
 
 export function modelEffortCapability(info: AgentModelInfo, target: Conversation): EffortCapability {
+  if (target.agent === 'external') throw new Error('外部主控不支持 CLI 模型与 effort 能力查询。');
   const id = target.model ?? info.defaultModel;
   const model = id == null ? undefined : info.models.find(model => model.id === id)
     ?? info.models.find(model => model.resolvedModel === id);
@@ -57,6 +58,7 @@ export function validateAgentEffort(agent: AgentName, effort: string): void {
 }
 
 export async function validateEffort(_adapter: AgentAdapter, target: Conversation, effort: string): Promise<EffortCapability> {
+  if (target.agent === 'external') throw new Error('外部主控不支持 CLI effort 设置。');
   validateAgentEffort(target.agent, effort);
   // 接受参数不构成目标模型或网关已支持的证据，也不发起模型目录查询。
   return normalizeEffortCapability(target.agent, undefined, { source: `${target.agent}-cli-argument`, modelId: target.model ?? null });
@@ -64,6 +66,10 @@ export async function validateEffort(_adapter: AgentAdapter, target: Conversatio
 
 /** Explicit default is resolved per launch, never persisted as a model ID. */
 export async function resolveDefaultModel(adapter: AgentAdapter, turn: AgentTurn): Promise<AgentTurn> {
+  if (turn.conversation.agent === 'external') {
+    if (turn.conversation.modelPolicy === 'cli-default') throw new Error('外部主控不能使用 CLI 默认模型策略。');
+    return turn;
+  }
   if (turn.conversation.modelPolicy !== 'cli-default' || turn.conversation.model || !turn.conversation.nativeId) return turn;
   const info = await adapter.getModelInfo?.(turn.conversation.cwd, turn.conversation);
   if (!info?.defaultModel || info.defaultModel === 'default') throw new Error('无法确认目标 CLI 当前默认模型，本轮未提交；显式默认策略已保留。');

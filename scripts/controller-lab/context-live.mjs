@@ -36,7 +36,7 @@ try {
       const bytes=readFileSync(sourceFile);originals.set(sourceFile,sha(bytes));copyFileSync(sourceFile,targetFile);
       if(sourceFile.includes('bridge-agent-presets')&&sourceFile.includes('private'))privateCopies.push(targetFile);
     };
-    for(const name of ['MEMORY.md','bridge-remote-agents','bridge-agent-presets','bridge-capabilities','bridge-chat-platforms','bridge-prompts.json']){
+    for(const name of ['MEMORY.md','bridge-computers','bridge-agent-presets','bridge-capabilities','bridge-registry/channels/lark/README.md','bridge-registry/channels/discord/README.md','bridge-prompts.json']){
       const sourceFile=join(sourceWorkspace,name);if(existsSync(sourceFile))copy(sourceFile,join(context,name));
     }
     copyFileSync(join(root,'workspace-template/README.md'),join(context,'README.md'));

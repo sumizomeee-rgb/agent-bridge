@@ -13,6 +13,25 @@ const target: ExecutionTargetBinding = { id: 'test', label: 'test', transport: '
   remoteRoot: 'G:\\Executor', nodePath: 'G:\\node.exe', agent: 'codex', agentCommand: { command: 'codex', args: [] }, cwd: 'G:\\Workspace' };
 const release: ExecutorRelease = { id: 'a'.repeat(64), archive: '', sha256: '', helper: '', installer: '', launcher: '' };
 
+test('authoritative owner migration precedes presets, caches per target mapping and blocks readiness on failure', async () => {
+  let now = 0, migrations = 0, fail = true; const order: string[] = [];
+  const owners = [{ controllerId: 'teto', botId: 'feishu:app', principalId: 'owner', oldUserId: 'feishu:app|account', userId: 'principal:owner' }];
+  const service = new RemoteDeploymentService(async () => [], () => {}, async () => { order.push('deploy'); return { state: 'ready' }; },
+    async () => release, () => now, async () => { order.push('presets'); return 0; }, async (_target, _cwd, value) => {
+      migrations++; order.push('owners'); assert.deepEqual(value, owners); if (fail) throw new Error('migration unavailable');
+    });
+  try {
+    service.registerOwnerMigration(owners);
+    assert.equal((await service.ensure(target, '.')).state, 'offline');
+    assert.deepEqual(order, ['deploy', 'owners']);
+    fail = false; now += 11000;
+    assert.equal((await service.ensure(target, '.')).state, 'ready');
+    assert.deepEqual(order.slice(-3), ['deploy', 'owners', 'presets']);
+    now += 31000; assert.equal((await service.ensure(target, '.')).state, 'ready');
+    assert.equal(migrations, 2); assert.deepEqual(order.slice(-2), ['deploy', 'presets']);
+  } finally { await service.close(); }
+});
+
 test('启动即检查，多个 Bot 和派工共享一次更新；后续检查可重试，关闭停止检查', async () => {
   let now = 0, calls = 0, builds = 0, state: DeploymentResult['state'] = 'offline'; const logs: string[] = [];
   let finish!: (value: DeploymentResult) => void;

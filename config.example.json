@@ -1,18 +1,22 @@
 {
-  "version": 3,
-  "startupProfiles": ["discord/default"],
-  "principals": [],
-  "spaces": [],
+  "version": 4,
   "groupMode": true,
   "internalBotCommunicationEnabled": false,
   "defaultAgent": "codex",
   "controllerMode": true,
-  "workspaceRoot": ".local/workspaces",
-  "dataDir": ".local/data",
+  "workspaceRoot": "../AgentWorkspace",
   "maxFileBytes": 20971520,
   "incomingAttachmentLimitsByPlatform": {
-    "discord": { "maxFileBytes": 104857600, "maxTotalBytes": 209715200, "maxAttachments": 10 },
-    "feishu": { "maxFileBytes": 104857600, "maxTotalBytes": 209715200, "maxAttachments": 10 }
+    "discord": {
+      "maxFileBytes": 104857600,
+      "maxTotalBytes": 209715200,
+      "maxAttachments": 10
+    },
+    "feishu": {
+      "maxFileBytes": 104857600,
+      "maxTotalBytes": 209715200,
+      "maxAttachments": 10
+    }
   },
   "commands": {
     "codex": {

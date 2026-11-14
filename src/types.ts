@@ -2,12 +2,15 @@ import type { FeedbackBatch, FeedbackRead } from './controller-feedback.js';
 import type { DispatchFailureBatch } from './dispatch-failures.js';
 
 export type AgentName = 'codex' | 'claude';
+export type ControllerAgentName = AgentName | 'external';
+export type ControllerBackend = { kind: 'native'; agent: AgentName } | { kind: 'external'; endpointId: string };
 export type SessionVisibility = 'hidden' | 'visible';
 export type BridgePlatform = 'discord' | 'feishu';
 export interface Conversation {
   id: string;
   userId: string;
-  agent: AgentName;
+  agent: ControllerAgentName;
+  /** Opaque real backend session identity; native CLI IDs or externally registered session IDs. */
   nativeId: string | null;
   /** Explicit per-conversation selection; null leaves the CLI default unchanged. */
   model?: string | null;
@@ -34,6 +37,13 @@ export interface Conversation {
 }
 export interface AgentCommand { command: string; args: string[] }
 export interface BridgeConfig {
+  controllerId?: string;
+  controllerBackend?: ControllerBackend;
+  controllerUserId?: string;
+  channelOwnerUserId?: string;
+  channelProxyUrl?: string | null;
+  channelDataDir?: string;
+  responseWaitMs?: number | null;
   /** Runtime identity is stable across profile/display-name changes. */
   botId?: string;
   /** Human names only; never identity, authorization, or routing selectors. */
@@ -42,8 +52,6 @@ export interface BridgeConfig {
   ownerUserId?: string;
   contextWorkspace?: string;
   workingCwd?: string;
-  /** Previous per-Bot default, used only to relocate inherited defaults on /new. */
-  legacyWorkspace?: string;
   groupMode?: boolean;
   /** 跨 Bot 后台互通开关；缺省保留旧部署行为，false 时仅允许公开协作。 */
   internalBotCommunicationEnabled?: boolean;
@@ -128,6 +136,7 @@ export interface PrivateInputMessage {
 export interface PrivateInputBatch { version: number; messages: PrivateInputMessage[] }
 export interface PrivateInputCheckResult { refreshRequired: boolean; input?: PrivateInputBatch }
 export interface AgentTurn {
+  deliveryRequirement?: 'private' | 'group' | 'none';
   conversation: Conversation;
   /** The real source of this input, never the last contacted destination. */
   source?: { messageId: string; userId: string; channelId: string; original?: ChatInputSource };
@@ -177,7 +186,7 @@ export interface AgentTurn {
   /** Disposable evidence-only execution: restricted filesystem tools, no inherited MCP/plugins. */
   readOnly?: boolean;
   /** Standalone background input, never a human authorization. */
-  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context' | 'group-event' | 'executor-message' | 'recovery'; toolName?: string; text: string; introductionRequested?: boolean };
+  event?: { kind: 'worker-result' | 'worker-progress' | 'wake' | 'workspace-context' | 'group-event' | 'executor-message' | 'recovery' | 'controller-input'; toolName?: string; text: string; introductionRequested?: boolean };
   /** Optional explicit worker effort inherited from the coordinating turn. */
   effort?: string;
   onModel?: (model: string) => void;
@@ -196,6 +205,9 @@ export interface AgentResult {
 }
 export interface AgentAdapter {
   run(turn: AgentTurn): Promise<AgentResult>;
+  /** External durable waiting is not an active local operation. */
+  isWaiting?(conversationId: string): boolean;
+  suspend?(conversationId: string): Promise<void>;
   /** queued 必须表示尚未提交或收到明确拒绝；不确定结果禁止自动重发。 */
   steer?(conversationId: string, supplement: AgentSupplement): Promise<SteerResult>;
   interrupt(conversationId: string, dispatchId?: string): Promise<void>;

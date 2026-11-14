@@ -5,12 +5,11 @@ import { collectOutgoingPaths } from './artifacts.js';
 import { assertBotCommunicationAllowed } from './bot-communication.js';
 import { isActiveWorker } from './overview.js';
 import type { HostConfig } from './config.js';
-import type { HostSemanticMarker } from './host-migration.js';
 import { HostStore, HostStateError, type HostController, type HostEvent, type HostGroup, type RoutedDeliverySource, type RoutedDeliveryTarget } from './host-store.js';
 import { prepareIncomingMessage } from './forwarded.js';
 import { HostInbox, type HostInput } from './host-inbox.js';
+import { ControllerCore, type ControllerCoreHooks } from './controller/core.js';
 import { BotRuntime, type BotRuntimeHooks } from './bot-runtime.js';
-import { SessionStore } from './store.js';
 import { parseCommand, groupCommands } from './commands.js';
 import { compareMessageIds, validMessageId } from './routing.js';
 import type { AgentTurn, BridgeConfig, BridgeMessage, IncomingDM, ReplyOptions } from './types.js';
@@ -32,6 +31,7 @@ export class HostRuntime {
   readonly store: HostStore;
   readonly inbox: HostInbox;
   readonly bots = new Map<string, BotRuntime>();
+  readonly controllers = new Map<string, ControllerCore>();
   readonly failures = new Map<string, string>();
   private readonly historyCursors = new Map<string, { expires: number; botId: string; principalId: string; conversationId: string;
     generation: number; spaceId: string; epoch: number; revision: number; options: ConversationHistoryOptions }>();
@@ -59,29 +59,17 @@ export class HostRuntime {
   private pumpDone: Promise<void> = Promise.resolve();
   private finishPump?: () => void;
 
-  constructor(readonly config: HostConfig, marker: HostSemanticMarker,
+  constructor(readonly config: HostConfig,
     private readonly requestRestart: BotRuntimeHooks['requestRestart'], private readonly report: (text: string) => void) {
     this.store = new HostStore(config.rootDataDir); this.inbox = new HostInbox(config.rootDataDir);
+    for(const controller of config.controllerConfigs) {
+      if(!controller.controllerId||!controller.ownerPrincipalId)throw new Error('Controller identity and owner are required');
+      this.store.registerController(controller.controllerId,controller.ownerPrincipalId);
+    }
     for (const bot of config.configs) {
       this.configurations.set(bot.botId!, bot);
-      this.store.registerBot({ botId: bot.botId!, platform: bot.platform!, applicationId: bot.applicationId!,
-        ...(bot.ownerPrincipalId ? { ownerPrincipalId: bot.ownerPrincipalId } : {}) });
-      for (const principal of config.principals) {
-        const account = principal.accounts[bot.botId!];
-        if (account) this.store.mapPrincipal({ botId: bot.botId!, principalId: principal.id, platformUserId: account, proof: 'explicit local principal configuration' });
-      }
-      const migrated = marker.bots.find(b => b.botId === bot.botId);
-      if (migrated?.ownerPrincipalId) this.store.claimOwner(bot.botId!, migrated.ownerPrincipalId);
-      if (migrated?.ownerUserId) bot.ownerUserId = migrated.ownerUserId;
-      if (!this.store.getController(bot.botId!) && migrated?.activeConversationId) {
-        const sessions = new SessionStore(bot.dataDir);
-        try {
-          const c = sessions.getConversation(migrated.activeConversationId);
-          if (!c || c.userId !== migrated.ownerUserId) throw new Error('迁移后的当前主控与激活账号不一致。');
-          this.store.setController(bot.botId!, migrated.ownerPrincipalId!, { conversationId: c.id, generation: 1, agent: c.agent,
-            nativeId: c.nativeId, model: c.model, effort: c.effort, ...(c.preset ? { preset: c.preset } : {}) }, 0);
-        } finally { sessions.close(); }
-      }
+      this.store.registerBot({botId:bot.botId!,controllerId:bot.controllerId!,platform:bot.platform!,applicationId:bot.applicationId!,ownerPrincipalId:bot.ownerPrincipalId});
+      for(const principal of config.principals){const account=principal.accounts[bot.botId!];if(account)this.store.mapPrincipal({botId:bot.botId!,principalId:principal.id,platformUserId:account,proof:'explicit local principal configuration'});}
     }
     for (const mapping of config.spaces) for (const [botId, raw] of Object.entries(mapping.accounts)) {
       this.store.mapSpace({ botId, platformSpaceId: raw, spaceId: mapping.id, proof: 'explicit local canonical space mapping' });
@@ -99,13 +87,7 @@ export class HostRuntime {
       authorize: (user, text) => this.authorize(botId, user, text),
       receiveGroup: message => this.receive(botId, message),
       requestRestart: origin => this.requestRestart(origin), isDraining: () => this.draining,
-      executorDirectory: () => ({ id: key('executor-directory', this.config.rootDataDir), recipients: [...this.bots.values()].flatMap(member => {
-        const config = member.config, userId = config.ownerUserId;
-        const owner = this.store.getBot(config.botId!)?.ownerPrincipalId;
-        if (!member.isReady() || !userId || !owner || !member.manager.currentConversation(userId)?.nativeId) return [];
-        return [{ scope: executorScope(userId), botId: config.botId!, userId, principalId: owner,
-          aliases: [...new Set([...(config.aliases ?? []), ...(member.transport.botUser?.username ? [member.transport.botUser.username] : [])])] }];
-      }) }),
+      executorDirectory: () => this.executorDirectory(),
       isGroupChannel: channel => {
         if (!channel.startsWith(bot.scopePrefix!)) return false;
         const raw = channel.slice(bot.scopePrefix!.length);
@@ -136,11 +118,18 @@ export class HostRuntime {
       resumeGroup: () => { this.switchPaused.delete(botId); void this.pump(); },
       manager: {
         binding: {
-          getActive: user => this.authorize(botId, user, '') ? this.store.getController(botId)?.conversationId ?? null : null,
+          getActive: user => this.authorize(botId, user, '') ? this.store.controllerForBot(botId)?.conversationId ?? null : null,
+          saveNativeId: (conversationId, nativeId) => {
+            const current = this.store.controllerForBot(botId);
+            if (current?.conversationId !== conversationId) return;
+            const target = this.controllers.get(bot.controllerId!)?.manager.conversationById(conversationId);
+            if (!target || !this.authorize(botId, target.userId, '')) return;
+            this.store.updateControllerNativeId(botId, current.generation, nativeId);
+          },
           setActive: (user, id, reason) => {
             if (!this.authorize(botId, user, '')) throw new Error('此账号不拥有当前 Bot。');
-            const current = this.store.getController(botId); if (current?.conversationId === id) return;
-            const sessions = this.bots.get(botId)?.manager;
+            const current = this.store.controllerForBot(botId); if (current?.conversationId === id) return;
+            const sessions = this.controllers.get(bot.controllerId!)?.manager;
             const target = sessions?.conversationById(id);
             if (!target) throw new Error('目标主控记录不存在。');
             const controller: HostController = { conversationId: id, generation: (current?.generation ?? 0) + 1,
@@ -174,7 +163,7 @@ export class HostRuntime {
           if (event && ['running', 'uncertain'].includes(event.state)) this.store.finishEvent(event.id, outcome);
           else if (event && ['queued', 'reserved'].includes(event.state)) this.store.cancelEvent(event.id, 'native turn did not start');
           const c = this.bots.get(botId)?.manager.currentConversation(bot.ownerUserId!);
-          if (c?.nativeId && this.store.getController(botId)?.conversationId === c.id) this.store.updateControllerNativeId(botId, this.store.getController(botId)!.generation, c.nativeId);
+          if (c?.nativeId && this.store.controllerForBot(botId)?.conversationId === c.id) this.store.updateControllerNativeId(botId, this.store.controllerForBot(botId)!.generation, c.nativeId);
           void this.pump();
         },
         onGroupSilent: async context => { this.assertContext(context); this.store.markEventDecision(context.eventId, 'silent'); },
@@ -182,7 +171,7 @@ export class HostRuntime {
         onGroupPublish: (context, text, paths, deliver) => this.publish(context, text, paths, deliver),
         onGroupCompletion: event => this.completion(botId, event),
         onInitializationState: (conversation, outcome) => {
-          const controller = this.store.getController(botId);
+          const controller = this.store.controllerForBot(botId);
           if (controller?.conversationId !== conversation.id) return;
           this.store.setControllerReady(botId, controller.generation, outcome === 'ready');
           if (conversation.nativeId) this.store.updateControllerNativeId(botId, controller.generation, conversation.nativeId);
@@ -196,14 +185,76 @@ export class HostRuntime {
       },
     };
   }
-  attach(bot: BotRuntime): void { this.bots.set(bot.config.botId!, bot); }
+  attach(bot: BotRuntime): void {
+    const id = bot.config.botId!;
+    if (this.bots.has(id) && this.bots.get(id) !== bot) throw new Error('Channel is already attached.');
+    this.attachCore(bot.core); this.bots.set(id, bot);
+  }
+  attachCore(core: ControllerCore): void {
+    const id = core.config.controllerId;
+    if (!id || !this.config.controllerConfigs.some(config => config.controllerId === id)) throw new Error('Controller is not registered.');
+    if (this.controllers.has(id) && this.controllers.get(id) !== core) throw new Error('Controller is already attached.');
+    this.controllers.set(id, core);
+  }
+  private executorDirectory(): ReturnType<NonNullable<ControllerCoreHooks['executorDirectory']>> {
+    return { id: key('executor-directory', this.config.rootDataDir), recipients: [...this.controllers].flatMap(([controllerId, core]) => {
+      const config = core.config, owner = config.ownerPrincipalId, userId = config.controllerUserId;
+      if (!owner || userId !== 'principal:' + owner || !core.isReady() || !this.config.principals.some(principal => principal.id === owner)) return [];
+      const current = this.store.getController(controllerId), conversation = core.manager.currentConversation(userId);
+      if (!current?.nativeId || conversation?.id !== current.conversationId || conversation.nativeId !== current.nativeId) return [];
+      const channel = config.botId ? this.bots.get(config.botId) : undefined;
+      return [{ scope: executorScope(controllerId, userId), controllerId, ...(config.botId ? { botId: config.botId } : {}), userId, principalId: owner,
+        aliases: [...new Set([...(config.aliases ?? []), ...(channel?.transport.botUser?.username ? [channel.transport.botUser.username] : [])])] }];
+    }) };
+  }
+  controllerHooks(config: BridgeConfig): ControllerCoreHooks {
+    const id = config.controllerId!, owner = config.ownerPrincipalId!, userId = config.controllerUserId!;
+    if (!id || !owner || !userId || config.botId) throw new Error('Independent controller identity is required.');
+    const authorize = (user: string) => user === userId && this.config.principals.some(principal => principal.id === owner);
+    return {
+      authorize, executorDirectory: () => this.executorDirectory(), requestRestart: origin => this.requestRestart(origin), isDraining: () => this.draining,
+      pauseGroup: () => {}, resumeGroup: () => {},
+      log: message => this.report('CONTROLLER ' + id + ' ' + message),
+      invoke: async (_turn, name, args, _callId, delegate) => {
+        if (['bridge_delivery_targets', 'bridge_read_group_history', 'bridge_group_context', 'bridge_start_collaboration', 'bridge_send_bot', 'bridge_broadcast'].includes(name))
+          throw new Error('This controller has no chat channel.');
+        return delegate(args);
+      },
+      manager: {
+        binding: {
+          getActive: user => authorize(user) ? this.store.getController(id)?.conversationId ?? null : null,
+          saveNativeId: (conversationId, nativeId) => {
+            const current = this.store.getController(id);
+            if (current?.conversationId !== conversationId) return;
+            const target = this.controllers.get(id)?.manager.conversationById(conversationId);
+            if (!target || !authorize(target.userId)) return;
+            this.store.updateIndependentControllerNativeId(id, current.generation, nativeId);
+          },
+          setActive: (user, conversationId) => {
+            if (!authorize(user)) throw new Error('Controller owner does not match.');
+            const previous = this.store.getController(id); if (previous?.conversationId === conversationId) return;
+            const target = this.controllers.get(id)?.manager.conversationById(conversationId);
+            if (!target || target.userId !== userId) throw new Error('Controller conversation is not owned.');
+            this.store.setIndependentController(id, owner, { conversationId, generation: (previous?.generation ?? 0) + 1,
+              agent: target.agent, nativeId: target.nativeId, model: target.model, effort: target.effort,
+              ...(target.preset ? { preset: target.preset } : {}) }, previous?.generation ?? 0);
+          },
+        },
+        onInitializationState: conversation => {
+          const current = this.store.getController(id);
+          if (current?.conversationId === conversation.id && conversation.nativeId)
+            this.store.updateIndependentControllerNativeId(id, current.generation, conversation.nativeId);
+        },
+      },
+    };
+  }
   /** Resolve old native ownership before manager recovery can start either a DM or group turn. */
   async prepareRecoveryBots(): Promise<void> {
     for (const [botId, bot] of this.bots) {
       if (this.failures.has(botId)) continue;
       const uncertain = this.store.listEvents(botId).filter(event => event.state === 'uncertain');
       for (const event of uncertain) {
-        const controller = this.store.getController(botId);
+        const controller = this.store.controllerForBot(botId);
         if (controller?.generation === event.generation && await bot.confirmControllerStopped(controller.conversationId)) {
           this.store.finishEvent(event.id, event.decision === 'silent' ? 'silent' : 'failed', 'prior native process confirmed stopped before Bot recovery; no replay');
         } else {
@@ -215,7 +266,10 @@ export class HostRuntime {
       }
     }
   }
-  private rawUser(config: BridgeConfig, user: string): string | null { return user.startsWith(config.scopePrefix!) ? user.slice(config.scopePrefix!.length) : null; }
+  private rawUser(config: BridgeConfig,user:string):string|null {
+    if(user===config.controllerUserId&&config.ownerPrincipalId)return this.ownerAccount(config.botId!,config.ownerPrincipalId) ?? null;
+    return config.scopePrefix&&user.startsWith(config.scopePrefix)?user.slice(config.scopePrefix.length):null;
+  }
   private principalAllowed(botId: string, principalId: string): boolean {
     const config = this.configurations.get(botId);
     const account = this.config.principals.find(p => p.id === principalId)?.accounts[botId];
@@ -237,8 +291,7 @@ export class HostRuntime {
   authorize(botId: string, user: string, text: string): boolean {
     this.refreshConfiguredPermissions();
     const config = this.configurations.get(botId)!;
-    if (!config.allowedUserIds.includes(user)) return false;
-    const raw = this.rawUser(config, user); if (!raw) return false;
+    const raw = this.rawUser(config,user); if(!raw||!config.allowedUserIds.includes(config.scopePrefix!+raw))return false;
     const principal = this.store.resolvePrincipal(botId, raw); if (!principal || !this.principalAllowed(botId, principal)) return false;
     const bot = this.store.getBot(botId)!;
     if (bot.ownerPrincipalId && bot.ownerPrincipalId !== principal) return false;
@@ -247,7 +300,7 @@ export class HostRuntime {
       if (!text.trim() || command && command.name !== 'new') return false;
       this.store.claimOwner(botId, principal);
     }
-    config.ownerUserId = user; return true;
+    config.ownerUserId = config.controllerUserId!; return true;
   }
   private space(botId: string, raw: string): string | null {
     const mapped = this.store.resolveSpace(botId, raw); if (mapped) return mapped;
@@ -342,7 +395,7 @@ export class HostRuntime {
     const hasUnknownScopedMention = !!command && config.platform === 'feishu' && message.space.mentionedUserIds.some(id => id !== this.bots.get(botId)?.transport.botUser?.id);
     const observedTargets = direct.length && !hasUnknownScopedMention ? direct : group?.memberBotIds ?? [];
     const observedGenerations = group && (!command || !observedTargets.some(id => this.isPaused(id)))
-      ? Object.fromEntries(observedTargets.map(id => [id, this.store.getController(id)?.generation ?? 0])) : null;
+      ? Object.fromEntries(observedTargets.map(id => [id, this.store.controllerForBot(id)?.generation ?? 0])) : null;
     const previous = this.ingressTails.get(spaceId) ?? Promise.resolve();
     const admitted = previous.catch(() => undefined).then(async (): Promise<{ execution?: Promise<void> }> => {
       if (this.closed || this.draining) return {};
@@ -436,7 +489,7 @@ export class HostRuntime {
         if (!stillCurrent() || !latestBinding) {
           this.inbox.setState(input.id, 'accepted', '旧输入在控制切换前收到，已取消，不穿越新代次。'); return;
         }
-        const targets = latestBinding.memberBotIds.filter(id => this.store.getBot(id)?.ready && this.store.getController(id));
+        const targets = latestBinding.memberBotIds.filter(id => this.store.getBot(id)?.ready && this.store.controllerForBot(id));
         if (!targets.length) {
           await this.controlReply(botId, message, '本群成员未初始化或未就绪；请先在对应 Bot 私聊初始化，或用群 /new 初始化本群全部成员。');
           this.inbox.setState(input.id, 'accepted'); this.inbox.saveCursor(botId, spaceId, message.id); return;
@@ -449,7 +502,7 @@ export class HostRuntime {
         const pub = this.store.appendPublic({ id: `human:${input.id}`, rootId: root.id, principalId: principal, text: message.text,
           attachments: message.attachments.map(a => ({ sourceBotId: botId, sourceMessageId: a.messageId, resourceKey: a.resourceKey, filename: a.filename })) });
         for (const target of targets) {
-          const c = this.store.getController(target)!;
+          const c = this.store.controllerForBot(target)!;
           this.store.enqueueEvent({ id: key(root.id, target, 'initial'), rootId: root.id, botId: target, generation: c.generation,
             kind: 'human', payload: { text: message.text, sourceBotId: botId, original: message }, publicCursor: pub.sequence });
         }
@@ -491,7 +544,7 @@ export class HostRuntime {
       text: message.text.slice(0, 4000), attachments: message.attachments.map(a => ({ id: a.id, filename: a.filename, contentType: a.content_type })) });
   }
   private continuousGeneration(botId: string, generation: number): boolean {
-    const current = this.store.getController(botId)?.generation ?? 0;
+    const current = this.store.controllerForBot(botId)?.generation ?? 0;
     let cursor = generation;
     for (const change of this.store.listControllerSwitches(botId)) {
       if (change.fromController.generation === cursor) cursor = change.toController.generation;
@@ -560,7 +613,7 @@ export class HostRuntime {
       const targets = mentions.length ? mentions : group.memberBotIds;
       if (targets.some(id => !group!.memberBotIds.includes(id))) throw new Error('指定 Bot 不属于当前已激活群。');
       const snapshot = group;
-      const generations = new Map(targets.map(id => [id, this.store.getController(id)?.generation ?? null]));
+      const generations = new Map(targets.map(id => [id, this.store.controllerForBot(id)?.generation ?? null]));
       for (const targetId of targets) {
         const bot = this.bots.get(targetId); if (!bot) throw new Error(`成员 ${targetId} 离线。`);
         const assertCurrent = () => {
@@ -569,7 +622,7 @@ export class HostRuntime {
           if (!binding?.enabled || binding.epoch !== snapshot.epoch || binding.revision !== snapshot.revision
             || binding.principalId !== principal || !binding.memberBotIds.includes(targetId)
             || !this.principalAllowed(targetId, principal) || !stored || stored.ownerPrincipalId !== null && stored.ownerPrincipalId !== principal
-            || (this.store.getController(targetId)?.generation ?? null) !== generations.get(targetId)) throw new Error('查询期间群绑定、负责人或主控代次已变化，未发送旧清单。');
+            || (this.store.controllerForBot(targetId)?.generation ?? null) !== generations.get(targetId)) throw new Error('查询期间群绑定、负责人或主控代次已变化，未发送旧清单。');
         };
         await this.verifyMember(targetId, spaceId, principal); assertCurrent();
         const channel = bot.config.scopePrefix! + this.rawSpace(targetId, spaceId)!;
@@ -579,7 +632,7 @@ export class HostRuntime {
           else if (control) await bot.transport.sendText(channel, text, options);
           else await bot.send(channel, text, options);
         };
-        if (!this.store.getBot(targetId)?.ready || !this.store.getController(targetId)) {
+        if (!this.store.getBot(targetId)?.ready || !this.store.controllerForBot(targetId)) {
           await reply('主控未初始化或未就绪；请先在此 Bot 私聊初始化。', { presentation: { title: '直属助手', tone: 'info',
             blocks: [{ kind: 'entry', text: '主控未初始化或未就绪；请先在此 Bot 私聊初始化。' }] } }, true);
           continue;
@@ -617,8 +670,8 @@ export class HostRuntime {
       for (const botId of [...group.memberBotIds].sort()) {
         const bot = this.bots.get(botId); if (!bot) throw new Error(`成员 ${botId} 离线。`);
         this.paused.add(botId); this.store.claimOwner(botId, group.principalId);
-        bot.config.ownerUserId = bot.config.scopePrefix! + this.ownerAccount(botId, group.principalId)!;
-        const previous = this.store.getController(botId);
+        bot.config.ownerUserId = bot.config.controllerUserId!;
+        const previous = this.store.controllerForBot(botId);
         try {
           const target = await bot.manager.prepareReset(bot.config.ownerUserId);
           prepared.push({ bot, target }); this.store.recordBatchCancellation(id, botId, { confirmed: true, detail: '受管旧定时及其执行已确认结束' });
@@ -756,7 +809,7 @@ export class HostRuntime {
     if (!target || !stored || target.config.platform !== this.configurations.get(botId)!.platform
       || stored.ownerPrincipalId !== source.principalId || !this.principalAllowed(targetId, source.principalId))
       throw new Error('目标须为同平台、同一负责人名下的已登记主控。');
-    const userId = target.config.scopePrefix! + this.ownerAccount(targetId, source.principalId)!;
+    const userId = target.config.controllerUserId!;
     const route = target.manager.knownDMChannels().filter(value => value.userId === userId
       && !this.hooks(target.config).isGroupChannel?.(value.channelId)).at(-1);
     if (!route) throw new Error('目标主控尚无该负责人的已保存私聊记录。');
@@ -779,7 +832,7 @@ export class HostRuntime {
     if (!group.memberBotIds.includes(targetBotId) || member?.ownerPrincipalId !== source.principalId || !member.ready || !member.controller
       || !this.bots.get(targetBotId)?.isReady() || this.failures.has(targetBotId) || this.isPaused(targetBotId)) throw new Error('指定主控非当前同负责人群成员、未就绪或受阻；未发起协作。');
     const assertCurrent = () => {
-      const now = this.deliverySource(botId, turn), binding = this.store.getGroup(group.spaceId), current = this.store.getController(targetBotId);
+      const now = this.deliverySource(botId, turn), binding = this.store.getGroup(group.spaceId), current = this.store.controllerForBot(targetBotId);
       if (now.generation !== source.generation || !binding?.enabled || binding.epoch !== group.epoch || binding.revision !== group.revision
         || current?.generation !== member.controller!.generation || !this.store.getBot(targetBotId)?.ready
         || this.failures.has(targetBotId) || this.isPaused(targetBotId)) throw new Error('查询期间群权限或主控代次已变化，未唤醒目标。');
@@ -1002,9 +1055,9 @@ export class HostRuntime {
 
   private assertContext(context: Context): HostEvent {
     this.refreshConfiguredPermissions();
-    const event = this.store.getEvent(context.eventId), group = this.store.getGroup(context.spaceId), controller = this.store.getController(context.botId);
+    const event = this.store.getEvent(context.eventId), group = this.store.getGroup(context.spaceId), controller = this.store.controllerForBot(context.botId);
     const root = this.store.getRoot(context.rootId);
-    if (root?.replyTo.collaborationMode && (group?.revision !== root.revision || this.store.getController(root.replyTo.initiatorBotId!)?.generation !== root.generations[root.replyTo.initiatorBotId!])) throw new Error('原协作发起主控或群成员绑定已改变。');
+    if (root?.replyTo.collaborationMode && (group?.revision !== root.revision || this.store.controllerForBot(root.replyTo.initiatorBotId!)?.generation !== root.generations[root.replyTo.initiatorBotId!])) throw new Error('原协作发起主控或群成员绑定已改变。');
     if (!event || !group?.enabled || group.epoch !== context.bindingEpoch || group.principalId !== context.principalId
       || !group.memberBotIds.includes(context.botId) || controller?.generation !== context.generation) throw new Error('群上下文、权限或主控代次已改变。');
     return event;
@@ -1105,7 +1158,7 @@ export class HostRuntime {
     const old = event.groupContext; if (!old || !event.wakeAllowed) return 'retain';
     const dispatchReview=event.purpose==='dispatch-failure'?event.dispatchFailureReviewId:undefined;
     if(event.purpose==='dispatch-failure'&&(!dispatchReview||dispatchReview!==event.taskId||!this.bots.get(botId)?.manager.validDispatchFailureReview(dispatchReview,old)))return 'retain';
-    const group = this.store.getGroup(old.spaceId), controller = this.store.getController(botId);
+    const group = this.store.getGroup(old.spaceId), controller = this.store.controllerForBot(botId);
     if (!group?.enabled || !controller || event.conversationId !== controller.conversationId || group.epoch !== old.bindingEpoch) {
       if(dispatchReview)this.bots.get(botId)?.manager.invalidateDispatchFailureReview(dispatchReview);return 'retain';
     }
@@ -1185,7 +1238,7 @@ export class HostRuntime {
     const assertCurrent = () => {
       const binding = this.store.getGroup(root.spaceId);
       if (!bot?.isReady() || !binding?.enabled || binding.epoch !== root.epoch || binding.revision !== root.revision
-        || this.store.getController(initiator)?.generation !== root.generations[initiator]
+        || this.store.controllerForBot(initiator)?.generation !== root.generations[initiator]
         || !this.principalAllowed(initiator, root.principalId) || this.store.getBot(initiator)?.ownerPrincipalId !== root.principalId)
         throw new Error('协作原授权或发起主控已失效，未改投。');
     };
@@ -1212,7 +1265,7 @@ export class HostRuntime {
       if (root.replyTo.collaborationMode === 'internal') {
         const initiator = root.replyTo.initiatorBotId!, sender = this.bots.get(initiator);
         if (!group?.enabled || group.epoch !== root.epoch || group.revision !== root.revision
-          || this.store.getController(initiator)?.generation !== root.generations[initiator] || !sender?.isReady()
+          || this.store.controllerForBot(initiator)?.generation !== root.generations[initiator] || !sender?.isReady()
           || !this.store.claimBudgetExhaustionNotice(rootId)) continue;
         const work = this.notifyCollaborationOwner(root.id, '本轮内部协作已达到自动交流上限，已停止新增互唤；已有执行任务继续。')
           .catch(() => this.report('INTERNAL_BUDGET_NOTICE_UNCERTAIN')).finally(() => this.budgetNotices.delete(work));
@@ -1304,7 +1357,7 @@ export class HostRuntime {
       this.store.registerOutbox({ id, eventId: context.eventId, audience: 'direct', targetBotIds: [target], payload: { text } });
       if (!this.store.beginOutboxSend(id)) return { state: this.store.getOutbox(id)?.state };
       try {
-        const c = this.store.getController(target); if (!c) throw new Error('目标 Bot 未初始化。');
+        const c = this.store.controllerForBot(target); if (!c) throw new Error('目标 Bot 未初始化。');
         this.store.enqueueEvent({ id: key(id, target), rootId: context.rootId, botId: target, generation: c.generation,
           kind: 'consultation', sourceBotId: botId, causeEventId: context.eventId, payload: { text, audience: 'internal named Bot only' } });
         this.store.finishOutbox(id, 'delivered', 'durable target inbox registered; not proof of read or acceptance');
@@ -1336,7 +1389,7 @@ export class HostRuntime {
       const taskId = bounded(args.taskId, 'taskId', 200); this.confirmStopped(taskId, botId);
       const handoff = this.store.proposeHandoff({ id: key(context.eventId, callId ?? taskId, 'handoff'), taskId,
         fromBotId: botId, toBotId: bounded(args.targetBotId, 'targetBotId', 200), summary: bounded(args.summary, 'summary') });
-      const c = this.store.getController(handoff.toBotId)!;
+      const c = this.store.controllerForBot(handoff.toBotId)!;
       this.store.enqueueEvent({ id: key(handoff.id, 'offer'), rootId: context.rootId, botId: handoff.toBotId, generation: c.generation,
         kind: 'handoff', sourceBotId: botId, causeEventId: context.eventId, payload: { text: `交接提议 ${handoff.id}：${handoff.summary}。接受前原 Bot 仍负责。` } });
       void this.pump(); return handoff;
@@ -1522,7 +1575,7 @@ export class HostRuntime {
     for (const input of this.inbox.uncertain()) this.report(`HOST_CONTROL_UNCERTAIN ${input.id}`);
     // An empty new adapter is not evidence that the previous native process ended.
     for (const event of this.store.listEvents().filter(e => e.state === 'uncertain')) {
-      const bot = this.bots.get(event.botId), controller = this.store.getController(event.botId);
+      const bot = this.bots.get(event.botId), controller = this.store.controllerForBot(event.botId);
       if (bot?.isReady() && controller?.generation === event.generation && await bot.confirmControllerStopped(controller.conversationId)) {
         this.store.finishEvent(event.id, event.decision === 'silent' ? 'silent' : 'failed', 'prior native process confirmed stopped; no model replay');
       } else this.report(`HOST_NATIVE_STOP_UNCONFIRMED bot=${event.botId} event=${event.id}`);
@@ -1531,7 +1584,7 @@ export class HostRuntime {
       if (!['committed', 'initializing'].includes(batch.state)) { this.report(`HOST_RESET_RECONCILIATION_REQUIRED operation=${batch.id} state=${batch.state}`); continue; }
       const input = this.inbox.get(batch.id);
       for (const member of batch.members.filter(m => m.initialization === 'pending')) {
-        const bot = this.bots.get(member.botId), controller = this.store.getController(member.botId);
+        const bot = this.bots.get(member.botId), controller = this.store.controllerForBot(member.botId);
         const raw = batch.spaceId ? this.rawSpace(member.botId, batch.spaceId) : undefined;
         if (!input || !bot?.isReady() || !raw || !member.prepared || controller?.conversationId !== member.prepared.conversationId
           || !this.principalAllowed(member.botId, batch.principalId)) { this.report(`HOST_RESET_INITIALIZATION_PENDING operation=${batch.id} bot=${member.botId}`); continue; }
@@ -1570,13 +1623,15 @@ export class HostRuntime {
       } catch (error) { this.store.stopGroup(group.spaceId, group.principalId, 'recovery permission/history unknown'); this.report('GROUP_RECOVERY_PAUSED ' + String(error)); }
     }
   }
-  beginDrain(): void { this.draining = true; for (const bot of this.bots.values()) bot.beginDrain(); }
-  isIdle(): boolean { return !this.ingressTails.size && !this.pending.size && !this.scheduledInputs.size && !this.spaceTails.size && !this.pumping && !this.preparations.size && !this.budgetNotices.size && [...this.bots.values()].every(bot => bot.isIdle()); }
+  beginDrain(): void { this.draining = true; const bound = new Set([...this.bots.values()].map(bot => bot.core)); for (const bot of this.bots.values()) bot.beginDrain(); for (const core of this.controllers.values()) if (!bound.has(core)) core.beginDrain(); }
+  isIdle(): boolean { return !this.ingressTails.size && !this.pending.size && !this.scheduledInputs.size && !this.spaceTails.size && !this.pumping && !this.preparations.size && !this.budgetNotices.size && [...this.bots.values()].every(bot => bot.isIdle()) && [...this.controllers.values()].every(core => core.isIdle()); }
   async close(): Promise<void> {
     this.closed = true; await Promise.allSettled([...this.ingressTails.values()]); await this.controlTail; await Promise.allSettled([...this.spaceTails.values()]); await this.pumpDone;
     await Promise.allSettled([...this.preparations.values(), ...this.budgetNotices]);
     const failures: unknown[] = [];
     for (const bot of this.bots.values()) try { await bot.close(); } catch (error) { failures.push(error); }
+    const bound = new Set([...this.bots.values()].map(bot => bot.core));
+    for (const core of this.controllers.values()) if (!bound.has(core)) try { await core.close(); } catch (error) { failures.push(error); }
     this.inbox.close(); this.store.close();
     if (failures.length) throw new AggregateError(failures, '部分 Bot 的停止尚未确认');
   }

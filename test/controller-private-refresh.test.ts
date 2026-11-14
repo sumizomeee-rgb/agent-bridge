@@ -263,3 +263,18 @@ for (const agent of ['codex','claude'] as const) test(`${agent} 新定时消息�
   await f.protocol.call('bridge_send_user',{text:'已按新要求处理，旧消息未登记'});f.protocol.complete();await running;
   assert.equal(checks,1);assert.equal(f.invoked.length,0);assert.equal(f.sends.length,1);
 });
+for (const agent of ['codex', 'claude'] as const) test(`${agent} background recovery preserves native image input without repeating event text`, async t => {
+  const f = fixture(t, agent), image = join(f.path, 'recovery.png');
+  writeFileSync(image, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aT5sAAAAASUVORK5CYII=', 'base64'));
+  const turn: AgentTurn = { ...f.turn, event: { kind: 'recovery', text: 'UNIQUE_RECOVERY_CONTENT' },
+    text: 'UNIQUE_RECOVERY_CONTENT', input: [{ type: 'text', text: 'UNIQUE_RECOVERY_CONTENT' }, { type: 'localImage', path: image }], imagePaths: [image] };
+  const running = f.adapter.run(turn); await until(() => f.protocol.turns === 1);
+  const message = f.protocol.written.find(value => agent === 'codex' ? value.method === 'turn/start' : value.type === 'user')!;
+  assert.equal(JSON.stringify(message).split('UNIQUE_RECOVERY_CONTENT').length - 1, 1);
+  if (agent === 'codex') assert.deepEqual((message.params as JsonObject).input, [{ type: 'localImage', path: image }]);
+  else {
+    const images = ((message.message as JsonObject).content as JsonObject[]).filter(value => value.type === 'image');
+    assert.equal(images.length, 1); assert.equal((images[0]!.source as JsonObject).media_type, 'image/png');
+  }
+  await f.protocol.call('bridge_send_user', { text: 'recovery complete' }); f.protocol.complete(); await running;
+});

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SshRemoteClient, requestRemoteHttp } from '../src/remote/client.js';
+import { SshRemoteClient, requestRemoteHttp, setRemoteDeploymentHook } from '../src/remote/client.js';
 import { RemoteAgentAdapter } from '../src/remote/adapter.js';
 import { TargetCatalogService } from '../src/remote/catalog.js';
 import type { JsonLineProcess } from '../src/agents/process.js';
@@ -147,4 +147,20 @@ test('computer refresh recovers a stale idle connection while cached reads perfo
     stale = true; const before = probes; await catalog.computerOverview(f.root, false); assert.equal(probes, before);
     assert.equal((await catalog.computerOverview(f.root, true))[1]!.connection, 'connected'); assert.equal(connections, 2);
   } finally { await catalog.close(); }
+});
+
+test('busy deployment fences new-schema handshakes while owner migration bypasses the deployment hook', async t => {
+  const f = fixture(t); let initialized = 0, checks = 0;
+  const client = new SshRemoteClient(f.binding, f.root);
+  // Keep this gate test entirely offline; startup would fail the expected diagnostic.
+  Object.defineProperty(client, 'initialize', { value: async () => { initialized++; throw new Error('fixture startup'); } });
+  setRemoteDeploymentHook(async () => { checks++; return { state: 'busy' }; });
+  try {
+    for (const method of ['hello', 'preset/describe']) {
+      await assert.rejects(client.request(method, {}), error => !!error && typeof error === 'object' && 'code' in error && error.code === 'REMOTE_PREPARATION_FAILED');
+    }
+    assert.equal(initialized, 0); assert.equal(checks, 2);
+    await assert.rejects(client.request('owners/migrate', { version: 1, owners: [] }), /fixture startup/);
+    assert.equal(initialized, 1); assert.equal(checks, 2);
+  } finally { setRemoteDeploymentHook(undefined); await client.close(); }
 });

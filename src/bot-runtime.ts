@@ -1,105 +1,60 @@
-import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer, type Server } from 'node:net';
 import { createHash } from 'node:crypto';
-import { agentEnvironment, prepareConfigPaths, safeError, redactText } from './config.js';
-import { CodexAdapter } from './agents/codex.js';
-import { ClaudeAdapter } from './agents/claude.js';
-import { SessionManager, type SessionManagerOptions } from './manager.js';
+import { prepareConfigPaths, safeError, redactText } from './config.js';
 import { prepareIncomingMessage } from './forwarded.js';
 import { PlatformTransport } from './platform.js';
-import { createControllerAdapter } from './controller/launch.js';
-import { PresetRuntime } from './presets/runtime.js';
-import { workspaceFile } from './workspace-layout.js';
-import { ControllerRuntime } from './controller/runtime.js';
-import { TaskRegistry, TaskService } from './tasks.js';
-import { DurableIngress } from './ingress.js';
-import { TargetCatalogService } from './remote/catalog.js';
-import { CapabilityHealthService } from './capabilities.js';
+import { DurableIngress, type DMHistoryOptions, type DMHistoryPage } from './ingress.js';
 import { closeResources } from './shutdown.js';
 import { BridgeLifecycle } from './lifecycle.js';
-import type { ControllerSchedule, ControllerTargetCatalog } from './controller/runtime-types.js';
 import { mapPresentation } from './presentation.js';
-import { knowledgeToolNames } from './controller-knowledge.js';
-import { controllerFileToolNames } from './controller/files.js';
-import type { AgentAdapter, AgentTurn, BridgeConfig, IncomingDM, ReplyOptions } from './types.js';
-import type { RestartOrigin } from './restart.js';
-import type { DMHistoryOptions, DMHistoryPage } from './ingress.js';
-import { HousekeeperService } from './housekeeper/service.js';
-import type { TaskCompletionEvent, TaskContextFile } from './tasks.js';
-import { randomUUID } from 'node:crypto';
+import { ControllerCore, type ControllerCoreHooks, type ControllerCoreDependencies } from './controller/core.js';
+import type { BridgeConfig, IncomingDM, ReplyOptions } from './types.js';
 
-export interface BotRuntimeHooks {
-  executorDirectory?: () => { id: string; recipients: import('./executor-messages.js').ExecutorRecipient[] };
-  authorize(userId: string, text: string): boolean;
+export interface BotRuntimeHooks extends ControllerCoreHooks {
   receiveGroup(message: IncomingDM): Promise<void>;
-  manager: Pick<SessionManagerOptions, 'binding' | 'onGroupTurnStart' | 'onSceneCheck' | 'onGroupTurnError' | 'onGroupTurnFinished' | 'onGroupSilent' | 'onControllerPublish' | 'onGroupPublish' | 'onGroupCompletion' | 'onInitializationState'> & { binding: NonNullable<SessionManagerOptions['binding']> };
-  invoke(turn: AgentTurn, name: string, input: Record<string, unknown>, callId: string | undefined, delegate: (input: Record<string, unknown>) => Promise<unknown>): Promise<unknown>;
-  prepareScheduledMessage?: (turn: AgentTurn, targetId: string) => Promise<NonNullable<ControllerSchedule['message']>>;
-  sendScheduledMessage?: (plan: ControllerSchedule) => Promise<void>;
-  scheduledMessageDelivered?: (id: string) => boolean;
-  canSendScheduledMessage?: () => boolean;
-  pauseGroup(): void;
-  resumeGroup(): void;
-  requestRestart(origin: RestartOrigin): Promise<unknown>;
-  isDraining(): boolean;
   allowDelivery(channelId: string): boolean;
   isGroupChannel?(channelId: string): boolean;
   onReady(): void;
-  onExecutionSettled?(): void;
-  /** Reconnect group recovery stays in the host; the DM journal never reads group history. */
   onReconnect?(): Promise<void>;
 }
-
 export type BotTransport = Pick<PlatformTransport, Exclude<keyof PlatformTransport, 'downloadFiles'>> & Partial<Pick<PlatformTransport, 'downloadFiles'>>;
-type Adapters = Record<'codex' | 'claude', AgentAdapter>;
-type ToolInvoker = (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string) => Promise<unknown>;
-type BotTargetCatalog = ControllerTargetCatalog & Pick<TargetCatalogService, 'computerOverview' | 'close'>;
-export interface BotRuntimeDependencies {
+export interface BotRuntimeDependencies extends ControllerCoreDependencies {
   createTransport?: (config: BridgeConfig, receive: (message: IncomingDM) => Promise<void>, hooks: ConstructorParameters<typeof PlatformTransport>[2]) => BotTransport;
-  createExecutionAdapters?: (config: BridgeConfig, env: NodeJS.ProcessEnv) => Adapters;
-  createControllerAdapters?: (config: BridgeConfig, env: NodeJS.ProcessEnv, execution: Adapters, invoke: ToolInvoker) => Adapters;
-  createTargetCatalog?: (config: BridgeConfig, execution: Adapters) => BotTargetCatalog;
-  createHealth?: (config: BridgeConfig) => Pick<CapabilityHealthService, 'refresh' | 'query' | 'startupSummary'>;
 }
 
-/** Owns one verified Bot. It never creates a project lock, process PID, or a second supervisor. */
+/** Channel admission and delivery only; controller state belongs to ControllerCore. */
 export class BotRuntime {
-  readonly manager: SessionManager;
+  readonly core: ControllerCore;
   readonly transport: BotTransport;
-  readonly controller?: ControllerRuntime;
-  readonly tasks: TaskRegistry;
-  readonly housekeeper?: HousekeeperService;
   readonly ingress: DurableIngress;
-  private readonly targetCatalog: BotTargetCatalog;
-  private readonly execution: Adapters;
-  private readonly controllerAdapters: Adapters;
   private readonly lifecycle: BridgeLifecycle;
-  private readonly taskService: TaskService;
+  private readonly channelConfig: BridgeConfig;
   private guard?: Server;
-  private closed = false;
-  private ready = false;
-  private verified = false;
-  private verifyPromise?: Promise<void>;
-  private startPromise?: Promise<void>;
-  private closePromise?: Promise<void>;
-  private reconnecting?: Promise<void>;
-  private lagTimer?: ReturnType<typeof setInterval>;
-  private readonly revisions = new Map<string, number>();
-  private readonly stamps = new Map<string, number>();
-  private readonly secrets: string[];
-  private readonly health: Pick<CapabilityHealthService, 'refresh' | 'query' | 'startupSummary'>;
-
-  constructor(readonly config: BridgeConfig, private readonly hooks: BotRuntimeHooks, dependencies: BotRuntimeDependencies = {}) {
-    if (!hooks.manager.binding) throw new Error('BotRuntime 必须使用宿主的当前主控绑定，不能退回按用户选择多个主控。');
-    prepareConfigPaths(config);
-    this.secrets = [config.token, config.appSecret ?? ''];
-    const env = agentEnvironment(config);
-    this.tasks = new TaskRegistry(config.dataDir);
-    this.execution = dependencies.createExecutionAdapters?.(config, env) ?? { codex: new CodexAdapter(config.commands.codex, env), claude: new ClaudeAdapter(config.commands.claude, env) };
-    this.targetCatalog = dependencies.createTargetCatalog?.(config, this.execution) ?? new TargetCatalogService(config, this.execution);
-    this.health = dependencies.createHealth?.(config) ?? new CapabilityHealthService(config);
-    this.transport = (dependencies.createTransport ?? ((selected, receive, events) => new PlatformTransport(selected, receive, events)))(config, async message => {
+  private closed=false;
+  private ready=false;
+  private verified=false;
+  private verifyPromise?:Promise<void>;
+  private startPromise?:Promise<void>;
+  private closePromise?:Promise<void>;
+  private reconnecting?:Promise<void>;
+  private lagTimer?:ReturnType<typeof setInterval>;
+  private readonly revisions=new Map<string,number>();
+  private readonly stamps=new Map<string,number>();
+  private readonly secrets:string[];
+  get manager(){return this.core.manager;}
+  get controller(){return this.core.controller;}
+  get tasks(){return this.core.tasks;}
+  get housekeeper(){return this.core.housekeeper;}
+  constructor(readonly config:BridgeConfig,private readonly hooks:BotRuntimeHooks,dependencies:BotRuntimeDependencies={}) {
+    if(!hooks.manager.binding)throw new Error('ControllerCore 必须使用已登记主控的会话绑定。');
+    if(!config.channelDataDir)throw new Error('渠道必须登记独立的 channelDataDir。');
+    this.channelConfig={...config,dataDir:config.channelDataDir,proxyUrl:config.channelProxyUrl ?? null};
+    if(config.controllerUserId && !config.channelOwnerUserId)throw new Error('渠道必须登记真实的 channelOwnerUserId。');
+    prepareConfigPaths(this.channelConfig);
+    this.secrets=[config.token,config.appSecret ?? ''];
+    this.transport = (dependencies.createTransport ?? ((selected, receive, events) => new PlatformTransport(selected, receive, events)))(this.channelConfig, async message => {
       if (this.closed || hooks.isDraining()) return;
       if (message.space) { await hooks.receiveGroup(message); return; }
       if (!hooks.isGroupChannel?.(message.channelId) && hooks.authorize(message.userId, message.text)) await this.ingress.receive(message);
@@ -110,125 +65,18 @@ export class BotRuntime {
         if (this.ready && !this.closed && !hooks.isDraining()) await this.recoverTransport();
       },
     });
-    this.controller = config.controllerMode ? new ControllerRuntime(config, this.execution, this.tasks, {
-      targetCatalog: this.targetCatalog,
-      prepareScheduledMessage: hooks.prepareScheduledMessage,
-      sendScheduledMessage: hooks.sendScheduledMessage,
-      scheduledMessageDelivered: hooks.scheduledMessageDelivered,
-      currentScheduleConversation: userId => this.manager?.currentConversation(userId) ?? null,
-      canSendScheduledMessage: () => this.ready && !this.closed && hooks.canSendScheduledMessage?.() !== false,
-      onCheckCapabilities: (_workspace, args) => this.health.query(config.contextWorkspace ?? config.workspace, args),
-      onExecutionSettled: () => this.hooks.onExecutionSettled?.(),
-      onCompletion: event => this.backgroundCompletion(event),
-      onExecutorMessage: (worker, message, userId) => this.manager.acceptExecutorMessage(worker, message, userId),
-      executorDirectory: hooks.executorDirectory,
-      onSupplementFailure: value => this.manager.workerInputFailed(value),
-      onPolicyReport: value => this.manager.workerPolicyReport(value),
-      onCountChanged: id => this.manager.refreshTaskCounts(id),
-      onWorkCountsChanged: counts => this.transport.setWorkCounts(counts),
-      onError: error => this.log('WORKER ' + safeError(error, this.secrets)),
-      isDraining: () => hooks.isDraining(),
-      onRequestRestart: origin => hooks.requestRestart(origin),
-      onStall: event => {
-        if (event.taskId && this.tasks.observeTask(event.taskId, event.observationKey,
-          `观察时间：${event.observedAt}；workerId：${event.workerId}；jobId：${event.jobId}；任务仍在执行，未自动重做。`)) this.manager.completionAvailable();
-      },
-    }) : undefined;
-    const invoke = async (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string): Promise<unknown> => {
-      try {
-        return await hooks.invoke(turn, name, args, id, input => knowledgeToolNames.has(name)
-          ? Promise.resolve(this.manager.invokeKnowledge(turn, name, input, id)) : controllerFileToolNames.has(name)
-            ? this.manager.invokeFileTool(turn, name, input) : ['bridge_list_dispatch_failures', 'bridge_ack_dispatch_failure'].includes(name)
-              ? Promise.resolve(this.manager.invokeDispatchFailureTool(turn, name, input, id)) : this.controller!.invoke(turn, name, input, id));
-      } catch (error) {
-        if (['bridge_start_worker', 'bridge_continue_worker', 'bridge_schedule_worker'].includes(name) && !turn.signal.aborted && !hooks.isDraining()) {
-          let message: string | undefined;
-          try { message = this.manager.recordDispatchFailure(turn, name, args, id, error); }
-          catch (recordError) { this.log('DISPATCH_FAILURE_JOURNAL ' + safeError(recordError, this.secrets)); }
-          if (message) {
-            // Preserve native uncertainty/exit properties and the original error type.
-            if (error instanceof Error) { try { error.message = message; } catch { /* The durable record still survives a frozen error. */ } }
-            else throw new Error(message, { cause: error });
-          }
-        }
-        throw error;
-      }
-    };
-    const presetRuntime = new PresetRuntime(workspaceFile(config.contextWorkspace ?? config.workspace, 'agent-presets', 'private'), config.dataDir);
-    const adapters = this.controller ? dependencies.createControllerAdapters?.(config, env, this.execution, invoke)
-      ?? { codex: createControllerAdapter(config, env, 'codex', this.execution.codex, invoke), claude: createControllerAdapter(config, env, 'claude', this.execution.claude, invoke) } : this.execution;
-    this.controllerAdapters = adapters;
-    this.manager = new SessionManager(config, adapters, {
-      sendText: (channel, text, options) => this.send(channel, text, options),
-      markReplyDelivered: messages => this.transport.markReplyDelivered(messages),
-      setTaskCount: (message, count) => this.transport.setTaskCount(message, count),
-    }, {
-      ...hooks.manager, taskRegistry: this.tasks, botName: () => this.transport.botUser?.username,
-      resolveControllerPreset: async selector => {
-        const workspace = config.contextWorkspace ?? config.workspace;
-        const entries = (await this.targetCatalog.listPresets!(workspace, { targetId: 'local' })).filter(item => item.enabled);
-        const exact = entries.find(item => item.id.toLowerCase() === selector.toLowerCase());
-        const matches = exact ? [exact] : entries.filter(item => item.aliases.some(alias => alias.toLowerCase() === selector.toLowerCase()));
-        if (matches.length !== 1) throw new Error(matches.length ? '预设名称不唯一，请使用预设 ID。' : '没有找到已启用的桥电脑预设；/model preset 查看清单。');
-        const binding = (await this.targetCatalog.resolvePreset!(workspace, matches[0]!.id)).preset!;
-        await presetRuntime.validate(binding);
-        return binding;
-      },
-      authorizeUser: user => hooks.authorize(user, ''),
-      onListComputers: (_conversation, refresh) => this.targetCatalog.computerOverview(config.contextWorkspace ?? config.workspace, refresh),
-      onDiagnostic: message => this.log(message),
-      onListWorkers: (conversation, scope) => Promise.resolve(this.controller?.queryWorkerOverview(conversation, scope) ?? []),
-      onRequestRestart: origin => hooks.requestRestart(origin) as ReturnType<NonNullable<SessionManagerOptions['onRequestRestart']>>,
-      ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
-      ...(this.controller ? {
-        onWorkerDefaults: argument => this.controller!.workerDefaultCommand(argument),
-        onHousekeeper: (message, argument) => this.housekeeper!.command(message, argument),
-        isHousekeeperEvent: event => this.housekeeper?.validEvent(event) === true,
-        housekeeperEventText: event => this.housekeeper!.eventText(event),
-        onStop: (id: string) => this.controller!.cancelConversation(id),
-        onDetach: (id: string) => this.controller!.detachConversation(id),
-        onInitializeWorkspace: (turn: AgentTurn) => this.controller!.initializeWorkspace(turn),
-        onInitializationError: (_conversation: unknown, error: unknown) => this.log('WORKSPACE ' + safeError(error, this.secrets)),
-        onPrepareSwitch: (source, target, channelId, prompt, signal) => this.controller!.prepareAgentSwitch(source, target, channelId, prompt, signal),
-        onRebindSwitch: (source, target) => this.controller!.rebindConversation(source, target),
-        onPauseSwitch: async source => { hooks.pauseGroup(); await this.controller!.pauseConversation(source.id); },
-        onResumeSwitch: async source => { await this.controller!.resumeConversation(source.id); hooks.resumeGroup(); },
-      } : {}),
-    });
-    this.housekeeper = this.controller ? new HousekeeperService(config, {
-      active: userId => this.manager.housekeeperActive(userId),
-      dispatch: (runId, state, prompt) => this.manager.housekeeperContext(state, turn => this.controller!.invoke(turn, 'bridge_start_worker',
-        { targetId: 'local', assistant: { kind: 'default' }, title: '事务同步摘要', prompt }, 'housekeeper:' + runId) as Promise<{ workerId: string; jobId: string }>).catch(error => {
-          const saved = state.run ? this.recoverHousekeeperRun(state.run.inputPath) : null;
-          if (saved) return saved; throw error;
-        }),
-      job: id => this.controller!.store.getJob(id),
-      recoverRun: run => this.recoverHousekeeperRun(run.inputPath),
-      eventForJob: id => this.tasks.queuedEvents().find(event => event.taskId === id) ?? null,
-      cancel: async (id, reason) => { const value = this.housekeeper?.store.read(); if (value) await this.controller!.cancelHousekeeperWorker(id, value.userId, reason); },
-      event: id => this.manager.housekeeperEventReceipt(id),
-      reroute: (run, state) => this.manager.housekeeperContext(state, async turn => {
-        const context = JSON.parse(readFileSync(turn.taskContextPath!, 'utf8')) as TaskContextFile;
-        const task = this.tasks.register(context, '事务同步摘要', randomUUID());
-        const summary = run.summary ?? (run.jobId ? this.controller!.store.getJob(run.jobId)?.result : null);
-        if (!summary) throw new Error('已保存的事务摘要缺失。');
-        this.tasks.acceptObservedResult(task.taskId, 'completed', summary);
-        const event = this.tasks.queuedEvents().find(event => event.taskId === task.taskId)!;
-        return { taskId: task.taskId, eventId: event.id, conversationId: turn.conversation.id };
-      }),
-      retireEvent: id => { if (this.tasks.claimEvent(id)) this.tasks.markDelivered(id); },
-      wake: () => this.manager.completionAvailable(),
-      notify: (state, text, key) => this.send(state.channelId, text, { deliveryKey: key }),
-      onError: error => this.log('HOUSEKEEPER ' + safeError(error, this.secrets)),
-      isPaused: () => !this.ready || this.closed || this.hooks.isDraining(),
-    }) : undefined;
-    this.taskService = new TaskService(this.tasks, { onCompletion: event => this.backgroundCompletion(event),
-      onCountChanged: id => this.manager.refreshTaskCounts(id), onError: error => this.log('TASK ' + safeError(error, this.secrets)) });
+    this.core=new ControllerCore(config,{...hooks,invoke:(...args)=>hooks.invoke(...args),log:message=>this.log(message)},{
+      sendText:(channel,text,options)=>this.send(channel,text,options),
+      markReplyDelivered:messages=>this.transport.markReplyDelivered(messages),
+      setTaskCount:(message,count)=>this.transport.setTaskCount(message,count),
+      setWorkCounts:counts=>this.transport.setWorkCounts(counts),
+      isReady:()=>this.isReady(),
+    },dependencies);
     const control = (message: IncomingDM) => /^(?:\/(?:stop|new|cwd)(?:\s|$)|\/agent\s+\S|new\s+chat$|新会话$|新聊天$)/i.test(message.text.trim());
-    this.ingress = new DurableIngress(config.dataDir, {
+    this.ingress = new DurableIngress(this.channelConfig.dataDir, {
       allowedUserIds: config.allowedUserIds, hasMessage: id => this.manager.hasMessage(id), isImmediate: control,
       onQueued: (message, replayOnly) => { const n = (this.revisions.get(message.userId) ?? 0) + (control(message) ? 1 : 0);
-        this.manager.privateInputQueued(message);
+        this.manager.privateInputQueued(this.controllerMessage(message));
         this.revisions.set(message.userId, n); if (!replayOnly) this.stamps.set(message.id, n); },
       handle: async message => {
         const workersCommand = /^\/workers(?:\s|$)/i.test(message.text.trim());
@@ -238,7 +86,7 @@ export class BotRuntime {
           if (!this.ready || this.closed || hooks.isDraining() || hooks.isGroupChannel?.(message.channelId) || !hooks.authorize(message.userId, message.text)) return;
           const current = () => control(message) || this.stamps.get(message.id) === (this.revisions.get(message.userId) ?? 0);
           const content = current() && !control(message) ? await prepareIncomingMessage(this.transport, message) : { text: message.text, imagePaths: [] };
-          const prepared = { id: message.id, userId: message.userId, channelId: message.channelId, text: content.text,
+          const prepared = { id: message.id, userId: config.controllerUserId ?? message.userId, channelId: message.channelId, text: content.text,
             source: { messageId: message.id, userId: message.userId, channelId: message.channelId, authorType: 'user' as const, ...message.source },
             imagePaths: content.imagePaths };
           if (!current()) { this.manager.discard(prepared); return; }
@@ -247,34 +95,16 @@ export class BotRuntime {
         } finally { this.stamps.delete(message.id); }
       },
       onError: (message, error) => { this.log('INGRESS ' + safeError(error, this.secrets));
-        if (!this.closed) void this.manager.reportInputFailure({ ...message, imagePaths: [] }, error, true, () => this.send(message.channelId, this.transport.failureText(error))).catch(() => undefined); },
+        if (!this.closed) void this.manager.reportInputFailure({ ...this.controllerMessage(message), imagePaths: [] }, error, true, () => this.send(message.channelId, this.transport.failureText(error))).catch(() => undefined); },
     });
-    this.lifecycle = new BridgeLifecycle(config, event => this.transport.onBridgeLifecycle(event), () => {
+    this.lifecycle = new BridgeLifecycle(this.channelConfig, event => this.transport.onBridgeLifecycle(event), () => {
       const contact = this.ingress.lastAuthorizedContact();
       return contact && !hooks.isGroupChannel?.(contact.channelId) && hooks.authorize(contact.userId, '') ? contact : undefined;
     }, error => this.log('LIFECYCLE_NOTICE_FAILED ' + safeError(error, this.secrets)));
   }
-  private recoverHousekeeperRun(inputPath: string): { workerId: string; jobId: string } | null {
-    const jobs = this.controller!.store.jobs().filter(job => job.origin.purpose === 'housekeeper' && job.prompt.includes(inputPath));
-    if (jobs.length > 1) throw new Error('同一事务批次有多个执行登记，未重复派工。');
-    const job = jobs[0]; return job ? { workerId: job.workerId, jobId: job.id } : null;
-  }
-  private backgroundCompletion(event: TaskCompletionEvent): void {
-    if (this.closed) return;
-    if (event.purpose === 'housekeeper') { this.housekeeper?.acceptCompletion(event); return; }
-    this.manager.completionAvailable();
-  }
-  log(message: string): void {
-    appendFileSync(join(this.config.logsDir, 'bridge.log'), `${new Date().toISOString()} ${safeError(message, this.secrets)}\n`);
-  }
-  isReady(): boolean { return this.ready && !this.closed; }
-  async confirmControllerStopped(conversationId: string): Promise<boolean> {
-    if (this.closed) return false;
-    const conversation = this.manager.conversationById(conversationId);
-    if (!conversation) return false;
-    try { return await this.controllerAdapters[conversation.agent].confirmStopped?.(conversationId) === true; }
-    catch (error) { this.log('CONTROLLER_STOP_UNCONFIRMED ' + safeError(error, this.secrets)); return false; }
-  }
+  log(message:string):void {appendFileSync(join(this.config.logsDir,'bridge.log'),`${new Date().toISOString()} ${safeError(message,this.secrets)}\n`);}
+  isReady():boolean{return this.ready && !this.closed;}
+  confirmControllerStopped(conversationId:string):Promise<boolean>{return this.core.confirmControllerStopped(conversationId);}
   private readDMHistory(channel: string, options: DMHistoryOptions): Promise<DMHistoryPage> {
     if (this.hooks.isGroupChannel?.(channel)) {
       this.log('IGNORED_LEGACY_GROUP_DM_CURSOR');
@@ -306,7 +136,7 @@ export class BotRuntime {
     if (this.closed) throw new Error('Bot 验证期间已关闭。');
     const guard = this.guard = createServer(socket => socket.destroy());
     const key = createHash('sha256').update(this.config.botId!).digest('hex').slice(0, 24);
-    const address = process.platform === 'win32' ? `\\\\.\\pipe\\agent-bridge-bot-${key}` : join(this.config.dataDir, `bridge-${key}.sock`);
+    const address = process.platform === 'win32' ? `\\\\.\\pipe\\agent-bridge-bot-${key}` : join(this.channelConfig.dataDir, `bridge-${key}.sock`);
     await new Promise<void>((resolve, reject) => { guard.once('error', reject); guard.listen(address, resolve); });
     this.verified = true;
   }
@@ -321,13 +151,7 @@ export class BotRuntime {
     await this.transport.onBridgeLifecycle({ phase: 'recovering' });
     await this.transport.start();
     if (this.closed) throw new Error('Bot 启动期间已关闭。');
-    await this.manager.recover();
-    await this.controller?.start();
-    try {
-      const cleanup = this.controller?.pruneWorkerCaches();
-      if (cleanup?.files) this.log(`WORKER_PLUGIN_CACHE_PRUNED files=${cleanup.files} bytes=${cleanup.bytes} workers=${cleanup.workers}`);
-      for (const error of cleanup?.errors ?? []) this.log('WORKER_PLUGIN_CACHE_CLEANUP_FAILED ' + error);
-    } catch (error) { this.log('WORKER_PLUGIN_CACHE_CLEANUP_FAILED ' + safeError(error, this.secrets)); }
+    await this.core.recover();
     this.seedDMChannels();
     await this.ingress.recover((channel, options) => this.readDMHistory(channel, options));
     if (this.closed) throw new Error('Bot 恢复期间已关闭。');
@@ -336,18 +160,22 @@ export class BotRuntime {
     this.lagTimer = setInterval(() => { const now = performance.now(), lag = now - lastTick - 1000; lastTick = now;
       if (lag >= 1000) this.log(`EVENT_LOOP_LAG ms=${Math.round(lag)}`); }, 1000);
     this.lagTimer.unref();
-    this.taskService.start(); this.ingress.start(); this.manager.completionAvailable(); this.housekeeper?.start();
+    const coreStarted=this.core.start(); this.ingress.start(); await coreStarted;
     if (this.config.features?.nativeCommands !== false) {
       try { await this.transport.syncSlashCommands(); this.log('SLASH_COMMANDS_SYNCED'); }
       catch (error) { this.log('SLASH_COMMANDS_FAILED ' + safeError(error, this.secrets)); }
     }
-    try { this.log(this.health.startupSummary(await this.health.refresh(this.config.contextWorkspace ?? this.config.workspace))); }
-    catch (error) { this.log('HEALTH ' + safeError(error, this.secrets)); }
     this.log(`READY bot=${this.transport.botUser?.username ?? this.config.botId} agent=${this.config.defaultAgent}`);
     this.hooks.onReady();
   }
+  private controllerMessage(message:IncomingDM):IncomingDM {
+    return {...message,userId:this.config.controllerUserId ?? message.userId,source:message.source ?? {messageId:message.id,userId:message.userId,channelId:message.channelId,authorType:'user'}};
+  }
   private seedDMChannels(): void {
-    for (const channel of this.manager.knownDMChannels()) if (!this.hooks.isGroupChannel?.(channel.channelId) && this.hooks.authorize(channel.userId, '')) this.ingress.seedChannel(channel);
+    for(const channel of this.manager.knownDMChannels()) {
+      const actual={...channel,userId:channel.userId===this.config.controllerUserId?this.config.channelOwnerUserId!:channel.userId};
+      if(!this.hooks.isGroupChannel?.(actual.channelId) && this.hooks.authorize(actual.userId,''))this.ingress.seedChannel(actual);
+    }
   }
   /** Called once after the shared host recovery; reconnects never publish startup notices. */
   publishReadyLifecycle(): Promise<void> { return this.isReady() ? this.lifecycle.ready() : Promise.resolve(); }
@@ -357,23 +185,20 @@ export class BotRuntime {
     await this.transport.sendText(channel, redactText(text, this.secrets), options ? { ...options,
       ...(options.presentation ? { presentation: mapPresentation(options.presentation, s => redactText(s, this.secrets)) } : {}) } : undefined);
   }
-  beginDrain(): void { this.housekeeper?.beginDrain(); this.ingress.pause(); this.manager.beginDrain(); this.controller?.beginDrain(); }
-  isIdle(): boolean { return this.manager.isIdle() && (this.housekeeper?.isIdle() ?? true) && (this.controller?.isIdle() ?? true) && this.transport.isIdle(); }
-  close(): Promise<void> {
-    if (this.closePromise) return this.closePromise;
-    this.closed = true; this.ready = false; clearInterval(this.lagTimer); this.housekeeper?.beginDrain();
-    this.closePromise = closeResources([
-      { name: '通信平台', close: () => this.transport.close() }, { name: '收件', close: () => this.ingress.close() },
-      { name: '任务回执', close: () => this.taskService.close() }, { name: '主控', close: () => this.manager.close() },
-      { name: '执行任务', close: async () => { await this.controller?.close(); } },
-      { name: '管家巡视', close: async () => { await this.housekeeper?.close(); } },
-      { name: '远程目录', close: () => this.targetCatalog.close() },
-      ...(this.controller ? Object.entries(this.execution).map(([name, adapter]) => ({ name, close: () => adapter.close() })) : []),
-      { name: '生命周期', close: () => this.lifecycle.close() },
-      { name: '任务数据库', close: () => this.tasks.close() }, { name: 'Bot独占锁', close: () => new Promise<void>((resolve, reject) => {
-        if (!this.guard?.listening) { resolve(); return; }
-        this.guard.close(error => error ? reject(error) : resolve());
-      }) },
+  beginDrain(): void { this.ingress.pause(); this.core.beginDrain(); }
+  isIdle(): boolean { return this.core.isIdle() && this.transport.isIdle(); }
+  close():Promise<void>{
+    if(this.closePromise)return this.closePromise;
+    this.closed=true;this.ready=false;clearInterval(this.lagTimer);
+    this.closePromise=closeResources([
+      {name:'通信平台',close:()=>this.transport.close()},
+      {name:'收件',close:()=>this.ingress.close()},
+      {name:'主控核心',close:()=>this.core.close()},
+      {name:'生命周期',close:()=>this.lifecycle.close()},
+      {name:'Bot独占锁',close:()=>new Promise<void>((resolve,reject)=>{
+        if(!this.guard?.listening){resolve();return;}
+        this.guard.close(error=>error?reject(error):resolve());
+      })},
     ]);
     return this.closePromise;
   }

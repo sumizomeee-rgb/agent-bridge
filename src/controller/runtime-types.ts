@@ -79,6 +79,7 @@ export interface WorkerPolicyReport {
   origin: TaskOrigin; workerId: string; jobId: string; taskId: string; taskTitle: string;
 }
 export interface ControllerRuntimeCallbacks {
+  createExecutorMessages?: () => import('../executor-messages.js').ExecutorMessages;
   onExecutorMessage?: (worker: ControllerWorker | null, message: import('../executor-messages.js').ExecutorMessage, userId: string) => boolean;
   executorDirectory?: () => { id: string; recipients: import('../executor-messages.js').ExecutorRecipient[] };
   targetCatalog?: ControllerTargetCatalog;

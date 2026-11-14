@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
-import type { AgentName, BridgePlatform } from './types.js';
+import type { AgentName, ControllerAgentName, BridgePlatform } from './types.js';
 import { parseCommand } from './commands.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null>;
@@ -18,12 +18,12 @@ export class HostStateError extends Error {
   }
 }
 export interface HostController {
-  conversationId: string; generation: number; agent: AgentName; nativeId: string | null;
+  conversationId: string; generation: number; agent: ControllerAgentName; nativeId: string | null;
   model?: string | null; effort?: string | null;
   preset?: import('./presets/types.js').PresetBinding;
 }
 export interface HostBot {
-  botId: string; platform: BridgePlatform; applicationId: string; ownerPrincipalId: string | null;
+  botId: string; controllerId: string; platform: BridgePlatform; applicationId: string; ownerPrincipalId: string | null;
   controller: HostController | null; ready: boolean;
 }
 export interface HostGroup {
@@ -126,7 +126,7 @@ function required(value: string, label: string): void {
 function bot(row: Row): HostBot {
   return { botId: String(row.bot_id), platform: String(row.platform) as BridgePlatform,
     applicationId: String(row.application_id), ownerPrincipalId: row.owner_id === null ? null : String(row.owner_id),
-    controller: row.controller_json === null ? null : parse<HostController>(row.controller_json), ready: Number(row.ready) === 1 };
+    controllerId: String(row.controller_id), controller: row.state_json == null ? null : parse<HostController>(row.state_json), ready: Number(row.ready) === 1 };
 }
 function group(row: Row): HostGroup {
   return { spaceId: String(row.space_id), principalId: String(row.principal_id), receiverBotId: String(row.receiver_bot_id),
@@ -184,9 +184,10 @@ export class HostStore {
       PRAGMA synchronous=FULL;
       PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS host_principals(id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1);
+      CREATE TABLE IF NOT EXISTS host_controllers(id TEXT PRIMARY KEY,owner_id TEXT REFERENCES host_principals(id),state_json TEXT);
       CREATE TABLE IF NOT EXISTS host_bots(
         bot_id TEXT PRIMARY KEY, platform TEXT NOT NULL, application_id TEXT NOT NULL,
-        owner_id TEXT REFERENCES host_principals(id), controller_json TEXT, ready INTEGER NOT NULL DEFAULT 0,
+        owner_id TEXT REFERENCES host_principals(id), controller_id TEXT NOT NULL REFERENCES host_controllers(id), ready INTEGER NOT NULL DEFAULT 0,
         UNIQUE(platform,application_id));
       CREATE TABLE IF NOT EXISTS host_principal_maps(
         bot_id TEXT NOT NULL REFERENCES host_bots(bot_id), platform_user_id TEXT NOT NULL,
@@ -367,20 +368,43 @@ export class HostStore {
     return source;
   }
 
-  registerBot(input: { botId: string; platform: BridgePlatform; applicationId: string; ownerPrincipalId?: string }): HostBot {
-    required(input.botId, 'botId'); required(input.applicationId, 'applicationId');
+  registerController(id: string, ownerPrincipalId?: string): void {
+    required(id,'controllerId');
+    if(ownerPrincipalId)this.run('INSERT OR IGNORE INTO host_principals(id) VALUES (?)',ownerPrincipalId);
+    const previous=this.one('SELECT owner_id FROM host_controllers WHERE id=?',id);
+    if(previous?.owner_id && ownerPrincipalId && previous.owner_id!==ownerPrincipalId)throw new HostStateError('forbidden','Controller owner cannot change');
+    this.run('INSERT OR IGNORE INTO host_controllers(id,owner_id) VALUES (?,?)',id,ownerPrincipalId??null);
+  }
+  getController(controllerId: string): HostController | null {
+    const row=this.one('SELECT state_json FROM host_controllers WHERE id=?',controllerId);
+    return row?.state_json?parse<HostController>(row.state_json):null;
+  }
+  setIndependentController(controllerId:string,principalId:string,controller:HostController,expectedGeneration:number):void {
+    const row=this.one('SELECT * FROM host_controllers WHERE id=?',controllerId),previous=this.getController(controllerId);
+    if(!row||row.owner_id!==principalId)throw new HostStateError('forbidden','Controller not owned');
+    if((previous?.generation??0)!==expectedGeneration||controller.generation!==expectedGeneration+1)throw new HostStateError('stale','Controller generation changed');
+    this.run('UPDATE host_controllers SET state_json=? WHERE id=?',JSON.stringify(controller),controllerId);
+  }
+  updateIndependentControllerNativeId(id: string, generation: number, nativeId: string): void {
+    const current = this.getController(id);
+    if (!current || current.generation !== generation) throw new HostStateError('stale', 'Controller generation changed');
+    this.run('UPDATE host_controllers SET state_json=? WHERE id=?', JSON.stringify({ ...current, nativeId }), id);
+  }
+  registerBot(input: { controllerId: string; botId: string; platform: BridgePlatform; applicationId: string; ownerPrincipalId?: string }): HostBot {
+    required(input.botId, 'botId'); required(input.applicationId, 'applicationId'); required(input.controllerId,'controllerId');
+    if(!this.one('SELECT id FROM host_controllers WHERE id=?',input.controllerId!))throw new HostStateError('not-found','Register controller before channel');
     if (input.botId !== `${input.platform}:${input.applicationId}`) throw new HostStateError('conflict', 'botId must contain the verified platform/application identity');
     return this.atomic(() => {
       const previous = this.getBot(input.botId);
-      if (previous && (previous.platform !== input.platform || previous.applicationId !== input.applicationId)) {
+      if (previous && (previous.platform !== input.platform || previous.applicationId !== input.applicationId || previous.controllerId !== input.controllerId)) {
         throw new HostStateError('conflict', 'Registered bot identity cannot change');
       }
       if (input.ownerPrincipalId) this.run('INSERT OR IGNORE INTO host_principals(id) VALUES (?)', input.ownerPrincipalId);
       if (previous?.ownerPrincipalId && input.ownerPrincipalId && previous.ownerPrincipalId !== input.ownerPrincipalId) {
         throw new HostStateError('forbidden', 'Bot owner cannot be transferred');
       }
-      if (!previous) this.run('INSERT INTO host_bots(bot_id,platform,application_id,owner_id) VALUES (?,?,?,?)',
-        input.botId, input.platform, input.applicationId, input.ownerPrincipalId ?? null);
+      if (!previous) this.run('INSERT INTO host_bots(bot_id,platform,application_id,owner_id,controller_id) VALUES (?,?,?,?,?)',
+        input.botId, input.platform, input.applicationId, input.ownerPrincipalId ?? null,input.controllerId!);
       else if (input.ownerPrincipalId && !previous.ownerPrincipalId) this.run('UPDATE host_bots SET owner_id=? WHERE bot_id=?', input.ownerPrincipalId, input.botId);
       return this.mustBot(input.botId);
     });
@@ -432,16 +456,17 @@ export class HostStore {
       return this.mustBot(botId);
     });
   }
-  getBot(botId: string): HostBot | null { const row = this.one('SELECT * FROM host_bots WHERE bot_id=?', botId); return row ? bot(row) : null; }
-  listBots(): HostBot[] { return this.rows('SELECT * FROM host_bots ORDER BY bot_id').map(bot); }
-  getController(botId: string): HostController | null { return this.mustBot(botId).controller; }
+  getBot(botId: string): HostBot | null { const row = this.one('SELECT b.*,c.state_json FROM host_bots b JOIN host_controllers c ON c.id=b.controller_id WHERE b.bot_id=?', botId); return row ? bot(row) : null; }
+  listBots(): HostBot[] { return this.rows('SELECT b.*,c.state_json FROM host_bots b JOIN host_controllers c ON c.id=b.controller_id ORDER BY b.bot_id').map(bot); }
+  controllerForBot(botId: string): HostController | null { return this.mustBot(botId).controller; }
   setController(botId: string, principalId: string, controller: HostController, expectedGeneration: number, ready = true): void {
     this.atomic(() => {
       this.assertMapped(botId, principalId);
       const value = this.mustBot(botId);
       if (value.ownerPrincipalId !== principalId) throw new HostStateError('forbidden', 'Claim owner before creating a controller');
       this.assertControllerChange(botId, controller, expectedGeneration);
-      this.run('UPDATE host_bots SET controller_json=?,ready=? WHERE bot_id=?', JSON.stringify(controller), Number(ready), botId);
+      this.run('UPDATE host_controllers SET state_json=? WHERE id=(SELECT controller_id FROM host_bots WHERE bot_id=?)', JSON.stringify(controller),botId);
+      this.run('UPDATE host_bots SET ready=? WHERE bot_id=?',Number(ready),botId);
       this.invalidateGeneration(botId, expectedGeneration);
     });
   }
@@ -462,7 +487,8 @@ export class HostStore {
       this.assertControllerChange(botId, controller, expectedGeneration);
       this.run('INSERT INTO host_controller_switches(id,bot_id,from_json,to_json) VALUES (?,?,?,?)', operationId, botId,
         JSON.stringify(previous.controller), JSON.stringify(controller));
-      this.run('UPDATE host_bots SET controller_json=?,ready=1 WHERE bot_id=?', JSON.stringify(controller), botId);
+      this.run('UPDATE host_controllers SET state_json=? WHERE id=(SELECT controller_id FROM host_bots WHERE bot_id=?)',JSON.stringify(controller),botId);
+      this.run('UPDATE host_bots SET ready=1 WHERE bot_id=?',botId);
       this.run("UPDATE host_events SET generation=? WHERE bot_id=? AND generation=? AND state IN ('queued','reserved')", controller.generation, botId, expectedGeneration);
       // Dedup aliases move with pending delivery, while completed historical events keep their original generation.
       this.run(`UPDATE host_deliveries SET generation=? WHERE bot_id=? AND generation=?
@@ -496,7 +522,7 @@ export class HostStore {
   updateControllerNativeId(botId: string, generation: number, nativeId: string): void {
     this.atomic(() => {
       const current = this.assertCurrent(botId, generation).controller!;
-      this.run('UPDATE host_bots SET controller_json=? WHERE bot_id=?', JSON.stringify({ ...current, nativeId }), botId);
+      this.run('UPDATE host_controllers SET state_json=? WHERE id=(SELECT controller_id FROM host_bots WHERE bot_id=?)',JSON.stringify({ ...current,nativeId }),botId);
     });
   }
   setControllerReady(botId: string, generation: number, ready: boolean): void {
@@ -1070,7 +1096,7 @@ export class HostStore {
     this.assertMapped(source.botId, source.principalId);
     const bot = this.assertCurrent(source.botId, source.generation);
     if (bot.ownerPrincipalId !== source.principalId || bot.controller?.conversationId !== source.conversationId
-      || source.userId !== source.botId + '|' + this.principalAccount(source.botId, source.principalId)
+      || source.userId !== 'principal:' + source.principalId
       || !source.channelId.startsWith(source.botId + '|') || target.botId !== source.botId || target.principalId !== source.principalId
       || !target.channelId.startsWith(source.botId + '|')) throw new HostStateError('forbidden', '投递主体、来源或目标身份不匹配');
     if (this.one('SELECT 1 FROM host_control_locks WHERE bot_id=?', source.botId)) throw new HostStateError('blocked', '控制操作已冻结，不能开始新发送');
@@ -1487,7 +1513,8 @@ export class HostStore {
         this.assertControllerChange(member.botId, member.prepared, member.previousGeneration, id);
       }
       for (const member of value.members) {
-        this.run('UPDATE host_bots SET controller_json=?,ready=0 WHERE bot_id=?', JSON.stringify(member.prepared), member.botId);
+        this.run('UPDATE host_controllers SET state_json=? WHERE id=(SELECT controller_id FROM host_bots WHERE bot_id=?)',JSON.stringify(member.prepared),member.botId);
+        this.run('UPDATE host_bots SET ready=0 WHERE bot_id=?',member.botId);
         this.invalidateGeneration(member.botId, member.previousGeneration);
       }
       this.run("UPDATE host_batches SET state='committed',error=NULL WHERE id=?", id);

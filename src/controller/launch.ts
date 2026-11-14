@@ -85,7 +85,7 @@ export function createControllerAdapter(config: BridgeConfig, env: NodeJS.Proces
   const ordinaryEnv = agent === 'claude' ? { ...env, CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' } : env;
   const options = { agent, dataDir: config.dataDir, contextWorkspace: config.contextWorkspace ?? config.workspace,
     internalBotCommunicationEnabled: config.internalBotCommunicationEnabled, defaultModels: config.defaultModels,
-    identity: { botId: config.botId, aliases: config.aliases ?? [] }, invokeTool };
+    identity: { controllerId: config.controllerId, botId: config.botId, aliases: config.aliases ?? [] }, invokeTool };
   return new ControllerLaunchAdapter(new NativeControllerAdapter(config.commands[agent], ordinaryEnv, { ...options, metadataAdapter }),
     runtime, config.commands[agent], ordinaryEnv, launch => new NativeControllerAdapter(launch.command, launch.env, { ...options, isolatedLaunch: true,
       metadataAdapter: agent === 'codex' ? new CodexAdapter(launch.command, launch.env) : new ClaudeAdapter(launch.command, launch.env) }));

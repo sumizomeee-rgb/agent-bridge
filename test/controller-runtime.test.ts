@@ -8,6 +8,8 @@ import test from 'node:test';
 import { ownTemporaryDirectory } from './temp-directory.js';
 import { AgentProcessStopError } from '../src/agents/process.js';
 import { ControllerRuntime } from '../src/controller/runtime.js';
+import { ExecutorMessages } from '../src/executor-messages.js';
+import { projectRoot } from '../src/config.js';
 import { SessionHandoffs } from '../src/controller/handoff.js';
 import { ControllerStore } from '../src/controller/store.js';
 import type { ControllerStallEvent } from '../src/controller/runtime-types.js';
@@ -67,7 +69,7 @@ function fixture() {
     taskContextPath: created.contextPath, signal: new AbortController().signal, onProgress: () => {} };
   const counts: number[] = []; const events: TaskCompletionEvent[] = []; const errors: unknown[] = []; const stalls: ControllerStallEvent[] = [];
   let now = Date.parse('2026-10-09T10:00:00Z');
-  const callbacks = { now: () => now, onCountChanged: (_id: string, count: number) => { counts.push(count); },
+  const callbacks = { createExecutorMessages: () => new ExecutorMessages(projectRoot, join(dir,'isolated-user-home')), now: () => now, onCountChanged: (_id: string, count: number) => { counts.push(count); },
     onCompletion: (event: TaskCompletionEvent) => { events.push(event); }, onStall: (event: ControllerStallEvent) => { stalls.push(event); }, onError: (error: unknown) => { errors.push(error); }, pollIntervalMs: 60000 };
   const runtime = new ControllerRuntime(config, { codex, claude }, registry, callbacks);
   return { dir, registry, codex, claude, config, callbacks, turn, counts, events, errors, stalls, runtime, advance: (ms: number) => { now += ms; } };
@@ -257,16 +259,21 @@ test('worker list preserves routing, active work and attachment state while resu
     };
     assert.equal(listed.workers.length, 2);
     const remote = listed.workers.find(value => value.workerId === a.workerId)!;
-    assert.deepEqual(remote.target, stored.target); assert.equal(remote.nativeId, stored.nativeId);
-    assert.equal(remote.model, stored.model); assert.equal(remote.actualModel, 'actual-model');
-    assert.equal(remote.effort, stored.effort); assert.equal(remote.actualEffort, 'high');
+    assert.deepEqual(remote.target, { id: stored.target!.id, label: stored.target!.label }); assert.equal(remote.nativeId, undefined);
+    assert.equal(remote.model, 'actual-model'); assert.equal(remote.actualModel, undefined); assert.equal(remote.effort, undefined);
+    const expanded = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: a.workerId }) as { workers: Record<string, unknown>[] };
+    assert.deepEqual(expanded.workers[0]!.target, stored.target); assert.equal(expanded.workers[0]!.nativeId, stored.nativeId);
+    assert.equal(expanded.workers[0]!.model, stored.model); assert.equal(expanded.workers[0]!.actualModel, 'actual-model');
+    assert.equal(expanded.workers[0]!.effort, stored.effort); assert.equal(expanded.workers[0]!.actualEffort, 'high');
     assert.equal(remote.blocked, true); assert.equal(remote.lastStatus, 'uncertain'); assert.equal(remote.lastJobId, a.jobId);
     assert.equal(remote.hasResult, true); assert.ok((remote.lastResultPreview as string).length <= 256);
     assert.equal(remote.lastResultPreviewTruncated, true); assert.equal('lastResult' in remote, false); assert.equal('supplements' in remote, false);
     const busy = listed.workers.find(value => value.workerId === b.workerId)!;
     assert.equal(busy.running, true); assert.equal(busy.queued, 1); assert.equal(busy.lastJobId, queued.jobId);
-    assert.equal(listed.schedules.length, 1); assert.equal('text' in listed.schedules[0]!, false);
-    assert.ok((listed.schedules[0]!.textPreview as string).length <= 256);
+    assert.equal('schedules' in listed, false);
+    const schedules = await f.runtime.invoke(f.turn, 'bridge_list_schedules', {}) as { schedules: Record<string, unknown>[] };
+    assert.equal(schedules.schedules.length, 1); assert.equal('text' in schedules.schedules[0]!, false);
+    assert.ok((schedules.schedules[0]!.textPreview as string).length <= 256);
     assert.deepEqual(f.runtime.store.getWorker(a.workerId)!.imagePaths, [image]);
     assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
     assert.equal(f.codex.turns.length, 1); assert.equal(f.claude.turns.length, 1);
@@ -287,21 +294,22 @@ test('one worker details retain every unresolved receipt and only recent bounded
         prompt: '未确认补充', imagePaths: [], status, createdAt: '2026-10-09', updatedAt: '2026-10-09' });
     }
     const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: Record<string, unknown>[] };
-    assert.deepEqual(listed.workers[0]!.supplementCounts, { accepted: 40, pending: 9, steering: 9, uncertain: 9 });
+    assert.equal('supplementCounts' in listed.workers[0]!, false);
     assert.equal('activeSupplements' in listed.workers[0]!, false);
     const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: a.workerId }) as { workers: {
       workerId: string; lastResult: string; lastResultTruncated: boolean; supplementsTotal: number; supplementsTruncated: boolean;
       supplements: { supplementId: string; reason: string; reasonTruncated: boolean }[];
-      activeSupplements: { supplementId: string; status: string }[];
-    }[]; schedules: unknown[] };
+      activeSupplements: { supplementId: string; status: string }[]; supplementCounts: Record<string, number>;
+    }[] };
     assert.equal(details.workers.length, 1); const value = details.workers[0]!;
+    assert.deepEqual(value.supplementCounts, { accepted: 40, pending: 9, steering: 9, uncertain: 9 });
     assert.equal(value.workerId, a.workerId); assert.equal(value.lastResult.length, 4096); assert.equal(value.lastResultTruncated, true);
     assert.equal(value.supplementsTotal, 67); assert.equal(value.supplementsTruncated, true);
     assert.deepEqual(value.supplements.map(receipt => receipt.supplementId), Array.from({ length: 20 }, (_unused, index) => 'history-' + (index + 20)));
     assert.ok(value.supplements.every(receipt => receipt.reason.length <= 256 && receipt.reasonTruncated));
     assert.equal(value.activeSupplements.length, 27);
     for (const status of ['pending', 'steering', 'uncertain']) assert.equal(value.activeSupplements.filter(receipt => receipt.status === status).length, 9);
-    assert.deepEqual(details.schedules, []); assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
+    assert.equal('schedules' in details, false); assert.equal(f.runtime.store.getJob(a.jobId)!.result, result);
     f.runtime.store.addWorker({ ...worker, id: 'foreign-worker', origin: { ...origin, userId: 'user-B' } });
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: 'foreign-worker' }), /不属于/);
     await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: '' }), /workerId/);
@@ -310,7 +318,7 @@ test('one worker details retain every unresolved receipt and only recent bounded
   } finally { await f.runtime.close(); f.registry.close(); }
 });
 
-test('all-worker result and wake previews share an 8 KiB budget without dropping identities', async t => {
+test('paged worker previews retain all identities within each 8 KiB budget; schedules expand separately', async t => {
   const f = fixture();
   try {
     const a = await launch(f.runtime, f.turn); await flush();
@@ -322,20 +330,22 @@ test('all-worker result and wake previews share an 8 KiB budget without dropping
       f.runtime.store.addJob({ ...job, id: 'retained-job-' + index, workerId });
     }
     await f.runtime.invoke(f.turn, 'bridge_schedule_controller', { afterSeconds: 30, text: '唤醒说明'.repeat(1000) });
-    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: {
-      workerId: string; nativeId: string; lastResultPreview: string; lastResultPreviewTruncated: boolean;
-    }[]; schedules: { scheduleId: string; textPreview: string; textPreviewTruncated: boolean }[] };
-    assert.equal(listed.workers.length, 40); assert.equal(new Set(listed.workers.map(value => value.workerId)).size, 40);
-    assert.ok(listed.workers.every(value => value.nativeId && value.lastResultPreviewTruncated));
-    const previews = [...listed.workers.map(value => value.lastResultPreview), ...listed.schedules.map(value => value.textPreview)];
-    assert.ok(previews.reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0) <= 8 * 1024);
-    assert.ok(previews.every(value => !value.includes('\uFFFD')));
-    const previous = { workers: listed.workers.map(({ lastResultPreview: _preview, lastResultPreviewTruncated: _truncated, ...value }) =>
-      ({ ...value, lastResult: result.slice(0, 4096), supplements: [] })),
-    schedules: listed.schedules.map(value => ({ scheduleId: value.scheduleId, text: '唤醒说明'.repeat(1000) })) };
-    const before = Buffer.byteLength(JSON.stringify(previous), 'utf8'); const after = Buffer.byteLength(JSON.stringify(listed), 'utf8');
-    assert.ok(after < before * 0.15, 'large histories no longer dominate the default response');
-    t.diagnostic('同样40个任务与1个预约：默认返回由 ' + before + ' 字节降至 ' + after + ' 字节。');
+    type WorkerPreview = { workerId: string; nativeId?: string; lastResultPreview: string; lastResultPreviewTruncated: boolean };
+    const retained: WorkerPreview[] = []; let offset: number | null = 0, pages = 0;
+    while (offset !== null) {
+      const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', { offset }) as { workers: WorkerPreview[]; total: number; nextOffset: number | null; hasMore: boolean };
+      assert.equal(listed.total, 40); assert.equal(listed.workers.length, 10); assert.equal(listed.hasMore, listed.nextOffset !== null);
+      assert.ok(listed.workers.every(value => value.nativeId === undefined && value.lastResultPreviewTruncated));
+      assert.ok(listed.workers.reduce((sum, value) => sum + Buffer.byteLength(value.lastResultPreview, 'utf8'), 0) <= 8 * 1024);
+      assert.ok(listed.workers.every(value => !value.lastResultPreview.includes('\uFFFD')));
+      retained.push(...listed.workers); offset = listed.nextOffset; pages++; assert(pages <= 4);
+    }
+    assert.equal(retained.length, 40); assert.equal(new Set(retained.map(value => value.workerId)).size, 40);
+    const details = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: a.workerId }) as { workers: { nativeId: string; totalResultChars: number }[] };
+    assert.equal(details.workers[0]!.nativeId, worker.nativeId); assert.equal(details.workers[0]!.totalResultChars, result.length);
+    const schedules = await f.runtime.invoke(f.turn, 'bridge_list_schedules', {}) as { schedules: { textPreview: string; textPreviewTruncated: boolean }[] };
+    assert.equal(schedules.schedules.length, 1); assert(schedules.schedules[0]!.textPreviewTruncated); assert(schedules.schedules[0]!.textPreview.length <= 256);
+    t.diagnostic('40个助手分4页可完整遍历，预约通过独立清单查询。');
     assert.equal(f.runtime.store.jobs().length, 40); assert.equal(f.codex.turns.length, 1);
   } finally { await f.runtime.close(); f.registry.close(); }
 });
@@ -1227,7 +1237,7 @@ test('a completed report survives cleanup uncertainty; confirming a stop updates
     assert.equal(job.status, 'uncertain'); assert.equal(job.processStopped, false); assert.deepEqual(job.nativeResult, report);
     assert.match(job.result!, /实现已保存；验收仍需核对/); assert.match(job.result!, /【桥】CLI 退出待核对/);
     assert.equal(f.runtime.store.getWorker(handle.workerId)!.blocked, true);
-    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', {}) as { workers: Array<{ resultKnown: boolean; processStopped: boolean }> };
+    const listed = await f.runtime.invoke(f.turn, 'bridge_list_workers', { workerId: handle.workerId }) as { workers: Array<{ resultKnown: boolean; processStopped: boolean }> };
     assert.equal(listed.workers[0]!.resultKnown, true); assert.equal(listed.workers[0]!.processStopped, false);
     assert.equal(f.runtime.queryWorkerOverview(f.turn.conversation)[0]!.resultKnown, true);
     const cancelled = await f.runtime.invoke(f.turn, 'bridge_cancel_worker', { workerId: handle.workerId }) as { stopped: boolean };
@@ -1295,4 +1305,32 @@ test('compact worker pages stay bounded, preserve scoped details and inject deli
   assert.equal(active.total, 0);
   await assert.rejects(f.runtime.invoke(f.turn, 'bridge_list_workers', { limit: 21 }), /分页参数/);
  } finally { await f.runtime.close(); f.registry.close(); }
+});
+
+test('external controller dispatch uses registered ordinary workers without inheriting controller model or effort', async () => {
+  const f = fixture();
+  f.turn.conversation.agent = 'external'; f.turn.conversation.model = 'external-model'; f.turn.conversation.effort = 'ultra';
+  let context: ReturnType<TaskRegistry['createContext']> | undefined;
+  try {
+    context = f.registry.createContext({ conversationId: f.turn.conversation.id, userId: 'user-A', channelId: 'dm-A', originMessageId: 'external-message', nativeId: 'native-parent', agent: 'external', cwd: f.dir });
+    f.turn.taskContextPath = context.contextPath;
+    f.runtime.store.setWorkerDefault('local', { kind: 'ordinary', agent: 'claude', model: 'haiku', effort: null });
+    f.claude.run = async turn => { f.claude.turns.push(turn); return { nativeId: 'worker-session', text: 'done', processStopped: true }; };
+    const receipt = await launch(f.runtime, f.turn);
+    while (f.runtime.store.getJob(receipt.jobId)?.status !== 'completed') await flush();
+    assert.equal(f.claude.turns[0]!.conversation.agent, 'claude');
+    assert.equal(f.claude.turns[0]!.conversation.model, 'haiku');
+    assert.equal(f.claude.turns[0]!.effort ?? null, null); assert.equal(f.codex.turns.length, 0);
+    f.runtime.store.setWorkerDefault('local', { kind: 'follow' });
+    await assert.rejects(launch(f.runtime, f.turn));
+  } finally { await f.runtime.close(); if (context) f.registry.closeContext(context.contextId); f.registry.close(); }
+});
+
+test('external controller never launches native agent-switch summaries', async () => {
+  const f = fixture();
+  try {
+    await assert.rejects(f.runtime.prepareAgentSwitch({ ...f.turn.conversation, agent: 'external' }, { ...f.turn.conversation, id: 'target', agent: 'claude', nativeId: null }, 'dm-A', 'switch', new AbortController().signal));
+    await assert.rejects(f.runtime.prepareAgentSwitch(f.turn.conversation, { ...f.turn.conversation, id: 'target', agent: 'external', nativeId: null }, 'dm-A', 'switch', new AbortController().signal));
+    assert.equal(f.codex.turns.length + f.claude.turns.length, 0);
+  } finally { await f.runtime.close(); f.registry.close(); }
 });

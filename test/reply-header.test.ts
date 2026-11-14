@@ -224,3 +224,11 @@ test('头部不拼连续绿勾，metadata 不允许换行刷消息', () => {
   assert.equal(header, '[Claude · model ＠everyone · 高 · cdef]');
   assert(!header.includes('\n') && !header.includes('✅'));
 });
+
+test('external controller reply has a distinct identity without invented CLI metadata', () => {
+  const identity = { conversationId: 'external', agent: 'external' as const, nativeId: 'external-session-abcd' };
+  const header = replyHeader(identity, null, null, null);
+  assert.match(header, /abcd/); assert.doesNotMatch(header, /Codex|Claude|CLI/);
+  assert.equal(header.split(' · ').length, 2);
+  assert.match(replyHeader(identity, null, 'registered-model', null), /registered-model/);
+});

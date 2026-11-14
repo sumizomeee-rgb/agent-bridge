@@ -6,6 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 import { projectRoot } from '../config.js';
 import type { ExecutionTargetBinding } from './types.js';
 import { deployPresets } from '../presets/deployment.js';
+import { SshRemoteClient } from './client.js';
+import type { ControllerOwnerMigration } from '../executor-messages.js';
 
 export interface DeploymentResult { state: 'ready' | 'busy' | 'offline' | 'configuration-error'; release?: string; reason?: string; presetCount?: number }
 export interface ExecutorRelease { id: string; archive: string; sha256: string; helper: string; installer: string; launcher: string }
@@ -101,9 +103,22 @@ export class RemoteDeploymentService {
   private readonly states = new Map<string, string>();
   private release?: Promise<ExecutorRelease>;
   private closed = false;
+  private owners: ControllerOwnerMigration[] = [];
+  private readonly migratedOwners = new Set<string>();
   constructor(private readonly list: () => Promise<Array<{ target: ExecutionTargetBinding; cwd: string }>>,
     private readonly log: (text: string) => void, private readonly deploy = deployExecutor, private readonly build = executorRelease,
-    private readonly now = Date.now, private readonly configure = deployPresets) {}
+    private readonly now = Date.now, private readonly configure = deployPresets,
+    private readonly migrateOwners = async (target: ExecutionTargetBinding, cwd: string, owners: ControllerOwnerMigration[]) => {
+      const client = new SshRemoteClient(target, cwd);
+      try { const receipt = await client.request<{ version: number }>('owners/migrate', { version: 1, owners });
+        if (receipt.version !== 1) throw new Error('远端归属迁移没有返回有效版本回执。');
+      } finally { await client.close(); }
+    }) {}
+  registerOwnerMigration(owners: ControllerOwnerMigration[]): void {
+    if (this.flights.size) throw new Error('执行器更新中不能变更操作者迁移声明。');
+    this.owners = owners.map(owner => ({ ...owner })).sort((a, b) => a.oldUserId.localeCompare(b.oldUserId));
+    this.recent.clear();
+  }
   ensure(target: ExecutionTargetBinding, cwd: string): Promise<DeploymentResult> {
     if (this.closed) return Promise.resolve({ state: 'offline', reason: '宿主正在关闭' });
     const key = executorKey(target) + ':' + resolve(cwd), running = this.flights.get(key); if (running) return running;
@@ -114,6 +129,13 @@ export class RemoteDeploymentService {
       let result: DeploymentResult;
       try { result = await this.deploy(target, await this.release, cwd); }
       catch (error) { this.release = undefined; result = { state: 'offline', reason: error instanceof Error ? error.message : '更新未完成' }; }
+      if (result.state === 'ready' && this.owners.length) {
+        const migrationKey = executorKey(target) + ':' + hash(JSON.stringify(this.owners));
+        if (!this.migratedOwners.has(migrationKey)) {
+          try { await this.migrateOwners(target, cwd, this.owners); this.migratedOwners.add(migrationKey); }
+          catch { result = { state: 'offline', release: result.release, reason: '旧助手操作者归属迁移未完成，未开放派工或续接' }; }
+        }
+      }
       if (result.state === 'ready') {
         try { result = { ...result, presetCount: await this.configure(target, cwd) }; }
         catch { result = { state: 'configuration-error', release: result.release, reason: '工作区预设自动准备未完成，未报告预设就绪' }; }

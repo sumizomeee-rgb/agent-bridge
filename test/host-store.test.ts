@@ -33,7 +33,8 @@ function open(t: TestContext, path: string): HostStore {
   const store = new HostStore(path); opened.get(path)!.push(store); return store;
 }
 function addBot(store: HostStore, botId: string, ready = true): void {
-  store.registerBot({ botId, platform: 'feishu', applicationId: botId.slice('feishu:'.length) });
+  const controllerId = 'controller-' + botId.slice('feishu:'.length); store.registerController(controllerId);
+  store.registerBot({ controllerId, botId, platform: 'feishu', applicationId: botId.slice('feishu:'.length) });
   store.mapPrincipal({ principalId: P, botId, platformUserId: `open-${botId}`, proof: 'explicit verified deployment mapping' });
   store.mapSpace({ botId, platformSpaceId: `native-${botId}-${SPACE}`, spaceId: SPACE, proof: 'explicit cross-application group verification' });
   if (ready) { store.claimOwner(botId, P); store.setController(botId, P, controller(botId), 0); }
@@ -46,7 +47,7 @@ function root(store: HostStore, id = 'root-1', targets = [A, B], limit = 8): voi
   store.acceptRoot({ id, spaceId: SPACE, principalId: P, sourceEventId: `human-${id}`, targetBotIds: targets, replyTo: ADDRESS, automaticLimit: limit });
 }
 function enqueue(store: HostStore, id: string, botId = A, kind: 'human' | 'observation' | 'consultation' | 'assistant-result' = 'human', rootId = 'root-1'): void {
-  store.enqueueEvent({ id, rootId, botId, generation: store.getController(botId)!.generation, kind, payload: { text: id } });
+  store.enqueueEvent({ id, rootId, botId, generation: store.controllerForBot(botId)!.generation, kind, payload: { text: id } });
 }
 function start(store: HostStore, botId = A): string {
   const reserved = store.claimNextEvent(botId); assert(reserved); assert.equal(reserved.state, 'reserved');
@@ -56,7 +57,7 @@ function start(store: HostStore, botId = A): string {
 
 test('routed sends bind source and exact destination, keep unknown sends across restart, and reject new IDs for an unresolved input', async t => {
   const path = await directory(t); let store = open(t, path); seed(store);
-  const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1, messageId: 'real-private-input', userId: A + '|open-' + A, channelId: A + '|private-owner' };
+  const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1, messageId: 'real-private-input', userId: 'principal:' + P, channelId: A + '|private-owner' };
   const binding = store.getGroup(SPACE)!;
   const target = { id: 'group-target', kind: 'group' as const, botId: A, principalId: P, channelId: A + '|native-' + A + '-' + SPACE, spaceId: SPACE, epoch: binding.epoch, revision: binding.revision };
   const input = { id: 'routed-first', source, target, payload: { text: 'authorized public supplement', paths: [] } };
@@ -77,7 +78,7 @@ test('routed sends bind source and exact destination, keep unknown sends across 
 
 test('routed delivery rejects cross-Bot destinations and revoked owner authority before any sending state', async t => {
   const store = open(t, await directory(t)); seed(store);
-  const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1, messageId: 'private-source', userId: A + '|open-' + A, channelId: A + '|private-owner' };
+  const source = { botId: A, principalId: P, conversationId: controller(A).conversationId, generation: 1, messageId: 'private-source', userId: 'principal:' + P, channelId: A + '|private-owner' };
   const target = { id: 'private', kind: 'private' as const, botId: B, principalId: P, userId: 'open-' + B, channelId: B + '|private-owner' };
   assert.throws(() => store.registerRoutedDelivery({ id: 'cross-bot', source, target, payload: { text: 'blocked', paths: [] } }), /身份不匹配/);
   store.setPrincipalEnabled(P, false);
@@ -95,13 +96,13 @@ test('bot identity, explicit principal/space proofs, and a claimed owner survive
   assert.throws(() => first.claimOwner(A, Q), /already owned/);
   assert.throws(() => first.mapPrincipal({ principalId: P, botId: A, platformUserId: 'renamed-open-id', proof: 'same display name' }), /immutable/);
   assert.throws(() => first.mapSpace({ botId: A, platformSpaceId: 'unrelated-room', spaceId: SPACE, proof: 'same group title' }), /immutable/);
-  assert.throws(() => first.registerBot({ botId: 'some-alias', platform: 'feishu', applicationId: 'app-a' }), /verified/);
+  assert.throws(() => first.registerBot({ controllerId:'controller-app-a', botId: 'some-alias', platform: 'feishu', applicationId: 'app-a' }), /verified/);
   first.close();
   const next = open(t, path);
   assert.equal(next.getBot(A)?.ownerPrincipalId, P);
-  assert.deepEqual(next.getController(A), controller(A));
+  assert.deepEqual(next.controllerForBot(A), controller(A));
   assert.equal(next.resolveSpace(A, `native-${A}-${SPACE}`), SPACE);
-  assert.throws(() => next.registerBot({ botId: A, platform: 'feishu', applicationId: 'app-a', ownerPrincipalId: Q }), /cannot be transferred/);
+  assert.throws(() => next.registerBot({ controllerId:'controller-app-a', botId: A, platform: 'feishu', applicationId: 'app-a', ownerPrincipalId: Q }), /cannot be transferred/);
 });
 
 test('two independently running SQLite clients race for owner; exactly one durable claim wins', async t => {
@@ -227,7 +228,7 @@ test('broadcast human root and both Bot-derived collaboration roots share reserv
 });
 
 function publicTurn(store: HostStore, id: string, botId = A, rootId = 'root-1'): void {
-  store.enqueueEvent({ id, rootId, botId, generation: store.getController(botId)!.generation, kind: 'observation', payload: { text: id } });
+  store.enqueueEvent({ id, rootId, botId, generation: store.controllerForBot(botId)!.generation, kind: 'observation', payload: { text: id } });
   assert.equal(start(store, botId), id);
 }
 
@@ -480,16 +481,16 @@ test('batch reset freezes overlapping controls, commits all pointers together an
   store.recordBatchCancellation('batch-1', A, { confirmed: true, detail: 'A scheduled execution stopped' });
   store.prepareBatchController('batch-1', A, controller(A, 2));
   assert.throws(() => store.commitBatchReset('batch-1'), /every member/);
-  assert.equal(store.getController(A)?.generation, 1); assert.equal(store.getController(B)?.generation, 1);
+  assert.equal(store.controllerForBot(A)?.generation, 1); assert.equal(store.controllerForBot(B)?.generation, 1);
   store.recordBatchCancellation('batch-1', B, { confirmed: true, detail: 'B scheduled execution stopped' });
   store.prepareBatchController('batch-1', B, controller(B, 2));
   const committed = store.commitBatchReset('batch-1'); assert.equal(committed.state, 'committed');
-  assert.equal(store.getController(A)?.generation, 2); assert.equal(store.getController(B)?.generation, 2);
-  assert.equal(store.getController(C)?.generation, 1); assert.equal(store.getBot(A)?.ready, false);
+  assert.equal(store.controllerForBot(A)?.generation, 2); assert.equal(store.controllerForBot(B)?.generation, 2);
+  assert.equal(store.controllerForBot(C)?.generation, 1); assert.equal(store.getBot(A)?.ready, false);
   store.recordBatchInitialization('batch-1', A, { ready: true, detail: 'tools loaded' });
   const done = store.recordBatchInitialization('batch-1', B, { ready: false, detail: 'gateway unavailable' });
   assert.equal(done.state, 'completed'); assert.equal(store.getBot(A)?.ready, true); assert.equal(store.getBot(B)?.ready, false);
-  assert.equal(store.getController(B)?.generation, 2); // Failed init never silently restores the old pointer.
+  assert.equal(store.controllerForBot(B)?.generation, 2); // Failed init never silently restores the old pointer.
 });
 
 test('crash after partial cancellation keeps journal/locks and never fakes rollback or reruns initialization', async t => {
@@ -502,7 +503,7 @@ test('crash after partial cancellation keeps journal/locks and never fakes rollb
   assert.equal(next.getBatchReset('crashed-batch')?.state, 'blocked');
   assert.equal(next.getBatchReset('crashed-batch')?.members[0]?.cancellation, 'confirmed');
   assert.equal(next.getBatchReset('crashed-batch')?.members[1]?.cancellation, 'blocked');
-  assert.equal(next.getController(A)?.generation, 1); assert.equal(next.getController(B)?.generation, 1);
+  assert.equal(next.controllerForBot(A)?.generation, 1); assert.equal(next.controllerForBot(B)?.generation, 1);
   assert.throws(() => next.beginBatchReset({ id: 'not-a-new-operation', principalId: P, botIds: [A] }), /Overlapping/);
   next.cancelBatchReset('crashed-batch', 'Operator inspected surviving execution; retain old pointers, A schedules remain cancelled');
   assert.equal(next.getBatchReset('crashed-batch')?.state, 'cancelled');
@@ -545,15 +546,15 @@ test('failure in the middle of SQL batch pointer updates rolls back every pointe
   }
   const fault = new DatabaseSync(store.path);
   try {
-    fault.exec(`CREATE TRIGGER reject_second_pointer BEFORE UPDATE OF controller_json ON host_bots
-      WHEN NEW.bot_id='${B}' BEGIN SELECT RAISE(ABORT,'injected second pointer failure'); END;`);
+    fault.exec(`CREATE TRIGGER reject_second_pointer BEFORE UPDATE OF state_json ON host_controllers
+      WHEN NEW.id='controller-${B.slice(7)}' BEGIN SELECT RAISE(ABORT,'injected second pointer failure'); END;`);
     assert.throws(() => store.commitBatchReset('atomic-batch'), /injected second pointer failure/);
-    assert.equal(store.getController(A)?.generation, 1); assert.equal(store.getController(B)?.generation, 1);
+    assert.equal(store.controllerForBot(A)?.generation, 1); assert.equal(store.controllerForBot(B)?.generation, 1);
     assert.equal(store.getBatchReset('atomic-batch')?.state, 'prepared');
     fault.exec('DROP TRIGGER reject_second_pointer');
   } finally { fault.close(); }
   assert.equal(store.commitBatchReset('atomic-batch').state, 'committed');
-  assert.equal(store.getController(A)?.generation, 2); assert.equal(store.getController(B)?.generation, 2);
+  assert.equal(store.controllerForBot(A)?.generation, 2); assert.equal(store.controllerForBot(B)?.generation, 2);
 });
 
 test('a delivery already in flight is recorded after group stop, without permitting a subsequent send', async t => {
@@ -605,8 +606,8 @@ test('backend switches preserve pending work forward through Codex to Claude to 
   first.close();
   const next = open(t, path);
   next.replaceControllerForAgentSwitch(A, P, codex, 2, 'switch-back-to-codex'); // Exact replay does not create another generation.
-  assert.equal(next.getController(A)?.generation, 3);
-  assert.equal(next.getController(A)?.nativeId, 'new-codex-from-latest-claude');
+  assert.equal(next.controllerForBot(A)?.generation, 3);
+  assert.equal(next.controllerForBot(A)?.nativeId, 'new-codex-from-latest-claude');
   assert.equal(next.getHandoff('preserved-handoff')?.state, 'proposed');
   const duplicate = next.enqueueEvent({ id: 'echo-pending', logicalId: 'pending-observation', rootId: 'root-1', botId: A, generation: 3, kind: 'observation', payload: {} });
   assert.equal(duplicate.id, 'pending-observation');
@@ -630,7 +631,7 @@ test('backend switch cannot proceed with uncertain native execution and atomical
   try {
     fault.exec("CREATE TRIGGER fail_task_rebind BEFORE UPDATE OF generation ON host_tasks BEGIN SELECT RAISE(ABORT,'rebind failure'); END;");
     assert.throws(() => store.replaceControllerForAgentSwitch(A, P, claude, 1, 'failed-switch'), /rebind failure/);
-    assert.equal(store.getController(A)?.generation, 1);
+    assert.equal(store.controllerForBot(A)?.generation, 1);
     assert.equal(store.getEvent('preserved-queue')?.generation, 1);
     assert.equal(store.getTask('rebind-fault')?.generation, 1);
     assert.equal(store.getRoot('root-1')?.generations[A], 1);
@@ -657,11 +658,11 @@ test('同引擎仅在预设线路改变时允许交接，保留队列并支持�
   const target: HostController = { ...controller(A, 2), preset };
   store.replaceControllerForAgentSwitch(A, P, target, 1, 'ordinary-to-preset');
   store.replaceControllerForAgentSwitch(A, P, target, 1, 'ordinary-to-preset');
-  assert.equal(store.getController(A)!.preset?.id, preset.id); assert.equal(store.getEvent('pending-preset-input')!.generation, 2);
+  assert.equal(store.controllerForBot(A)!.preset?.id, preset.id); assert.equal(store.getEvent('pending-preset-input')!.generation, 2);
   assert.throws(() => store.replaceControllerForAgentSwitch(A, P, { ...controller(A, 3), preset }, 2), /current backend/);
   const changed = { ...controller(A, 3), preset: { ...preset, id: 'local-other', fingerprint: 'b'.repeat(64) } };
   store.replaceControllerForAgentSwitch(A, P, changed, 2, 'preset-to-preset');
   assert.equal(store.getEvent('pending-preset-input')!.generation, 3);
   store.replaceControllerForAgentSwitch(A, P, controller(A, 4), 3, 'preset-to-ordinary');
-  assert.equal(store.getController(A)!.preset, undefined); assert.equal(store.getEvent('pending-preset-input')!.generation, 4);
+  assert.equal(store.controllerForBot(A)!.preset, undefined); assert.equal(store.getEvent('pending-preset-input')!.generation, 4);
 });

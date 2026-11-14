@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { projectRoot } from '../src/config.js';
+import { ExecutorMessages } from '../src/executor-messages.js';
 import { BotRuntime, type BotRuntimeDependencies, type BotRuntimeHooks, type BotTransport } from '../src/bot-runtime.js';
 import { SessionStore } from '../src/store.js';
 import { TaskRegistry, type TaskCompletionEvent, type TaskContextFile } from '../src/tasks.js';
@@ -65,21 +66,22 @@ class LocalAdapter implements AgentAdapter {
   async interrupt() {} async close() { this.closed++; }
   async confirmStopped() { return this.stopProof === true; }
 }
-function setup(t: TestContext, options: { root?: string; appId?: string; controller?: boolean } = {}) {
+function setup(t: TestContext, options: { root?: string; appId?: string; controller?: boolean; canonical?: boolean } = {}) {
   const root = options.root ?? ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-bot-runtime-')), 'bridge-bot-runtime-');
   const appId = options.appId ?? String(123456789012345678n + BigInt(++serial));
   const prefix = `discord:${appId}|`;
   const config: BridgeConfig = { botId: `discord:${appId}`, applicationId: appId, platform: 'discord', profile: `discord/offline${serial}`, scopePrefix: prefix,
-    token: 'fixture-secret', allowedUserIds: [prefix + rawUser], externalAllowedUserIds: [rawUser], ownerUserId: prefix + rawUser,
+    token: 'fixture-secret', allowedUserIds: [prefix + rawUser], externalAllowedUserIds: [rawUser], ownerUserId: options.canonical ? 'principal:owner' : prefix + rawUser,
+    ...(options.canonical ? { controllerId:'offline-controller',controllerUserId:'principal:owner',channelOwnerUserId:prefix+rawUser,controllerBackend:{kind:'native' as const,agent:'codex' as const} } : {}),
     workspace: join(root, 'workspace'), contextWorkspace: join(root, 'workspace'), workingCwd: join(root, 'workspace'),
-    dataDir: join(root, 'data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
+    dataDir: join(root, 'data'), channelDataDir: join(root,'channel-data'), logsDir: join(root, 'logs'), attachmentsDir: join(root, 'images'),
     defaultAgent: 'codex', defaultModels: { codex: 'offline-model', claude: 'offline-model' }, controllerMode: options.controller !== false,
     proxyUrl: null, commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } }, maxImageBytes: 100 };
   mkdirSync(config.workspace, { recursive: true }); writeFileSync(join(config.workspace, 'README.md'), '# Shared fixture\n{{include:bridge/controller-protocol}}\n{{include:bridge/tool-index}}\n{{include:workspace/MEMORY.md}}'); writeFileSync(join(config.workspace, 'MEMORY.md'), '# Owner rules');
   const execution = { codex: new LocalAdapter(), claude: new LocalAdapter() }, controllers = { codex: new LocalAdapter(true), claude: new LocalAdapter(true) };
   const groups: IncomingDM[] = [], initialization: string[] = [], groupCompletions: TaskCompletionEvent[] = []; let ready = 0, reconnected = 0;
   let activeController: string | null = null;
-  const hooks: BotRuntimeHooks = { authorize: user => user === config.ownerUserId, receiveGroup: async message => { groups.push(message); },
+  const hooks: BotRuntimeHooks = { authorize: user => user === config.ownerUserId || options.canonical === true && user === prefix + rawUser, receiveGroup: async message => { groups.push(message); },
     manager: { binding: { getActive: user => user === config.ownerUserId ? activeController : null, setActive(user, id) { assert.equal(user, config.ownerUserId); activeController = id; } }, onInitializationState: (_conversation, outcome) => { initialization.push(outcome); }, onGroupCompletion: async event => { groupCompletions.push(event); return 'queued'; } },
     invoke: (_turn, _name, args, _id, delegate) => delegate(args), pauseGroup() {}, resumeGroup() {},
     requestRestart: async () => ({ accepted: false }), isDraining: () => false, allowDelivery: () => true,
@@ -89,7 +91,9 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
   const healthReport = (workspace = config.workspace) => ({ version: 1 as const, workspace, checkedAt: '2026-10-17', stale: false, scope: 'static-prerequisites' as const, items: [], total: 0, omitted: 0 });
   let controllerInvoke!: Parameters<NonNullable<BotRuntimeDependencies['createControllerAdapters']>>[3];
   const dependencies: BotRuntimeDependencies = {
+    createExecutorMessages: () => new ExecutorMessages(projectRoot, join(root,'isolated-user-home')),
     createTransport: (selected, receive, events) => transport = new LocalTransport(selected, receive, events),
+    createExternalAdapter: () => new LocalAdapter(true),
     createExecutionAdapters: () => execution, createControllerAdapters: (_config, _env, _execution, invoke) => { controllerInvoke = invoke; return controllers; },
     createTargetCatalog: () => ({
       async listTargets() { return []; }, async resolveTarget(_workspace, id, agent, cwd) { return { id, agent, label: id, transport: 'local', cwd: cwd ?? config.workspace, agentCommand: config.commands[agent] }; },
@@ -99,7 +103,7 @@ function setup(t: TestContext, options: { root?: string; appId?: string; control
   };
   const bot = new BotRuntime(config, hooks, dependencies);
   t.after(async () => { await bot.close().catch(() => {}); });
-  const message = (id: string, text: string, group = false): IncomingDM => ({ id: prefix + id, userId: config.ownerUserId!, channelId: prefix + (group ? '456789012345678901' : rawChannel), text, attachments: [],
+  const message = (id: string, text: string, group = false): IncomingDM => ({ id: prefix + id, userId: config.channelOwnerUserId ?? config.ownerUserId!, channelId: prefix + (group ? '456789012345678901' : rawChannel), text, attachments: [],
     ...(group ? { space: { kind: 'group', spaceId: '456789012345678901', mentionedUserIds: ['999999999999999999'] } } : {}) });
   return { root, config, bot, transport, execution, controllers, hooks, dependencies, groups, initialization, groupCompletions, message,
     invoke: (turn: AgentTurn, name: string, args: Record<string, unknown>, id?: string) => controllerInvoke(turn, name, args, id),
@@ -172,7 +176,7 @@ test('真实 BotRuntime 管理入口贯通历史与持久清单，new 保留但�
       await f.invoke(turn, 'bridge_update_tasks', { changes: [{ id: 'goal', expectedVersion: 0, title: '真实 Bot 路径', state: 'in_progress', nextStep: '核对后来纠正', evidenceIds: ['input:' + turn.source!.messageId] }] }, 'save');
     }
     if (!turn.event && turn.text.includes('新会话查旧目标')) {
-      assert.match(turn.taskChecklist!, /真实 Bot 路径/);
+      assert.equal(JSON.parse(turn.taskChecklist!).counts.in_progress, 1);
       const history = await f.invoke(turn, 'bridge_search_chat_history', { query: '记住原目标' }) as { messages: unknown[] };
       assert.equal(history.messages.length, 1);
       const task = await f.invoke(turn, 'bridge_list_tasks', { id: 'goal' }) as { task: { state: string } };
@@ -240,7 +244,7 @@ test('转发引用到达真实主控入口，历史斜杠不重建会话或重�
 
 test('BotRuntime requires one host-owned controller binding before opening runtime resources', t => {
   const f = setup(t);
-  assert.throws(() => new BotRuntime(f.config, { ...f.hooks, manager: {} } as BotRuntimeHooks, f.dependencies), /必须使用宿主的当前主控绑定/);
+  assert.throws(() => new BotRuntime(f.config, { ...f.hooks, manager: {} } as BotRuntimeHooks, f.dependencies), /必须使用已登记主控的会话绑定/);
   const store = new SessionStore(f.config.dataDir);
   try { assert.equal(store.getActive(f.config.ownerUserId!), null); } finally { store.close(); }
 });
@@ -307,17 +311,26 @@ test('主控停止证明只接受执行适配器程序证据，没有已知会�
   await f.bot.close(); assert.equal(await f.bot.confirmControllerStopped(conversation.id), false);
 });
 
-test('实际main --check完整加载v3启动集合而不访问网络、创建运行数据或争抢项目锁', async t => {
+test('实际main --check完整加载v4启动集合而不访问网络、创建运行数据或争抢项目锁', async t => {
   const root = ownTemporaryDirectory(mkdtempSync(join(tmpdir(), 'bridge-main-check-')), 'bridge-main-check-'), configPath = join(root, 'config.json');
-  const profiles = join(root, 'bots', 'feishu'); mkdirSync(profiles, { recursive: true });
-  for (const name of ['a', 'b']) writeFileSync(join(profiles, `${name}.json`), JSON.stringify({ applicationId: `cli_offline${name}`, appSecret: 'fake-secret-never-output', allowedUserIds: [`ou_owner${name}`], network: { proxyPort: null } }));
-  const dataDir = join(root, 'data'); writeFileSync(configPath, JSON.stringify({ version: 3, startupProfiles: ['feishu/a', 'feishu/b'], workspaceRoot: join(root, 'contexts'), dataDir,
-    commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } }));
+  const workspace = join(root, 'contexts'), registry = join(workspace, 'bridge-registry');
+  const write = (path: string, value: unknown) => { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, JSON.stringify(value)); };
+  write(join(registry, 'config.json'), { version: 4, controllers: ['a', 'b'], startupControllers: ['a', 'b'],
+    channels: ['feishu:cli_offlinea', 'feishu:cli_offlineb'], principals: [{ id: 'owner', accounts: { 'feishu:cli_offlinea': 'ou_ownera', 'feishu:cli_offlineb': 'ou_ownerb' } }], spaces: [] });
+  for (const name of ['a', 'b']) {
+    const applicationId = `cli_offline${name}`, channelId = `feishu:${applicationId}`, directory = join(registry, 'channels', 'lark', 'bots', applicationId);
+    write(join(directory, 'config.json'), { version: 1, id: channelId, platform: 'feishu', applicationId, profile: `feishu/${name}`, allowedUserIds: [`ou_owner${name}`], network: { proxyPort: null } });
+    write(join(directory, 'credentials.json'), { version: 1, appSecret: 'fake-secret-never-output' });
+    write(join(registry, 'controllers', name, 'config.json'), { version: 1, id: name, ownerPrincipalId: 'owner', backend: { kind: 'native', agent: 'codex' }, channelId });
+  }
+  write(configPath, { version: 4, workspaceRoot: workspace,
+    commands: { codex: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] } } });
   const lock = await acquireInstanceLock(projectRoot, root); t.after(() => new Promise<void>(resolve => lock.close(() => resolve())));
   const checked = spawnSync(process.execPath, [fileURLToPath(new URL('../src/main.js', import.meta.url)), '--check', '--config', configPath],
     { encoding: 'utf8', timeout: 10_000, windowsHide: true, env: { ...process.env, HTTP_PROXY: 'http://127.0.0.1:1', HTTPS_PROXY: 'http://127.0.0.1:1' } });
   assert.equal(checked.status, 0, checked.stderr); assert.match(checked.stdout, /CONFIG_OK.*bots=2.*feishu\/a,feishu\/b/);
-  assert(!checked.stdout.includes('fake-secret')); assert.equal(existsSync(dataDir), false); assert.equal(existsSync(join(root, 'contexts')), false);
+  assert(!checked.stdout.includes('fake-secret')); assert.equal(existsSync(join(workspace, 'bridge-local')), false);
+  for (const name of ['a', 'b']) assert.equal(existsSync(join(registry, 'controllers', name, 'data')), false);
 });
 
 
@@ -495,4 +508,16 @@ test('真实完成回调仅对已确认退出且未提交的元数据失败提�
         '即使前置失败原因仍在，已保存结果也禁止自动重试');
     }
   });
+});
+
+test('渠道真实用户与主控稳定身份分离，原始来源保留且收件库归渠道',async t=>{
+  const f=setup(t,{canonical:true});await f.bot.verify();await f.bot.start();
+  const message=f.message('100000000000000099','核对独立身份');await f.transport.emit(message);
+  await until(()=>f.bot.manager.isIdle()&&f.controllers.codex.turns.some(turn=>turn.text.includes('核对独立身份')));
+  const turn=f.controllers.codex.turns.find(turn=>turn.text.includes('核对独立身份'))!;
+  assert.equal(turn.conversation.userId,'principal:owner');assert.equal(turn.source!.userId,'principal:owner');
+  assert.equal(turn.source!.original!.userId,message.userId);
+  assert.equal(f.bot.ingress.getMessage(message.id)!.userId,message.userId);
+  assert(existsSync(join(f.config.channelDataDir!,'ingress.sqlite')));
+  assert(!existsSync(join(f.config.dataDir,'ingress.sqlite')));
 });

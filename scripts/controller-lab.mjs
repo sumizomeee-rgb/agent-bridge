@@ -7,18 +7,20 @@ import { parseArgs } from 'node:util';
 import { verifyParity } from './controller-lab/parity.mjs';
 
 const { values } = parseArgs({ options: {
+  'baseline-only': { type: 'boolean', default: false },
   'selection-only': { type: 'boolean', default: false },
-  targets: { type: 'string' }, 'controller-model': { type: 'string' }, 'controller-effort': { type: 'string', default: 'xhigh' },
+  targets: { type: 'string' }, 'controller-model': { type: 'string' }, 'controller-preset': { type: 'string' }, 'controller-effort': { type: 'string' },
   live: { type: 'boolean', default: false }, config: { type: 'string' },
   agent: { type: 'string', default: 'codex' }, 'runtime-root': { type: 'string' },
   'source-root': { type: 'string' },
 } });
 const root = resolve(values['runtime-root'] ?? join(dirname(fileURLToPath(import.meta.url)), '..'));
 if (!['codex', 'claude', 'both'].includes(values.agent)) throw new Error('--agent must be codex, claude or both');
+if (values['baseline-only'] && !values.live) throw new Error('--baseline-only requires --live and an explicit --config');
 if (values.live && !values.config) throw new Error('--live requires an explicit --config (real configured paths; production defaults read-only)');
 const runDir = join(root, '.local', 'controller-lab', new Date().toISOString().replace(/[:.]/g, '-') + '-' + process.pid);
 mkdirSync(runDir, { recursive: true });
-const evidence = { version: 1, startedAt: new Date().toISOString(), mode: values.live ? 'live' : 'deterministic',
+const evidence = { version: 1, startedAt: new Date().toISOString(), mode: values['baseline-only'] ? 'configured-baseline' : values.live ? 'live' : 'deterministic',
   runDir, runtimeHashes: {}, harnessHashes: {}, cases: [], status: 'running',
   scope: { platform: 'local receipt sink; no Feishu/Discord network connection', isolation: 'fresh conversations and journals; actual configured catalog, defaults, SSH, deployment and executors',
     configuredPathsRequired: values.live, excluded: ['production conversation history', 'real platform delivery', 'business tools', 'cross-day stability'] } };
@@ -36,9 +38,9 @@ try {
   try {
   if (!values.live) {
     // Known unrelated remote-stop regressions are deliberately outside this named suite.
-    const files = ['workspace-layout', 'workspace-documents', 'workspace-manager', 'handoff', 'controller-resilience', 'controller-native', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement', 'completed-cli-stop', 'turn-retirement', 'slash', 'overview', 'overview-runtime', 'overview-discord', 'worker-result-overview', 'restart-command', 'restart-ingress', 'restart', 'worker-restart-recovery', 'worker-session', 'controller-runtime', 'worker-selection', 'remote', 'remote-deployment', 'deployment-command', 'executor-supervisor', 'presets', 'preset-pipeline', 'preset-deployment', 'controller-worker-archive', 'controller-recovery', 'housekeeper-service', 'housekeeper-sources', 'harness', 'harness-deployment'];
+    const files = ['workspace-layout', 'workspace-documents', 'workspace-manager', 'handoff', 'controller-resilience', 'controller-native', 'controller-coordinator', 'controller-core', 'executor-messages', 'remote-owner-migration', 'host-store', 'host-scene-store', 'host-collaboration-store', 'host-scene-runtime', 'controller-presets', 'controller-context', 'controller-scene-refresh', 'controller-recovery-gate', 'controller-scheduled-message', 'workspace-registry', 'registry-migration', 'controller-ownership-migration', 'controller-state-migration', 'external-controller', 'external-recovery-store', 'external-server', 'main-headless', 'config', 'controller-feedback', 'private-input-manager', 'private-input-store', 'presentation-lifecycle', 'controller-native-delivery', 'task-manager', 'restart-manager', 'maintenance-drain', 'controller-group-lab', 'host-runtime', 'bot-runtime', 'process-retirement', 'completed-cli-stop', 'turn-retirement', 'slash', 'overview', 'overview-runtime', 'overview-discord', 'worker-result-overview', 'restart-command', 'restart-ingress', 'restart', 'worker-restart-recovery', 'worker-session', 'controller-runtime', 'worker-selection', 'remote', 'remote-deployment', 'deployment-command', 'executor-supervisor', 'presets', 'preset-pipeline', 'preset-deployment', 'controller-worker-archive', 'controller-recovery', 'housekeeper-service', 'housekeeper-sources', 'harness', 'harness-deployment'];
     const output = [];
-    const child = spawn(process.execPath, ['--test', '--test-concurrency=2', '--test-reporter=tap', ...['faults', 'parity'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
+    const child = spawn(process.execPath, ['--test', '--test-concurrency=2', '--test-reporter=tap', ...['faults', 'parity', 'configured-live'].map(name => join(dirname(fileURLToPath(import.meta.url)), 'controller-lab', name + '.test.mjs')), ...files.map(name => join(root, 'dist/test', name + '.test.js'))],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', bytes => output.push(bytes)); child.stderr.on('data', bytes => output.push(bytes));
     const code = await new Promise((accept, reject) => { child.on('error', reject); child.on('close', accept); });
@@ -50,9 +52,9 @@ try {
     const { runLive } = await import('./controller-lab/live.mjs');
     const { runConfigured } = await import('./controller-lab/configured-live.mjs');
     for (const agent of values.agent === 'both' ? ['codex', 'claude'] : [values.agent]) {
-      if (!values['selection-only']) await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save });
+      if (!values['selection-only'] && !values['baseline-only']) await runLive({ root, runDir, configPath: resolve(values.config), agent, evidence, save });
       await runConfigured({ root, runDir, configPath: resolve(values.config), agent, evidence, save, targets: values.targets?.split(','),
-        controllerModel: values['controller-model'], controllerEffort: values['controller-effort'] });
+        baselineOnly: values['baseline-only'], controllerModel: values['controller-model'], controllerPreset: values['controller-preset'], controllerEffort: values['controller-effort'] ?? (values['baseline-only'] ? 'low' : 'xhigh') });
     }
   }
   } finally { parity.assertUnchanged(); evidence.parity.unchangedAtEnd = true; }

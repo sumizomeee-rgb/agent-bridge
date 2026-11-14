@@ -1,12 +1,10 @@
 # Agent Bridge
 
-在 Windows 上运行，通过 Discord 或飞书与 Codex / Claude 主控对话，并派发本机或远端执行助手。一个宿主启动同一平台的多个 Bot；每个 Bot 的激活账号、当前主控、任务和原生会话独立，私聊与已激活工作群共用该 Bot 的主控，用户上下文工作区可以共享。
+在 Windows 上运行。主控以稳定 controller ID 独立登记，使用 Codex、Claude 或外部 Agent 进行思考；可绑定飞书 / Discord Bot，也可不绑定聊天渠道。助手、会话、任务和定时归属主控，渠道管理平台身份、收发与附件；多个主控可以共享用户工作区。
 
 ## 首次部署
 
-`/status` 查看原有会话状态；`/status host` 直接采集桥电脑的 CPU、物理内存、运行时长及 CPU/私有内存各前 5 个进程。CPU 使用短时采样并按全部逻辑核折算，内存榜另附工作集；仅查询，不唤醒主控、不创建会话，主控忙碌时也可使用。Windows 提供进程榜单，其他系统目前只提供整机概况；进程采集失败会明确标记，不把缺失当作零占用。
-
-已验证平台为 Windows x64。开始前准备：已认证的 Codex CLI、已配置供应商的 Claude Code，以及所选平台的 Bot 应用、凭据和允许访问的用户账号。供应商、认证、模型别名沿用自己的 CLI / CC Switch 设置。运行还需要同平台的 Node 运行时、依赖、构建与 `harness/` 资产；源码构建或复制发行资产的方法见下方[配置物料](#配置物料)。旧部署先完成 [v3 宿主迁移](docs/profiles.md#现有部署迁移到-v3)。
+已验证平台为 Windows x64。原生主控需目标用户已经配置 Codex CLI / Claude Code 的认证、供应商和 skills；绑定聊天渠道时另需对应 Bot 应用、凭据和允许用户账号。运行资产及源码构建见下方[配置物料](#配置物料)。旧部署先完成 [v4 离线登记迁移](docs/controller-registry.md#旧部署的一次性迁移)。
 
 ### 1. 指定工作区目录
 
@@ -16,18 +14,13 @@
 .\init-workspace.ps1 -Path 'D:\Agent Workspace'
 ```
 
-生成器无需 Node 或联网，只补缺失文件，保留已有内容。在工作区 `MEMORY.md` 填写用户偏好、本地约定和环境入口；随后在每个所选 Bot Profile 中把 `workspace` 设置为这个绝对路径。多个 Bot 填同一路径即可共享资料。只设置公共 `workspaceRoot` 时，实际工作区会派生为 `<workspaceRoot>/<平台>/<应用ID>`，不会直接使用该根目录。
+生成器无需 Node 或联网，只补缺失文件，保留已有内容。在工作区 `MEMORY.md` 填写用户偏好、本地约定和环境入口；将 [config.example.json](config.example.json) 复制为项目 `.local/config.json`，填写 CLI 路径和 `workspaceRoot`。相对工作区路径以该配置文件所在目录解析，推荐部署时填写绝对路径。
 
-### 2. 选择要启动的平台
+### 2. 登记主控与可选渠道
 
-选择 Discord 或飞书，并使用对应模板：
+在工作区 `bridge-registry/config.json` 登记稳定主控 ID、`startupControllers`、渠道 ID、操作者和群地址映射。每个主控的后端、owner、等待策略及可选 channel 绑定放在 `controllers/<id>/config.json`；渠道配置和凭据分别放在 `channels/lark|discord/bots/<应用ID>/config.json`、`credentials.json`。渠道目录使用 `lark`，消息身份仍为 `feishu:<应用ID>`。
 
-| 平台 | Bot 配置模板 | 本地配置位置 | 启动集合示例 |
-| --- | --- | --- | --- |
-| Discord | [profiles/discord.example.json](profiles/discord.example.json) | `.local/bots/discord/main.json` | `["discord/main"]` |
-| 飞书 | [profiles/feishu.example.json](profiles/feishu.example.json) | `.local/bots/feishu/main.json` | `["feishu/main"]` |
-
-将 [config.example.json](config.example.json) 复制为 `.local/config.json`，使用 `version: 3`，将 `startupProfiles` 设为所选集合。一个宿主可列多个同平台 Bot，不能混合两平台。填写各 Profile 的真实应用 ID、Token 或 appSecret、白名单及工作区路径，并替换公共配置中的 CLI 示例路径；负责人映射和工作群配置见下方[配置物料](#配置物料)。模板占位符不能直接运行。
+主控默认直接使用已指定的共享工作区，不再按 Bot 派生目录；显式 `workspace` / `workingCwd` 可单独设置。不绑定渠道的外部主控通过本机 API 接入。完整结构、最小配置、外部 API 与迁移指令见 [主控与渠道登记](docs/controller-registry.md)。真实登记与凭据均不进 Git。
 
 ### 检查并启动
 
@@ -40,16 +33,16 @@
 
 Discord 将 `feishu` 换为 `discord`。`-Platform` 只核对平台与配置一致，不修改启动集合；省略时使用配置集合。`-Profile` 只校验集合成员，不单独启动该 Bot。`-Check` 做离线配置和路径检查，不连接平台或模型，也不证明代理、认证或模型当前可用。
 
-需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。代理按各 Profile 的 `network.proxyPort` 配置，也可用 `.\start.ps1 -ProxyPort 7898` 临时覆盖。详细步骤见[部署与迁移](docs/deployment.md)。
+需要登录后隐藏启动：以管理员运行 `.\install-startup.ps1 -StartNow`；手动停用用 `.\stop.ps1`。主控与渠道分别在各自配置的 `network.proxyPort` 设置代理，也可用 `.\start.ps1 -ProxyPort 7898` 临时覆盖。详细步骤见[部署与迁移](docs/deployment.md)。
 
 ## 配置物料
 
 | 物料 | 准备内容与权威说明 |
 | --- | --- |
 | 运行与构建 | 源码构建需 Node `>=24.12.0`，运行 `npm ci`、`npm run build`；启动脚本使用 `.local/runtime/win-x64/node.exe`，须另行准备。复制同平台发行资产时携带 `dist/`、`node_modules/`、`.local/runtime/`、`harness/`、脚本与工作区骨架，不能只复制 `dist/`。见[开发与验证](docs/development.md)及 [runtime-manifest.json](runtime-manifest.json)。 |
-| 宿主与 CLI | `.local/config.json` 保存 v3 启动集合、CLI 路径及公共选项；每个 Bot 的配置在 `.local/bots/<平台>/<名称>.json`。CLI 路径须对应目标电脑，认证和网关沿用用户配置。见[Profile 与宿主迁移](docs/profiles.md)。 |
+| 宿主与 CLI | `.local/config.json` 只保存 v4 工作区入口、CLI 路径与公共运行选项；启动集合及身份登记在工作区 `bridge-registry/`。见[主控与渠道登记](docs/controller-registry.md)。 |
 | Bot 身份与访问 | Discord 使用应用 ID、Bot Token 和允许用户 ID；飞书使用应用 ID、appSecret 和允许用户 open ID。负责人使用及群协作登记 `principals` 账号映射；工作群另需启用群功能并登记 `spaces`，飞书按应用核对群地址。平台权限、网络及功能开关见[部署说明](docs/deployment.md)。 |
-| 用户工作区 | 由生成器补缺；各 Profile 的 `workspace` 指向实际目录。`workingCwd` 或私聊 `/cwd` 选择工程执行目录，固定上下文仍来自用户工作区。见下方[工作区职责与生成原理](#工作区职责与生成原理)。 |
+| 用户工作区 | 由生成器补缺；bootstrap 的 `workspaceRoot` 指向实际目录，主控默认共用。`workingCwd` 或私聊 `/cwd` 选择工程执行目录，固定上下文仍来自用户工作区。见下方[工作区职责与生成原理](#工作区职责与生成原理)。 |
 | 可选电脑、能力与预设 | 空清单可以使用，本机 `local` 内置。跨电脑、浏览器能力及固定模型助手按需登记，分别见[部署说明](docs/deployment.md)、[能力登记](docs/capabilities.md)、[派发预设](docs/presets.md)。私有启动配置及凭据只在用户工作区维护，不入 Git、不注入主控正文。 |
 
 ### 工作区职责与生成原理
@@ -61,10 +54,11 @@ D:\Agent Workspace/
 ├─ README.md                   主控规则与固定上下文引用
 ├─ MEMORY.md                   用户偏好、本地约定、环境与入口
 ├─ bridge-prompts.json         共享快捷提示词
-├─ bridge-remote-agents/        电脑、SSH 与 CLI 的非秘密登记
+├─ bridge-computers/           电脑、SSH 与 CLI 的非秘密登记
 ├─ bridge-agent-presets/        派工预设；private/ 保存启动配置与凭据
 ├─ bridge-capabilities/         能力入口及有范围的历史验收
-├─ bridge-chat-platforms/       lark.md、discord.md，按需读取
+├─ bridge-registry/            主控、渠道与操作者登记；身份凭据及各自 data/
+├─ bridge-local/               host/ 宿主状态与日志；browser/ 浏览器运行资料
 ├─ bridge-transaction-sync/     同步器交付的跨平台可读正文
 └─ tmp/                        按任务收纳临时材料与待交付附件
 ```
@@ -77,10 +71,12 @@ D:\Agent Workspace/
 
 ## 使用与维护
 
+`/status host` 直接查看桥电脑 CPU、物理内存、运行时长及 CPU / 私有内存各前 5 个进程；不唤醒主控，忙碌时也可使用。Windows 提供进程榜单，其他系统目前只提供整机概况。
+
 - [使用说明](docs/usage.md)：私聊和群命令、读图与附件、模型/强度、助手及持久任务清单。
 - [定时消息](docs/scheduled-messages.md)：固定正文直接发送、主控唤醒与助手计划的选择、生命周期和回执。
 - [派发预设](docs/presets.md)：按电脑选择普通／预设助手及保存默认；桥电脑初始跟随主控，远端默认须显式设置。
-- [部署与迁移](docs/deployment.md)、[Profile 与宿主迁移](docs/profiles.md)：配置、跨电脑登记、升级、备份与启动。
+- [部署与迁移](docs/deployment.md)、[主控与渠道登记](docs/controller-registry.md)：v4 配置、外部 Agent、离线迁移与启动。
 - [能力登记与就绪检查](docs/capabilities.md)：当前轻检查与历史验收范围。
 - [群聊与多个长期主控 Bot](docs/group-controller-design.md)：唯一群聊设计稿与现场验收边界。
 - [开发与验证](docs/development.md)、[隔离主控验收](docs/controller-lab.md)：源码构建、回归和真实模型验收范围。
@@ -108,8 +104,9 @@ D:\Agent Workspace/
 ```mermaid
 flowchart LR
   P[Discord / 飞书] --> H[Host：身份、群、权限与路由]
-  H --> B[每 Bot：持久收件与会话管理]
-  W[工作区 README 显式引用] --> N[原生主控 adapter]
+  H --> B[独立 ControllerCore：会话、工具与任务]
+  E[外部 Agent：本机认证 API] --> B
+  W[工作区 README 显式引用] --> N[Native / External 主控 adapter]
   B --> N
   N --> T[共用工具登记与硬校验]
   T --> R[助手、轮次与计划调度]
@@ -120,7 +117,7 @@ flowchart LR
   S --> P
 ```
 
-Host 管 Bot/操作者/群与投递权限，Bot 装配平台和持久收件，SessionManager 管当前主控与输入、切换和结果汇报；NativeControllerAdapter 管 Codex app-server / Claude stream-json 原生轮次和工具交付封闭。ControllerRuntime 管 worker/job、目标、执行与计划；本地或远端 adapter 执行，TaskRegistry 保存结果事件。只读文件、历史和清单由专用服务处理，跨 Bot 协作由 Host 路由。源码职责详见[开发指南](docs/development.md)。
+Host 管独立主控、渠道、操作者、群与投递权限；ControllerCore 统一装配主控、任务和工具，BotRuntime 负责绑定渠道的收发。SessionManager 管输入、切换和结果汇报；NativeControllerAdapter 管 Codex app-server / Claude stream-json，ExternalControllerAdapter 通过持久事件、lease 和显式结束接入外部 Agent。ControllerRuntime 管 worker/job、目标、执行与计划；本地或远端 adapter 执行，TaskRegistry 保存结果事件。只读文件、历史和清单由专用服务处理，跨 Bot 协作由 Host 路由。源码职责详见[开发指南](docs/development.md)。
 
 ```text
 agent-bridge/
@@ -129,7 +126,7 @@ agent-bridge/
 ├─ start.ps1 / stop.ps1         启动 / 手动停用
 ├─ install-startup.ps1          登录后后台启动
 ├─ config.example.json         公共配置示例
-├─ profiles/                   Discord / 飞书 Bot 模板
+├─ profiles/                   历史 Bot Profile 模板，仅旧版迁移参考
 ├─ runtime-manifest.json        已验证运行时信息
 ├─ package.json / package-lock.json
 ├─ docs/                       使用、部署与开发指南
@@ -139,7 +136,7 @@ agent-bridge/
 ├─ src/                        Host、Bot、主控与执行源码
 ├─ test/                       自动化测试
 ├─ dist/ / node_modules/       构建与依赖，不进 Git
-└─ .local/                     工程运行时、配置、会话、日志与备份，不进 Git
+└─ .local/                     工程运行时与 bootstrap 配置，不进 Git
 ```
 
 ## Harness 与工具升级

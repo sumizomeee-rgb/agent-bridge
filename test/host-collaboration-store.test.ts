@@ -15,7 +15,8 @@ async function setup(t: TestContext, mode: 'public' | 'internal' = 'internal', b
   t.after(async () => { for (const store of stores) store.close(); await rm(path, { recursive: true, force: true }); });
   const store = open();
   for (const id of [A, B]) {
-    store.registerBot({ botId: id, platform: 'feishu', applicationId: id.slice(7) });
+    const controllerId = 'controller-' + id.slice(7); store.registerController(controllerId);
+    store.registerBot({ controllerId, botId: id, platform: 'feishu', applicationId: id.slice(7) });
     store.mapPrincipal({ botId: id, principalId: P, platformUserId: 'user-' + id, proof: 'verified owner' });
     store.mapSpace({ botId: id, platformSpaceId: 'space-' + id, spaceId: SPACE, proof: 'verified group' });
     store.claimOwner(id, P); store.setController(id, P, controller(id), 0);

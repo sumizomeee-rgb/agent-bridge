@@ -10,3 +10,6 @@ dist/
 /agent-presets/
 /bridge-agent-presets/
 /tmp/
+/bridge-registry/
+/bridge-local/
+/bridge-computers/
