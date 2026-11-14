@@ -42,7 +42,7 @@ interface WorkspaceInitializationJournal {
 interface AgentSwitchJournal {
   version: 1; source: Conversation; target: Conversation; channelId: string;
   phase: 'preparing' | 'prepared' | 'committing' | 'committed' | 'failed';
-  createdAt: string; updatedAt: string; error?: string;
+  createdAt: string; updatedAt: string; error?: string; externalHandoffId?: string;
 }interface RunningTurn {
   messageId: string;
   conversationId: string;
@@ -67,6 +67,8 @@ export interface SessionManagerOptions {
   onGroupPublish?: (context: GroupTurnContext, text: string, paths: string[], deliver: () => Promise<void>) => Promise<void>;
   onPrepareSwitch?: (source: Conversation, target: Conversation, channelId: string, prompt: string, signal: AbortSignal) => Promise<{ contextSeed: string }>;
   onRebindSwitch?: (source: Conversation, target: Conversation) => void | Promise<void>;
+  onCommitExternalHandoff?: (id: string) => void;
+  onCompleteExternalHandoff?: (id: string, conversationId: string) => void;
   onPauseSwitch?: (source: Conversation) => Promise<void>; onResumeSwitch?: (source: Conversation) => void | Promise<void>;
   botName?: () => string | undefined;
   mergeDelayMs?: number; receiptIntervalMs?: number; taskRegistry?: TaskRegistry;
@@ -1065,6 +1067,50 @@ export class SessionManager {
     journal.updatedAt = new Date().toISOString(); const temp = path + '.' + randomUUID() + '.tmp';
     writeFileSync(temp, JSON.stringify(journal), { mode: 0o600 }); renameSync(temp, path);
   }
+  /** A real external session change creates a new bridge conversation and reuses durable parent rebinding. */
+  async handoffExternalSession(operationId:string,userId:string,previousSessionId:string,sessionId:string):Promise<string> {
+    if(this.closed||this.draining||!this.config.allowedUserIds.includes(userId)||this.options.authorizeUser?.(userId)===false)
+      throw new Error('当前主控不能交接');
+    if(!/^[a-f0-9-]{36}$/i.test(operationId)||!sessionId||sessionId===previousSessionId||!this.options.onCommitExternalHandoff)
+      throw new Error('外部交接参数或提交入口无效');
+    const directory=join(this.config.dataDir,'agent-switches');
+    let journal:AgentSwitchJournal|undefined;
+    if(existsSync(directory))for(const file of readdirSync(directory).filter(name=>/^[a-f0-9-]{36}\.json$/i.test(name))){
+      const value=JSON.parse(readFileSync(join(directory,file),'utf8')) as AgentSwitchJournal;
+      if(value.externalHandoffId===operationId){journal=value;break;}
+    }
+    if(journal&&(journal.source.userId!==userId||journal.source.nativeId!==previousSessionId||journal.target.nativeId!==sessionId))
+      throw new Error('交接日志参数冲突');
+    if(journal?.phase==='committed')return journal.target.id;
+    const source=journal?.source??this.store.getActive(userId);
+    if(!source||source.agent!=='external'||source.nativeId!==previousSessionId)throw new Error('当前真实外部会话不匹配');
+    const active=this.store.getActive(userId);
+    if(active?.id!==source.id&&active?.id!==journal?.target.id)throw new Error('当前主控会话已变化');
+    if(this.switches.has(userId))throw new Error('主控已有其他交接');
+    this.resetCommands.set(userId,(this.resetCommands.get(userId)??0)+1);
+    try {
+      await this.options.onPauseSwitch?.(source);
+      await this.adapter('external').suspend?.(source.id);
+      await this.userWorkers.get(userId);
+      if(!journal){
+        const target=this.selectedConversation(userId,'external',source.cwd,source);
+        this.store.saveNativeId(target.id,sessionId);
+        const now=new Date().toISOString();
+        journal={version:1,source,target:this.store.getConversation(target.id)!,channelId:'controller:'+this.config.controllerId,
+          externalHandoffId:operationId,phase:'committing',createdAt:now,updatedAt:now};
+        this.saveSwitchJournal(journal);
+      }
+      await this.commitAgentSwitch(journal);
+      return journal.target.id;
+    } finally {
+      this.releaseResetBarrier(userId);
+      if(!journal||journal.phase!=='committing'){
+        await this.options.onResumeSwitch?.(source);
+        if(journal)await this.options.onResumeSwitch?.(journal.target);
+        if(!this.closed){this.wake(journal?.target.id??source.id);this.completionAvailable();}
+      }
+    }
+  }
   private async commitAgentSwitch(journal: AgentSwitchJournal): Promise<void> {
     const source = this.store.getConversation(journal.source.id), target = this.store.getConversation(journal.target.id);
     const active = source ? this.store.getActive(source.userId) : null;
@@ -1073,11 +1119,17 @@ export class SessionManager {
     this.store.recoveries.cancelConversation(source.id);
     journal.phase = 'committing'; this.pendingSwitches.add(source.userId); this.saveSwitchJournal(journal);
     if (this.config.controllerMode && !this.options.onRebindSwitch) throw new Error('Agent 切换提交缺少任务重绑入口。');
+    if(journal.externalHandoffId){
+      if(!this.options.onCommitExternalHandoff)throw new Error('外部交接恢复入口缺失');
+      this.options.onCommitExternalHandoff(journal.externalHandoffId);
+    }
     await this.options.onRebindSwitch?.(source, target);
     this.store.rebindQueued(source.id, target.id);
     if (this.store.getActive(source.userId)?.id !== target.id) this.store.setActive(source.userId, target.id, 'agent-switch');
     this.store.savePreferences(target);
-    journal.phase = 'committed'; journal.target = this.store.getConversation(target.id)!; this.saveSwitchJournal(journal); this.pendingSwitches.delete(source.userId);
+    journal.phase = 'committed'; journal.target = this.store.getConversation(target.id)!; this.saveSwitchJournal(journal);
+    if(journal.externalHandoffId)this.options.onCompleteExternalHandoff?.(journal.externalHandoffId,target.id);
+    this.pendingSwitches.delete(source.userId);
     const latest = this.latestMessages.get(source.userId); if (latest?.conversationId === source.id) this.latestMessages.set(source.userId, { ...latest, conversationId: target.id });
   }
   private async recoverAgentSwitches(): Promise<void> {
@@ -1091,6 +1143,7 @@ export class SessionManager {
       } else if (journal.phase === 'preparing' || journal.phase === 'prepared') {
         journal.phase = 'failed'; journal.error = '准备阶段因重启中断；未重做模型调用，保留原主控。'; this.saveSwitchJournal(journal);
       }
+      if(journal.phase==='committed'&&journal.externalHandoffId)this.options.onCompleteExternalHandoff?.(journal.externalHandoffId,journal.target.id);
       await this.options.onResumeSwitch?.(journal.source); await this.options.onResumeSwitch?.(journal.target);
     }
   }

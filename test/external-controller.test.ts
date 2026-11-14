@@ -58,7 +58,7 @@ test('external instance replacement fences stale decisions and cancellation reti
   const f=fixture(t),adapter=f.adapter(),old=adapter.connect('old','old-session');
   const waiting=adapter.run(f.turn());const cancelled=assert.rejects(waiting,/撤销/);
   const id=decision(adapter,old.lease);
-  assert.throws(()=>adapter.connect('new','different-session'),/先新建主控会话/);
+  assert.throws(()=>adapter.connect('new','different-session'),/显式交接/);
   const current=adapter.connect('new','old-session');
   assert.throws(()=>adapter.accept(old.lease,id),/失效/);adapter.accept(current.lease,id);
   await adapter.interrupt('conversation');await cancelled;
@@ -115,4 +115,31 @@ test('external requested introduction has no infinite recovery and headless none
   const id = decision(adapter, binding.lease); adapter.accept(binding.lease, id);
   assert.deepEqual(await adapter.finish(binding.lease, id), { status: 'completed' }); await none;
   assert.equal(f.published(), 0);
+});
+
+
+test('idle connect cannot silently overwrite a real session and status retrieves saved call results',async t=>{
+  const f=fixture(t),adapter=f.adapter(),binding=adapter.connect('first-instance','actual-session');
+  assert.throws(()=>adapter.connect('new-instance','different-session'),/显式交接/);
+  const waiting=adapter.run(f.turn('inspect-source')),suspended=assert.rejects(waiting,{name:'ExternalControllerSuspended'});
+  const id=decision(adapter,binding.lease);adapter.accept(binding.lease,id);
+  await adapter.call(binding.lease,id,'stable-call','bridge_start_worker',{prompt:'goal'});
+  assert.deepEqual(adapter.status({decisionId:id,callId:'stable-call'}).call,{status:'done',result:{accepted:true}});
+  await adapter.suspend('conversation');await suspended;
+  const replacement=adapter.connect('replacement-instance','actual-session');
+  assert.notEqual(replacement.lease,binding.lease);assert.equal(replacement.sessionId,'actual-session');
+  assert.throws(()=>adapter.events(binding.lease),/失效/);
+});
+
+test('session handoff rejects active tool execution and mismatched prior session',async t=>{
+  const f=fixture(t);let release!:()=>void;
+  const adapter=new ExternalControllerAdapter(f.config,async()=>{await new Promise<void>(resolve=>release=resolve);return {done:true};});
+  t.after(()=>adapter.close());const binding=adapter.connect('i','s');
+  const waiting=adapter.run(f.turn('busy')),suspended=assert.rejects(waiting,{name:'ExternalControllerSuspended'});
+  const id=decision(adapter,binding.lease);adapter.accept(binding.lease,id);
+  const call=adapter.call(binding.lease,id,'busy-call','bridge_start_worker',{});
+  await assert.rejects(adapter.handoff(binding.lease,'s','other','new',async()=>{throw new Error('must not transfer');}),/在途工具/);
+  release();await call;
+  await assert.rejects(adapter.handoff(binding.lease,'wrong','other','new',async()=>{throw new Error('must not transfer');}),/来源真实 Session/);
+  await adapter.suspend('conversation');await suspended;await adapter.close();
 });

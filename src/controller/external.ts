@@ -11,6 +11,7 @@ export class ExternalControllerSuspended extends Error {
   constructor() { super('External controller waiting persisted'); this.name='ExternalControllerSuspended'; }
 }
 interface Binding { instanceId:string; sessionId:string; generation:number; lease:string }
+interface ExternalHandoff { id:string; previous:Binding; next:Binding; status:'prepared'|'applied'|'completed'; conversationId?:string }
 interface Decision { id:string; sourceId:string; conversationId:string; generation:number; status:string; deadline:number|null; input:unknown; coordination?:Record<string,unknown>; result?:AgentResult;
   turnFacts?:Pick<AgentTurn,'source'|'text'|'input'|'imagePaths'|'chatScene'> }
 interface LiveDecision { decision:Decision; state:ControllerCoordinationState; busy:number; port:ControllerDecisionPort }
@@ -25,6 +26,7 @@ export class ExternalControllerAdapter implements AgentAdapter {
   private readonly coordinator:ControllerCoordinator;
   private readonly context:ControllerContextRenderer;
   private closing=false;
+  private handoffBusy=false;
   constructor(private readonly config:BridgeConfig,invoke:Invoke) {
     this.coordinator=new ControllerCoordinator({invokeTool:invoke,internalBotCommunicationEnabled:config.internalBotCommunicationEnabled});
     this.context=new ControllerContextRenderer({defaultModels:config.defaultModels,internalBotCommunicationEnabled:config.internalBotCommunicationEnabled,
@@ -38,6 +40,7 @@ export class ExternalControllerAdapter implements AgentAdapter {
         CREATE TABLE IF NOT EXISTS external_decisions(id TEXT PRIMARY KEY,source_id TEXT NOT NULL,conversation_id TEXT NOT NULL,value_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS external_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS external_calls(id TEXT PRIMARY KEY,signature TEXT NOT NULL,status TEXT NOT NULL,result_json TEXT);
+        CREATE TABLE IF NOT EXISTS external_handoffs(signature TEXT PRIMARY KEY,value_json TEXT NOT NULL);
       `);}
     return this.database;
   }
@@ -59,10 +62,13 @@ export class ExternalControllerAdapter implements AgentAdapter {
   private emit(id:string,payload:unknown):void {this.db().prepare('INSERT OR IGNORE INTO external_events(id,payload_json) VALUES(?,?)').run(id,JSON.stringify(payload));}
   connect(instanceId:string,sessionId:string):Binding {
     instanceId=valid(instanceId,'instanceId');sessionId=valid(sessionId,'sessionId');
-    if(this.closing)throw new Error('主控端口正在关闭');
+    if(this.closing||this.handoffBusy)throw new Error('主控端口正在关闭或交接');
     if([...this.active.values()].some(live=>live.busy>0))throw new Error('仍有在途工具调用，暂不能更换外部实例');
+    if(this.db().prepare("SELECT 1 FROM external_handoffs WHERE json_extract(value_json,'$.status')='applied'").get())
+      throw new Error('外部会话交接尚待完成，请重试原交接');
     const previous=this.binding();
     if(previous?.instanceId===instanceId&&previous.sessionId===sessionId)return previous;
+    if(previous&&previous.sessionId!==sessionId)throw new Error('真实外部 Session 已变化，请显式交接，不可直接连接覆盖');
     if([...this.active.values()].some(live=>live.state.turn.conversation.nativeId&&live.state.turn.conversation.nativeId!==sessionId))
       throw new Error('当前主控会话已经绑定真实外部 Session；更换 Session 请先新建主控会话');
     const binding={instanceId,sessionId,generation:(previous?.generation??0)+1,lease:randomUUID()};
@@ -74,6 +80,84 @@ export class ExternalControllerAdapter implements AgentAdapter {
     }
     return binding;
   }
+  status(query:{decisionId?:string;callId?:string}={}):Record<string,unknown> {
+    const result:Record<string,unknown>={binding:this.binding(),eventSequence:Number(this.db().prepare('SELECT COALESCE(MAX(sequence),0) AS value FROM external_events').get()!.value),
+      decisions:this.db().prepare('SELECT value_json FROM external_decisions ORDER BY rowid DESC LIMIT 100').all().map(row=>{
+        const value=JSON.parse(String(row.value_json)) as Decision;
+        return {id:value.id,conversationId:value.conversationId,generation:value.generation,status:value.status,deadline:value.deadline};
+      })};
+    if(query.decisionId){
+      const row=this.db().prepare('SELECT value_json FROM external_decisions WHERE id=?').get(query.decisionId);
+      if(!row)result.call={status:'not_found'};
+      else if(query.callId){
+        const decision=JSON.parse(String(row.value_json)) as Decision;
+        const call=this.db().prepare('SELECT status,result_json FROM external_calls WHERE id=?').get(JSON.stringify([decision.sourceId,query.callId]));
+        result.call=call?{status:call.status==='running'&&!this.calls.has(JSON.stringify([decision.sourceId,query.callId]))?'unknown':call.status,
+          ...(call.result_json?{result:JSON.parse(String(call.result_json))}:{})}:{status:'not_found'};
+      }
+    }
+    return result;
+  }
+  async handoff(lease:string,previousSessionId:string,instanceId:string,sessionId:string,transfer:(id:string,previousSessionId:string,sessionId:string)=>Promise<string>):Promise<unknown> {
+    previousSessionId=valid(previousSessionId,'previousSessionId');instanceId=valid(instanceId,'instanceId');sessionId=valid(sessionId,'sessionId');
+    if(previousSessionId===sessionId)throw new Error('相同真实 Session 请重新连接，无需交接');
+    if(this.closing||this.handoffBusy||[...this.active.values()].some(live=>live.busy>0))throw new Error('主控正在关闭、交接或存在在途工具调用');
+    const signature=createHash('sha256').update(canonicalControllerJSON([lease,previousSessionId,instanceId,sessionId])).digest('hex');
+    const saved=this.db().prepare('SELECT value_json FROM external_handoffs WHERE signature=?').get(signature);
+    let operation:ExternalHandoff;
+    if(saved)operation=JSON.parse(String(saved.value_json));
+    else {
+      this.authorize(lease);const previous=this.binding()!;
+      if(previous.sessionId!==previousSessionId)throw new Error('交接来源真实 Session 已变化');
+      operation={id:randomUUID(),previous,next:{instanceId,sessionId,generation:previous.generation+1,lease:randomUUID()},status:'prepared'};
+      this.db().prepare('INSERT INTO external_handoffs VALUES(?,?)').run(signature,JSON.stringify(operation));
+    }
+    if(operation.status==='completed')return {status:'handed-off',...operation.next,conversationId:operation.conversationId,duplicate:true};
+    const current=this.binding();
+    if(current?.lease!==operation.previous.lease&&current?.lease!==operation.next.lease)throw new Error('交接已被更新的外部实例取代');
+    this.handoffBusy=true;
+    try {
+      const conversationId=await transfer(operation.id,previousSessionId,sessionId);
+      // transfer commits the binding as part of its restart-recoverable switching journal.
+      const row=this.db().prepare('SELECT value_json FROM external_handoffs WHERE signature=?').get(signature)!;
+      operation=JSON.parse(String(row.value_json));
+      if(this.binding()?.lease!==operation.next.lease)throw new Error('交接未提交外部绑定');
+      operation.status='completed';operation.conversationId=conversationId;
+      this.db().prepare('UPDATE external_handoffs SET value_json=? WHERE signature=?').run(JSON.stringify(operation),signature);
+      return {status:'handed-off',...operation.next,conversationId,duplicate:false};
+    } finally {this.handoffBusy=false;}
+  }
+  commitHandoff(id:string):void {
+    const row=this.db().prepare("SELECT signature,value_json FROM external_handoffs WHERE json_extract(value_json,'$.id')=?").get(id);
+    if(!row)throw new Error('交接意图不存在');
+    const operation=JSON.parse(String(row.value_json)) as ExternalHandoff,current=this.binding();
+    if(operation.status!=='prepared'){
+      if(current?.lease!==operation.next.lease)throw new Error('交接绑定已被更新');
+      return;
+    }
+    if(current?.lease!==operation.previous.lease||[...this.active.values()].some(live=>live.busy>0))throw new Error('交接来源已变化或仍有工具在执行');
+    this.transaction(()=>{
+      this.db().prepare('INSERT INTO external_binding VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET value_json=excluded.value_json').run(JSON.stringify(operation.next));
+      for(const item of this.db().prepare('SELECT value_json FROM external_decisions').all()){
+        const decision=JSON.parse(String(item.value_json)) as Decision;
+        if(decision.generation===operation.previous.generation&&['queued','accepted'].includes(decision.status)){decision.status='handed-off';this.save(decision);}
+      }
+      operation.status='applied';this.db().prepare('UPDATE external_handoffs SET value_json=? WHERE signature=?').run(JSON.stringify(operation),String(row.signature));
+      this.emit('handoff:'+id,{kind:'session-handoff',handoffId:id,previousSessionId:operation.previous.sessionId,sessionId:operation.next.sessionId,generation:operation.next.generation});
+    });
+  }
+  completeHandoff(id:string,conversationId:string):void {
+    const row=this.db().prepare("SELECT signature,value_json FROM external_handoffs WHERE json_extract(value_json,'$.id')=?").get(id);
+    if(!row)throw new Error('交接意图不存在');
+    const operation=JSON.parse(String(row.value_json)) as ExternalHandoff;
+    if(operation.status==='completed'){
+      if(operation.conversationId!==conversationId)throw new Error('已完成交接的目标会话不同');
+      return;
+    }
+    if(operation.status!=='applied'||this.binding()?.lease!==operation.next.lease)throw new Error('交接绑定未完成');
+    operation.status='completed';operation.conversationId=conversationId;
+    this.db().prepare('UPDATE external_handoffs SET value_json=? WHERE signature=?').run(JSON.stringify(operation),String(row.signature));
+  }
   events(lease:string,after=0):unknown[] {
     this.authorize(lease);
     return this.db().prepare('SELECT sequence,payload_json FROM external_events WHERE sequence>? ORDER BY sequence LIMIT 100').all(after)
@@ -82,6 +166,7 @@ export class ExternalControllerAdapter implements AgentAdapter {
   private authorize(lease:string,decisionId?:string):LiveDecision|undefined {
     const binding=this.binding();if(!binding||binding.lease!==lease)throw new Error('外部实例已失效或未认证');
     if(!decisionId)return undefined;
+    if(this.handoffBusy)throw new Error('外部主控正在交接');
     const live=[...this.active.values()].find(item=>item.decision.id===decisionId);
     if(!live||live.decision.generation!==binding.generation||!['queued','accepted'].includes(live.decision.status))throw new Error('决策已退休、撤销或尚未恢复');
     if(live.decision.deadline!==null&&Date.now()>live.decision.deadline)throw new Error('主控响应等待已到期；已派助手不受影响，需核对后重新激活');

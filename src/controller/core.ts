@@ -152,6 +152,8 @@ export class ControllerCore {
       onDiagnostic: message => this.log(message),
       onListWorkers: (conversation, scope) => Promise.resolve(this.controller?.queryWorkerOverview(conversation, scope) ?? []),
       onRequestRestart: origin => hooks.requestRestart(origin) as ReturnType<NonNullable<SessionManagerOptions['onRequestRestart']>>,
+      onCommitExternalHandoff: id => (adapters.external as ExternalControllerAdapter).commitHandoff(id),
+      onCompleteExternalHandoff: (id,conversationId) => (adapters.external as ExternalControllerAdapter).completeHandoff(id,conversationId),
       ...(config.controllerMode ? { mergeDelayMs: 0 } : {}),
       ...(this.controller ? {
         onWorkerDefaults: argument => this.controller!.workerDefaultCommand(argument),

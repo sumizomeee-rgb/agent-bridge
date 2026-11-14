@@ -7,6 +7,8 @@ import type { ExternalControllerAdapter } from './external.js';
 
 export interface ExternalControllerEndpoint {
   id: string; adapter: ExternalControllerAdapter; submit: (requestId: string, text: string) => Promise<void>;
+  hasInput?: (requestId: string) => boolean;
+  handoff?: (operationId:string,previousSessionId:string,sessionId:string)=>Promise<string>;
 }
 export interface ExternalControllerServerOptions { hostDataDir: string; controllers: ExternalControllerEndpoint[] }
 export interface ExternalServerLocation { host: '127.0.0.1'; port: number; manifestPath: string }
@@ -80,12 +82,28 @@ export class ExternalControllerServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       if (request.socket.remoteAddress !== '127.0.0.1') throw new HttpError(403, '仅限本机');
-      const url = new URL(request.url ?? '/', 'http://127.0.0.1'), match = /^\/controllers\/([A-Za-z0-9_.-]+)\/(connect|events|accept|call|finish|input)$/.exec(url.pathname);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1'), match = /^\/controllers\/([A-Za-z0-9_.-]+)\/(connect|events|accept|call|finish|input|status|handoff)$/.exec(url.pathname);
       if (!match) throw new HttpError(404, '接口不存在');
       const endpoint = this.endpoints.get(match[1]!); if (!endpoint) throw new HttpError(404, '主控不存在');
       const expected = this.tokens.get(endpoint.id)!, supplied = request.headers.authorization?.replace(/^Bearer /, '') ?? '';
       if (!/^[a-f0-9]{64}$/.test(supplied) || supplied.length !== expected.length || !timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) throw new HttpError(401, '认证失败');
       const action = match[2]!;
+      if(action==='status'){
+        if(request.method!=='GET')throw new HttpError(405,'需要GET');
+        const requestId=url.searchParams.get('requestId'),decisionId=url.searchParams.get('decisionId'),callId=url.searchParams.get('callId');
+        if(callId&&!decisionId)throw new HttpError(400,'callId需要decisionId');
+        const result=endpoint.adapter.status({...(decisionId?{decisionId:field(decisionId,'decisionId')}:{}),...(callId?{callId:field(callId,'callId')}:{})});
+        if(requestId){
+          field(requestId,'requestId');
+          const row=this.database!.prepare('SELECT status FROM inputs WHERE controller_id=? AND request_id=?').get(endpoint.id,requestId);
+          let status=row?String(row.status):'not_found';
+          if(status==='unknown'&&endpoint.hasInput?.(requestId)){
+            this.database!.prepare("UPDATE inputs SET status='accepted' WHERE controller_id=? AND request_id=?").run(endpoint.id,requestId);status='accepted';
+          }
+          result.input={requestId,status};
+        }
+        this.send(response,200,result);return;
+      }
       if (action === 'events') {
         if (request.method !== 'GET') throw new HttpError(405, '需要GET');
         const after = Number(url.searchParams.get('after') ?? 0); if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(400, 'after无效');
@@ -94,6 +112,11 @@ export class ExternalControllerServer {
       if (request.method !== 'POST') throw new HttpError(405, '需要POST');
       const body = await this.body(request); let result: unknown;
       if (action === 'connect') result = endpoint.adapter.connect(field(body.instanceId, 'instanceId'), field(body.sessionId, 'sessionId'));
+      else if(action==='handoff'){
+        if(Object.keys(body).some(key=>!['lease','previousSessionId','instanceId','sessionId'].includes(key)))throw new HttpError(400,'交接参数无效');
+        if(!endpoint.handoff)throw new HttpError(409,'主控未提供交接入口');
+        result=await endpoint.adapter.handoff(field(body.lease,'lease'),field(body.previousSessionId,'previousSessionId'),field(body.instanceId,'instanceId'),field(body.sessionId,'sessionId'),endpoint.handoff);
+      }
       else if (action === 'input') {
         if (Object.keys(body).some(key => key !== 'requestId' && key !== 'text')) throw new HttpError(400, '输入仅接受requestId和text');
         result = await this.input(endpoint, field(body.requestId, 'requestId'), field(body.text, 'text', 65536));

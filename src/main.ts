@@ -130,6 +130,11 @@ try {
   if(externalControllers.length) {
     externalServer=new ExternalControllerServer({hostDataDir:config.rootDataDir,controllers:externalControllers.map(([id,core])=>({
       id,adapter:core.controllerAdapter('external') as ExternalControllerAdapter,
+      hasInput:requestId=>core.manager.hasMessage('external:'+id+':'+createHash('sha256').update(requestId).digest('hex')),
+      handoff:(operationId,previousSessionId,sessionId)=>{
+        if(closing||!core.isReady()||host.controllerHooks(core.config).isDraining())throw new Error('主控正在启动或维护，暂不交接');
+        return core.manager.handoffExternalSession(operationId,core.config.controllerUserId!,previousSessionId,sessionId);
+      },
       submit:async(requestId,text)=>{
         if(core.config.botId)throw new Error('此主控已绑定聊天渠道，请从原渠道发送新消息。');
         if(closing || !core.isReady() || host.controllerHooks(core.config).isDraining())throw new Error('主控正在启动或维护，暂不接受新输入。');

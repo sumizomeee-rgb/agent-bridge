@@ -96,20 +96,24 @@ bridge-local/browser/
 
 宿主启动就绪后，在 `bridge-local/host/external-api.json` 写入本机动态监听地址、各主控 URL 与 scoped bearer token；每个主控的持久 token 另存于 `external-api/<controllerId>.json`。这些都是私有凭据文件，不复制到公开文档或聊天内容。服务只监听 `127.0.0.1`，请求先验证对应主控的 token，再解析正文；JSON 正文上限 64 KiB。正常关闭移除就绪 manifest，重启后重新读取当前端口，不能把磁盘旧端口当作存活证明。
 
-以下路径均接在 manifest 中该主控 URL 后。除 events 外均为 POST，头部为 `Authorization: Bearer <该主控token>`：
+以下路径均接在 manifest 中该主控 URL 后。除 events/status 外均为 POST，头部为 `Authorization: Bearer <该主控token>`：
 
 | 路径 | 参数与作用 |
 | --- | --- |
-| `/connect` | `instanceId, sessionId`；登记真实外部实例和会话，取得 lease。新实例替换旧 lease，旧实例不能继续写入；原主控已绑定的真实 Session 保持不变，更换 Session 先新建主控会话。 |
+| `/connect` | `instanceId, sessionId`；登记真实外部实例和会话，取得 lease。同一真实 Session 可由新实例接回并替换旧 lease，旧实例不能继续写入；真实 Session 变化必须显式 handoff，不可直接覆盖。 |
 | `/input` | `requestId, text`；仅无渠道主控接受新的外部输入，来源和 owner 由宿主固定，调用者不能传 userId/channelId。 |
+| `GET /status` | 已认证的本主控 binding（含 lease）、持久决策简表与 eventSequence；可带 requestId 查输入账本，或 decisionId + callId 查原工具结果。不会返回 API bearer token。 |
+| `/handoff` | `lease, previousSessionId, instanceId, sessionId`；明确换到新的真实外部 Session，创建新的桥 conversation，稳定 controller ID 不变；迁移原助手、任务、计划、待处理事件与排队输入。 |
 | `GET /events?lease=…&after=N` | 增量读取持久事件，使用 sequence 游标；decision 事件含本轮输入、固定上下文与来源。 |
 | `/accept` | `lease, decisionId`；明确接收当前决策。 |
 | `/call` | `lease, decisionId, callId, name, args`；调用主控工具，沿用统一协调和权限校验。 |
 | `/finish` | `lease, decisionId`；显式请求结束当前决策，由共同协调器验证是否完成；需要补充决策时继续消费新事件。 |
 
-`input` 的 accepted 只表示桥已接收输入，不等于 Agent 完成回复。`requestId` 持久去重：相同正文重复提交不会再次派送，异参冲突被拒绝；提交结果 unknown 必须核对，不能更换 ID 盲目重发。工具 `callId` 同样保留既有调用记录和未知结果，不自动重做副作用。绑定了聊天渠道的外部主控可从 API 消费决策和调用工具，但新用户消息从已绑定的真实渠道进入。
+`input` 的 accepted 只表示桥已接收输入，不等于 Agent 完成回复。`requestId` 持久去重：相同正文重复提交不会再次派送，异参冲突被拒绝；提交结果 unknown 用 status 核对，不能更换 ID 盲目重发；当宿主已持久保存对应输入时，查询可确认 accepted。工具 `callId` 同样保留既有调用记录和未知结果，不自动重做副作用。绑定了聊天渠道的外部主控可从 API 消费决策和调用工具，但新用户消息从已绑定的真实渠道进入。
 
 外部等待可跨正常重启：决策、事件、lease 和协调状态保存在主控 data；重连后按当前 lease、事件游标和 decisionId 继续。`wait.responseMs:null` 不设响应期限，正整数配置响应期限；原 deadline 跨重启保留，不重新计时。到期只结束该等待，不把已派助手当作停止。停止、新建会话、会话替换或期限到达会使旧决策失效；旧 lease / decision 不能继续操作。外部 Agent 必须显式 finish，连接成功、读过事件或工具返回均不自动代表完成。
+
+交接仅在没有在途工具调用时进行；旧 lease 与旧 Session 必须匹配。交接意图和跨库提交 journal 持久保留，重启先按原日志幂等完成绑定与任务转移，不重新生成同一交接的会话。旧决策及 callId 账本可追溯，新真实 Session 不冒充旧 Session；仅云电脑/PID 或运行实例改变而真实 Session 不变时，使用 connect 接回即可。
 
 ## 旧部署的一次性迁移
 
