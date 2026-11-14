@@ -46,9 +46,9 @@ class PrivateProtocol implements RpcTransport {
     return { ok: response.status === 200 && !body.result?.isError && !body.error, value: body.result
       ? body.result.isError ? { error: body.result.content[0]!.text } : JSON.parse(body.result.content[0]!.text) : { error: body.error } };
   }
-  complete() {
-    if (this.agent === 'codex') this.emit({ method: 'turn/completed', params: { threadId: 'same-private-native', turn: { id: 'private-turn-' + this.turns, status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'DONE' }] } } });
-    else this.emit({ type: 'result', subtype: 'success', session_id: 'same-private-native', result: 'DONE' });
+  complete(text = 'DONE') {
+    if (this.agent === 'codex') this.emit({ method: 'turn/completed', params: { threadId: 'same-private-native', turn: { id: 'private-turn-' + this.turns, status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text }] } } });
+    else this.emit({ type: 'result', subtype: 'success', session_id: 'same-private-native', result: text });
   }
   async stop() { this.stopped = true; }
 }
@@ -278,3 +278,33 @@ for (const agent of ['codex', 'claude'] as const) test(`${agent} background reco
   }
   await f.protocol.call('bridge_send_user', { text: 'recovery complete' }); f.protocol.complete(); await running;
 });
+
+for (const agent of ['codex', 'claude'] as const) {
+  test(`${agent} requested introduction without delivery gets exactly one restricted correction before a real final send`, async t => {
+    const f = fixture(t, agent);
+    const running = f.adapter.run({ ...f.turn, event: { kind: 'workspace-context', text: 'Introduce through the original private channel.', introductionRequested: true } });
+    await until(() => f.protocol.turns === 1);
+    f.protocol.complete('1. Duties and abilities. 2. Preferences. 3. Continuation.');
+    await until(() => f.protocol.turns === 2);
+    assert.equal(f.sends.length, 0); assert.equal(f.invoked.length, 0);
+    assert.match(JSON.stringify(f.protocol.written.at(-1)), /reportRecoveryOnly/);
+    const dispatch = await f.protocol.call('bridge_start_worker', { prompt: 'must not dispatch' });
+    assert.equal(dispatch.ok, false); assert.equal(f.invoked.length, 0);
+    const final = await f.protocol.call('bridge_send_user', { text: '1. Duties. 2. Preferences. 3. Continuation.' });
+    assert.equal(final.ok, true);
+    f.protocol.complete(); await running;
+    assert.equal(f.protocol.turns, 2); assert.equal(f.sends.length, 1);
+  });
+  test(`${agent} requested introduction cannot silently finish twice while ordinary background events stay silent`, async t => {
+    const f = fixture(t, agent);
+    const running = f.adapter.run({ ...f.turn, event: { kind: 'workspace-context', text: 'Introduce now.', introductionRequested: true } });
+    const rejected = assert.rejects(running, /没有通过公开通道回复/);
+    await until(() => f.protocol.turns === 1); f.protocol.complete('unpublished introduction');
+    await until(() => f.protocol.turns === 2); f.protocol.complete('still unpublished');
+    await rejected; assert.equal(f.protocol.turns, 2); assert.equal(f.sends.length, 0);
+    const background = fixture(t, agent);
+    const silent = background.adapter.run({ ...background.turn, event: { kind: 'worker-progress', text: 'Background evidence.' } });
+    await until(() => background.protocol.turns === 1); background.protocol.complete(); await silent;
+    assert.equal(background.protocol.turns, 1); assert.equal(background.sends.length, 0);
+  });
+}

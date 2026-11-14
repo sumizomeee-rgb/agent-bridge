@@ -1,14 +1,16 @@
 import { resolve } from 'node:path';
 import { migrateWorkspaceRegistry } from './registry-migration.js';
+import { repairWorkspaceRegistryArtifacts } from './registry-artifact-repair.js';
 import { migrateControllerOwnership } from './controller-ownership-migration.js';
 
 async function run(): Promise<void> {
   const args = process.argv.slice(2);
-  let configPath: string | undefined, workspaceRoot: string | undefined, hostBootAt: string | undefined, apply = false;
+  let configPath: string | undefined, workspaceRoot: string | undefined, hostBootAt: string | undefined, apply = false, repair = false;
   const controllerIds: Record<string, string> = {}, owners: Record<string, string> = {};
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (arg === '--apply') apply = true;
+    if (arg === '--repair-artifacts') repair=true;
+    else if (arg === '--apply') apply = true;
     else if (arg === '--dry-run') apply = false;
     else if (arg === '--config' || arg === '--workspace' || arg === '--host-boot-at') {
       const value = args[++index]; if (!value || value.startsWith('--')) throw new Error(arg + ' 缺少路径。');
@@ -21,6 +23,7 @@ async function run(): Promise<void> {
       target[key] = value.slice(offset + 1);
     } else throw new Error('未知参数：' + arg);
   }
+  if(repair){if(!workspaceRoot||configPath||hostBootAt||Object.keys(controllerIds).length||Object.keys(owners).length)throw new Error('材料修复使用 --repair-artifacts --workspace 工作区 [--apply]');process.stdout.write(JSON.stringify(repairWorkspaceRegistryArtifacts({workspaceRoot,dryRun:!apply}),null,2)+'\n');return;}
   if (!configPath) throw new Error('需要 --config；默认只预览，--apply 执行停机迁移。');
   const plan = await migrateWorkspaceRegistry({ configPath, workspaceRoot, hostBootAt, controllerIds, owners, dryRun: !apply, migrateHost: migrateControllerOwnership });
   process.stdout.write(JSON.stringify(plan, null, 2) + '\n');

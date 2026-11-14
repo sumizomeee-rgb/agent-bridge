@@ -26,7 +26,12 @@ export interface RegistryMigrationPlan {
 export interface RegistryPathMapping {from:string;to:string}
 const pathKeys=new Set(['cwd','path','root','home','dataDir','attachmentsDir','logsDir','registryDir','contextPath','ticketPath','ticket_path','context_path','rollout_path','transcriptPath','completionFile','exitFile','resultFile','imagePaths','images_json','attachmentPaths','helperPath','nodePath','remoteRoot','sshConfig','browserRoot','browserProfile','profileDir','userDataDir','profileHome','sqliteHome','localPath','localPaths','outputPath','inputPath','launchDir','privateRoot','dataRoot','sessionDir','codexHome','claudeHome','args']);
 const ownerKeys=new Set(['userId','user_id','ownerUserId','owner_user_id']);
-const sourceKeys=new Set(['source','original','source_json']);
+function businessSource(value:unknown):boolean {
+  if(!value||typeof value!=='object'||Array.isArray(value))return false;const v=value as Record<string,unknown>;
+  const conversation=typeof v.id==='string'&&typeof v.userId==='string'&&typeof v.cwd==='string'&&['codex','claude','external'].includes(String(v.agent))&&(v.nativeId===null||typeof v.nativeId==='string');
+  const routed=['botId','principalId','conversationId','messageId','userId','channelId'].every(key=>typeof v[key]==='string')&&Number.isSafeInteger(v.generation);
+  return conversation||routed;
+}
 const channelFiles=new Set(['ingress.sqlite','feishu-outbox.sqlite','lifecycle.sqlite']);
 const channelDirectories=new Set(['attachments']);
 const transientFiles=new Set(['bridge.pid.json','supervisor.pid.json','stop.request','drain-stop.request','disabled']);
@@ -36,15 +41,15 @@ function inside(root:string,path:string):string|null{
   return suffix===''||suffix!=='..'&&!suffix.startsWith('..'+sep)&&!isAbsolute(suffix)?suffix:null;
 }
 /** Relocate program path fields and canonical business owners; provenance/text/signatures remain unchanged. */
-export function relocateRegistryValue(value:unknown,mappings:RegistryPathMapping[],principalUsers:Record<string,string>,key='',sourceEvidence=false):unknown{
-  sourceEvidence ||= sourceKeys.has(key);
+export function relocateRegistryValue(value:unknown,mappings:RegistryPathMapping[],principalUsers:Record<string,string>,key='',sourceEvidence=false,legacySourceProtection=false):unknown{
+  sourceEvidence ||= key==='original'||key==='source_json'||key==='source'&&(legacySourceProtection||!businessSource(value));
   if(typeof value==='string'){
     if(!sourceEvidence&&ownerKeys.has(key)&&principalUsers[value])return principalUsers[value];
     if(pathKeys.has(key))for(const mapping of mappings){const suffix=inside(mapping.from,value);if(suffix!==null)return join(mapping.to,suffix);}
     return value;
   }
-  if(Array.isArray(value))return value.map(item=>relocateRegistryValue(item,mappings,principalUsers,key,sourceEvidence));
-  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).map(([name,item])=>[name,relocateRegistryValue(item,mappings,principalUsers,name,sourceEvidence)]));
+  if(Array.isArray(value))return value.map(item=>relocateRegistryValue(item,mappings,principalUsers,key,sourceEvidence,legacySourceProtection));
+  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).map(([name,item])=>[name,relocateRegistryValue(item,mappings,principalUsers,name,sourceEvidence,legacySourceProtection)]));
   return value;
 }
 function stopped(path:string):boolean{
@@ -116,11 +121,12 @@ function rewriteDatabase(path:string,mappings:RegistryPathMapping[],users:Record
     db.exec('COMMIT');
   }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}finally{db.close();}
 }
-function rewriteFiles(root:string,mappings:RegistryPathMapping[],users:Record<string,string>):void{
+function rewriteFiles(root:string,mappings:RegistryPathMapping[],users:Record<string,string>,dataRoot=root):void{
   for(const name of readdirSync(root)){const path=join(root,name),stat=lstatSync(path);if(stat.isSymbolicLink())continue;
-    if(stat.isDirectory())rewriteFiles(path,mappings,users);
+    if(stat.isDirectory())rewriteFiles(path,mappings,users,dataRoot);
     else if(name.endsWith('.sqlite'))rewriteDatabase(path,mappings,users);
     else if(name.endsWith('.json')||name.endsWith('.jsonl')){
+      if(/^session-handoffs[\\/][^\\/]+[\\/]source\.json$/.test(relative(dataRoot,path)))continue;
       const bytes=readFileSync(path),source=bytes.toString('utf8').replace(/^\uFEFF/,'');let next:string;
       try{next=name.endsWith('.jsonl')?source.split(/\r?\n/).map(line=>line.trim()?JSON.stringify(relocateRegistryValue(JSON.parse(line),mappings,users)):line).join(source.includes('\r\n')?'\r\n':'\n')
         :json(relocateRegistryValue(JSON.parse(source),mappings,users));}catch{continue;}
@@ -132,6 +138,19 @@ function controllerId(profile:BotProfile,botId:string,configured?:string):string
   const candidate=configured??profile.aliases?.find(alias=>/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(alias))?.toLowerCase()??'controller-'+createHash('sha256').update(botId).digest('hex').slice(0,12);
   if(!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(candidate))throw new Error('无效的目标主控ID：'+candidate);return candidate;
 }
+
+export function validateFrozenHandoffArtifacts(dataDir:string):void {
+ const root=join(dataDir,'session-handoffs');if(!existsSync(root))return;
+ for(const entry of readdirSync(root,{withFileTypes:true})){
+  if(entry.isSymbolicLink())throw new Error('续接材料目录不得是链接');if(!entry.isDirectory())continue;
+  const directory=join(root,entry.name),manifestPath=join(directory,'manifest.json'),sourcePath=join(directory,'source.json');
+  if(!existsSync(manifestPath)&&!existsSync(sourcePath))continue;
+  const manifest=readJson(manifestPath),bytes=readFileSync(sourcePath);
+  if(manifest.version!==1||manifest.targetId!==entry.name||typeof manifest.snapshotHash!=='string'||createHash('sha256').update(bytes).digest('hex')!==manifest.snapshotHash)throw new Error('原续接快照校验失败，拒绝迁移：'+sourcePath);
+  if(typeof manifest.contextHash==='string'&&createHash('sha256').update(readFileSync(join(directory,'context.md'))).digest('hex')!==manifest.contextHash)throw new Error('原续接摘要校验失败，拒绝迁移：'+directory);
+ }
+}
+
 /** One-shot offline semantic migration. Source material remains available for post-start verification/recycling. */
 export async function migrateWorkspaceRegistry(options:RegistryMigrationOptions):Promise<RegistryMigrationPlan>{
   const configPath=resolve(options.configPath),configBytes=readFileSync(configPath),raw=readJson(configPath);
@@ -186,6 +205,7 @@ export async function migrateWorkspaceRegistry(options:RegistryMigrationOptions)
     for(const [index,binding] of bindings.entries()){
       const profile=profiles[index]!,controllerDir=join(stageRegistry,'controllers',binding.controllerId),channelDir=join(stageRegistry,'channels',profile.platform==='feishu'?'lark':'discord','bots',profile.applicationId!);
       mkdirSync(join(controllerDir,'data'),{recursive:true});mkdirSync(join(channelDir,'data'),{recursive:true});
+      validateFrozenHandoffArtifacts(binding.sourceDataDir);
       if(existsSync(binding.sourceDataDir))for(const name of readdirSync(binding.sourceDataDir)){
         if(transientFiles.has(name)||/\.sqlite-(wal|shm)$/.test(name))continue;
         const target=join(channelFiles.has(name)||channelDirectories.has(name)?channelDir:controllerDir,'data',name);

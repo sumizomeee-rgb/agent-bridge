@@ -151,7 +151,7 @@ export class ControllerCoordinator {
       return active.turn.onReadBridgeFeedback(args);
     }
     if (name === 'bridge_silent') {
-      if (active.turn.deliveryRequirement !== 'none' && (!active.turn.groupContext || !active.turn.onSilent)) throw new Error('静默终态只适用于已授权的群参与轮次或无渠道主控。');
+      if (active.turn.deliveryRequirement !== 'none' && (active.turn.event?.introductionRequested === true || !active.turn.groupContext || !active.turn.onSilent)) throw new Error('静默终态只适用于已授权的群参与轮次或无渠道主控。');
       if (Object.keys(args).length) throw new Error('静默工具不接受参数。');
       const admitted = [...active.inFlightTools.entries()].filter(([id]) => id !== callId).map(([, tool]) => tool.promise);
       active.sealed = true;
@@ -330,7 +330,8 @@ export class ControllerCoordinator {
         return 'continued';
       }
       const noDelivery = active.turn.deliveryRequirement === 'none';
-      if (!noDelivery && active.turn.controllerRecovery && !active.turn.groupContext && !active.turn.event
+      const requiresIntroduction = !noDelivery && active.turn.event?.introductionRequested === true;
+      if (!noDelivery && (requiresIntroduction || active.turn.controllerRecovery && !active.turn.groupContext && !active.turn.event)
         && active.publicCalls === 0 && !active.silent && !active.sealed && !active.replyRecovery) {
         active.replyRecovery = true;
         active.privateFinalCallId = undefined;
@@ -350,7 +351,8 @@ export class ControllerCoordinator {
       }
       if (active.publicationPreparationError && !active.silent) throw active.publicationPreparationError;
       const privateFinalRequired = !!active.turn.onPrivateInputCheck && !active.turn.groupContext && !active.turn.event;
-      if (!noDelivery && (!active.turn.event || active.turn.event.kind === 'recovery' || active.replyRecovery) && active.publicCalls === 0 && !active.silent && (!active.restartAccepted || privateFinalRequired))
+      if (!noDelivery && (!active.turn.event || active.turn.event.kind === 'recovery' || active.replyRecovery || requiresIntroduction)
+        && active.publicCalls === 0 && (requiresIntroduction || !active.silent) && (!active.restartAccepted || privateFinalRequired || requiresIntroduction))
         throw Object.assign(new Error('主控没有通过公开通道回复，本轮未标记为成功。'), { finalReplyMissing: true });
       const result = port.result();
       active.sealed = true;

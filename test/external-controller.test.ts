@@ -88,3 +88,31 @@ test('external private reassessment restores updated source and attachments afte
   assert.equal(observed?.source?.messageId,'new-input');assert.equal(observed?.text,'new goal');assert.deepEqual(observed?.imagePaths,['new-image.png']);
   await second.suspend('conversation');await cleanup;await second.close();
 });
+
+test('external requested introduction shares the one-shot restricted correction and sends publicly once', async t => {
+  const f = fixture(t), adapter = f.adapter(), binding = adapter.connect('instance', 'intro-session');
+  const running = adapter.run({ ...f.turn('intro', 'private'), event: { kind: 'workspace-context', text: 'Introduce now.', introductionRequested: true } });
+  const first = decision(adapter, binding.lease); adapter.accept(binding.lease, first);
+  assert.deepEqual(await adapter.finish(binding.lease, first), { status: 'continued' });
+  const correction = decision(adapter, binding.lease); assert.notEqual(correction, first);
+  adapter.accept(binding.lease, correction);
+  await assert.rejects(adapter.call(binding.lease, correction, 'dispatch', 'bridge_start_worker', { prompt: 'not allowed' }));
+  assert.equal(f.calls(), 0);
+  await adapter.call(binding.lease, correction, 'final', 'bridge_send_user', { text: 'Three-point introduction.' });
+  await adapter.call(binding.lease, correction, 'final', 'bridge_send_user', { text: 'Three-point introduction.' });
+  await adapter.finish(binding.lease, correction); await running; assert.equal(f.published(), 1);
+});
+
+test('external requested introduction has no infinite recovery and headless none still needs no delivery', async t => {
+  const f = fixture(t), adapter = f.adapter(), binding = adapter.connect('instance', 'intro-session');
+  const running = adapter.run({ ...f.turn('failed-intro', 'private'), event: { kind: 'workspace-context', text: 'Introduce now.', introductionRequested: true } });
+  const rejected = assert.rejects(running, /没有通过公开通道回复/);
+  const first = decision(adapter, binding.lease); adapter.accept(binding.lease, first); await adapter.finish(binding.lease, first);
+  const correction = decision(adapter, binding.lease); adapter.accept(binding.lease, correction);
+  await assert.rejects(adapter.finish(binding.lease, correction), /没有通过公开通道回复/); await rejected;
+  assert.equal(adapter.events(binding.lease).filter((event: any) => event.kind === 'decision').length, 2);
+  const none = adapter.run({ ...f.turn('headless-intro', 'none'), event: { kind: 'workspace-context', text: 'No channel.', introductionRequested: true } });
+  const id = decision(adapter, binding.lease); adapter.accept(binding.lease, id);
+  assert.deepEqual(await adapter.finish(binding.lease, id), { status: 'completed' }); await none;
+  assert.equal(f.published(), 0);
+});
