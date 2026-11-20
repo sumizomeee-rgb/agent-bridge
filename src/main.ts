@@ -116,14 +116,22 @@ try {
     catch (error) { host.failures.set(selected.controllerId!, safeError(error, secrets)); log(`CONTROLLER_UNAVAILABLE ${selected.controllerId} ${safeError(error, secrets)}`); }
   }
   await host.prepareRecoveryBots();
-  await Promise.all([...host.bots].filter(([id]) => !host.failures.has(id)).map(async ([id, bot]) => {
-    try { await bot.start(); }
-    catch (error) { host.failures.set(id, safeError(error, secrets)); log(`BOT_START_FAILED ${id} ${safeError(error, secrets)}`); }
-  }));
-  await Promise.all([...host.controllers].filter(([,core])=>!core.config.botId).map(async ([id,core])=>{
-    try { await core.start(); }
-    catch(error) { host.failures.set(id,safeError(error,secrets)); log(`CONTROLLER_START_FAILED ${id} ${safeError(error,secrets)}`); await core.close().catch(failure=>log('CONTROLLER_CLOSE_FAILED '+safeError(failure,secrets))); }
-  }));
+  for (const { botId, controllerId } of config.controllerConfigs) {
+    const id = botId ?? controllerId!;
+    const runtime = botId ? host.bots.get(botId) : host.controllers.get(id);
+    if (!runtime || host.failures.has(id)) continue;
+
+    try {
+      await runtime.start();
+    } catch (error) {
+      const detail = safeError(error, secrets);
+      host.failures.set(id, detail);
+      log(`${botId ? 'BOT_START_FAILED' : 'CONTROLLER_START_FAILED'} ${id} ${detail}`);
+      if (!botId) {
+        await runtime.close().catch(failure => log('CONTROLLER_CLOSE_FAILED ' + safeError(failure, secrets)));
+      }
+    }
+  }
   if (![...host.controllers.values()].some(core=>core.isReady())) throw new Error('没有可用的主控，宿主未就绪。');
   await host.recover(); restart.ready();
   const externalControllers = [...host.controllers].filter(([,core])=>core.isReady() && core.config.controllerBackend?.kind==='external');
